@@ -2636,6 +2636,16 @@ std::optional<ShieldingRequirement> Coil::get_shielding_requirement_for_interfac
 
 Layer Coil::create_shielding_layer(const ShieldingRequirement& shieldingRequirement, std::pair<size_t, size_t> windingsMapKey) {
     double shieldThickness = shieldingRequirement.get_thickness().value_or(defaults.defaultShieldThickness);
+    // A wound screen is a single layer of wire, so its build follows the wire outer diameter
+    if (shieldingRequirement.get_type() == ShieldingType::WOUND && shieldingRequirement.get_wire()) {
+        try {
+            auto shieldWire = find_wire_by_name(shieldingRequirement.get_wire().value());
+            shieldThickness = std::max(shieldWire.get_maximum_outer_width(), shieldWire.get_maximum_outer_height());
+        }
+        catch (const std::exception& e) {
+            log("Shield wire not found, keeping requirement thickness: " + shieldingRequirement.get_wire().value());
+        }
+    }
     double coverage = shieldingRequirement.get_coverage().value_or(1);
 
     auto bobbin = resolve_bobbin();
