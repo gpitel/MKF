@@ -66,6 +66,8 @@ struct Defaults {
     const std::string defaultInsulationMaterial = "ETFE";
     const std::string defaultLayerInsulationMaterial = "Kapton HN";
     const std::string defaultConductorMaterial = "copper";
+    // Electrostatic shield thickness, in m, used when a shielding requirement gives no explicit thickness
+    const double defaultShieldThickness = 0.0001;
     const std::string defaultPcbInsulationMaterial = "FR4";
     const std::string defaultBobbinMaterial = "PET";
     // Core coating thickness per surface, in m, used when a core's coating is given

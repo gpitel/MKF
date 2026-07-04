@@ -2595,6 +2595,147 @@ bool Coil::calculate_mechanical_insulation() {
     return true;
 }
 
+void Coil::set_shielding_requirements(std::vector<ShieldingRequirement> shieldingRequirements) {
+    _shieldingRequirements = shieldingRequirements;
+}
+
+std::optional<ShieldingRequirement> Coil::get_shielding_requirement_for_interface(size_t leftWindingIndex, size_t rightWindingIndex, size_t interfaceIndex) {
+    auto shieldingRequirements = _shieldingRequirements;
+    if (_inputs && _inputs->get_design_requirements().get_shielding()) {
+        auto requirementsFromInputs = _inputs->get_design_requirements().get_shielding().value();
+        shieldingRequirements.insert(shieldingRequirements.end(), requirementsFromInputs.begin(), requirementsFromInputs.end());
+    }
+    if (shieldingRequirements.empty()) {
+        return std::nullopt;
+    }
+    auto functionalDescription = get_functional_description();
+    if (leftWindingIndex >= functionalDescription.size() || rightWindingIndex >= functionalDescription.size() || leftWindingIndex == rightWindingIndex) {
+        return std::nullopt;
+    }
+    auto leftWindingName = functionalDescription[leftWindingIndex].get_name();
+    auto rightWindingName = functionalDescription[rightWindingIndex].get_name();
+    for (auto& shieldingRequirement : shieldingRequirements) {
+        auto betweenWindings = shieldingRequirement.get_between_windings();
+        if (betweenWindings.size() != 2) {
+            continue;
+        }
+        if ((betweenWindings[0] != leftWindingName || betweenWindings[1] != rightWindingName) &&
+            (betweenWindings[0] != rightWindingName || betweenWindings[1] != leftWindingName)) {
+            continue;
+        }
+        auto interfaces = shieldingRequirement.get_interfaces();
+        if (!interfaces || interfaces->empty()) {
+            return shieldingRequirement;
+        }
+        if (std::find(interfaces->begin(), interfaces->end(), int64_t(interfaceIndex)) != interfaces->end()) {
+            return shieldingRequirement;
+        }
+    }
+    return std::nullopt;
+}
+
+Layer Coil::create_shielding_layer(const ShieldingRequirement& shieldingRequirement, std::pair<size_t, size_t> windingsMapKey) {
+    double shieldThickness = shieldingRequirement.get_thickness().value_or(defaults.defaultShieldThickness);
+    double coverage = shieldingRequirement.get_coverage().value_or(1);
+
+    auto bobbin = resolve_bobbin();
+    auto windingWindows = bobbin.get_processed_description().value().get_winding_windows();
+    auto bobbinWindingWindowShape = bobbin.get_winding_window_shape();
+    auto windingOrientation = get_winding_orientation();
+    // Align with the insulation layers already built for this interface, when present
+    auto layersOrientation = _layersOrientation;
+    if (_insulationInterSectionsLayers.contains(windingsMapKey) && !_insulationInterSectionsLayers[windingsMapKey].empty()) {
+        layersOrientation = _insulationInterSectionsLayers[windingsMapKey][0].get_orientation();
+    }
+
+    Layer shieldLayer;
+    shieldLayer.set_partial_windings(std::vector<PartialWinding>{});
+    shieldLayer.set_type(ElectricalType::SHIELDING);
+    shieldLayer.set_name(shieldingRequirement.get_name().value_or("temp shielding"));
+    shieldLayer.set_orientation(layersOrientation);
+    shieldLayer.set_turns_alignment(CoilAlignment::CENTERED);
+    shieldLayer.set_filling_factor(1);
+
+    if (bobbinWindingWindowShape == WindingWindowShape::RECTANGULAR) {
+        shieldLayer.set_coordinate_system(CoordinateSystem::CARTESIAN);
+        double windingWindowHeight = windingWindows[0].get_height().value();
+        double windingWindowWidth = windingWindows[0].get_width().value();
+        auto margin = shieldingRequirement.get_margin();
+        bool hasMargin = margin && margin->size() == 2;
+        if (layersOrientation == WindingOrientation::OVERLAPPING) {
+            double breadth = hasMargin? std::max(0.0, windingWindowHeight - (*margin)[0] - (*margin)[1]) : windingWindowHeight * coverage;
+            shieldLayer.set_dimensions(std::vector<double>{shieldThickness, breadth});
+        }
+        else {
+            double breadth = hasMargin? std::max(0.0, windingWindowWidth - (*margin)[0] - (*margin)[1]) : windingWindowWidth * coverage;
+            shieldLayer.set_dimensions(std::vector<double>{breadth, shieldThickness});
+        }
+    }
+    else {
+        shieldLayer.set_coordinate_system(CoordinateSystem::POLAR);
+        double windingWindowRadialHeight = windingWindows[0].get_radial_height().value();
+        double windingWindowAngle = windingWindows[0].get_angle().value();
+        if (windingOrientation == WindingOrientation::OVERLAPPING) {
+            shieldLayer.set_dimensions(std::vector<double>{shieldThickness, windingWindowAngle * coverage});
+        }
+        else {
+            double shieldThicknessInAngle = wound_distance_to_angle(shieldThickness, windingWindowRadialHeight);
+            shieldLayer.set_dimensions(std::vector<double>{windingWindowRadialHeight * coverage, shieldThicknessInAngle});
+        }
+    }
+    return shieldLayer;
+}
+
+size_t Coil::get_interface_layers_thickness_dimension_index(std::pair<size_t, size_t> windingsMapKey) {
+    auto bobbin = resolve_bobbin();
+    auto bobbinWindingWindowShape = bobbin.get_winding_window_shape();
+    if (bobbinWindingWindowShape == WindingWindowShape::RECTANGULAR) {
+        auto layersOrientation = _layersOrientation;
+        if (_insulationInterSectionsLayers.contains(windingsMapKey) && !_insulationInterSectionsLayers[windingsMapKey].empty()) {
+            layersOrientation = _insulationInterSectionsLayers[windingsMapKey][0].get_orientation();
+        }
+        return layersOrientation == WindingOrientation::OVERLAPPING? 0 : 1;
+    }
+    return get_winding_orientation() == WindingOrientation::OVERLAPPING? 0 : 1;
+}
+
+double Coil::get_shielding_extra_dimension(std::pair<size_t, size_t> windingsMapKey, size_t interfaceIndex) {
+    auto shieldingRequirement = get_shielding_requirement_for_interface(windingsMapKey.first, windingsMapKey.second, interfaceIndex);
+    if (!shieldingRequirement) {
+        return 0;
+    }
+    auto shieldLayer = create_shielding_layer(shieldingRequirement.value(), windingsMapKey);
+    size_t layerThicknessDimensionIndex = get_interface_layers_thickness_dimension_index(windingsMapKey);
+    double extraDimension = shieldLayer.get_dimensions()[layerThicknessDimensionIndex];
+    // The shield must be sandwiched in insulation on both faces: a single-layer stack gets its layer cloned
+    if (_insulationInterSectionsLayers.contains(windingsMapKey) && _insulationInterSectionsLayers[windingsMapKey].size() == 1) {
+        extraDimension += _insulationInterSectionsLayers[windingsMapKey][0].get_dimensions()[layerThicknessDimensionIndex];
+    }
+    return extraDimension;
+}
+
+std::vector<Layer> Coil::get_interface_layers_with_shielding(std::pair<size_t, size_t> windingsMapKey, size_t interfaceIndex) {
+    std::vector<Layer> interfaceLayers;
+    if (_insulationInterSectionsLayers.contains(windingsMapKey)) {
+        interfaceLayers = _insulationInterSectionsLayers[windingsMapKey];
+    }
+    auto shieldingRequirement = get_shielding_requirement_for_interface(windingsMapKey.first, windingsMapKey.second, interfaceIndex);
+    if (!shieldingRequirement) {
+        return interfaceLayers;
+    }
+    auto shieldLayer = create_shielding_layer(shieldingRequirement.value(), windingsMapKey);
+    if (interfaceLayers.empty()) {
+        interfaceLayers.push_back(shieldLayer);
+    }
+    else {
+        if (interfaceLayers.size() == 1) {
+            interfaceLayers.push_back(interfaceLayers[0]);
+        }
+        interfaceLayers.insert(interfaceLayers.begin() + (interfaceLayers.size() + 1) / 2, shieldLayer);
+    }
+    return interfaceLayers;
+}
+
 bool Coil::calculate_insulation(bool simpleMode) {
     auto inputs = _inputs.value();
 
@@ -2770,43 +2911,38 @@ std::vector<std::pair<size_t, double>> Coil::get_ordered_sections(double spaceFo
 std::vector<std::pair<ElectricalType, std::pair<size_t, double>>> Coil::add_insulation_to_sections(std::vector<std::pair<size_t, double>> orderedSections){
     std::vector<std::pair<ElectricalType, std::pair<size_t, double>>> orderedSectionsWithInsulation;
     auto windingOrientation = get_winding_orientation();
+    size_t sectionThicknessDimensionIndex = windingOrientation == WindingOrientation::OVERLAPPING? 0 : 1;
+    size_t insulationInterfaceIndex = 0;
     for (size_t sectionIndex = 1; sectionIndex < orderedSections.size(); ++sectionIndex) {
         auto leftWindingIndex = orderedSections[sectionIndex - 1].first;
         auto rightWindingIndex = orderedSections[sectionIndex].first;
-        auto windingsMapKey = std::pair<size_t, size_t>{leftWindingIndex, rightWindingIndex}; 
+        auto windingsMapKey = std::pair<size_t, size_t>{leftWindingIndex, rightWindingIndex};
         if (!_insulationSections.contains(windingsMapKey)) {
             continue;
         }
+        double interfaceDimension = _insulationSections[windingsMapKey].get_dimensions()[sectionThicknessDimensionIndex]
+                                    + get_shielding_extra_dimension(windingsMapKey, insulationInterfaceIndex);
+        insulationInterfaceIndex++;
         auto currentSpaceForLeftSection = orderedSections[sectionIndex - 1].second;
         auto currentSpaceForRightSection = orderedSections[sectionIndex].second;
 
-        if (windingOrientation == WindingOrientation::OVERLAPPING) {
-            std::pair<size_t, double> leftSectionInfo = {leftWindingIndex, currentSpaceForLeftSection - _insulationSections[windingsMapKey].get_dimensions()[0] / 2};
-            orderedSections[sectionIndex - 1] = leftSectionInfo;
-            std::pair<size_t, double> rightSectionInfo = {rightWindingIndex, currentSpaceForRightSection - _insulationSections[windingsMapKey].get_dimensions()[0] / 2};
-            orderedSections[sectionIndex] = rightSectionInfo;
-        }
-        else if (windingOrientation == WindingOrientation::CONTIGUOUS) {
-            std::pair<size_t, double> leftSectionInfo = {leftWindingIndex, currentSpaceForLeftSection - _insulationSections[windingsMapKey].get_dimensions()[1] / 2};
-            orderedSections[sectionIndex - 1] = leftSectionInfo;
-            std::pair<size_t, double> rightSectionInfo = {rightWindingIndex, currentSpaceForRightSection - _insulationSections[windingsMapKey].get_dimensions()[1] / 2};
-            orderedSections[sectionIndex] = rightSectionInfo;
-        }
+        std::pair<size_t, double> leftSectionInfo = {leftWindingIndex, currentSpaceForLeftSection - interfaceDimension / 2};
+        orderedSections[sectionIndex - 1] = leftSectionInfo;
+        std::pair<size_t, double> rightSectionInfo = {rightWindingIndex, currentSpaceForRightSection - interfaceDimension / 2};
+        orderedSections[sectionIndex] = rightSectionInfo;
     }
 
+    insulationInterfaceIndex = 0;
     orderedSectionsWithInsulation.push_back({ElectricalType::CONDUCTION, orderedSections[0]});
     for (size_t sectionIndex = 1; sectionIndex < orderedSections.size(); ++sectionIndex) {
         auto leftWindingIndex = orderedSections[sectionIndex - 1].first;
         auto rightWindingIndex = orderedSections[sectionIndex].first;
-        auto windingsMapKey = std::pair<size_t, size_t>{leftWindingIndex, rightWindingIndex}; 
+        auto windingsMapKey = std::pair<size_t, size_t>{leftWindingIndex, rightWindingIndex};
         if (_insulationSections.contains(windingsMapKey)) {
-            std::pair<size_t, double> insulationSectionInfo;
-            if (windingOrientation == WindingOrientation::OVERLAPPING) {
-                insulationSectionInfo = {SIZE_MAX, _insulationSections[windingsMapKey].get_dimensions()[0]};
-            }
-            else if (windingOrientation == WindingOrientation::CONTIGUOUS) {
-                insulationSectionInfo = {SIZE_MAX, _insulationSections[windingsMapKey].get_dimensions()[1]};
-            }
+            double interfaceDimension = _insulationSections[windingsMapKey].get_dimensions()[sectionThicknessDimensionIndex]
+                                        + get_shielding_extra_dimension(windingsMapKey, insulationInterfaceIndex);
+            insulationInterfaceIndex++;
+            std::pair<size_t, double> insulationSectionInfo = {SIZE_MAX, interfaceDimension};
 
             orderedSectionsWithInsulation.push_back({ElectricalType::INSULATION, insulationSectionInfo});
         }
@@ -2823,16 +2959,12 @@ std::vector<std::pair<ElectricalType, std::pair<size_t, double>>> Coil::add_insu
         // We don't add one in the sections are contiguous, as they end in the bobbin
         auto leftWindingIndex = orderedSections.back().first;
         auto rightWindingIndex = orderedSections[0].first;
-        auto windingsMapKey = std::pair<size_t, size_t>{leftWindingIndex, rightWindingIndex}; 
+        auto windingsMapKey = std::pair<size_t, size_t>{leftWindingIndex, rightWindingIndex};
 
         if (_insulationSections.contains(windingsMapKey)) {
-            std::pair<size_t, double> insulationSectionInfo;
-            if (windingOrientation == WindingOrientation::OVERLAPPING) {
-                insulationSectionInfo = {SIZE_MAX, _insulationSections[windingsMapKey].get_dimensions()[0]};
-            }
-            else if (windingOrientation == WindingOrientation::CONTIGUOUS) {
-                insulationSectionInfo = {SIZE_MAX, _insulationSections[windingsMapKey].get_dimensions()[1]};
-            }
+            double interfaceDimension = _insulationSections[windingsMapKey].get_dimensions()[sectionThicknessDimensionIndex]
+                                        + get_shielding_extra_dimension(windingsMapKey, insulationInterfaceIndex);
+            std::pair<size_t, double> insulationSectionInfo = {SIZE_MAX, interfaceDimension};
 
             orderedSectionsWithInsulation.push_back({ElectricalType::INSULATION, insulationSectionInfo});
         }
@@ -4132,6 +4264,20 @@ bool Coil::wind_by_rectangular_sections(std::vector<double> proportionPerWinding
 
                 auto insulationSection = _insulationSections[windingsMapKey];
 
+                // Interface ordinal: how many insulation sections were materialized before this one
+                size_t insulationInterfaceIndex = 0;
+                for (auto& existingSection : sectionsDescription) {
+                    if (existingSection.get_type() != ElectricalType::CONDUCTION) {
+                        insulationInterfaceIndex++;
+                    }
+                }
+                double shieldingExtraDimension = get_shielding_extra_dimension(windingsMapKey, insulationInterfaceIndex);
+                if (shieldingExtraDimension != 0) {
+                    auto insulationSectionDimensions = insulationSection.get_dimensions();
+                    insulationSectionDimensions[windingOrientation == WindingOrientation::OVERLAPPING? 0 : 1] += shieldingExtraDimension;
+                    insulationSection.set_dimensions(insulationSectionDimensions);
+                }
+
                 insulationSection.set_group(group.get_name());
                 insulationSection.set_name("Insulation between " + get_name(previousWindingIndex) + " and " + get_name(nextWindingIndex) + " section " + std::to_string(sectionIndex));
                 if (windingOrientation == WindingOrientation::OVERLAPPING) {
@@ -4529,6 +4675,20 @@ bool Coil::wind_by_round_sections(std::vector<double> proportionPerWinding, std:
                 }
 
                 auto insulationSection = _insulationSections[windingsMapKey];
+
+                // Interface ordinal: how many insulation sections were materialized before this one
+                size_t insulationInterfaceIndex = 0;
+                for (auto& existingSection : sectionsDescription) {
+                    if (existingSection.get_type() != ElectricalType::CONDUCTION) {
+                        insulationInterfaceIndex++;
+                    }
+                }
+                double shieldingExtraDimension = get_shielding_extra_dimension(windingsMapKey, insulationInterfaceIndex);
+                if (shieldingExtraDimension != 0) {
+                    auto insulationSectionDimensions = insulationSection.get_dimensions();
+                    insulationSectionDimensions[windingOrientation == WindingOrientation::OVERLAPPING? 0 : 1] += shieldingExtraDimension;
+                    insulationSection.set_dimensions(insulationSectionDimensions);
+                }
 
                 insulationSection.set_group(group.get_name());
                 insulationSection.set_name("Insulation between " + get_name(previousWindingIndex) + " and " + get_name(nextWindingIndex) + " section " + std::to_string(sectionIndex));
@@ -5153,39 +5313,67 @@ bool Coil::wind_by_rectangular_layers() {
                 log(_insulationInterSectionsLayersLog[windingsMapKey]);
                 continue;
             }
-            auto insulationLayers = _insulationInterSectionsLayers[windingsMapKey];
+
+            // Interface ordinal: how many insulation sections come before this one
+            size_t insulationInterfaceIndex = 0;
+            for (size_t priorSectionIndex = 0; priorSectionIndex < sectionIndex; ++priorSectionIndex) {
+                if (sections[priorSectionIndex].get_type() != ElectricalType::CONDUCTION) {
+                    insulationInterfaceIndex++;
+                }
+            }
+            auto insulationLayers = get_interface_layers_with_shielding(windingsMapKey, insulationInterfaceIndex);
 
             if (insulationLayers.size() == 0) {
                 continue;
                 // throw std::runtime_error("There must be at least one insulation layer between layers");
             }
 
-            double layerWidth = insulationLayers[0].get_dimensions()[0];
-            double layerHeight = insulationLayers[0].get_dimensions()[1];
-
-            double currentLayerCenterWidth;
-            double currentLayerCenterHeight;
-            if (sections[sectionIndex].get_layers_orientation() == WindingOrientation::OVERLAPPING) {
-                currentLayerCenterWidth = roundFloat(sections[sectionIndex].get_coordinates()[0] - sections[sectionIndex].get_dimensions()[0] / 2 + layerWidth / 2, 9);
-                currentLayerCenterHeight = roundFloat(sections[sectionIndex].get_coordinates()[1], 9);
-            } else {
-                currentLayerCenterWidth = roundFloat(sections[sectionIndex].get_coordinates()[0], 9);
-                currentLayerCenterHeight = roundFloat(sections[sectionIndex].get_coordinates()[1] + sections[sectionIndex].get_dimensions()[1] / 2 - layerHeight / 2, 9);
+            // Shield margins shift the shield off the section center when asymmetric
+            std::optional<std::vector<double>> shieldingMargin;
+            auto interfaceShieldingRequirement = get_shielding_requirement_for_interface(windingsMapKey.first, windingsMapKey.second, insulationInterfaceIndex);
+            if (interfaceShieldingRequirement && interfaceShieldingRequirement->get_margin() && interfaceShieldingRequirement->get_margin()->size() == 2) {
+                shieldingMargin = interfaceShieldingRequirement->get_margin();
             }
+
+            // Layers can have different thicknesses (e.g. a shielding layer between insulation layers),
+            // so advance from the section edge by each layer's own thickness
+            double currentLayerEdgeWidth = roundFloat(sections[sectionIndex].get_coordinates()[0] - sections[sectionIndex].get_dimensions()[0] / 2, 9);
+            double currentLayerEdgeHeight = roundFloat(sections[sectionIndex].get_coordinates()[1] + sections[sectionIndex].get_dimensions()[1] / 2, 9);
 
             for (size_t layerIndex = 0; layerIndex < insulationLayers.size(); ++layerIndex) {
                 auto insulationLayer = insulationLayers[layerIndex];
+                double layerWidth = insulationLayer.get_dimensions()[0];
+                double layerHeight = insulationLayer.get_dimensions()[1];
+                double currentLayerCenterWidth;
+                double currentLayerCenterHeight;
+                if (sections[sectionIndex].get_layers_orientation() == WindingOrientation::OVERLAPPING) {
+                    currentLayerCenterWidth = roundFloat(currentLayerEdgeWidth + layerWidth / 2, 9);
+                    currentLayerCenterHeight = roundFloat(sections[sectionIndex].get_coordinates()[1], 9);
+                    if (insulationLayer.get_type() == ElectricalType::SHIELDING && shieldingMargin) {
+                        currentLayerCenterHeight = roundFloat(currentLayerCenterHeight + ((*shieldingMargin)[1] - (*shieldingMargin)[0]) / 2, 9);
+                    }
+                } else {
+                    currentLayerCenterWidth = roundFloat(sections[sectionIndex].get_coordinates()[0], 9);
+                    currentLayerCenterHeight = roundFloat(currentLayerEdgeHeight - layerHeight / 2, 9);
+                    if (insulationLayer.get_type() == ElectricalType::SHIELDING && shieldingMargin) {
+                        currentLayerCenterWidth = roundFloat(currentLayerCenterWidth + ((*shieldingMargin)[0] - (*shieldingMargin)[1]) / 2, 9);
+                    }
+                }
                 insulationLayer.set_coordinate_system(CoordinateSystem::CARTESIAN);
                 insulationLayer.set_section(sections[sectionIndex].get_name());
-                insulationLayer.set_name(sections[sectionIndex].get_name() +  " insulation layer " + std::to_string(layerIndex));
+                // A shield keeps the name given in its requirement; unnamed layers get a positional one
+                if (insulationLayer.get_type() != ElectricalType::SHIELDING || insulationLayer.get_name() == "temp shielding") {
+                    std::string layerTypeLabel = insulationLayer.get_type() == ElectricalType::SHIELDING? " shielding layer " : " insulation layer ";
+                    insulationLayer.set_name(sections[sectionIndex].get_name() + layerTypeLabel + std::to_string(layerIndex));
+                }
                 insulationLayer.set_coordinates(std::vector<double>{currentLayerCenterWidth, currentLayerCenterHeight, 0});
                 layers.push_back(insulationLayer);
 
                 if (sections[sectionIndex].get_layers_orientation() == WindingOrientation::CONTIGUOUS) {
-                    currentLayerCenterHeight = roundFloat(currentLayerCenterHeight - layerHeight, 9);
+                    currentLayerEdgeHeight = roundFloat(currentLayerEdgeHeight - layerHeight, 9);
                 }
                 else {
-                    currentLayerCenterWidth = roundFloat(currentLayerCenterWidth + layerWidth, 9);
+                    currentLayerEdgeWidth = roundFloat(currentLayerEdgeWidth + layerWidth, 9);
                 }
             }
         }
@@ -5458,38 +5646,41 @@ bool Coil::wind_by_round_layers() {
                 continue;
             }
 
-            auto insulationLayers = _insulationInterSectionsLayers[windingsMapKey];
+            // Interface ordinal: how many insulation sections come before this one
+            size_t insulationInterfaceIndex = 0;
+            for (size_t priorSectionIndex = 0; priorSectionIndex < sectionIndex; ++priorSectionIndex) {
+                if (sections[priorSectionIndex].get_type() != ElectricalType::CONDUCTION) {
+                    insulationInterfaceIndex++;
+                }
+            }
+            auto insulationLayers = get_interface_layers_with_shielding(windingsMapKey, insulationInterfaceIndex);
             if (insulationLayers.size() == 0) {
                 throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION, "There must be at least one insulation layer between layers");
             }
 
-            double layerRadialHeight = insulationLayers[0].get_dimensions()[0];
-
-            double currentLayerCenterRadialHeight;
-            double currentLayerCenterAngle;
-
-            if (sections[sectionIndex].get_layers_orientation() == WindingOrientation::OVERLAPPING) {
-                currentLayerCenterRadialHeight = roundFloat(sections[sectionIndex].get_coordinates()[0] - sections[sectionIndex].get_dimensions()[0] / 2 + layerRadialHeight / 2, 9);
-                currentLayerCenterAngle = roundFloat(sections[sectionIndex].get_coordinates()[1], 9);
-            } else {
+            if (sections[sectionIndex].get_layers_orientation() != WindingOrientation::OVERLAPPING) {
                 throw std::invalid_argument("Only overlapping layers allowed in toroids");
             }
 
+            // Layers can have different thicknesses (e.g. a shielding layer between insulation layers),
+            // so advance from the section edge by each layer's own thickness
+            double currentLayerEdgeRadialHeight = roundFloat(sections[sectionIndex].get_coordinates()[0] - sections[sectionIndex].get_dimensions()[0] / 2, 9);
+            double currentLayerCenterAngle = roundFloat(sections[sectionIndex].get_coordinates()[1], 9);
+
             for (size_t layerIndex = 0; layerIndex < insulationLayers.size(); ++layerIndex) {
                 auto insulationLayer = insulationLayers[layerIndex];
+                double layerRadialHeight = insulationLayer.get_dimensions()[0];
                 insulationLayer.set_section(sections[sectionIndex].get_name());
                 insulationLayer.set_coordinate_system(CoordinateSystem::POLAR);
-                insulationLayer.set_name(sections[sectionIndex].get_name() +  " insulation layer " + std::to_string(layerIndex));
-                insulationLayer.set_coordinates(std::vector<double>{currentLayerCenterRadialHeight, currentLayerCenterAngle, 0});
+                // A shield keeps the name given in its requirement; unnamed layers get a positional one
+                if (insulationLayer.get_type() != ElectricalType::SHIELDING || insulationLayer.get_name() == "temp shielding") {
+                    std::string layerTypeLabel = insulationLayer.get_type() == ElectricalType::SHIELDING? " shielding layer " : " insulation layer ";
+                    insulationLayer.set_name(sections[sectionIndex].get_name() + layerTypeLabel + std::to_string(layerIndex));
+                }
+                insulationLayer.set_coordinates(std::vector<double>{roundFloat(currentLayerEdgeRadialHeight + layerRadialHeight / 2, 9), currentLayerCenterAngle, 0});
                 layers.push_back(insulationLayer);
 
-
-                if (sections[sectionIndex].get_layers_orientation() == WindingOrientation::OVERLAPPING) {
-                    currentLayerCenterRadialHeight = roundFloat(currentLayerCenterRadialHeight + layerRadialHeight, 9);
-                }
-                else {
-                    throw std::invalid_argument("Only overlapping layers allowed in toroids");
-                }
+                currentLayerEdgeRadialHeight = roundFloat(currentLayerEdgeRadialHeight + layerRadialHeight, 9);
             }
         }
     }

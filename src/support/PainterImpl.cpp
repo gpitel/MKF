@@ -547,6 +547,9 @@ void Painter::paint_two_piece_set_coil_layers(Magnetic magnetic) {
             _root.style(".layer_" + std::to_string(i)).set_attr("opacity", _opacity).set_attr("fill", constants.coilPainterColorsScaleLayers[i % constants.coilPainterColorsScaleLayers.size()]);
             paint_rectangle(layers[i].get_coordinates()[0], layers[i].get_coordinates()[1], layers[i].get_dimensions()[0], layers[i].get_dimensions()[1], "layer_" + std::to_string(i), shapes);
         }
+        else if (layers[i].get_type() == ElectricalType::SHIELDING) {
+            paint_rectangle(layers[i].get_coordinates()[0], layers[i].get_coordinates()[1], layers[i].get_dimensions()[0], layers[i].get_dimensions()[1], "copper", shapes);
+        }
         else {
             paint_rectangle(layers[i].get_coordinates()[0], layers[i].get_coordinates()[1], layers[i].get_dimensions()[0], layers[i].get_dimensions()[1], "insulation", shapes);
         }
@@ -595,7 +598,7 @@ void Painter::paint_toroidal_coil_layers(Magnetic magnetic) {
             std::string termination = angleProportion < 1? "butt" : "round";
 
             std::string cssClassName = generate_random_string();
-            if (layers[i].get_type() == ElectricalType::CONDUCTION) {
+            if (layers[i].get_type() == ElectricalType::CONDUCTION || layers[i].get_type() == ElectricalType::SHIELDING) {
                 _root.style("." + cssClassName).set_attr("stroke-width", strokeWidth * _scale).set_attr("fill", "none").set_attr("stroke", std::regex_replace(std::string(settings.get_painter_color_copper()), std::regex("0x"), "#"));
             }
             else {
@@ -635,6 +638,9 @@ void Painter::paint_two_piece_set_coil_turns(Magnetic magnetic, bool skipMarginA
             for (size_t i = 0; i < layers.size(); ++i){
                 if (layers[i].get_type() == ElectricalType::INSULATION) {
                     paint_rectangle(layers[i].get_coordinates()[0], layers[i].get_coordinates()[1], layers[i].get_dimensions()[0], layers[i].get_dimensions()[1], "insulation", shapes);
+                }
+                else if (layers[i].get_type() == ElectricalType::SHIELDING) {
+                    paint_rectangle(layers[i].get_coordinates()[0], layers[i].get_coordinates()[1], layers[i].get_dimensions()[0], layers[i].get_dimensions()[1], "copper", shapes);
                 }
             }
             paint_two_piece_set_margin(magnetic);
@@ -771,7 +777,7 @@ void Painter::paint_toroidal_coil_turns(Magnetic magnetic, bool skipMarginAndLay
         auto layers = winding.get_layers_description().value();
 
         for (size_t i = 0; i < layers.size(); ++i){
-            if (layers[i].get_type() == ElectricalType::INSULATION) {
+            if (layers[i].get_type() == ElectricalType::INSULATION || layers[i].get_type() == ElectricalType::SHIELDING) {
 
                 double strokeWidth = layers[i].get_dimensions()[0];
                 double circleDiameter = (initialRadius - layers[i].get_coordinates()[0]) * 2;
@@ -789,8 +795,9 @@ void Painter::paint_toroidal_coil_turns(Magnetic magnetic, bool skipMarginAndLay
                     continue;
                 }
 
+                auto layerColor = layers[i].get_type() == ElectricalType::SHIELDING? settings.get_painter_color_copper() : settings.get_painter_color_insulation();
                 std::string cssClassName = generate_random_string();
-                _root.style("." + cssClassName).set_attr("stroke-width", strokeWidth * _scale).set_attr("fill", "none").set_attr("stroke", std::regex_replace(std::string(settings.get_painter_color_insulation()), std::regex("0x"), "#"));
+                _root.style("." + cssClassName).set_attr("stroke-width", strokeWidth * _scale).set_attr("fill", "none").set_attr("stroke", std::regex_replace(std::string(layerColor), std::regex("0x"), "#"));
                 paint_circle(0, 0, circleDiameter / 2, cssClassName, nullptr, layers[i].get_dimensions()[1], -(layers[i].get_coordinates()[1] + layers[i].get_dimensions()[1] / 2), {0, 0});
 
                 if (layers[i].get_additional_coordinates()) {

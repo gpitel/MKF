@@ -203,7 +203,7 @@ if(ENABLE_NGSPICE)
         include(ExternalProject)
         
         set(NGSPICE_VERSION "45.2")
-        set(NGSPICE_URL "file:///home/alf/OpenMagnetics/ngspice-45.2.tar.gz")
+        set(NGSPICE_URL "file://$ENV{HOME}/om-deps/ngspice-45.2.tar.gz")
         
         # Configure options for ngspice shared library build
     # Basic configuration - NO CIDER, NO XSPICE for minimal build
@@ -220,6 +220,7 @@ if(ENABLE_NGSPICE)
         
         set(NGSPICE_CONFIGURE_FLAGS
             "--with-ngshared"
+            "--enable-static"
             "--disable-debug"
             "--without-x"
             "--disable-xspice"
@@ -227,7 +228,7 @@ if(ENABLE_NGSPICE)
             "--disable-openmp"
             "--with-readline=no"
             "CFLAGS=-O2 -fwasm-exceptions -sSUPPORT_LONGJMP=wasm"
-            "CXXFLAGS=-O2 -fwasm-exceptions -sSUPPORT_LONGJMP=wasm"
+            "CXXFLAGS=-O2 -fwasm-exceptions -sSUPPORT_LONGJMP=wasm -Wno-invalid-specialization"
             "LDFLAGS=-fwasm-exceptions -sSUPPORT_LONGJMP=wasm"
         )
         
@@ -283,9 +284,7 @@ echo 'WASM patches applied successfully'
             BUILD_COMMAND emmake make -j${CMAKE_BUILD_PARALLEL_LEVEL}
             INSTALL_COMMAND make install
             BUILD_IN_SOURCE 0
-            # Note: Despite .so extension, this is actually a WASM static library
-            # Version 45.2 produces libngspice.so.0.0.14
-            BUILD_BYPRODUCTS ${NGSPICE_INSTALL_DIR}/lib/libngspice.so.0.0.14 ${NGSPICE_INSTALL_DIR}/lib/libngspice.so
+            BUILD_BYPRODUCTS ${NGSPICE_INSTALL_DIR}/lib/libngspice.a ${NGSPICE_INSTALL_DIR}/lib/libngspice.so
         )
     else()
         # Native build configuration - basic ngspice only
@@ -326,9 +325,11 @@ echo 'WASM patches applied successfully'
     if(WIN32)
         target_link_libraries(ngspice INTERFACE ${NGSPICE_INSTALL_DIR}/lib/ngspice.lib)
     elseif(EMSCRIPTEN)
-        # Despite .so extension, this is a WASM static library when built with emscripten
-        # Use the symlink for version independence
-        target_link_libraries(ngspice INTERFACE ${NGSPICE_INSTALL_DIR}/lib/libngspice.so)
+        # The .so produced by emconfigure is a real wasm dylib, which would force
+        # emscripten dynamic linking (MAIN_MODULE + shipping side modules). Link the
+        # static archive instead (requires configuring ngspice with --enable-static)
+        # so the final wasm is a single self-contained module.
+        target_link_libraries(ngspice INTERFACE ${NGSPICE_INSTALL_DIR}/lib/libngspice.a)
     else()
         target_link_libraries(ngspice INTERFACE ${NGSPICE_INSTALL_DIR}/lib/libngspice.so)
     endif()
@@ -522,8 +523,11 @@ ENDIF(HAVE_PLASMA)
 
 
 # On Windows, build as STATIC to avoid DLL boundary issues with inline globals
+# On Emscripten, build as STATIC so the wasm executables link everything into a
+# single self-contained module (wasm dynamic linking needs MAIN_MODULE + side
+# modules shipped at runtime, which the frontend deployment does not do)
 # On other platforms, build as SHARED for better compatibility
-if(WIN32)
+if(WIN32 OR EMSCRIPTEN)
     add_library(MKF STATIC ${SOURCES})
 else()
     add_library(MKF SHARED ${SOURCES})

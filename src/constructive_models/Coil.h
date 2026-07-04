@@ -127,6 +127,9 @@ class Coil : public MAS::Coil {
         CoilAlignment _sectionAlignment = CoilAlignment::INNER_OR_TOP;
         bool _sectionAlignmentExplicit = false;
         std::optional<Inputs> _inputs;
+        // Shielding requirements set directly (e.g. from the frontend coil configuration),
+        // consulted alongside _inputs design requirements by get_shielding_requirement_for_pair
+        std::vector<ShieldingRequirement> _shieldingRequirements;
         std::map<std::string, CoilAlignment> _turnsAlignmentPerSection;
         std::map<std::string, WindingOrientation> _layersOrientationPerSection;
         // Real-winding turn blocking (global to the winding window). Filled by wind() between
@@ -246,6 +249,12 @@ class Coil : public MAS::Coil {
         bool calculate_insulation(bool simpleMode = false);
         bool calculate_custom_thickness_insulation(double thickness);
         bool calculate_mechanical_insulation();
+        std::optional<ShieldingRequirement> get_shielding_requirement_for_interface(size_t leftWindingIndex, size_t rightWindingIndex, size_t interfaceIndex);
+        Layer create_shielding_layer(const ShieldingRequirement& shieldingRequirement, std::pair<size_t, size_t> windingsMapKey);
+        size_t get_interface_layers_thickness_dimension_index(std::pair<size_t, size_t> windingsMapKey);
+        double get_shielding_extra_dimension(std::pair<size_t, size_t> windingsMapKey, size_t interfaceIndex);
+        std::vector<Layer> get_interface_layers_with_shielding(std::pair<size_t, size_t> windingsMapKey, size_t interfaceIndex);
+        void set_shielding_requirements(std::vector<ShieldingRequirement> shieldingRequirements);
         bool delimit_and_compact();
 
         void log(std::string entry);
