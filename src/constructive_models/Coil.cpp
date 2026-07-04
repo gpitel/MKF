@@ -2608,19 +2608,18 @@ std::optional<ShieldingRequirement> Coil::get_shielding_requirement_for_interfac
     if (shieldingRequirements.empty()) {
         return std::nullopt;
     }
-    auto functionalDescription = get_functional_description();
-    if (leftWindingIndex >= functionalDescription.size() || rightWindingIndex >= functionalDescription.size() || leftWindingIndex == rightWindingIndex) {
+    if (leftWindingIndex >= get_functional_description().size() || rightWindingIndex >= get_functional_description().size() || leftWindingIndex == rightWindingIndex) {
         return std::nullopt;
     }
-    auto leftWindingName = functionalDescription[leftWindingIndex].get_name();
-    auto rightWindingName = functionalDescription[rightWindingIndex].get_name();
+    // Windings are referenced by index (0-based, functionalDescription order, like
+    // isolationSides) so renaming a winding cannot break its shields
     for (auto& shieldingRequirement : shieldingRequirements) {
         auto betweenWindings = shieldingRequirement.get_between_windings();
         if (betweenWindings.size() != 2) {
             continue;
         }
-        if ((betweenWindings[0] != leftWindingName || betweenWindings[1] != rightWindingName) &&
-            (betweenWindings[0] != rightWindingName || betweenWindings[1] != leftWindingName)) {
+        if ((betweenWindings[0] != int64_t(leftWindingIndex) || betweenWindings[1] != int64_t(rightWindingIndex)) &&
+            (betweenWindings[0] != int64_t(rightWindingIndex) || betweenWindings[1] != int64_t(leftWindingIndex))) {
             continue;
         }
         auto interfaces = shieldingRequirement.get_interfaces();
