@@ -2608,18 +2608,21 @@ std::optional<ShieldingRequirement> Coil::get_shielding_requirement_for_interfac
     if (shieldingRequirements.empty()) {
         return std::nullopt;
     }
-    if (leftWindingIndex >= get_functional_description().size() || rightWindingIndex >= get_functional_description().size() || leftWindingIndex == rightWindingIndex) {
+    auto functionalDescription = get_functional_description();
+    if (leftWindingIndex >= functionalDescription.size() || rightWindingIndex >= functionalDescription.size() || leftWindingIndex == rightWindingIndex) {
         return std::nullopt;
     }
-    // Windings are referenced by index (0-based, functionalDescription order, like
-    // isolationSides) so renaming a winding cannot break its shields
+    // Windings are referenced by name, as everywhere else in MAS; the frontends keep
+    // the references valid when a winding is renamed
+    auto leftWindingName = functionalDescription[leftWindingIndex].get_name();
+    auto rightWindingName = functionalDescription[rightWindingIndex].get_name();
     for (auto& shieldingRequirement : shieldingRequirements) {
         auto betweenWindings = shieldingRequirement.get_between_windings();
         if (betweenWindings.size() != 2) {
             continue;
         }
-        if ((betweenWindings[0] != int64_t(leftWindingIndex) || betweenWindings[1] != int64_t(rightWindingIndex)) &&
-            (betweenWindings[0] != int64_t(rightWindingIndex) || betweenWindings[1] != int64_t(leftWindingIndex))) {
+        if ((betweenWindings[0] != leftWindingName || betweenWindings[1] != rightWindingName) &&
+            (betweenWindings[0] != rightWindingName || betweenWindings[1] != leftWindingName)) {
             continue;
         }
         auto interfaces = shieldingRequirement.get_interfaces();
