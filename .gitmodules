@@ -1,6 +1,6 @@
 [submodule "MAS"]
 	path = MAS
-	url = https://github.com/OpenMagnetics/MAS.git
+	url = ../MAS.git
 [submodule "cci_coords"]
 	path = cci_coords
 	url = https://github.com/OpenMagnetics/cci_coords.git
@@ -10,7 +10,7 @@
 	branch = main
 [submodule "PEAS"]
 	path = PEAS
-	url = https://github.com/Power-Supply-Manufacturers-Association/PEAS.git
+	url = ../PEAS.git
 	branch = main
 [submodule "CIAS"]
 	path = CIAS
