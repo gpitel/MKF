@@ -1,6 +1,9 @@
 #include <source_location>
 #include <iomanip>
 #include <map>
+#include <fstream>
+#include <chrono>
+#include <cmath>
 #include "physical_models/LeakageInductance.h"
 #include "support/Painter.h"
 #include "support/Utils.h"
@@ -848,6 +851,47 @@ TEST_CASE("Leakage inductance matrix is symmetric and reproduces pairwise leakag
             CHECK_THAT(fromMatrix, WithinRel(pairwise, 0.02));
         }
     }
+
+    settings.reset();
+}
+
+TEST_CASE("Leakage inductance completes on a large multi-winding foil coil", "[physical-model][leakage-inductance][regression]") {
+    // Regression guard for the leakage-inductance grid-solve blow-up. This coil (8 windings,
+    // 518 turns, two thin foil shield layers on a large U-core window; derived from the
+    // 06_llc_xfmr example) drives the field-solve grid to ~89,000 points. Before the fix the
+    // per-winding solve was dominated by an O(N^2) per-pair winding-name string lookup on top
+    // of an over-resolved grid, so this call ran for minutes and the calculation never
+    // appeared to finish. It must now complete in well under a second per winding.
+    settings.reset();
+
+    auto testDataPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "leakage_multiwinding_foil_stress.json");
+    std::ifstream file(testDataPath);
+    REQUIRE(file.good());
+    json masJson;
+    file >> masJson;
+    file.close();
+
+    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+    REQUIRE(magnetic.get_coil().get_functional_description().size() == 8);
+
+    double frequency = 100000;
+    auto start = std::chrono::steady_clock::now();
+    auto leakage = LeakageInductance().calculate_leakage_inductance_all_windings(magnetic, frequency);
+    double elapsedSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+    // Every winding must get a finite, positive leakage inductance.
+    auto perWinding = leakage.get_leakage_inductance_per_winding();
+    REQUIRE(perWinding.size() >= 1);
+    for (const auto& inductance : perWinding) {
+        double value = inductance.get_nominal().value();
+        CHECK(std::isfinite(value));
+        CHECK(value > 0.0);
+    }
+
+    // The fix takes the whole all-windings solve from minutes to ~1 s. 30 s is a generous,
+    // non-flaky ceiling that an uncapped-grid or per-pair-lookup regression blows past by an
+    // order of magnitude.
+    CHECK(elapsedSeconds < 30.0);
 
     settings.reset();
 }
