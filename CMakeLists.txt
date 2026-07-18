@@ -166,17 +166,17 @@ FetchContent_Declare(rapidfuzz
   GIT_TAG b5830af53bd1b3c7460a8de1e9f7095df99b3470)  # was 'main' (floating); pinned to known-good
 FetchContent_MakeAvailable(rapidfuzz)
 
-# Eigen - Header-only linear algebra library (for Albach 2D boundary value solver)
+# Eigen - header-only (Albach 2D boundary-value solver). Fetch the headers but skip Eigen's
+# CMake project: 3.4.0 unconditionally builds its blas/lapack subdirs (the EIGEN_BUILD_* options
+# that disable them postdate it), which enable_language(Fortran) and break the Windows/MSVC
+# configure. SOURCE_SUBDIR points at a dir with no CMakeLists.txt, so MakeAvailable only
+# populates the sources (headers land in _deps/eigen-src, on the include path below).
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(eigen
     GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
     GIT_TAG 3.4.0
-    GIT_SHALLOW TRUE)
-# Disable Eigen's BLAS/LAPACK and testing (avoids Fortran dependency for WASM builds)
-set(EIGEN_BUILD_BLAS OFF CACHE BOOL "" FORCE)
-set(EIGEN_BUILD_LAPACK OFF CACHE BOOL "" FORCE)
-set(EIGEN_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR _headers_only_skip_eigen_cmake)
 FetchContent_MakeAvailable(eigen)
 include_directories("${CMAKE_BINARY_DIR}/_deps/eigen-src")
 
@@ -431,6 +431,9 @@ add_custom_command(
     -S ${PEAS_DIR}/schemas/inputs/operatingConditions.json
     -S ${PEAS_DIR}/schemas/outputs/insulationCoordination.json
     -S ${PEAS_DIR}/schemas/outputs/lossElementPerHarmonic.json
+    # Referenced by lossElementPerHarmonic.json via a relative $ref; list it explicitly so
+    # quicktype resolves it by $id (relative-path resolution fails on Windows).
+    -S ${PEAS_DIR}/schemas/outputs/outputBase.json
     -o ${MAS_DIRECTORY}/MAS.hpp --namespace MAS --source-style single-source --type-style pascal-case --member-style underscore-case --enumerator-style upper-underscore-case --no-boost
   USES_TERMINAL)
 
