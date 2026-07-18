@@ -76,11 +76,11 @@ ComplexField PainterInterface::calculate_magnetic_field(OperatingPoint operating
     auto frequency = harmonics.get_frequencies()[harmonicIndex];
 
     bool includeFringing = settings.get_painter_include_fringing();
-    bool mirroringDimension = settings.get_painter_mirroring_dimension();
+    int mirroringDimension = settings.get_painter_mirroring_dimension();  // int (0/1/2/3 mirroring planes), was truncated through bool
 
     size_t numberPointsX = settings.get_painter_number_points_x();
     size_t numberPointsY = settings.get_painter_number_points_y();
-    Field inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, true).first;
+    Field inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, true, true, true).first;
 
     auto modelOverride = settings.get_painter_magnetic_field_strength_model();
     // Use painter override if set, otherwise use the simulation magnetic field strength model
@@ -88,8 +88,11 @@ ComplexField PainterInterface::calculate_magnetic_field(OperatingPoint operating
     // Use the configured fringing effect model from settings
     auto fringingEffectModel = settings.get_magnetic_field_strength_fringing_effect_model();
     MagneticField magneticField(magneticFieldModel, fringingEffectModel);
-    settings.set_magnetic_field_include_fringing(includeFringing);
-    settings.set_magnetic_field_mirroring_dimension(mirroringDimension);
+    // RAII: restore the global magnetic-field settings on scope exit. They used to be
+    // overwritten permanently, leaking the painter's fringing/mirroring choice into
+    // every later physics computation in the process.
+    SettingsGuard<bool> fringingGuard(settings, &Settings::get_magnetic_field_include_fringing, &Settings::set_magnetic_field_include_fringing, includeFringing);
+    SettingsGuard<int> mirroringGuard(settings, &Settings::get_magnetic_field_mirroring_dimension, &Settings::set_magnetic_field_mirroring_dimension, mirroringDimension);
     ComplexField field;
     {
         auto windingWindowMagneticStrengthFieldOutput = magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic, inducedField);
@@ -144,18 +147,21 @@ ComplexField PainterInterface::calculate_magnetic_field_internal_only(OperatingP
     auto frequency = harmonics.get_frequencies()[harmonicIndex];
 
     bool includeFringing = settings.get_painter_include_fringing();
-    bool mirroringDimension = settings.get_painter_mirroring_dimension();
+    int mirroringDimension = settings.get_painter_mirroring_dimension();  // int (0/1/2/3 mirroring planes), was truncated through bool
 
     size_t numberPointsX = settings.get_painter_number_points_x();
     size_t numberPointsY = settings.get_painter_number_points_y();
-    Field inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, true).first;
+    Field inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, true, true, true).first;
 
     auto modelOverride = settings.get_painter_magnetic_field_strength_model();
     auto magneticFieldModel = modelOverride.value_or(settings.get_magnetic_field_strength_model());
     auto fringingEffectModel = settings.get_magnetic_field_strength_fringing_effect_model();
     MagneticField magneticField(magneticFieldModel, fringingEffectModel);
-    settings.set_magnetic_field_include_fringing(includeFringing);
-    settings.set_magnetic_field_mirroring_dimension(mirroringDimension);
+    // RAII: restore the global magnetic-field settings on scope exit. They used to be
+    // overwritten permanently, leaking the painter's fringing/mirroring choice into
+    // every later physics computation in the process.
+    SettingsGuard<bool> fringingGuard(settings, &Settings::get_magnetic_field_include_fringing, &Settings::set_magnetic_field_include_fringing, includeFringing);
+    SettingsGuard<int> mirroringGuard(settings, &Settings::get_magnetic_field_mirroring_dimension, &Settings::set_magnetic_field_mirroring_dimension, mirroringDimension);
     
     auto windingWindowMagneticStrengthFieldOutput = magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic, inducedField);
     return windingWindowMagneticStrengthFieldOutput.get_field_per_frequency()[0];
@@ -188,18 +194,21 @@ ComplexField PainterInterface::calculate_magnetic_field_external_only(OperatingP
     auto frequency = harmonics.get_frequencies()[harmonicIndex];
 
     bool includeFringing = settings.get_painter_include_fringing();
-    bool mirroringDimension = settings.get_painter_mirroring_dimension();
+    int mirroringDimension = settings.get_painter_mirroring_dimension();  // int (0/1/2/3 mirroring planes), was truncated through bool
 
     size_t numberPointsX = settings.get_painter_number_points_x();
     size_t numberPointsY = settings.get_painter_number_points_y();
-    Field inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, true).first;
+    Field inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, true, true, true).first;
 
     auto modelOverride = settings.get_painter_magnetic_field_strength_model();
     auto magneticFieldModel = modelOverride.value_or(settings.get_magnetic_field_strength_model());
     auto fringingEffectModel = settings.get_magnetic_field_strength_fringing_effect_model();
     MagneticField magneticField(magneticFieldModel, fringingEffectModel);
-    settings.set_magnetic_field_include_fringing(includeFringing);
-    settings.set_magnetic_field_mirroring_dimension(mirroringDimension);
+    // RAII: restore the global magnetic-field settings on scope exit. They used to be
+    // overwritten permanently, leaking the painter's fringing/mirroring choice into
+    // every later physics computation in the process.
+    SettingsGuard<bool> fringingGuard(settings, &Settings::get_magnetic_field_include_fringing, &Settings::set_magnetic_field_include_fringing, includeFringing);
+    SettingsGuard<int> mirroringGuard(settings, &Settings::get_magnetic_field_mirroring_dimension, &Settings::set_magnetic_field_mirroring_dimension, mirroringDimension);
     
     // Swap to external coordinates
     auto turns = magnetic.get_coil().get_turns_description().value();
@@ -536,11 +545,16 @@ Field PainterInterface::calculate_electric_field_sdf(OperatingPoint operatingPoi
     bool includeFringing = settings.get_painter_include_fringing();
     int mirroringDimension = settings.get_painter_mirroring_dimension();
 
-    auto oldCoilMesherInsideTurnsFactor = settings.get_coil_mesher_inside_turns_factor();
-    // Use same factor as LEGACY method for consistent mesh generation
-    settings.set_coil_mesher_inside_turns_factor(1.2);
-    settings.set_magnetic_field_include_fringing(includeFringing);
-    settings.set_magnetic_field_mirroring_dimension(mirroringDimension);
+    // Use same factor as LEGACY method for consistent mesh generation.
+    // RAII (ABT #113 sweep): previously saved/restored by hand at three of the
+    // four exits — the `!coil.get_turns_description()` early return leaked the
+    // 1.2 factor, and any exception leaked it too.
+    SettingsGuard<double> mesherFactorGuard(settings, &Settings::get_coil_mesher_inside_turns_factor, &Settings::set_coil_mesher_inside_turns_factor, 1.2);
+    // RAII: restore the global magnetic-field settings on scope exit. They used to be
+    // overwritten permanently, leaking the painter's fringing/mirroring choice into
+    // every later physics computation in the process.
+    SettingsGuard<bool> fringingGuard(settings, &Settings::get_magnetic_field_include_fringing, &Settings::set_magnetic_field_include_fringing, includeFringing);
+    SettingsGuard<int> mirroringGuard(settings, &Settings::get_magnetic_field_mirroring_dimension, &Settings::set_magnetic_field_mirroring_dimension, mirroringDimension);
 
     auto strayCapacitanceModel = settings.get_stray_capacitance_model();
     StrayCapacitance strayCapacitance(strayCapacitanceModel);
@@ -553,13 +567,12 @@ Field PainterInterface::calculate_electric_field_sdf(OperatingPoint operatingPoi
     auto frequency = harmonics.get_frequencies()[harmonicIndex];
     size_t numberPointsX = settings.get_painter_number_points_x();
     size_t numberPointsY = settings.get_painter_number_points_y();
-    Field inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, false, false).first;
+    Field inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, false, false, true).first;
 
     auto capacitanceOutput = strayCapacitance.calculate_capacitance(coil, operatingPoint);
     auto voltageDropAmongTurnsOpt = capacitanceOutput.get_voltage_drop_among_turns();
     if (!voltageDropAmongTurnsOpt) {
         // Return the mesh field even without voltage data
-        settings.set_coil_mesher_inside_turns_factor(oldCoilMesherInsideTurnsFactor);
         return inducedField;
     }
     auto voltageDropAmongTurns = voltageDropAmongTurnsOpt.value();
@@ -568,8 +581,6 @@ Field PainterInterface::calculate_electric_field_sdf(OperatingPoint operatingPoi
         return inducedField;
     }
     auto turns = coil.get_turns_description().value();
-
-    settings.set_coil_mesher_inside_turns_factor(oldCoilMesherInsideTurnsFactor);
 
     // Clear values to zero - we just want the mesh grid positions
     for (size_t i = 0; i < inducedField.get_data().size(); ++i) {
@@ -619,7 +630,6 @@ Field PainterInterface::calculate_electric_field_sdf(OperatingPoint operatingPoi
 
     // If no pairs found, return the empty field
     if (pairInfos.empty()) {
-        settings.set_coil_mesher_inside_turns_factor(oldCoilMesherInsideTurnsFactor);
         return inducedField;
     }
 
@@ -720,19 +730,25 @@ Field PainterInterface::calculate_electric_field(OperatingPoint operatingPoint, 
     auto frequency = harmonics.get_frequencies()[harmonicIndex];
 
     bool includeFringing = settings.get_painter_include_fringing();
-    bool mirroringDimension = settings.get_painter_mirroring_dimension();
+    int mirroringDimension = settings.get_painter_mirroring_dimension();  // int (0/1/2/3 mirroring planes), was truncated through bool
 
     size_t numberPointsX = settings.get_painter_number_points_x();
     size_t numberPointsY = settings.get_painter_number_points_y();
-    auto oldCoilMesherInsideTurnsFactor = settings.get_coil_mesher_inside_turns_factor();
-    settings.set_coil_mesher_inside_turns_factor(1.2);
-    Field inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, false, false).first;
-    settings.set_coil_mesher_inside_turns_factor(oldCoilMesherInsideTurnsFactor);
+    Field inducedField;
+    {
+        // RAII (ABT #113 sweep): exception-safe replacement for the manual
+        // save/set/restore around the mesh generation.
+        SettingsGuard<double> mesherFactorGuard(settings, &Settings::get_coil_mesher_inside_turns_factor, &Settings::set_coil_mesher_inside_turns_factor, 1.2);
+        inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, false, false, true).first;
+    }
 
     auto strayCapacitanceModel = settings.get_stray_capacitance_model();
     StrayCapacitance strayCapacitance(strayCapacitanceModel);
-    settings.set_magnetic_field_include_fringing(includeFringing);
-    settings.set_magnetic_field_mirroring_dimension(mirroringDimension);
+    // RAII: restore the global magnetic-field settings on scope exit. They used to be
+    // overwritten permanently, leaking the painter's fringing/mirroring choice into
+    // every later physics computation in the process.
+    SettingsGuard<bool> fringingGuard(settings, &Settings::get_magnetic_field_include_fringing, &Settings::set_magnetic_field_include_fringing, includeFringing);
+    SettingsGuard<int> mirroringGuard(settings, &Settings::get_magnetic_field_mirroring_dimension, &Settings::set_magnetic_field_mirroring_dimension, mirroringDimension);
 
     auto [pixelXDimension, pixelYDimension] = Painter::get_pixel_dimensions(magnetic);
 

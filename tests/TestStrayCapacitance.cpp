@@ -5,8 +5,10 @@
 #include "support/Utils.h"
 #include "support/Settings.h"
 #include "support/Painter.h"
+#include "processors/Sweeper.h"
 #include "TestingUtils.h"
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/benchmark/catch_benchmark.hpp>
 
@@ -44,6 +46,40 @@ TEST_CASE("Calculate capacitance among two windings each with 1 turn and 1 paral
             CHECK_THAT(capacitance, WithinRel(expectedValues[firstKey][secondKey], maximumError));
         }
     }
+}
+
+TEST_CASE("Tripole is the positive 3-cap pi-model; 6C is the canonical Biela/Kolar network", "[physical-model][stray-capacitance][models]") {
+    settings.reset();
+    auto coilJsonStr = R"({"bobbin": "Dummy", "functionalDescription":[{"name": "Primary", "numberTurns": 10, "numberParallels": 1, "isolationSide": "primary", "wire": "Round 1.00 - Grade 1" }, {"name": "Secondary", "numberTurns": 10, "numberParallels": 1, "isolationSide": "secondary", "wire": "Round 1.00 - Grade 1" } ] })";
+    auto coreJsonStr = R"({"name": "core", "functionalDescription": {"type": "twoPieceSet", "material": "N87", "shape": "PQ 32/20", "gapping": [{"type": "residual", "length": 0.000005 }], "numberStacks": 1 } })";
+    auto [core, coil] = prepare_core_and_coil_from_json(coreJsonStr, coilJsonStr);
+
+    auto output = StrayCapacitance().calculate_capacitance(coil);
+    auto amongWindings = output.get_capacitance_among_windings().value();
+    auto tripole = output.get_tripole_capacitance_per_winding().value().at("Primary").at("Secondary");
+    auto sixCap = output.get_six_capacitor_network_per_winding().value().at("Primary").at("Secondary");
+
+    double cselfP = amongWindings.at("Primary").at("Primary");
+    double cselfS = amongWindings.at("Secondary").at("Secondary");
+    double cinter = amongWindings.at("Primary").at("Secondary");
+
+    // Tripole = the measurable positive 3-capacitor pi-model: {primary self, secondary self, inter}.
+    CHECK(tripole.get_c1() == Catch::Approx(cselfP));
+    CHECK(tripole.get_c2() == Catch::Approx(cselfS));
+    CHECK(tripole.get_c3() == Catch::Approx(cinter));
+    // The three tripole caps must be strictly positive (the whole point of the pi-model).
+    CHECK(tripole.get_c1() > 0.0);
+    CHECK(tripole.get_c2() > 0.0);
+    CHECK(tripole.get_c3() > 0.0);
+
+    // Six-capacitor network = Biela/Kolar eq. (30) from C0 = the inter-winding static capacitance:
+    // C1=C2=-C0/6, C3=C4=C0/3, C5=C6=C0/6.
+    CHECK(sixCap.get_c3() == Catch::Approx(cinter / 3.0));
+    CHECK(sixCap.get_c4() == Catch::Approx(sixCap.get_c3()));
+    CHECK(sixCap.get_c1() == Catch::Approx(-sixCap.get_c3() / 2.0));   // -C0/6 = -(C0/3)/2
+    CHECK(sixCap.get_c2() == Catch::Approx(sixCap.get_c1()));
+    CHECK(sixCap.get_c5() == Catch::Approx(sixCap.get_c3() / 2.0));    // C0/6 = (C0/3)/2
+    CHECK(sixCap.get_c6() == Catch::Approx(sixCap.get_c5()));
 }
 
 TEST_CASE("Calculate capacitance of a winding with 8 turns and 1 parallel", "[physical-model][stray-capacitance][smoke-test]") {
@@ -1068,35 +1104,40 @@ TEST_CASE("Bug: beta is NAN in capacitance calculation with processed coil", "[s
                     if (strandCoating && strandCoating->get_grade()) {
                     }
                 } catch (const std::exception& e) {
+                    FAIL_CHECK("resolve_strand/resolve_coating threw for winding " << i << ": " << e.what());
                 }
             }
         }
     }
-    
-    // Try to calculate capacitance with different models
-    for (auto model : {OpenMagnetics::StrayCapacitanceModels::ALBACH, 
+
+    // Repro point (beta was NAN): every model must produce a Maxwell capacitance
+    // matrix whose entries are all finite.
+    for (auto model : {OpenMagnetics::StrayCapacitanceModels::ALBACH,
                        OpenMagnetics::StrayCapacitanceModels::KOCH,
                        OpenMagnetics::StrayCapacitanceModels::MASSARINI,
                        OpenMagnetics::StrayCapacitanceModels::DUERDOTH}) {
-        
-        
+        INFO("Model: " << magic_enum::enum_name(model));
         try {
             StrayCapacitance strayCapacitance(model);
             auto output = strayCapacitance.calculate_capacitance(coil);
-            
-            if (output.get_maxwell_capacitance_matrix()) {
-                auto matrix = output.get_maxwell_capacitance_matrix().value();
-                if (matrix.size() > 0) {
+
+            REQUIRE(output.get_maxwell_capacitance_matrix());
+            auto matrix = output.get_maxwell_capacitance_matrix().value();
+            CHECK(matrix.size() > 0);
+            for (const auto& entry : matrix) {
+                for (const auto& [winding1, innerMap] : entry.get_magnitude()) {
+                    for (const auto& [winding2, capacitance] : innerMap) {
+                        double value = OpenMagnetics::resolve_dimensional_values(capacitance);
+                        INFO("Capacitance " << winding1 << " / " << winding2);
+                        CHECK(std::isfinite(value));
+                    }
                 }
             }
-            
         } catch (const std::exception& e) {
-            // Don't fail the test, just report the error
+            FAIL_CHECK("calculate_capacitance threw for model "
+                       << magic_enum::enum_name(model) << ": " << e.what());
         }
     }
-    
-    // The test should complete without crashing
-    REQUIRE(true);
 }
 
 TEST_CASE("Investigate capacitance calculation from bug_capacitance_error_2.json", "[physical-model][stray-capacitance][bug-investigation]") {
@@ -1575,4 +1616,152 @@ TEST_CASE("Turn_To_Core_Capacitance_Bounded_And_Monotone", "[physical-model][str
 
     // Degenerate inputs return 0 rather than NaN/Inf.
     REQUIRE(StrayCapacitance::calculate_turn_to_core_capacitance(0.0, L, tEnamel, epsEnamel, 0.0, tCoating, epsCoating) == 0.0);
+}
+
+// ABT #31 repro: sweep_impedance_over_frequency -> "capacitance cannot be NaN".
+// Reproduced with the planar flyback MAS the user reported (the same failure also
+// hits the WE CMC catalogue via the El Choker tool).
+TEST_CASE("ABT31 sweep_impedance_over_frequency capacitance NaN repro", "[physical-model][stray-capacitance][abt31]") {
+    settings.reset();
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "custom_magnetic_flyback.json");
+    OpenMagnetics::Mas mas;
+    OpenMagnetics::from_file(path, mas);
+    auto magnetic = mas.get_magnetic();
+
+    for (auto title : {std::string("Impedance over frequency"), std::string("Common-mode impedance")}) {
+        try {
+            auto sweep = Sweeper().sweep_impedance_over_frequency(magnetic, 1e3, 1e9, 100, "log", title);
+            bool finite = true;
+            for (auto y : sweep.get_y_points()) if (!std::isfinite(y)) finite = false;
+            UNSCOPED_INFO(title << " => sweep finite=" << finite);
+            CHECK(finite);
+        }
+        catch (const std::exception& e) {
+            UNSCOPED_INFO(title << " THREW: " << e.what());
+            FAIL_CHECK(title << " threw");
+        }
+    }
+}
+
+// Regression for a NaN report on the stray capacitance of a 3-winding PLANAR
+// flyback (custom_magnetic_flyback.json). The coil-only and operating-point
+// paths must return finite, real capacitances for planar wires (parallel-plate
+// model). See the companion "(through-core)" case for the with-core path.
+TEST_CASE("Calculate stray capacitance of custom planar flyback", "[physical-model][stray-capacitance]") {
+    settings.reset();
+
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "custom_magnetic_flyback.json");
+    OpenMagnetics::Mas mas;
+    OpenMagnetics::from_file(path, mas);
+    auto magnetic = mas.get_magnetic();
+    auto coil = magnetic.get_coil();
+    auto inputs = mas.get_inputs();
+    auto operatingPoint = inputs.get_operating_point(0);
+
+    StrayCapacitance strayCapacitance;
+
+    // Raw turn-to-turn capacitances (planar parallel-plate model) must be finite.
+    auto capacitanceAmongTurns = strayCapacitance.calculate_capacitance_among_turns(coil);
+    REQUIRE_FALSE(capacitanceAmongTurns.empty());
+    for (auto& [turnsKey, capacitance] : capacitanceAmongTurns) {
+        UNSCOPED_INFO("C[turn " << turnsKey.first << "][turn " << turnsKey.second << "] = " << capacitance);
+        REQUIRE(std::isfinite(capacitance));
+        REQUIRE(capacitance >= 0);
+    }
+
+    auto checkMaxwell = [](const std::string& label, const StrayCapacitanceOutput& output) {
+        auto maxwellCapacitanceMatrix = output.get_maxwell_capacitance_matrix().value();
+        REQUIRE_FALSE(maxwellCapacitanceMatrix.empty());
+        for (auto& matrixAtFreq : maxwellCapacitanceMatrix) {
+            for (auto& [firstKey, row] : matrixAtFreq.get_magnitude()) {
+                for (auto& [secondKey, capacitanceWithTolerance] : row) {
+                    auto capacitance = OpenMagnetics::resolve_dimensional_values(capacitanceWithTolerance);
+                    UNSCOPED_INFO(label << " C[" << firstKey << "][" << secondKey << "] = " << capacitance);
+                    REQUIRE(std::isfinite(capacitance));
+                }
+            }
+        }
+    };
+
+    checkMaxwell("coil", strayCapacitance.calculate_capacitance(coil));
+    checkMaxwell("coil+operatingPoint", strayCapacitance.calculate_capacitance(coil, operatingPoint));
+}
+
+// The with-core (through-core) inter-winding path now supports planar/foil/
+// rectangular wires (flat conductors modelled as an area-equivalent cylinder in
+// the turn-to-core field-spreading integral), so separated planar windings + core
+// must return a finite capacitance matrix instead of throwing.
+TEST_CASE("Calculate stray capacitance of custom planar flyback (through-core)", "[physical-model][stray-capacitance]") {
+    settings.reset();
+
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "custom_magnetic_flyback.json");
+    OpenMagnetics::Mas mas;
+    OpenMagnetics::from_file(path, mas);
+    auto magnetic = mas.get_magnetic();
+    auto coil = magnetic.get_coil();
+    auto core = magnetic.get_core();
+
+    StrayCapacitance strayCapacitance;
+    StrayCapacitanceOutput output;
+    REQUIRE_NOTHROW(output = strayCapacitance.calculate_capacitance(coil, core));
+
+    auto maxwell = output.get_maxwell_capacitance_matrix().value();
+    REQUIRE_FALSE(maxwell.empty());
+    for (auto& matrixAtFreq : maxwell) {
+        for (auto& [firstKey, row] : matrixAtFreq.get_magnitude()) {
+            for (auto& [secondKey, capacitanceWithTolerance] : row) {
+                auto capacitance = OpenMagnetics::resolve_dimensional_values(capacitanceWithTolerance);
+                UNSCOPED_INFO("C[" << firstKey << "][" << secondKey << "] = " << capacitance);
+                REQUIRE(std::isfinite(capacitance));
+            }
+        }
+    }
+
+    // The through-core element for a flat conductor must be a finite, positive, and
+    // physically small (sub-nF) per-winding self term.
+    auto amongWindings = output.get_capacitance_among_windings().value();
+    for (auto& [firstName, row] : amongWindings) {
+        for (auto& [secondName, capacitance] : row) {
+            UNSCOPED_INFO("Cww[" << firstName << "][" << secondName << "] = " << capacitance);
+            REQUIRE(std::isfinite(capacitance));
+        }
+    }
+}
+
+// ABT #173: the boundary turns of a separated-winding toroidal CMC (where the two
+// windings face each other across the separation gap) got a NEGATIVE static
+// capacitance (-0.57 pF on WE 744834622): the insulation layers credited between
+// those turns (4.7 mm, collected along the winding path) exceeded the actual
+// 2.8 mm gap, driving distanceThroughAir negative, and the Albach second-order
+// correction — wrongly fed the layer stack instead of the wire coating thickness —
+// dominated with Z < 0. A negative pair capacitance propagated into a negative
+// among-windings off-diagonal, which silently killed the DM resonance and turned
+// the wideband leakage tank into a bare series inductor.
+TEST_CASE("Static turn capacitances are non-negative on a separated-winding toroidal CMC", "[physical-model][stray-capacitance]") {
+    settings.reset();
+    auto testDataPath = get_test_data_path(std::source_location::current(), "cmc_redexpert_744834622.json");
+    std::ifstream file(testDataPath);
+    REQUIRE(file.good());
+    auto magneticJson = nlohmann::json::parse(file);
+    OpenMagnetics::Magnetic magnetic(magneticJson);
+    magnetic = magnetic_autocomplete(magnetic);
+    auto coil = magnetic.get_coil();
+    auto core = magnetic.get_core();
+    if (!coil.get_turns_description()) {
+        coil.wind();
+    }
+
+    auto amongTurns = OpenMagnetics::StrayCapacitance().calculate_capacitance_among_turns(coil);
+    for (auto& [key, capacitance] : amongTurns) {
+        UNSCOPED_INFO("C(turn " << key.first << ", turn " << key.second << ") = " << capacitance);
+        REQUIRE(capacitance >= 0.0);
+    }
+
+    auto amongWindings = OpenMagnetics::StrayCapacitance().calculate_capacitance(coil, core).get_capacitance_among_windings().value();
+    auto w0 = coil.get_functional_description()[0].get_name();
+    auto w1 = coil.get_functional_description()[1].get_name();
+    // The adjacent-winding off-diagonal must be a physical, positive lumped capacitance
+    // (it damps/places the DM resonance and the wideband leakage tank).
+    CHECK(amongWindings[w0][w1] > 0.0);
+    CHECK(amongWindings[w0][w1] < 1e-9);
 }

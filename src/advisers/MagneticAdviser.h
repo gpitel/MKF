@@ -154,6 +154,15 @@ class MagneticAdviser{
         };
         bool _simulateResults = true;
         bool _uniqueCoreShapes = false;
+        // ABT #164: active type constraints for the in-flight call. Set by the
+        // ctx-aware overloads (via a scoped RAII guard) and consumed by the base
+        // flow, which threads them to the nested CoreAdviser/CoilAdviser as
+        // LOCAL filtered views. Replaces the old DatabaseFilterScope that
+        // swapped the process-shared coreDatabase/wireDatabase in place (not
+        // fan-out-safe: concurrent MagneticAdviser calls saw each other's
+        // filtered catalogs). Default-empty => no filtering, identical to the
+        // pre-#164 base-overload behaviour.
+        AdviserConstraints _constraints;
         MAS::MagneticApplication _application = MAS::MagneticApplication::POWER;
         CoreAdviser::CoreAdviserModes _coreAdviserMode = CoreAdviser::CoreAdviserModes::STANDARD_CORES;
 
@@ -237,6 +246,11 @@ class MagneticAdviser{
          * @return Vector of (Mas, score) pairs sorted by ascending total losses.
          */
         std::vector<std::pair<Mas, double>> get_advised_magnetic_fast(Inputs inputs, size_t maximumNumberResults = 1);
+        // Fast analytical design with a caller-supplied filter flow: strictlyRequired
+        // filters (e.g. DC/EFFECTIVE_CURRENT_DENSITY) DROP any wound candidate that
+        // fails them, so the fast path can gate winding current density without the
+        // full CoilAdviser. Empty flow == the plain fast path above.
+        std::vector<std::pair<Mas, double>> get_advised_magnetic_fast(Inputs inputs, std::vector<MagneticFilterOperation> filterFlow, size_t maximumNumberResults = 1);
 
         /**
          * @brief Score a collection of magnetic designs using the filter flow.

@@ -2,6 +2,7 @@
 #include "constructive_models/MasMigration.h"
 #include <algorithm>
 #include <map>
+#include <set>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -231,6 +232,13 @@ Coil::Coil(const MAS::Coil coil) {
     if (coil.get_turns_description()) {
         hasTurnsData = true;
         set_turns_description(coil.get_turns_description());
+    }
+    if (hasSectionsData) {
+        // Externally-provided descriptions always sit at their FINAL multi-window
+        // positions (the +x winding frame is transient inside wind()); without
+        // this a later delimit_and_compact would re-compact mirrored-window
+        // sections as if they were frame-local.
+        set_group_window_sides_applied(true);
     }
     auto delimitAndCompact = settings.get_coil_delimit_and_compact();
 
@@ -537,7 +545,10 @@ std::vector<ConnectionReservedSpace> Coil::get_connection_reserved_spaces() {
             allLayers.push_back(layer);
         }
     }
-    if (allLayers.size() < 2) {
+    // Single-layer windings still have entrance/exit TERMINAL leads (drawn, and feeding
+    // the connection loss); only the inter-layer links need >= 2 layers, and that loop
+    // no-ops naturally. Bail out only when there is no conduction layer at all.
+    if (allLayers.empty()) {
         return spaces;
     }
     bool layersAreContiguous = (allLayers[0].get_orientation() == WindingOrientation::CONTIGUOUS);
@@ -1229,22 +1240,78 @@ bool Coil::fast_wind() {
     if (!get_layers_description()) {
         return false;
     }
-    auto previousIncludeAdditionalCoordinates = settings.get_coil_include_additional_coordinates();
-    settings.set_coil_include_additional_coordinates(false);
-    wind_by_turns();
-    settings.set_coil_include_additional_coordinates(previousIncludeAdditionalCoordinates);
+    {
+        // RAII (ABT #113 sweep): exception-safe replacement for the manual
+        // save/set/restore — wind_by_turns can throw.
+        SettingsGuard<bool> includeAdditionalCoordinatesGuard(settings, &Settings::get_coil_include_additional_coordinates, &Settings::set_coil_include_additional_coordinates, false);
+        wind_by_turns();
+    }
 
     if (!get_turns_description()) {
         return false;
     }
+    // Multi-column winding: mirror negative-x-window groups into place (no-op for
+    // single-window coils).
+    apply_group_window_sides();
     return true;
 }
 
 bool Coil::unwind() {
+    _groupWindowSidesApplied = false;
     set_sections_description(std::nullopt);
     set_layers_description(std::nullopt);
     set_turns_description(std::nullopt);
     return true;
+}
+
+bool Coil::rewind_layers_and_turns() {
+    if (!get_sections_description()) {
+        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+            "rewind_layers_and_turns needs a sections description to re-flow into");
+    }
+    // Sections may arrive at their FINAL multi-window positions (hand-edited or
+    // deserialized); the layer/turn placement math lives in the +x winding
+    // frame, so unwrap, re-flow, and re-apply — the custom rectangles round-trip
+    // through the same transform.
+    bool rewrapGroupWindowSides = _groupWindowSidesApplied;
+    if (rewrapGroupWindowSides) {
+        apply_group_window_sides(true);
+    }
+    wind_by_layers();
+    bool result = false;
+    if (get_layers_description()) {
+        wind_by_turns();
+        result = get_turns_description().has_value();
+    }
+    if (rewrapGroupWindowSides) {
+        apply_group_window_sides(false);
+    }
+    if (result) {
+        generate_toroidal_additional_coordinates();
+    }
+    return result;
+}
+
+void Coil::generate_toroidal_additional_coordinates() {
+    // The outer return crossings of toroidal turns (additionalCoordinates) are
+    // generated inside delimit_and_compact_round_window; re-flow paths that skip
+    // compaction (custom-rect rewinds, compact-off winds) must rebuild them or
+    // the external half of every turn silently disappears from the description.
+    if (!settings.get_coil_include_additional_coordinates()) {
+        return;
+    }
+    if (!get_turns_description() || !get_layers_description()) {
+        return;
+    }
+    auto bobbin = resolve_bobbin();
+    if (bobbin.get_winding_window_shape() != WindingWindowShape::ROUND) {
+        return;
+    }
+    // Same frame dance as delimit_and_compact_round_window: the additional-turn
+    // math runs on polar turns, the stored description is cartesian.
+    convert_turns_to_polar_coordinates();
+    wind_toroidal_additional_turns();
+    convert_turns_to_cartesian_coordinates();
 }
 
 bool Coil::wind() {
@@ -1284,6 +1351,35 @@ std::vector<size_t> Coil::extract_stack_up(std::vector<Section> sections) {
 }
 
 bool Coil::wind(std::vector<double> proportionPerWinding, std::vector<size_t> pattern, size_t repetitions) {
+    // REAL WINDING: a wire that makes N turns crosses the winding-window plane N+1
+    // times — the beginning of the first turn occupies its own physical slot in the
+    // cross-section (for 3 turns, 4 wire crossings per parallel appear in the 2D
+    // projection). Wind one extra turn per winding (one extra slot per parallel, since
+    // slots = numberTurns x numberParallels): the first placed turn of each parallel is
+    // that beginning crossing; every following turn is the wrap ending at its own
+    // crossing. The bump lasts for the whole wind — including the turn-blocking
+    // re-winds — and the electrical turn count is restored on exit (RAII), so
+    // inductance and turns-ratio semantics are untouched.
+    struct RealWindingCrossingBump {
+        Coil& coil;
+        bool active = false;
+        explicit RealWindingCrossingBump(Coil& c) : coil(c) {}
+        void arm() {
+            if (active || !settings.get_coil_use_real_winding_geometry()) return;
+            for (auto& winding : coil.get_mutable_functional_description()) {
+                winding.set_number_turns(winding.get_number_turns() + 1);
+            }
+            active = true;
+        }
+        ~RealWindingCrossingBump() {
+            if (active) {
+                for (auto& winding : coil.get_mutable_functional_description()) {
+                    winding.set_number_turns(winding.get_number_turns() - 1);
+                }
+            }
+        }
+    } realWindingCrossingBump(*this);
+
     bool windEvenIfNotFit = settings.get_coil_wind_even_if_not_fit();
     bool delimitAndCompact = settings.get_coil_delimit_and_compact();
     bool tryRewind = settings.get_coil_try_rewind();
@@ -1331,6 +1427,11 @@ bool Coil::wind(std::vector<double> proportionPerWinding, std::vector<size_t> pa
                 logEntry("Building centered single-turn toroidal", "Coil", 2);
                 return build_centered_single_turn_toroidal();
             }
+
+            // REAL WINDING: arm the N+1-crossing bump (declared at function scope so it
+            // also covers the global turn-blocking re-wind below) only after the
+            // centered-single-turn special case has had its chance.
+            realWindingCrossingBump.arm();
 
             if (_insulationSections.size() == 0) {
 
@@ -1388,7 +1489,10 @@ bool Coil::wind(std::vector<double> proportionPerWinding, std::vector<size_t> pa
         // leads cross what), so iterate to a fixpoint. Entirely gated behind the real-winding flag —
         // ideal winding never enters this loop, so its geometry is unchanged.
         logEntry("Applying real winding geometry (global turn blocking)", "Coil", 2);
-        const size_t maximumBlockingIterations = 8;
+        // Upper bound: each iteration can at most add one blocked slot per layer edge and
+        // spill one extra layer per section; window-sized windings converge in a handful,
+        // and the post-loop check below turns genuine divergence into a loud error.
+        const size_t maximumBlockingIterations = 16;
         for (size_t blockingIteration = 0; blockingIteration < maximumBlockingIterations; ++blockingIteration) {
             auto freshBlocked = compute_connection_blocked_slots_per_layer();
             // Accumulate the blocked slots MONOTONICALLY (element-wise max) instead of replacing them.
@@ -1425,16 +1529,79 @@ bool Coil::wind(std::vector<double> proportionPerWinding, std::vector<size_t> pa
                     delimit_and_compact();
                 }
             }
+            // Align INSIDE the loop: packing the blocked layers' turns against their
+            // unblocked edge moves which slots the leads cross, so the next iteration's
+            // blocking must be derived from the ALIGNED geometry — aligning only after
+            // the loop leaves silently unblocked slots (turns inside terminal leads).
+            align_blocked_layer_turns();
+        }
+        // Verify the fixpoint actually converged: the last re-wind may have produced NEW
+        // blocking that the loop never re-applied (cap exhaustion) — silent residue leaves
+        // turns inside reserved lead slots.
+        {
+            auto residual = compute_connection_blocked_slots_per_layer();
+            for (const auto& [layerName, edges] : residual) {
+                const auto& accumulated = _connectionBlockedSlotsPerLayer[layerName];
+                if (edges.first > accumulated.first || edges.second > accumulated.second) {
+                    throw CoilException(
+                        ErrorCode::COIL_WINDING_ERROR,
+                        "Real winding turn blocking did not converge for layer '" + layerName +
+                        "' (needs {" + std::to_string(edges.first) + "," +
+                        std::to_string(edges.second) + "} blocked slots, applied {" +
+                        std::to_string(accumulated.first) + "," +
+                        std::to_string(accumulated.second) + "})");
+                }
+            }
         }
         result = are_sections_and_layers_fitting() && bool(get_turns_description());
-        // For Z-wound layers, pack the turns against the unblocked edge so the slots freed by blocking
-        // line up with the terminal leads at the window edges (delimit otherwise centres them, leaving
-        // a turn-sized gap on the unblocked side and clipping the terminal slot on the blocked side).
-        align_blocked_layer_turns();
         logEntry("Applying real winding geometry (connection reserved space)", "Coil", 2);
         apply_connection_reserved_space();
     }
+    if (result) {
+        // Multi-column winding: groups were wound in the +x window-local frame;
+        // mirror the ones whose winding window sits on the negative-x side into
+        // their real position. No-op for single-window coils.
+        apply_group_window_sides();
+        // Hand-drawn section rectangles (winding studio) override the computed
+        // placement LAST — after compaction and mirroring — so no later pass
+        // can move them; layers+turns are re-flowed inside each drawn rect.
+        result = apply_custom_section_rects();
+        if (result && !delimitAndCompact) {
+            // Compact-off toroid winds skipped delimit_and_compact_round_window,
+            // the only place the outer return crossings are normally generated.
+            generate_toroidal_additional_coordinates();
+        }
+    }
     return result;
+}
+
+bool Coil::apply_custom_section_rects() {
+    if (_customSectionRects.empty() || !get_sections_description()) {
+        return true;
+    }
+    auto sections = get_sections_description().value();
+    bool anyApplied = false;
+    for (auto& section : sections) {
+        auto customRect = _customSectionRects.find(section.get_name());
+        if (customRect == _customSectionRects.end()) {
+            continue;
+        }
+        section.set_coordinates(customRect->second.first);
+        section.set_dimensions(customRect->second.second);
+        // The drawn rectangle invalidates the previously wound layer count —
+        // wind_by_layers honors a section's numberLayers when present, which
+        // would keep e.g. a single overflowing layer instead of re-packing
+        // into the new rect.
+        section.set_number_layers(std::nullopt);
+        anyApplied = true;
+    }
+    if (!anyApplied) {
+        // Stale names (the pattern changed and the drawn sections no longer
+        // exist) are the caller's to clean up; the wound result stays valid.
+        return true;
+    }
+    set_sections_description(sections);
+    return rewind_layers_and_turns();
 }
 
 bool Coil::wind_planar(std::vector<size_t> stackUp, std::optional<double> borderToWireDistance, std::map<size_t, double> wireToWireDistance, std::map<std::pair<size_t, size_t>, double> insulationThickness, double coreToLayerDistance) {
@@ -3016,13 +3183,14 @@ std::pair<size_t, std::vector<int64_t>> get_number_layers_needed_and_number_phys
     return get_number_layers_needed_and_number_physical_turns(section.get_coordinates()[0] - section.get_dimensions()[0] / 2, section.get_dimensions()[1], wire, physicalTurnsInSection, windingWindowRadius);
 }
 
-void Coil::apply_margin_tape(std::vector<std::pair<ElectricalType, std::pair<size_t, double>>> orderedSectionsWithInsulation) {
-    if (_marginsPerSection.size() < orderedSectionsWithInsulation.size()) {
+void Coil::apply_margin_tape(std::vector<std::pair<ElectricalType, std::pair<size_t, double>>> orderedSectionsWithInsulation, size_t sectionIndexOffset) {
+    if (_marginsPerSection.size() < sectionIndexOffset + orderedSectionsWithInsulation.size()) {
         // Resize (not replace) so preloaded margins are preserved, matching equalize_margins
-        _marginsPerSection.resize(orderedSectionsWithInsulation.size(), {0, 0});
+        _marginsPerSection.resize(sectionIndexOffset + orderedSectionsWithInsulation.size(), {0, 0});
     }
 
     for (size_t sectionIndex = 0; sectionIndex < orderedSectionsWithInsulation.size(); ++sectionIndex) {
+        size_t marginIndex = sectionIndexOffset + sectionIndex;
         if (orderedSectionsWithInsulation[sectionIndex].first == ElectricalType::CONDUCTION) {
             if (sectionIndex > 0 && !_coilSectionInterfaces.empty()) {
 
@@ -3044,10 +3212,10 @@ void Coil::apply_margin_tape(std::vector<std::pair<ElectricalType, std::pair<siz
                 auto previousWindingIndex = orderedSectionsWithInsulation[sectionIndex - 2].second.first;
                 auto windingsMapKey = std::pair<size_t, size_t>{previousWindingIndex, windingIndex};
                 auto coilSectionInterface = _coilSectionInterfaces[windingsMapKey];
-                _marginsPerSection[sectionIndex][0] =  std::max(_marginsPerSection[sectionIndex][0], coilSectionInterface.get_total_margin_tape_distance() / 2);
-                _marginsPerSection[sectionIndex][1] =  std::max(_marginsPerSection[sectionIndex][1], coilSectionInterface.get_total_margin_tape_distance() / 2);
-                _marginsPerSection[sectionIndex - 2][0] =  std::max(_marginsPerSection[sectionIndex - 2][0], coilSectionInterface.get_total_margin_tape_distance() / 2);
-                _marginsPerSection[sectionIndex - 2][1] =  std::max(_marginsPerSection[sectionIndex - 2][1], coilSectionInterface.get_total_margin_tape_distance() / 2);
+                _marginsPerSection[marginIndex][0] =  std::max(_marginsPerSection[marginIndex][0], coilSectionInterface.get_total_margin_tape_distance() / 2);
+                _marginsPerSection[marginIndex][1] =  std::max(_marginsPerSection[marginIndex][1], coilSectionInterface.get_total_margin_tape_distance() / 2);
+                _marginsPerSection[marginIndex - 2][0] =  std::max(_marginsPerSection[marginIndex - 2][0], coilSectionInterface.get_total_margin_tape_distance() / 2);
+                _marginsPerSection[marginIndex - 2][1] =  std::max(_marginsPerSection[marginIndex - 2][1], coilSectionInterface.get_total_margin_tape_distance() / 2);
             }
         }
     }
@@ -3181,20 +3349,35 @@ bool Coil::create_default_groups(Bobbin bobbin, WiringTechnology coilType, doubl
 
     auto bobbinWindingWindowShape = bobbin.get_winding_window_shape();
 
-    // Build the per-winding partials once; they go in group 0 by default.
-    std::vector<PartialWinding> partialWindings;
+    // Distribute the windings by their functional placement: each winding goes to
+    // the winding window its windingWindow field names, defaulting to window 0 (the
+    // schema-documented default when the field is absent).
     double numberWindings = get_functional_description().size();
+    std::vector<std::vector<PartialWinding>> partialWindingsPerWindow(windingWindows.size());
+    bool anyExplicitPlacement = false;
     for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
+        auto requestedWindow = get_functional_description()[windingIndex].get_winding_window();
+        if (requestedWindow) {
+            anyExplicitPlacement = true;
+            if (requestedWindow.value() < 0 || static_cast<size_t>(requestedWindow.value()) >= windingWindows.size()) {
+                throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                    "Winding " + get_name(windingIndex) + " requests winding window " +
+                    std::to_string(requestedWindow.value()) + " but the bobbin has " +
+                    std::to_string(windingWindows.size()) + " winding windows");
+            }
+        }
+        size_t windowIndex = requestedWindow ? static_cast<size_t>(requestedWindow.value()) : 0;
         PartialWinding partialWinding;
         partialWinding.set_winding(get_name(windingIndex));
         partialWinding.set_parallels_proportion(std::vector<double>(get_number_parallels(windingIndex), 1));
-        partialWindings.push_back(partialWinding);
+        partialWindingsPerWindow[windowIndex].push_back(partialWinding);
     }
 
     std::vector<Group> groups;
     for (size_t i = 0; i < windingWindows.size(); ++i) {
         Group g;
         g.set_name("Column " + std::to_string(i));
+        g.set_winding_window(static_cast<int64_t>(i));
         g.set_coordinates({windingWindows[i].get_coordinates().value()[0], windingWindows[i].get_coordinates().value()[1]});
         if (bobbinWindingWindowShape == WindingWindowShape::RECTANGULAR) {
             g.set_dimensions(std::vector<double>{windingWindows[i].get_width().value() - coreToLayerDistance * 2, windingWindows[i].get_height().value()});
@@ -3206,20 +3389,99 @@ bool Coil::create_default_groups(Bobbin bobbin, WiringTechnology coilType, doubl
         }
         g.set_sections_orientation(get_winding_orientation());
         g.set_type(coilType);
-        if (i == 0) {
-            g.set_partial_windings(partialWindings);
-        }
-        else {
-            g.set_partial_windings(std::vector<PartialWinding>{});
-        }
+        g.set_partial_windings(partialWindingsPerWindow[i]);
         groups.push_back(g);
     }
+    split_shared_window_groups(groups, windingWindows);
     set_groups_description(groups);
 
-    OM_WARNING("Multi-column bobbin detected (" + std::to_string(windingWindows.size()) +
-               " winding windows). All windings placed in column 0 by default. "
-               "Call assign_windings_to_columns() to distribute.");
+    if (!anyExplicitPlacement) {
+        OM_WARNING("Multi-column bobbin detected (" + std::to_string(windingWindows.size()) +
+                   " winding windows) and no winding carries a windingWindow placement. All windings "
+                   "placed in window 0 by default. Set windingWindow on the windings or call "
+                   "assign_windings_to_columns() to distribute.");
+    }
     return true;
+}
+
+void Coil::split_shared_window_groups(std::vector<Group>& groups, const std::vector<WindingWindowElement>& windingWindows) {
+    // Region sharing: the main-column winding forms an annulus whose two crossings
+    // occupy the inner side of BOTH window regions, while a lateral winding hugs its
+    // leg on the outer side of its region. When both kinds are wound they share the
+    // region width: main-wound groups keep the inner half, lateral-wound groups the
+    // outer half. With only one kind wound, every group keeps the full region.
+    if (windingWindows.size() <= 1) {
+        return;
+    }
+    if (!windingWindows[0].get_width()) {
+        // Radial (toroidal) windows share by angle, not width; nothing to split.
+        return;
+    }
+    auto mainColumnEdge = windingWindows[0].get_column();
+    auto isLateralWound = [&](const Group& group) {
+        size_t windowIndex = group.get_winding_window() ? static_cast<size_t>(group.get_winding_window().value()) : 0;
+        if (windowIndex >= windingWindows.size()) {
+            throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                "Group " + group.get_name() + " references winding window " + std::to_string(windowIndex) +
+                " but the bobbin has " + std::to_string(windingWindows.size()) + " winding windows");
+        }
+        auto columnEdge = windingWindows[windowIndex].get_column();
+        return bool(columnEdge && (!mainColumnEdge || columnEdge.value() != mainColumnEdge.value()));
+    };
+
+    bool anyMainWound = false;
+    bool anyLateralWound = false;
+    for (auto& group : groups) {
+        if (group.get_partial_windings().empty()) {
+            continue;
+        }
+        if (isLateralWound(group)) {
+            anyLateralWound = true;
+        }
+        else {
+            anyMainWound = true;
+        }
+    }
+    if (!anyLateralWound) {
+        return;
+    }
+
+    // The lateral bobbin's column wall sits between the leg's face and the winding
+    // space (mirroring the main bobbin's wall against the main column), so every
+    // lateral-wound group gives up one columnThickness at its leg. Under sharing,
+    // the region is split at the CORE window's midline (main bobbin wall to leg
+    // face), which hands both sides equal winding space: wall + space inward, space
+    // + wall outward.
+    double columnThickness = resolve_bobbin().get_processed_description().value().get_column_thickness();
+
+    for (auto& group : groups) {
+        if (group.get_partial_windings().empty()) {
+            continue;
+        }
+        bool lateralWound = isLateralWound(group);
+        auto dimensions = group.get_dimensions();
+        auto coordinates = group.get_coordinates();
+        double sideSign = coordinates[0] >= 0 ? 1.0 : -1.0;
+        double regionInnerEdge = std::abs(coordinates[0]) - dimensions[0] / 2;
+        double regionOuterEdge = std::abs(coordinates[0]) + dimensions[0] / 2;
+        double newInnerEdge = regionInnerEdge;
+        double newOuterEdge = lateralWound ? regionOuterEdge - columnThickness : regionOuterEdge;
+        if (anyMainWound && anyLateralWound) {
+            // Core-window midline: from the main bobbin's wall face (inner edge minus
+            // its wall) to the leg face (region outer edge).
+            double coreWindowMidline = (regionInnerEdge - columnThickness + regionOuterEdge) / 2;
+            if (lateralWound) {
+                newInnerEdge = coreWindowMidline;
+            }
+            else {
+                newOuterEdge = coreWindowMidline;
+            }
+        }
+        coordinates[0] = sideSign * (newInnerEdge + newOuterEdge) / 2;
+        dimensions[0] = newOuterEdge - newInnerEdge;
+        group.set_coordinates(coordinates);
+        group.set_dimensions(dimensions);
+    }
 }
 
 size_t Coil::find_window_index_for_group(const std::string& groupName) const {
@@ -3227,18 +3489,27 @@ size_t Coil::find_window_index_for_group(const std::string& groupName) const {
     if (!groupsOpt) return 0;
     auto groups = groupsOpt.value();
 
-    Bobbin bobbinResolved;
-    try {
-        bobbinResolved = const_cast<Coil*>(this)->resolve_bobbin();
-    } catch (...) {
-        return 0;
+    Bobbin bobbinResolved = const_cast<Coil*>(this)->resolve_bobbin();
+    if (!bobbinResolved.get_processed_description()) {
+        throw CoilNotProcessedException("Bobbin not processed, cannot resolve the winding window of group " + groupName);
     }
-    if (!bobbinResolved.get_processed_description()) return 0;
     auto windingWindows = bobbinResolved.get_processed_description().value().get_winding_windows();
     if (windingWindows.size() <= 1) return 0;
 
     for (auto& g : groups) {
         if (g.get_name() == groupName) {
+            // Prefer the explicit windingWindow reference (stamped by
+            // create_default_groups / assign_windings_to_columns, or supplied
+            // in the MAS file).
+            if (g.get_winding_window()) {
+                auto windowIndex = g.get_winding_window().value();
+                if (windowIndex < 0 || static_cast<size_t>(windowIndex) >= windingWindows.size()) {
+                    throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                        "Group " + groupName + " references winding window " + std::to_string(windowIndex) +
+                        " but the bobbin has " + std::to_string(windingWindows.size()) + " winding windows");
+                }
+                return static_cast<size_t>(windowIndex);
+            }
             auto gc = g.get_coordinates();
             for (size_t j = 0; j < windingWindows.size(); ++j) {
                 auto wwc = windingWindows[j].get_coordinates().value();
@@ -3249,9 +3520,297 @@ size_t Coil::find_window_index_for_group(const std::string& groupName) const {
                     return j;
                 }
             }
+            throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                "Group " + groupName + " carries no windingWindow reference and its coordinates match no "
+                "winding window of the multi-window bobbin; cannot resolve its placement");
         }
     }
+    throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+        "Group " + groupName + " does not exist in the groups description");
+}
+
+size_t Coil::resolve_section_winding_window_index(const Section& section) const {
+    if (section.get_winding_window()) {
+        auto windowIndex = section.get_winding_window().value();
+        if (windowIndex < 0) {
+            throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                "Section " + section.get_name() + " references negative winding window " + std::to_string(windowIndex));
+        }
+        return static_cast<size_t>(windowIndex);
+    }
+    if (section.get_group()) {
+        return find_window_index_for_group(section.get_group().value());
+    }
     return 0;
+}
+
+WoundColumnFrame Coil::get_wound_column_frame_for_section(const std::string& sectionName) {
+    auto bobbin = resolve_bobbin();
+    auto bobbinProcessedDescription = bobbin.get_processed_description().value();
+
+    auto buildMainColumnFrame = [&]() {
+        WoundColumnFrame frame;
+        frame.shape = bobbinProcessedDescription.get_column_shape();
+        frame.columnDepth = bobbinProcessedDescription.get_column_depth();
+        if (bobbinProcessedDescription.get_column_width()) {
+            frame.columnWidth = bobbinProcessedDescription.get_column_width().value();
+        }
+        else {
+            auto bobbinWindingWindow = bobbinProcessedDescription.get_winding_windows()[0];
+            frame.columnWidth = bobbinWindingWindow.get_coordinates().value()[0] - bobbinWindingWindow.get_width().value() / 2;
+        }
+        frame.axisX = 0;
+        return frame;
+    };
+
+    if (!get_sections_description()) {
+        throw CoilNotProcessedException("Sections description is missing, cannot resolve the wound column of section " + sectionName);
+    }
+    auto sections = get_sections_description().value();
+    std::optional<Section> section;
+    for (auto& candidate : sections) {
+        if (candidate.get_name() == sectionName) {
+            section = candidate;
+            break;
+        }
+    }
+    if (!section) {
+        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+            "Section " + sectionName + " does not exist in the sections description");
+    }
+
+    size_t windowIndex = resolve_section_winding_window_index(section.value());
+    if (windowIndex == 0) {
+        return buildMainColumnFrame();
+    }
+
+    auto windingWindows = bobbinProcessedDescription.get_winding_windows();
+    if (windowIndex >= windingWindows.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+            "Section " + sectionName + " references winding window " + std::to_string(windowIndex) +
+            " but the bobbin has " + std::to_string(windingWindows.size()) + " winding windows");
+    }
+    auto columnEdge = windingWindows[windowIndex].get_column();
+    if (!columnEdge) {
+        // Schema default: a window without a column edge wraps the main column
+        // (e.g. the stacked chambers of a split bobbin).
+        return buildMainColumnFrame();
+    }
+    if (!_coreColumns) {
+        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+            "Section " + sectionName + " is placed in winding window " + std::to_string(windowIndex) +
+            " wound around core column " + std::to_string(columnEdge.value()) +
+            ", but the core columns were not provided; call set_core_columns before winding");
+    }
+    auto columns = _coreColumns.value();
+    if (columnEdge.value() < 0 || static_cast<size_t>(columnEdge.value()) >= columns.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+            "Winding window " + std::to_string(windowIndex) + " references core column " +
+            std::to_string(columnEdge.value()) + " but the core has " + std::to_string(columns.size()) + " columns");
+    }
+    auto column = columns[static_cast<size_t>(columnEdge.value())];
+    if (column.get_coordinates()[0] == 0) {
+        // The window's column IS the main column (shared-region entries pointing back).
+        return buildMainColumnFrame();
+    }
+    WoundColumnFrame frame;
+    frame.shape = column.get_shape();
+    // The lateral bobbin wraps its leg like the main one wraps the main column:
+    // one column-wall thickness sits between the leg and the winding space.
+    frame.columnWidth = column.get_width() / 2 + bobbinProcessedDescription.get_column_thickness();
+    frame.columnDepth = column.get_depth() / 2 + bobbinProcessedDescription.get_column_thickness();
+    // The winding frame is the +x side; mirrored (negative-x) windows are wound
+    // against the mirrored column and flipped into place afterwards.
+    frame.axisX = std::abs(column.get_coordinates()[0]);
+    return frame;
+}
+
+std::optional<double> Coil::get_turn_length_in_frame(const WoundColumnFrame& frame, double turnX) {
+    double radius = frame.axisX == 0 ? turnX : std::abs(turnX - frame.axisX);
+    double length;
+    if (frame.shape == ColumnShape::ROUND) {
+        length = 2 * std::numbers::pi * radius;
+    }
+    else if (frame.shape == ColumnShape::OBLONG) {
+        length = 2 * std::numbers::pi * radius + 4 * (frame.columnDepth - frame.columnWidth);
+    }
+    else if (frame.shape == ColumnShape::RECTANGULAR || frame.shape == ColumnShape::IRREGULAR) {
+        length = 4 * frame.columnDepth + 4 * frame.columnWidth + 2 * std::numbers::pi * (radius - frame.columnWidth);
+    }
+    else {
+        throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA, "only round or rectangular columns supported for bobbins");
+    }
+    if (length < 0) {
+        return std::nullopt;
+    }
+    return length;
+}
+
+void Coil::apply_group_window_sides(bool inverse) {
+    if (!get_groups_description() || !get_sections_description()) {
+        return;
+    }
+    if (inverse && !_groupWindowSidesApplied) {
+        return;
+    }
+    if (!inverse && _groupWindowSidesApplied) {
+        return;
+    }
+    Bobbin bobbinResolved = resolve_bobbin();
+    if (!bobbinResolved.get_processed_description()) {
+        return;
+    }
+    auto windingWindows = bobbinResolved.get_processed_description().value().get_winding_windows();
+    if (windingWindows.size() <= 1) {
+        return;
+    }
+
+    // Per-section placement transform out of the +x winding frame:
+    // 1. Sections wound around a NON-main column are reflected across their window
+    //    center, so the winding hugs the column it actually wraps (the lateral leg's
+    //    face is the window's outer edge; the winder laid them against the inner edge
+    //    like a main-column winding). Their turn lengths are recomputed for the new
+    //    radius around the leg.
+    // 2. Sections whose window sits on the negative-x side are mirrored into place.
+    // 3. Every turn gets its SECOND cross-section crossing as an additional
+    //    coordinate: a turn around any column intersects the drawing plane twice
+    //    (main-column turns on the far side of the main column, lateral-column turns
+    //    outside the core), mirroring what toroidal turns already carry.
+    struct SectionWindowTransform {
+        bool reflectAcrossWindowCenter = false;
+        double windingFrameWindowCenterX = 0;
+        bool mirrorSide = false;
+        double finalColumnAxisX = 0;
+    };
+    std::map<std::string, SectionWindowTransform> transformPerSection;
+
+    auto mainColumnEdge = windingWindows[0].get_column();
+    // Reflection pivots on the GROUP's allocated sub-region (which may be half the
+    // window when the region is shared with the main winding's annulus), falling
+    // back to the window itself for sections without a group.
+    std::map<std::string, double> groupCenterXByName;
+    auto placementGroups = get_groups_description().value();
+    for (auto& group : placementGroups) {
+        groupCenterXByName[group.get_name()] = group.get_coordinates()[0];
+    }
+    auto sections = get_sections_description().value();
+    bool anyTransform = false;
+    for (auto& section : sections) {
+        size_t windowIndex = resolve_section_winding_window_index(section);
+        if (windowIndex >= windingWindows.size()) {
+            throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                "Section " + section.get_name() + " references winding window " + std::to_string(windowIndex) +
+                " but the bobbin has " + std::to_string(windingWindows.size()) + " winding windows");
+        }
+        auto& windingWindow = windingWindows[windowIndex];
+        SectionWindowTransform transform;
+        transform.mirrorSide = windingWindow.get_coordinates().value()[0] < 0;
+        auto columnEdge = windingWindow.get_column();
+        // Schema default: a window without a column edge wraps the main column.
+        bool lateralWound = columnEdge && (!mainColumnEdge || columnEdge.value() != mainColumnEdge.value());
+        transform.reflectAcrossWindowCenter = lateralWound;
+        if (section.get_group() && groupCenterXByName.contains(section.get_group().value())) {
+            transform.windingFrameWindowCenterX = std::abs(groupCenterXByName[section.get_group().value()]);
+        }
+        else {
+            transform.windingFrameWindowCenterX = std::abs(windingWindow.get_coordinates().value()[0]);
+        }
+        if (lateralWound) {
+            double windingFrameAxisX = get_wound_column_frame_for_section(section.get_name()).axisX;
+            transform.finalColumnAxisX = transform.mirrorSide ? -windingFrameAxisX : windingFrameAxisX;
+        }
+        transformPerSection[section.get_name()] = transform;
+        anyTransform = anyTransform || transform.reflectAcrossWindowCenter || transform.mirrorSide;
+    }
+
+    bool emitBothCrossings = settings.get_coil_include_additional_coordinates() && !inverse;
+    if (!anyTransform && !emitBothCrossings) {
+        return;
+    }
+
+    auto transformX = [inverse](double x, const SectionWindowTransform& transform) {
+        // Forward: reflect (hug the wound leg) then mirror (negative-x side).
+        // Inverse: same involutions in reverse order.
+        if (inverse && transform.mirrorSide) {
+            x = -x;
+        }
+        if (transform.reflectAcrossWindowCenter) {
+            x = 2 * transform.windingFrameWindowCenterX - x;
+        }
+        if (!inverse && transform.mirrorSide) {
+            x = -x;
+        }
+        return x;
+    };
+    auto transformCoordinates = [&](std::vector<double> coordinates, const SectionWindowTransform& transform) {
+        coordinates[0] = transformX(coordinates[0], transform);
+        return coordinates;
+    };
+
+    for (auto& section : sections) {
+        section.set_coordinates(transformCoordinates(section.get_coordinates(), transformPerSection[section.get_name()]));
+    }
+    set_sections_description(sections);
+
+    if (get_layers_description()) {
+        auto layers = get_layers_description().value();
+        for (auto& layer : layers) {
+            if (!layer.get_section() || !transformPerSection.contains(layer.get_section().value())) {
+                continue;
+            }
+            auto& transform = transformPerSection[layer.get_section().value()];
+            layer.set_coordinates(transformCoordinates(layer.get_coordinates(), transform));
+            if (layer.get_additional_coordinates()) {
+                auto additionalCoordinates = layer.get_additional_coordinates().value();
+                for (auto& coordinates : additionalCoordinates) {
+                    coordinates = transformCoordinates(coordinates, transform);
+                }
+                layer.set_additional_coordinates(additionalCoordinates);
+            }
+        }
+        set_layers_description(layers);
+    }
+
+    if (get_turns_description()) {
+        auto turns = get_turns_description().value();
+        for (auto& turn : turns) {
+            if (!turn.get_section() || !transformPerSection.contains(turn.get_section().value())) {
+                continue;
+            }
+            auto& transform = transformPerSection[turn.get_section().value()];
+            turn.set_coordinates(transformCoordinates(turn.get_coordinates(), transform));
+            if (transform.reflectAcrossWindowCenter) {
+                // The reflection changed the turn's radius around its column: recompute
+                // the length in the winding frame (absolute coordinates).
+                auto frame = get_wound_column_frame_for_section(turn.get_section().value());
+                auto turnLength = get_turn_length_in_frame(frame, std::abs(turn.get_coordinates()[0]));
+                if (!turnLength) {
+                    throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+                        "Negative turn length after placing turn " + turn.get_name() + " around its column");
+                }
+                turn.set_length(turnLength.value());
+            }
+            if (transform.mirrorSide) {
+                // A mirrored turn is wound the opposite way around its column.
+                if (turn.get_orientation()) {
+                    turn.set_orientation(turn.get_orientation().value() == TurnOrientation::CLOCKWISE
+                                             ? TurnOrientation::COUNTER_CLOCKWISE
+                                             : TurnOrientation::CLOCKWISE);
+                }
+            }
+            if (emitBothCrossings) {
+                // Second crossing of the turn with the drawing plane: the reflection of
+                // the first crossing across the wound column's axis (axis 0 for the
+                // main column: the far side of the center leg; the leg axis for
+                // lateral columns: outside the core).
+                double secondCrossingX = 2 * transform.finalColumnAxisX - turn.get_coordinates()[0];
+                turn.set_additional_coordinates(std::vector<std::vector<double>>{
+                    {secondCrossingX, turn.get_coordinates()[1]}});
+            }
+        }
+        set_turns_description(turns);
+    }
+    _groupWindowSidesApplied = !inverse;
 }
 
 void Coil::assign_windings_to_columns(const std::vector<std::vector<size_t>>& windingIndicesPerColumn) {
@@ -3274,6 +3833,7 @@ void Coil::assign_windings_to_columns(const std::vector<std::vector<size_t>>& wi
     for (size_t col = 0; col < windingWindows.size(); ++col) {
         Group g;
         g.set_name("Column " + std::to_string(col));
+        g.set_winding_window(static_cast<int64_t>(col));
         g.set_coordinates({windingWindows[col].get_coordinates().value()[0], windingWindows[col].get_coordinates().value()[1]});
         if (bobbinWindingWindowShape == WindingWindowShape::RECTANGULAR) {
             g.set_dimensions(std::vector<double>{windingWindows[col].get_width().value(), windingWindows[col].get_height().value()});
@@ -3300,6 +3860,7 @@ void Coil::assign_windings_to_columns(const std::vector<std::vector<size_t>>& wi
         g.set_partial_windings(partialWindings);
         groups.push_back(g);
     }
+    split_shared_window_groups(groups, windingWindows);
     set_groups_description(groups);
 }
 
@@ -3340,6 +3901,8 @@ bool Coil::wind_by_sections(std::vector<double> proportionPerWinding, std::vecto
     set_sections_description(std::nullopt);
     set_layers_description(std::nullopt);
     set_turns_description(std::nullopt);
+    // Fresh sections are wound in the +x winding frame.
+    _groupWindowSidesApplied = false;
 
     std::vector<size_t> maybeVirtualizedPattern = pattern;
     std::vector<double> maybeVirtualizedProportionPerWinding = proportionPerWinding;
@@ -3872,8 +4435,55 @@ bool Coil::wind_by_rectangular_sections(std::vector<double> proportionPerWinding
 
     auto groups = get_groups_description().value();
     std::vector<std::vector<double>> remainingParallelsProportion;
+    for (size_t windingIndex = 0; windingIndex < get_functional_description().size(); ++windingIndex) {
+        remainingParallelsProportion.push_back(std::vector<double>(get_number_parallels(windingIndex), 1));
+    }
+    // Multi-column winding: each group is wound independently with the subset of the
+    // pattern that belongs to its windings, in a window-local frame on the +x side of
+    // the main column (apply_group_window_sides mirrors negative-x windows at the end
+    // of wind()). Single-group coils keep the exact historical inputs.
+    bool multiGroup = groups.size() > 1;
+    size_t marginSectionOffset = 0;
 
     for (auto group : groups) {
+        std::vector<size_t> groupPattern = pattern;
+        std::vector<double> groupProportionPerWinding = proportionPerWinding;
+        std::set<size_t> groupWindingIndexes;
+        std::optional<size_t> groupWindowIndex;
+        if (multiGroup) {
+            for (auto& groupPartialWinding : group.get_partial_windings()) {
+                groupWindingIndexes.insert(get_winding_index_by_name(groupPartialWinding.get_winding()));
+            }
+            if (groupWindingIndexes.empty()) {
+                continue;
+            }
+            groupPattern.clear();
+            for (auto windingIndex : pattern) {
+                if (groupWindingIndexes.contains(windingIndex)) {
+                    groupPattern.push_back(windingIndex);
+                }
+            }
+            if (groupPattern.empty()) {
+                throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                    "Group " + group.get_name() + " has windings but none of them appear in the winding pattern");
+            }
+            // The group's windings share this group's full window space.
+            double groupProportionSum = 0;
+            for (auto windingIndex : groupWindingIndexes) {
+                groupProportionSum += proportionPerWinding[windingIndex];
+            }
+            for (auto windingIndex : groupWindingIndexes) {
+                groupProportionPerWinding[windingIndex] = proportionPerWinding[windingIndex] / groupProportionSum;
+            }
+            groupWindowIndex = find_window_index_for_group(group.get_name());
+            // Wind in the +x window-local frame; mirrored back afterwards.
+            if (group.get_coordinates()[0] < 0) {
+                auto groupCoordinates = group.get_coordinates();
+                groupCoordinates[0] = -groupCoordinates[0];
+                group.set_coordinates(groupCoordinates);
+            }
+        }
+
         double availableWidth = group.get_dimensions()[0];
         double availableHeight = group.get_dimensions()[1];
         double spaceForSections = 0;
@@ -3886,7 +4496,7 @@ bool Coil::wind_by_rectangular_sections(std::vector<double> proportionPerWinding
             spaceForSections = availableHeight;
         }
 
-        auto orderedSections = get_ordered_sections(spaceForSections, proportionPerWinding, pattern, repetitions);
+        auto orderedSections = get_ordered_sections(spaceForSections, groupProportionPerWinding, groupPattern, repetitions);
 
         auto orderedSectionsWithInsulation = add_insulation_to_sections(orderedSections);
 
@@ -3911,6 +4521,7 @@ bool Coil::wind_by_rectangular_sections(std::vector<double> proportionPerWinding
         // center-tapped magnetic throws an exception.
         for (size_t wIdx = 0; wIdx < numberWindings; ++wIdx) {
             if (numberSectionsPerWinding[wIdx] != 0) continue;
+            if (multiGroup && !groupWindingIndexes.contains(wIdx)) continue;
             const auto& wwOpt = get_functional_description()[wIdx].get_wound_with();
             if (!wwOpt || wwOpt->empty()) continue;
             for (const auto& partnerName : wwOpt.value()) {
@@ -3936,6 +4547,7 @@ bool Coil::wind_by_rectangular_sections(std::vector<double> proportionPerWinding
         if (!_virtualizationMap.empty()) {
             for (size_t wIdx = 0; wIdx < numberWindings; ++wIdx) {
                 if (numberSectionsPerWinding[wIdx] != 0) continue;
+                if (multiGroup && !groupWindingIndexes.contains(wIdx)) continue;
                 for (const auto& [virtualIdx, members] : _virtualizationMap) {
                     if (std::find(members.begin(), members.end(), wIdx) == members.end()) continue;
                     for (auto pIdx : members) {
@@ -3949,18 +4561,28 @@ bool Coil::wind_by_rectangular_sections(std::vector<double> proportionPerWinding
             }
         }
 
-        auto windByConsecutiveTurns = wind_by_consecutive_turns(get_number_turns(), get_number_parallels(), numberSectionsPerWinding);
-       
-        auto wirePerWinding = get_wires();
-        for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
-            remainingParallelsProportion.push_back(std::vector<double>(get_number_parallels(windingIndex), 1));
+        if (multiGroup) {
+            // Windings belonging to other groups have zero sections here; give them a
+            // placeholder slot count so the style chooser's zero-slot guard doesn't
+            // fire. Their style entry is never read: only this group's windings appear
+            // in this group's ordered sections.
+            for (size_t wIdx = 0; wIdx < numberWindings; ++wIdx) {
+                if (!groupWindingIndexes.contains(wIdx) && numberSectionsPerWinding[wIdx] == 0) {
+                    numberSectionsPerWinding[wIdx] = 1;
+                }
+            }
         }
+        auto windByConsecutiveTurns = wind_by_consecutive_turns(get_number_turns(), get_number_parallels(), numberSectionsPerWinding);
+
+        auto wirePerWinding = get_wires();
         double currentSectionCenterWidth = DBL_MAX;
         double currentSectionCenterHeight = DBL_MAX;
 
-        apply_margin_tape(orderedSectionsWithInsulation);
+        apply_margin_tape(orderedSectionsWithInsulation, marginSectionOffset);
 
         for (size_t sectionIndex = 0; sectionIndex < orderedSectionsWithInsulation.size(); ++sectionIndex) {
+            // Margins are indexed flat across ALL groups in winding order.
+            size_t marginIndex = marginSectionOffset + sectionIndex;
             if (orderedSectionsWithInsulation[sectionIndex].first == ElectricalType::CONDUCTION) {
                 auto sectionInfo = orderedSectionsWithInsulation[sectionIndex].second;
                 auto windingIndex = sectionInfo.first;
@@ -4016,16 +4638,19 @@ bool Coil::wind_by_rectangular_sections(std::vector<double> proportionPerWinding
                 section.set_name(get_name(windingIndex) +  " section " + std::to_string(currentSectionPerWinding[windingIndex]));
                 section.set_partial_windings(std::vector<PartialWinding>{partialWinding});  // TODO: support more than one winding per section?
                 section.set_group(group.get_name());
+                if (groupWindowIndex) {
+                    section.set_winding_window(static_cast<int64_t>(groupWindowIndex.value()));
+                }
                 section.set_type(ElectricalType::CONDUCTION);
-                section.set_margin(_marginsPerSection[sectionIndex]);
+                section.set_margin(_marginsPerSection[marginIndex]);
                 section.set_layers_orientation(_layersOrientation);
                 section.set_coordinate_system(CoordinateSystem::CARTESIAN);
                 
                 if (windingOrientation == WindingOrientation::OVERLAPPING) {
-                    section.set_dimensions(std::vector<double>{currentSectionWidth, currentSectionHeight - _marginsPerSection[sectionIndex][0] - _marginsPerSection[sectionIndex][1]});
+                    section.set_dimensions(std::vector<double>{currentSectionWidth, currentSectionHeight - _marginsPerSection[marginIndex][0] - _marginsPerSection[marginIndex][1]});
                 }
                 else {
-                    section.set_dimensions(std::vector<double>{currentSectionWidth - _marginsPerSection[sectionIndex][0] - _marginsPerSection[sectionIndex][1], currentSectionHeight});
+                    section.set_dimensions(std::vector<double>{currentSectionWidth - _marginsPerSection[marginIndex][0] - _marginsPerSection[marginIndex][1], currentSectionHeight});
                 }
 
                 if (wirePerWinding[windingIndex].get_type() == WireType::FOIL && !wirePerWinding[windingIndex].get_conducting_height()) {
@@ -4067,7 +4692,7 @@ bool Coil::wind_by_rectangular_sections(std::vector<double> proportionPerWinding
                                              " availableWidth: " + std::to_string(availableWidth) +
                                              " currentSectionWidth: " + std::to_string(currentSectionWidth) +
                                              " currentSectionHeight: " + std::to_string(currentSectionHeight) + 
-                                             " _marginsPerSection[sectionIndex][0]: " + std::to_string(_marginsPerSection[sectionIndex][0])
+                                             " _marginsPerSection[marginIndex][0]: " + std::to_string(_marginsPerSection[marginIndex][0])
                                              );
                 }
                 if (windingOrientation == WindingOrientation::OVERLAPPING) {
@@ -4089,10 +4714,10 @@ bool Coil::wind_by_rectangular_sections(std::vector<double> proportionPerWinding
                 }
 
                 if (windingOrientation == WindingOrientation::OVERLAPPING) {
-                    section.set_filling_factor(get_area_used_in_wires(wirePerWinding[windingIndex], physicalTurnsThisSection) / (currentSectionWidth * (currentSectionHeight - _marginsPerSection[sectionIndex][0] - _marginsPerSection[sectionIndex][1])));
-                } 
+                    section.set_filling_factor(get_area_used_in_wires(wirePerWinding[windingIndex], physicalTurnsThisSection) / (currentSectionWidth * (currentSectionHeight - _marginsPerSection[marginIndex][0] - _marginsPerSection[marginIndex][1])));
+                }
                 else {
-                    section.set_filling_factor(get_area_used_in_wires(wirePerWinding[windingIndex], physicalTurnsThisSection) / ((currentSectionWidth - _marginsPerSection[sectionIndex][0] - _marginsPerSection[sectionIndex][1]) * currentSectionHeight));
+                    section.set_filling_factor(get_area_used_in_wires(wirePerWinding[windingIndex], physicalTurnsThisSection) / ((currentSectionWidth - _marginsPerSection[marginIndex][0] - _marginsPerSection[marginIndex][1]) * currentSectionHeight));
                 }
                 section.set_winding_style(windByConsecutiveTurns[windingIndex]);
                 sectionsDescription.push_back(section);
@@ -4133,6 +4758,9 @@ bool Coil::wind_by_rectangular_sections(std::vector<double> proportionPerWinding
                 auto insulationSection = _insulationSections[windingsMapKey];
 
                 insulationSection.set_group(group.get_name());
+                if (groupWindowIndex) {
+                    insulationSection.set_winding_window(static_cast<int64_t>(groupWindowIndex.value()));
+                }
                 insulationSection.set_name("Insulation between " + get_name(previousWindingIndex) + " and " + get_name(nextWindingIndex) + " section " + std::to_string(sectionIndex));
                 if (windingOrientation == WindingOrientation::OVERLAPPING) {
                     insulationSection.set_coordinates(std::vector<double>{currentSectionCenterWidth + insulationSection.get_dimensions()[0] / 2,
@@ -4157,6 +4785,7 @@ bool Coil::wind_by_rectangular_sections(std::vector<double> proportionPerWinding
 
             }
         }
+        marginSectionOffset += orderedSectionsWithInsulation.size();
     }
 
     for (size_t windingIndex = 0; windingIndex < get_functional_description().size(); ++windingIndex) {
@@ -5589,25 +6218,22 @@ bool Coil::wind_by_rectangular_turns() {
     if (!get_layers_description()) {
         return false;
     }
-    bool windEvenIfNotFit = settings.get_coil_wind_even_if_not_fit();
     auto wirePerWinding = get_wires();
     std::vector<std::vector<int64_t>> currentTurnIndex;
     for (size_t windingIndex = 0; windingIndex < get_functional_description().size(); ++windingIndex) {
         currentTurnIndex.push_back(std::vector<int64_t>(get_number_parallels(windingIndex), 0));
     }
-    auto bobbin = resolve_bobbin();
-    auto bobbinColumnShape = bobbin.get_processed_description().value().get_column_shape();
-    auto bobbinColumnDepth = bobbin.get_processed_description().value().get_column_depth();
-    double bobbinColumnWidth;
-    if (bobbin.get_processed_description().value().get_column_width()) {
-        bobbinColumnWidth = bobbin.get_processed_description().value().get_column_width().value();
-    }
-    else {
-        auto bobbinWindingWindow = std::get<Bobbin>(get_bobbin()).get_processed_description().value().get_winding_windows()[0];
-        double bobbinWindingWindowWidth = bobbinWindingWindow.get_width().value();
-        double bobbinWindingWindowCenterWidth = bobbinWindingWindow.get_coordinates().value()[0];
-        bobbinColumnWidth = bobbinWindingWindowCenterWidth - bobbinWindingWindowWidth / 2;
-    }
+    // Wound-column frame per section (multi-column winding support): the main window
+    // resolves to the historical bobbin column scalars; sections placed in other
+    // winding windows resolve their window's column edge.
+    std::map<std::string, WoundColumnFrame> woundColumnFramePerSection;
+    auto getFrameForSection = [&](const std::string& sectionName) -> const WoundColumnFrame& {
+        auto frameIterator = woundColumnFramePerSection.find(sectionName);
+        if (frameIterator == woundColumnFramePerSection.end()) {
+            frameIterator = woundColumnFramePerSection.emplace(sectionName, get_wound_column_frame_for_section(sectionName)).first;
+        }
+        return frameIterator->second;
+    };
 
     auto layers = get_layers_description().value();
 
@@ -5675,10 +6301,19 @@ bool Coil::wind_by_rectangular_turns() {
 
             } 
             else {
+                // Place the turns at the geometry the caller committed to (the preset layer's
+                // coordinates/dimensions). Whether that geometry actually fits the winding window is a
+                // SEPARATE decision, owned by are_sections_and_layers_fitting() and enforced upstream in
+                // wind()/rewind() (which only call wind_by_turns once fit — or windEvenIfNotFit — holds).
+                // The old veto here ("contiguous turns wider than the window -> return false") re-made
+                // that fit decision inside the turn placer, but ONLY for the contiguous branch: the
+                // OVERLAPPING branch above and the round winder both render preset over-full layers
+                // without objection. That asymmetry meant a direct wind_by_turns() over a preset,
+                // over-full contiguous-rectangular coil (web bug 359 / ABT #160) uniquely produced no
+                // turns at all, while every other orientation rendered them. Drop the veto so the
+                // rectangular contiguous branch behaves like its siblings; degenerate placements (a turn
+                // pushed to a non-positive radius) are still rejected by the turn-length guards below.
                 totalLayerWidth = roundFloat(physicalTurnsInLayer * wireWidth, 9);
-                if (!windEvenIfNotFit && totalLayerWidth > std::get<Bobbin>(get_bobbin()).get_processed_description().value().get_winding_windows()[0].get_width().value()) {
-                    return false;
-                }
                 totalLayerHeight = layer.get_dimensions()[1];
                 currentTurnHeightIncrement = 0;
                 currentTurnCenterHeight = roundFloat(layer.get_coordinates()[1], 9);
@@ -5737,32 +6372,12 @@ bool Coil::wind_by_rectangular_turns() {
                         Turn turn;
                         turn.set_coordinates(std::vector<double>{currentTurnCenterWidth, currentTurnCenterHeight});
                         turn.set_layer(layer.get_name());
-                        if (bobbinColumnShape == ColumnShape::ROUND) {
-                            turn.set_length(2 * std::numbers::pi * currentTurnCenterWidth);
-                            if (turn.get_length() < 0) {
-                                return false;
-                                // throw std::runtime_error("Something wrong happened in turn length 2: " + std::to_string(turn.get_length()) +
-                                //                          " currentTurnCenterWidth: " + std::to_string(currentTurnCenterWidth) +
-                                //                          " layer.get_coordinates()[0]: " + std::to_string(layer.get_coordinates()[0]));
-                            }
-                        }
-                        else if (bobbinColumnShape == ColumnShape::OBLONG) {
-                            turn.set_length(2 * std::numbers::pi * currentTurnCenterWidth + 4 * (bobbinColumnDepth - bobbinColumnWidth));
-                            if (turn.get_length() < 0) {
+                        {
+                            auto turnLength = get_turn_length_in_frame(getFrameForSection(layer.get_section().value()), currentTurnCenterWidth);
+                            if (!turnLength) {
                                 return false;
                             }
-                        }
-                        else if (bobbinColumnShape == ColumnShape::RECTANGULAR || bobbinColumnShape == ColumnShape::IRREGULAR) {
-                            double currentTurnCornerRadius = currentTurnCenterWidth - bobbinColumnWidth;
-                            turn.set_length(4 * bobbinColumnDepth + 4 * bobbinColumnWidth + 2 * std::numbers::pi * currentTurnCornerRadius);
-
-                            if (turn.get_length() < 0) {
-                                return false;
-                                // throw std::runtime_error("Something wrong happened in turn length 2: " + std::to_string(turn.get_length()) + " bobbinColumnDepth: " + std::to_string(bobbinColumnDepth)  + " bobbinColumnWidth: " + std::to_string(bobbinColumnWidth)  + " currentTurnCornerRadius: " + std::to_string(currentTurnCornerRadius));
-                            }
-                        }
-                        else {
-                            throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA, "only round or rectangular columns supported for bobbins");
+                            turn.set_length(turnLength.value());
                         }
                         turn.set_name(partialWinding.get_winding() + " parallel " + std::to_string(parallelIndex) + " turn " + std::to_string(currentTurnIndex[windingIndex][parallelIndex]));
                         turn.set_orientation(TurnOrientation::CLOCKWISE);
@@ -5778,9 +6393,6 @@ bool Coil::wind_by_rectangular_turns() {
                             turn.set_cross_sectional_shape(TurnCrossSectionalShape::RECTANGULAR);
                         }
                         turn.set_coordinate_system(CoordinateSystem::CARTESIAN);
-                        if (turn.get_name() == "winding 1 parallel 1 turn 0") {
-                        }
-
                         turns.push_back(turn);
                         currentTurnCenterWidth += currentTurnWidthIncrement;
                         currentTurnCenterHeight -= currentTurnHeightIncrement;
@@ -5800,30 +6412,12 @@ bool Coil::wind_by_rectangular_turns() {
                             Turn turn;
                             turn.set_coordinates(std::vector<double>{currentTurnCenterWidth, currentTurnCenterHeight});
                             turn.set_layer(layer.get_name());
-                            if (bobbinColumnShape == ColumnShape::ROUND) {
-                                turn.set_length(2 * std::numbers::pi * currentTurnCenterWidth);
-                                    if (turn.get_length() < 0) {
-                                        return false;
-                                        // throw std::runtime_error("Something wrong happened in turn length 3: " + std::to_string(turn.get_length()) + " currentTurnCenterWidth: " + std::to_string(currentTurnCenterWidth));
-                                    }
-                            }
-                            else if (bobbinColumnShape == ColumnShape::OBLONG) {
-                                turn.set_length(2 * std::numbers::pi * currentTurnCenterWidth + 4 * (bobbinColumnDepth - bobbinColumnWidth));
-                                    if (turn.get_length() < 0) {
-                                        return false;
-                                        // throw std::runtime_error("Something wrong happened in turn length 3: " + std::to_string(turn.get_length()) + " currentTurnCenterWidth: " + std::to_string(currentTurnCenterWidth));
-                                    }
-                            }
-                            else if (bobbinColumnShape == ColumnShape::RECTANGULAR || bobbinColumnShape == ColumnShape::IRREGULAR) {
-                                double currentTurnCornerRadius = currentTurnCenterWidth - bobbinColumnWidth;
-                                turn.set_length(4 * bobbinColumnDepth + 4 * bobbinColumnWidth + 2 * std::numbers::pi * currentTurnCornerRadius);
-                                if (turn.get_length() < 0) {
+                            {
+                                auto turnLength = get_turn_length_in_frame(getFrameForSection(layer.get_section().value()), currentTurnCenterWidth);
+                                if (!turnLength) {
                                     return false;
-                                    // throw std::runtime_error("Something wrong happened in turn length 3: " + std::to_string(turn.get_length()) + " bobbinColumnDepth: " + std::to_string(bobbinColumnDepth)  + " bobbinColumnWidth: " + std::to_string(bobbinColumnWidth)  + " currentTurnCornerRadius: " + std::to_string(currentTurnCornerRadius));
                                 }
-                            }
-                            else {
-                                throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA, "only round or rectangular columns supported for bobbins");
+                                turn.set_length(turnLength.value());
                             }
                             turn.set_name(partialWinding.get_winding() + " parallel " + std::to_string(parallelIndex) + " turn " + std::to_string(currentTurnIndex[windingIndex][parallelIndex]));
                             turn.set_orientation(TurnOrientation::CLOCKWISE);
@@ -5975,6 +6569,16 @@ bool Coil::build_centered_single_turn_toroidal() {
         turn.set_cross_sectional_shape(TurnCrossSectionalShape::RECTANGULAR);
     }
     turn.set_coordinate_system(CoordinateSystem::POLAR);
+
+    // Outer XY-plane crossing, same polar-mirror convention as wind_toroidal_additional_turns
+    // ({-2*columnWidth - radialDepth, same angle}): the centered turn crosses the hole plane at
+    // the toroid centre AND at the mirrored point outside the ring. Every other toroidal wind
+    // path emits this via wind_toroidal_additional_turns; without it downstream consumers
+    // (Painter, 3D builders) cannot know where the wire wraps the ring.
+    if (settings.get_coil_include_additional_coordinates()) {
+        turn.set_additional_coordinates(std::vector<std::vector<double>>{
+            {-2 * bobbinColumnWidth - windingWindowRadialHeight, 0.0}});
+    }
 
     set_turns_description(std::vector<Turn>{turn});
     convert_turns_to_cartesian_coordinates();
@@ -6918,6 +7522,26 @@ std::vector<double> Coil::get_aligned_section_dimensions_rectangular_window(size
     }
     if (windowIndex >= allWindingWindows.size()) windowIndex = 0;
     std::vector<WindingWindowElement> windingWindows = {allWindingWindows[windowIndex]};
+    // Winding frame: groups are wound on the +x side of the main column and mirrored
+    // into place at the end of wind(); align against the window's +x image.
+    if (windingWindows[0].get_coordinates() && windingWindows[0].get_coordinates().value()[0] < 0) {
+        auto windowCoordinates = windingWindows[0].get_coordinates().value();
+        windowCoordinates[0] = -windowCoordinates[0];
+        windingWindows[0].set_coordinates(windowCoordinates);
+    }
+    // Multi-window coils align against the group's allocated sub-region (which may be
+    // half the window when the region is shared with the main winding's annulus).
+    if (allWindingWindows.size() > 1 && sectionGroupOpt && get_groups_description()) {
+        auto alignmentGroups = get_groups_description().value();
+        for (auto& group : alignmentGroups) {
+            if (group.get_name() == sectionGroupOpt.value()) {
+                windingWindows[0].set_coordinates(std::vector<double>{std::abs(group.get_coordinates()[0]), group.get_coordinates()[1], 0});
+                windingWindows[0].set_width(group.get_dimensions()[0]);
+                windingWindows[0].set_height(group.get_dimensions()[1]);
+                break;
+            }
+        }
+    }
     double windingWindowHeight = windingWindows[0].get_height().value();
     double windingWindowWidth = windingWindows[0].get_width().value();
     auto windingOrientation = get_winding_orientation();
@@ -6925,9 +7549,15 @@ std::vector<double> Coil::get_aligned_section_dimensions_rectangular_window(size
     if (sections.size() == 0) {
         throw CoilNotProcessedException("No sections in coil");
     }
+    // With more than one group, alignment totals only cover the sections sharing this
+    // section's group (each group fills its own winding window).
+    bool scopeToGroup = get_groups_description() && get_groups_description()->size() > 1;
     double totalSectionsWidth = 0;
     double totalSectionsHeight = 0;
     for (size_t auxSectionIndex = 0; auxSectionIndex < sections.size(); ++auxSectionIndex) {
+        if (scopeToGroup && sections[auxSectionIndex].get_group() != sections[sectionIndex].get_group()) {
+            continue;
+        }
         if (windingOrientation == WindingOrientation::OVERLAPPING) {
             totalSectionsWidth += sections[auxSectionIndex].get_dimensions()[0];
             if (sections[auxSectionIndex].get_type() == ElectricalType::CONDUCTION) {
@@ -7298,13 +7928,27 @@ bool Coil::delimit_and_compact() {
 
     auto bobbin = resolve_bobbin();
 
+    // The compaction cursor math lives in the +x winding frame. Callers may
+    // re-compact an already-placed multi-window coil (e.g. CoilAdviser after
+    // wind()): unwrap the placement transform, compact, and re-apply it.
+    bool rewrapGroupWindowSides = _groupWindowSidesApplied;
+    if (rewrapGroupWindowSides) {
+        apply_group_window_sides(true);
+    }
+
+    bool result;
     auto bobbinWindingWindowShape = bobbin.get_winding_window_shape();
     if (bobbinWindingWindowShape == WindingWindowShape::RECTANGULAR) {
-        return delimit_and_compact_rectangular_window();
+        result = delimit_and_compact_rectangular_window();
     }
     else {
-        return delimit_and_compact_round_window();
+        result = delimit_and_compact_round_window();
     }
+
+    if (rewrapGroupWindowSides) {
+        apply_group_window_sides(false);
+    }
+    return result;
 }
 
 WiringTechnology Coil::get_coil_type(size_t groupIndex) const {
@@ -7434,21 +8078,34 @@ bool Coil::delimit_and_compact_rectangular_window() {
         }
 
         auto bobbinColumnShape = std::get<Bobbin>(get_bobbin()).get_processed_description().value().get_column_shape();
-        auto bobbinColumnDepth = std::get<Bobbin>(get_bobbin()).get_processed_description().value().get_column_depth();
-        double bobbinColumnWidth;
-        if (std::get<Bobbin>(get_bobbin()).get_processed_description().value().get_column_width()) {
-            bobbinColumnWidth = std::get<Bobbin>(get_bobbin()).get_processed_description().value().get_column_width().value();
-        }
-        else {
-            auto bobbinWindingWindow = std::get<Bobbin>(get_bobbin()).get_processed_description().value().get_winding_windows()[0];
-            double bobbinWindingWindowWidth = bobbinWindingWindow.get_width().value();
-            double bobbinWindingWindowCenterWidth = bobbinWindingWindow.get_coordinates().value()[0];
-            bobbinColumnWidth = bobbinWindingWindowCenterWidth - bobbinWindingWindowWidth / 2;
-        }
+
+        // Wound-column frame per section for the turn-length recompute after the
+        // compacting shift (multi-column winding support).
+        std::map<std::string, WoundColumnFrame> woundColumnFramePerSection;
+        auto getFrameForSection = [&](const std::string& sectionName) -> const WoundColumnFrame& {
+            auto frameIterator = woundColumnFramePerSection.find(sectionName);
+            if (frameIterator == woundColumnFramePerSection.end()) {
+                frameIterator = woundColumnFramePerSection.emplace(sectionName, get_wound_column_frame_for_section(sectionName)).first;
+            }
+            return frameIterator->second;
+        };
 
         auto windingOrientation = get_winding_orientation();
+        bool multiWindowCompaction = get_groups_description() && get_groups_description()->size() > 1;
 
         for (size_t sectionIndex = 0; sectionIndex < sections.size(); ++sectionIndex) {
+            // A new group means a new winding window: restart the compaction cursor
+            // from this section's aligned position (multi-column winding support).
+            // Guarded on both sections carrying a group: sections without one (e.g.
+            // planar insulation sections) must not break their neighbours' run.
+            if (multiWindowCompaction && sectionIndex > 0 &&
+                sections[sectionIndex].get_group() && sections[sectionIndex - 1].get_group() &&
+                sections[sectionIndex].get_group().value() != sections[sectionIndex - 1].get_group().value()) {
+                currentCoilWidth = alignedSectionDimensionsPerSection[sectionIndex][0];
+                currentCoilHeight = alignedSectionDimensionsPerSection[sectionIndex][1];
+                paddingAmongSectionWidth = alignedSectionDimensionsPerSection[sectionIndex][2];
+                paddingAmongSectionHeight = alignedSectionDimensionsPerSection[sectionIndex][3];
+            }
             if (windingOrientation == WindingOrientation::OVERLAPPING) {
                 currentCoilHeight = alignedSectionDimensionsPerSection[sectionIndex][1];
                 currentCoilWidth += sections[sectionIndex].get_dimensions()[0] / 2;
@@ -7536,28 +8193,12 @@ bool Coil::delimit_and_compact_rectangular_window() {
                                     }));
                                 }
 
-                                if (bobbinColumnShape == ColumnShape::ROUND) {
-                                    turns[turnIndex].set_length(2 * std::numbers::pi * turns[turnIndex].get_coordinates()[0]);
-                                    if (turns[turnIndex].get_length() < 0) {
-                                        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Something wrong happened in turn length 1: " + std::to_string(turns[turnIndex].get_length()) + " turns[turnIndex].get_coordinates()[0]: " + std::to_string(turns[turnIndex].get_coordinates()[0]));
+                                {
+                                    auto turnLength = get_turn_length_in_frame(getFrameForSection(sections[sectionIndex].get_name()), turns[turnIndex].get_coordinates()[0]);
+                                    if (!turnLength) {
+                                        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Something wrong happened in turn length 1: negative length for turn " + turns[turnIndex].get_name() + " at x: " + std::to_string(turns[turnIndex].get_coordinates()[0]));
                                     }
-                                }
-                                else if (bobbinColumnShape == ColumnShape::OBLONG) {
-                                    turns[turnIndex].set_length(2 * std::numbers::pi * turns[turnIndex].get_coordinates()[0] + 4 * (bobbinColumnDepth - bobbinColumnWidth));
-                                    if (turns[turnIndex].get_length() < 0) {
-                                        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Something wrong happened in turn length 1: " + std::to_string(turns[turnIndex].get_length()) + " turns[turnIndex].get_coordinates()[0]: " + std::to_string(turns[turnIndex].get_coordinates()[0]));
-                                    }
-                                }
-                                else if (bobbinColumnShape == ColumnShape::RECTANGULAR || bobbinColumnShape == ColumnShape::IRREGULAR) {
-                                    double currentTurnCornerRadius = turns[turnIndex].get_coordinates()[0] - bobbinColumnWidth;
-                                    turns[turnIndex].set_length(4 * bobbinColumnDepth + 4 * bobbinColumnWidth + 2 * std::numbers::pi * currentTurnCornerRadius);
-
-                                    if (turns[turnIndex].get_length() < 0) {
-                                        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Something wrong happened in turn length 1: " + std::to_string(turns[turnIndex].get_length()) + " bobbinColumnDepth: " + std::to_string(bobbinColumnDepth)  + " bobbinColumnWidth: " + std::to_string(bobbinColumnWidth)  + " currentTurnCornerRadius: " + std::to_string(currentTurnCornerRadius));
-                                    }
-                                }
-                                else {
-                                    throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA, "only round or rectangular columns supported for bobbins");
+                                    turns[turnIndex].set_length(turnLength.value());
                                 }
                             }
                         }
@@ -7864,6 +8505,12 @@ bool Coil::delimit_and_compact_round_window() {
                                 turns[turnIndex].get_coordinates()[0],
                                 turns[turnIndex].get_coordinates()[1] - compactingShiftAngle
                             }));
+
+                            // ABT #186: a toroidal turn's rotation is the cross-section azimuth and is
+                            // set equal to its polar angle at creation. The angular compaction above shifts
+                            // the polar angle, so rotation must be re-synced to it — otherwise MagneticField
+                            // rotates the induced-field images by a stale angle and painters mis-orient the box.
+                            turns[turnIndex].set_rotation(turns[turnIndex].get_coordinates()[1]);
 
 
                             if (bobbinColumnShape == ColumnShape::ROUND) {
@@ -8647,8 +9294,12 @@ std::vector<std::vector<size_t>> Coil::get_patterns(Inputs& inputs, CoreType cor
 
     std::vector<std::vector<size_t>> sectionPatterns;
     
-    // Generate patterns based on isolation side permutations
-    for(size_t i = 0; i < tgamma(isolationSidesRequired.size() + 1) / 2; ++i) {
+    // Generate patterns based on isolation side permutations. Bound = n!/2 but at least 1:
+    // the old float form tgamma(n+1)/2 evaluated to 0.5 for a single isolation side and the
+    // `i < 0.5` comparison still ran one iteration; integer n!/2 would truncate to 0 and
+    // produce NO pattern at all for plain inductors. (FIX L-COIL-3 factorial helper.)
+    size_t patternBound = std::max<size_t>(1, factorial(isolationSidesRequired.size()) / 2);
+    for(size_t i = 0; i < patternBound; ++i) {
         std::vector<size_t> sectionPattern;
         for (auto isolationSide : isolationSidesRequired) {
             for (size_t windingIndex = 0; windingIndex < numWindings; ++windingIndex) {
@@ -9025,8 +9676,9 @@ void Coil::set_intersection_insulation(double layerThickness, size_t numberInsul
 }
 
 std::vector<Wire> Coil::guess_round_wire_from_dc_resistance(std::vector<double> dcResistances, double maxError) {
-    auto oldSetting = settings.get_coil_wind_even_if_not_fit();
-    settings.set_coil_wind_even_if_not_fit(true);
+    // RAII (ABT #113 sweep): the loop below winds/simulates repeatedly and can
+    // throw; the manual restore at the end leaked wind_even_if_not_fit=true.
+    SettingsGuard<bool> windEvenIfNotFitGuard(settings, &Settings::get_coil_wind_even_if_not_fit, &Settings::set_coil_wind_even_if_not_fit, true);
 
     double maximumError = DBL_MAX;
     size_t timeout = 100;
@@ -9059,7 +9711,6 @@ std::vector<Wire> Coil::guess_round_wire_from_dc_resistance(std::vector<double> 
         }
     }
 
-    settings.set_coil_wind_even_if_not_fit(oldSetting);
     return get_wires();
 }
 

@@ -630,16 +630,19 @@ TEST_CASE("Temperature: T36 Two Windings Schematic Only", "[temperature][round-w
     // Build thermal circuit and generate schematic (minimal solve)
     Temperature temp(magnetic, config);
     auto result = temp.calculateTemperatures();
-    
+    // The thermal network must actually have been built.
+    CHECK(temp.getNodes().size() > 0);
+    CHECK(temp.getResistances().size() > 0);
+
     // Paint the magnetic geometry for visualization
     Painter painter;
     painter.paint_core(magnetic);
     painter.paint_coil_turns(magnetic);
     auto svg = painter.export_svg();
+    CHECK(svg.find("<svg") != std::string::npos);
     std::ofstream file("output/T36_geometry_visualization.svg");
     file << svg;
     file.close();
-    
 }
 
 TEST_CASE("Temperature: T20 Two Windings Quadrant Visualization", "[temperature][round-winding-window][smoke-test]") {
@@ -732,7 +735,11 @@ TEST_CASE("Temperature: Toroidal Quadrant Visualization", "[temperature][round-w
     
     // Calculate temperatures (builds network and generates schematic even if solver fails)
     auto result = temp.calculateTemperatures();
-    
+    // The thermal network must actually have been built and the schematic written.
+    CHECK(temp.getNodes().size() > 0);
+    CHECK(temp.getResistances().size() > 0);
+    // Temperature::plotSchematic writes the schematic as '<path>.json'.
+    CHECK(std::filesystem::exists(config.schematicOutputPath + ".json"));
 }
 
 
@@ -1219,17 +1226,64 @@ TEST_CASE("Temperature: Bulk Resistance", "[temperature][smoke-test]") {
     
     REQUIRE(result.converged);
     
-    double totalLosses = config.coreLosses + config.windingLosses;
-    double deltaT = result.maximumTemperature - config.ambientTemperature;
-    double expectedRth = deltaT / totalLosses;
-    
-    // Thermal resistance calculation from deltaT/totalLosses should match reported value
-    REQUIRE_THAT(result.totalThermalResistance, 
-                 Catch::Matchers::WithinRel(expectedRth, 0.01));
+    // Energy conservation. The previous check compared deltaT/totalLosses against
+    // result.totalThermalResistance, which is DEFINED as deltaT/totalPower — a tautology.
+    // Instead assert the real physics: at steady state the heat leaving to the ambient node
+    // equals the total injected power.
+    auto ebNodes = temp.getNodes();
+    size_t ambientIdx = ebNodes.size();
+    for (size_t i = 0; i < ebNodes.size(); ++i) {
+        if (ebNodes[i].part == ThermalNodePartType::AMBIENT) { ambientIdx = i; break; }
+    }
+    REQUIRE(ambientIdx < ebNodes.size());
+    double heatToAmbient = 0.0;
+    for (const auto& r : temp.getResistances()) {
+        size_t other = ebNodes.size();
+        if (r.nodeToId == ambientIdx)      other = r.nodeFromId;
+        else if (r.nodeFromId == ambientIdx) other = r.nodeToId;
+        if (other < ebNodes.size() && r.resistance > 0.0) {
+            heatToAmbient += (ebNodes[other].temperature - ebNodes[ambientIdx].temperature) / r.resistance;
+        }
+    }
+    double totalInjected = 0.0;
+    for (const auto& n : ebNodes) totalInjected += n.powerDissipation;
+    REQUIRE(totalInjected > 0.0);
+    REQUIRE_THAT(heatToAmbient, Catch::Matchers::WithinRel(totalInjected, 0.02));  // 2%: steady-state energy balance
     // Updated after removing inner-outer turn connections (was >15.0 before)
     // Further updated with gravity-aware convection (only top surfaces cool)
-    REQUIRE(result.totalThermalResistance > 10.0);  
+    REQUIRE(result.totalThermalResistance > 10.0);
     REQUIRE(result.totalThermalResistance < 150.0);  // Increased from 100 due to reduced convection
+}
+
+TEST_CASE("Temperature: Failure paths fail loudly", "[temperature][smoke-test]") {
+    // Accessors/solver must throw on bad input rather than silently return a sentinel
+    // (the pre-review behaviour was zeros/garbage on degenerate input).
+    std::vector<int64_t> numberTurns({10});
+    std::vector<int64_t> numberParallels({1});
+    std::string shapeName = "ETD 29/16/10";
+    auto coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, shapeName, 1,
+        WindingOrientation::OVERLAPPING, WindingOrientation::OVERLAPPING,
+        CoilAlignment::CENTERED, CoilAlignment::CENTERED);
+    auto core = OpenMagneticsTesting::get_quick_core(shapeName, json::array(), 1, "N87");
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(coil);
+
+    TemperatureConfig config;
+    config.ambientTemperature = 25.0;
+    applySimulatedLosses(config, magnetic);
+    config.plotSchematic = false;
+
+    Temperature temp(magnetic, config);
+    auto result = temp.calculateTemperatures();
+    REQUIRE(result.converged);
+
+    // getTemperatureAtPoint must reject an under-specified point, not guess.
+    REQUIRE_THROWS_AS(temp.getTemperatureAtPoint(std::vector<double>{0.0}), std::runtime_error);
+    // A valid query returns a finite temperature at or above ambient.
+    double t = temp.getTemperatureAtPoint(std::vector<double>{0.0, 0.0, 0.0});
+    REQUIRE(std::isfinite(t));
+    REQUIRE(t >= config.ambientTemperature - 0.001);
 }
 
 TEST_CASE("Temperature: Forced vs Natural Convection", "[temperature][smoke-test]") {
@@ -1431,7 +1485,10 @@ TEST_CASE("Temperature: Maniktala Formula Comparison", "[temperature][smoke-test
             REQUIRE(result.converged);
             
             double error = std::abs(result.totalThermalResistance - Rth_maniktala) / Rth_maniktala;
-            REQUIRE(error < 3.0);
+            // Cross-MODEL sanity check (network solver vs the analytical Maniktala formula):
+            // they are different models (actual disagreement ~1.7x here), so this is an
+            // order-of-magnitude agreement bound, tightened from an unfalsifiable 300% to 200%.
+            REQUIRE(error < 2.0);
         }
     }
 }
@@ -2093,15 +2150,19 @@ TEST_CASE("Temperature: Core Internal Gradient", "[temperature][smoke-test]") {
 
     TemperatureConfig config;
     config.ambientTemperature = 25.0;
-    config.coreLosses = 3.0;
     applySimulatedLosses(config, magnetic);
+    // This ungapped ETD 44 at 1 A / 15 turns saturates, so the SIMULATED core loss (~50 W)
+    // is unrealistically high for a thermal test (it would destroy the core). Pin a
+    // realistic 3 W so the internal-gradient check reflects a physical operating point;
+    // applySimulatedLosses still provides the per-turn winding-loss distribution.
+    config.coreLosses = 3.0;
     config.plotSchematic = false;
 
     Temperature temp(magnetic, config);
     auto result = temp.calculateTemperatures();
 
     REQUIRE(result.converged);
-    
+
     // Check core node temperatures
     auto nodes = temp.getNodes();
     double maxCoreTemp = 0;
@@ -2123,7 +2184,10 @@ TEST_CASE("Temperature: Core Internal Gradient", "[temperature][smoke-test]") {
     // Central column (40% of losses) to lateral columns (20% of losses) creates natural gradient
     double internalGradient = maxCoreTemp - minCoreTemp;
     REQUIRE(internalGradient >= 0);
-    REQUIRE(internalGradient < 1000.0);  // Accommodates half-core model with quadrant-specific convection
+    // Ferrite conducts well (~4 W/m.K), so the within-core gradient is modest; a physical
+    // sanity ceiling (was an unfalsifiable 1000 K). If this trips, the actual value points
+    // at a real conduction-model problem.
+    REQUIRE(internalGradient < 50.0);
 }
 
 TEST_CASE("Temperature: Detailed Loss Distribution", "[temperature][smoke-test]") {
@@ -3268,7 +3332,7 @@ TEST_CASE("Temperature: 220kW Transformer", "[temperature][transformer][smoke-te
     REQUIRE(result.totalThermalResistance > 0.0);
 }
 
-TEST_CASE("Temperature: PQ Single Turn Quadrant Surface Areas", "[temperature][concentric][geometry]") {
+TEST_CASE("Temperature: PQ Single Turn Quadrant Surface Areas", "[temperature][concentric][geometry][smoke-test]") {
     // Create a PQ core with just one turn to verify quadrant surface areas
     // PQ cores have round columns, so turn length = 2*pi*r at each face's radial position
     std::vector<int64_t> numberTurns({1});
@@ -3350,7 +3414,7 @@ TEST_CASE("Temperature: PQ Single Turn Quadrant Surface Areas", "[temperature][c
     REQUIRE(leftArea < rightArea);
 }
 
-TEST_CASE("Temperature: Toroidal Single Turn Quadrant Surface Areas", "[temperature][toroidal][geometry]") {
+TEST_CASE("Temperature: Toroidal Single Turn Quadrant Surface Areas", "[temperature][toroidal][geometry][smoke-test]") {
     // Create a toroidal core with one turn to verify quadrant surface areas
     // Toroidal cores always have round columns: turn length = 2*pi*r
     std::vector<int64_t> numberTurns({1});
@@ -3439,7 +3503,7 @@ TEST_CASE("Temperature: Toroidal Single Turn Quadrant Surface Areas", "[temperat
     REQUIRE(innerArea < outerArea);
 }
 
-TEST_CASE("Temperature: Planar Single Turn Quadrant Surface Areas", "[temperature][planar][geometry]") {
+TEST_CASE("Temperature: Planar Single Turn Quadrant Surface Areas", "[temperature][planar][geometry][smoke-test]") {
     // Create a planar core (ER) with one turn to verify quadrant surface areas
     // Planar cores are concentric with round columns
     std::vector<int64_t> numberTurns({1});
@@ -3523,7 +3587,7 @@ TEST_CASE("Temperature: Planar Single Turn Quadrant Surface Areas", "[temperatur
 }
 
 
-TEST_CASE("Temperature: concentric_transformer", "[temperature]") {
+TEST_CASE("Temperature: concentric_transformer", "[temperature][smoke-test]") {
     auto jsonPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "concentric_transformer.json");
     auto mas = OpenMagneticsTesting::mas_loader(jsonPath);
     
@@ -3554,7 +3618,7 @@ TEST_CASE("Temperature: concentric_transformer", "[temperature]") {
     // Get temperatures by component type
     auto tempsByType = temp.getTemperaturesByComponentType();
     auto tempsPerTurn = temp.getTemperaturePerTurn();
-    
+
     SECTION("Core temperature validation against Icepak") {
         // Icepak core temperatures from solution overview
         // core_0: 63.50°C (from Icepak)
@@ -3570,47 +3634,26 @@ TEST_CASE("Temperature: concentric_transformer", "[temperature]") {
     }
     
     SECTION("Individual turn temperatures from Icepak export") {
-        // Validate specific turn temperatures exported from Icepak
-        // Secondary_Parallel_0_Turn_4_copper: 60.01°C (Icepak)
-        // Check if turn W0_Turn_4 exists in results
-        if (tempsPerTurn.find("Turn_W0_Turn_4") != tempsPerTurn.end()) {
-            REQUIRE_THAT(tempsPerTurn.at("Turn_W0_Turn_4"), Catch::Matchers::WithinRel(60.01, 0.25)); // 25% tolerance
-        }
-        // Secondary_Parallel_0_Turn_5_copper: 59.30°C (Icepak)
-        // Check if turn W0_Turn_5 exists in results
-        if (tempsPerTurn.find("Turn_W0_Turn_5") != tempsPerTurn.end()) {
-            REQUIRE_THAT(tempsPerTurn.at("Turn_W0_Turn_5"), Catch::Matchers::WithinRel(59.30, 0.25)); // 25% tolerance
-        }
-        // Primary_Parallel_0_Turn_6_copper: 38.72°C (Icepak)
-        // Check if turn W0_Turn_6 exists in results
-        if (tempsPerTurn.find("Turn_W0_Turn_6") != tempsPerTurn.end()) {
-            REQUIRE_THAT(tempsPerTurn.at("Turn_W0_Turn_6"), Catch::Matchers::WithinRel(38.72, 0.25)); // 25% tolerance
-        }
-        // Primary_Parallel_0_Turn_8_copper: 49.82°C (Icepak)
-        // Check if turn W0_Turn_8 exists in results
-        if (tempsPerTurn.find("Turn_W0_Turn_8") != tempsPerTurn.end()) {
-            REQUIRE_THAT(tempsPerTurn.at("Turn_W0_Turn_8"), Catch::Matchers::WithinRel(49.82, 0.25)); // 25% tolerance
-        }
-        // Secondary_Parallel_0_Turn_2_copper: 59.31°C (Icepak)
-        // Check if turn W0_Turn_2 exists in results
-        if (tempsPerTurn.find("Turn_W0_Turn_2") != tempsPerTurn.end()) {
-            REQUIRE_THAT(tempsPerTurn.at("Turn_W0_Turn_2"), Catch::Matchers::WithinRel(59.31, 0.25)); // 25% tolerance
-        }
-        // Secondary_Parallel_0_Turn_3_copper: 59.30°C (Icepak)
-        // Check if turn W0_Turn_3 exists in results
-        if (tempsPerTurn.find("Turn_W0_Turn_3") != tempsPerTurn.end()) {
-            REQUIRE_THAT(tempsPerTurn.at("Turn_W0_Turn_3"), Catch::Matchers::WithinRel(59.30, 0.25)); // 25% tolerance
-        }
-        // Secondary_Parallel_0_Turn_10_copper: 42.80°C (Icepak)
-        // Check if turn W0_Turn_10 exists in results
-        if (tempsPerTurn.find("Turn_W0_Turn_10") != tempsPerTurn.end()) {
-            REQUIRE_THAT(tempsPerTurn.at("Turn_W0_Turn_10"), Catch::Matchers::WithinRel(42.80, 0.25)); // 25% tolerance
-        }
-        // Primary_Parallel_1_Turn_5_copper: 59.30°C (Icepak)
-        // Check if turn W1_Turn_5 exists in results
-        if (tempsPerTurn.find("Turn_W1_Turn_5") != tempsPerTurn.end()) {
-            REQUIRE_THAT(tempsPerTurn.at("Turn_W1_Turn_5"), Catch::Matchers::WithinRel(59.30, 0.25)); // 25% tolerance
-        }
+        // Per-turn temperatures from Icepak, asserted against the REAL turn keys from
+        // getTemperaturePerTurn. These were previously looked up as "Turn_W0_Turn_N",
+        // which never matched any key, so every assertion silently skipped (dead code).
+        // NOTE: the thermal model currently predicts a nearly-uniform winding temperature
+        // (~49C for this design) rather than Icepak's per-turn spread (38-60C), so the 25%
+        // bracket validates the aggregate winding level, not the per-turn distribution.
+        // Each lookup REQUIREs its key to exist, so a future turn-naming change fails loudly
+        // instead of silently skipping.
+        auto checkTurn = [&](const std::string& key, double icepakCelsius) {
+            REQUIRE(tempsPerTurn.count(key) == 1);
+            REQUIRE_THAT(tempsPerTurn.at(key), Catch::Matchers::WithinRel(icepakCelsius, 0.25));
+        };
+        checkTurn("Secondary parallel 0 turn 4", 60.01);
+        checkTurn("Secondary parallel 0 turn 5", 59.30);
+        checkTurn("Primary parallel 0 turn 6",   38.72);
+        checkTurn("Primary parallel 0 turn 8",   49.82);
+        checkTurn("Secondary parallel 0 turn 2", 59.31);
+        checkTurn("Secondary parallel 0 turn 3", 59.30);
+        checkTurn("Secondary parallel 0 turn 10", 42.80);
+        checkTurn("Primary parallel 1 turn 5",   59.30);
     }
     
     SECTION("Winding temperature by index") {
@@ -3625,7 +3668,7 @@ TEST_CASE("Temperature: concentric_transformer", "[temperature]") {
 }
 
 
-TEST_CASE("Temperature: concentric_flyback_rectangular_column", "[temperature]") {
+TEST_CASE("Temperature: concentric_flyback_rectangular_column", "[temperature][smoke-test]") {
     // The Icepak reference ranges in this test (cap 605.73, floor 363.44 on
     // the "core" component) were calibrated on 2026-03-03 (commit 356189a3).
     // Multiple legitimate thermal-model fixes have shipped since — notably
@@ -3748,7 +3791,7 @@ TEST_CASE("Temperature: concentric_flyback_rectangular_column", "[temperature]")
     }
 }
 
-TEST_CASE("Temperature: concentric_transformer_contiguous_rectangular_wire", "[temperature]") {
+TEST_CASE("Temperature: concentric_transformer_contiguous_rectangular_wire", "[temperature][smoke-test]") {
     // Same situation as Temperature: concentric_flyback_rectangular_column —
     // Icepak reference ranges (cap 473.04, floor 283.82) frozen on 2026-03-03,
     // current model output 270.93°C undershoots the floor by ~5%. Cumulative
@@ -3907,7 +3950,7 @@ TEST_CASE("Temperature: concentric_transformer_contiguous_rectangular_wire", "[t
 }
 
 
-TEST_CASE("Temperature: BuckInductor T134_77_27 from MAS file", "[temperature][concentric][buck-inductor]") {
+TEST_CASE("Temperature: BuckInductor T134_77_27 from MAS file", "[temperature][concentric][buck-inductor][smoke-test]") {
     // The fixture BuckInductor_164uH_T134_77_27.json was referenced when this
     // test was added in 7717b002 ("fix(thermal): skip zero-thickness insulation
     // layers in toroidal thermal model") but the JSON file was never committed
@@ -3953,7 +3996,10 @@ TEST_CASE("Temperature: BuckInductor T134_77_27 from MAS file", "[temperature][c
     try {
         result = temp.calculateTemperatures();
         exportTemperatureFieldSvg("BuckInductor_T134", magnetic, result.nodeTemperatures, config.ambientTemperature);
-    } catch (...) {}
+    } catch (const std::exception& e) {
+        // A throw used to be silently swallowed here; it must fail the test.
+        FAIL("calculateTemperatures/exportTemperatureFieldSvg threw: " << e.what());
+    }
     exportThermalCircuitSchematic("BuckInductor_T134", temp);
 
     REQUIRE(result.converged);
@@ -3965,7 +4011,7 @@ TEST_CASE("Temperature: BuckInductor T134_77_27 from MAS file", "[temperature][c
     REQUIRE(tempsByType.at("core") > config.ambientTemperature);
 }
 
-TEST_CASE("Temperature: coreOnly mode concentric E-core", "[temperature][core-only]") {
+TEST_CASE("Temperature: coreOnly mode concentric E-core", "[temperature][core-only][smoke-test]") {
     std::vector<int64_t> numberTurns({10});
     std::vector<int64_t> numberParallels({1});
     std::string shapeName = "E 42/21/15";
@@ -3997,7 +4043,7 @@ TEST_CASE("Temperature: coreOnly mode concentric E-core", "[temperature][core-on
     REQUIRE(result.averageCoreTemperature > config.ambientTemperature);
 }
 
-TEST_CASE("Temperature: coreOnly mode toroidal core", "[temperature][core-only]") {
+TEST_CASE("Temperature: coreOnly mode toroidal core", "[temperature][core-only][smoke-test]") {
     std::vector<int64_t> numberTurns({10});
     std::vector<int64_t> numberParallels({1});
     std::string shapeName = "T 20/10/7";
@@ -4027,7 +4073,7 @@ TEST_CASE("Temperature: coreOnly mode toroidal core", "[temperature][core-only]"
     REQUIRE(result.maximumTemperature > config.ambientTemperature);
 }
 
-TEST_CASE("Temperature: coreOnly zero losses stays at ambient", "[temperature][core-only]") {
+TEST_CASE("Temperature: coreOnly zero losses stays at ambient", "[temperature][core-only][smoke-test]") {
     std::vector<int64_t> numberTurns({10});
     std::vector<int64_t> numberParallels({1});
     std::string shapeName = "E 42/21/15";

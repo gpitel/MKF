@@ -15,13 +15,12 @@ struct SaturationParameters {
     double le;             // Effective magnetic path length [m]
     double primaryTurns;   // Number of primary turns
     double Lmag;           // Magnetizing inductance [H]
+    double Isat;           // Saturation current [A] — from Magnetic::calculate_saturation_current
+                           // (gapped B_sat·N·A_e/L). NOT recomputed here: the previous local
+                           // formula Bsat/(mu0*mu_r)*le/N used the UNGAPPED core path and
+                           // under-reported I_sat by the gap factor (~10×), collapsing the
+                           // exported saturable inductor above the bogus value (ABT #40).
     bool valid;            // Whether parameters are valid
-
-    double Isat() const {
-        const double mu0 = 4e-7 * M_PI;
-        double Hsat = Bsat / (mu0 * mu_r);
-        return Hsat * le / primaryTurns;
-    }
 
     double fluxLinkageSat() const {
         return primaryTurns * Ae * Bsat;
@@ -51,5 +50,38 @@ std::string emit_mutual_resistance_network_spice(
     const std::vector<CircuitSimulatorExporter::MutualResistanceCoefficients>& mutualCoeffs,
     double magnetizingInductance,
     size_t numWindings);
+
+// PD-safe behavioural realization of the mutual (cross-coupling) resistance loss for
+// n>=2 windings (abt #50/#72/#76): grounded uncoupled ladders + sense/behavioural sources,
+// adding NO magnetically coupled inductors, so the Lmag coupled-L matrix stays
+// positive-definite. For n==2 it replaces the old auxiliary-winding ladder whose emitted
+// topology did not reproduce its own fitted model (abt #76). Requires the winding series
+// path to be routed through the Node_Wtop_<k> nodes (see export_magnetic_as_subcircuit,
+// LADDER mode).
+std::string emit_mutual_resistance_behavioural_spice(
+    const std::vector<CircuitSimulatorExporter::MutualResistanceCoefficients>& mutualCoeffs,
+    size_t numWindings,
+    double frequency);
+
+// Behavioural large-signal (Generalized Steinmetz) core-loss element in parallel with the
+// magnetizing inductance (nodeIn->nodeOut). Emits a flux-integrator node plus an eps-smoothed
+// dissipative current source realizing p = k1*|dB/dt|^alpha*|B|^(beta-alpha). Shared by the
+// ngspice and LTspice exporters (both accept the same B/G/C constructs); quoteExpression wraps
+// the B-source expression in single quotes for ngspice and leaves it bare for LTspice.
+std::string emit_gse_core_loss_spice(
+    const GseCoreLossParams& params,
+    const std::string& windingIndex,
+    const std::string& nodeIn,
+    const std::string& nodeOut,
+    bool quoteExpression);
+
+// Stray/parasitic capacitance network (positive 3-capacitor / pi-model): one self-capacitance
+// across each winding (P<i>+ -> P<i>-, self-resonance) + one inter-winding capacitance between
+// each winding pair (P<i>+ -> P<j>+, common-mode coupling), as plain positive terminal caps from
+// StrayCapacitance's energy method (capacitance_among_windings). Standard SPICE `C…` syntax, so it
+// is shared verbatim by the ngspice and LTspice exporters. Gated by
+// circuit_simulator_include_stray_capacitance and only emitted when the coil is wound (turns
+// description present); returns "" otherwise.
+std::string emit_stray_capacitance_spice(const Coil& coil, size_t numWindings);
 
 } // namespace OpenMagnetics

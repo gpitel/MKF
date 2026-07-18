@@ -848,6 +848,16 @@ std::vector<double> StrayCapacitanceModel::preprocess_data_for_round_wires(Turn 
             effectiveRelativePermittivityLayers = get_effective_relative_permittivity(distancesThroughLayers[index - 1], effectiveRelativePermittivityLayers, distancesThroughLayers[index], relativePermittivityLayers[index]);
         }
     }
+    // The insulation layers are collected along the winding path, not the turns'
+    // closest approach, so their summed thickness can exceed the actual
+    // surface-to-surface separation (seen on the boundary turns of a
+    // separated-winding toroidal CMC: 4.7 mm of layers across a 2.8 mm gap).
+    // The dielectric between two turns cannot be thicker than their gap — cap it,
+    // or distanceThroughAir goes negative and corrupts every downstream formula
+    // (ABT #173: negative static capacitance).
+    if (distanceThroughLayers > std::max(distanceBetweenTurns, 0.0)) {
+        distanceThroughLayers = std::max(distanceBetweenTurns, 0.0);
+    }
     double distanceThroughAir = distanceBetweenTurns - distanceThroughLayers;
 
     if (distanceBetweenTurns < 0) {
@@ -1140,8 +1150,15 @@ double StrayCapacitanceAlbachModel::calculate_static_capacitance_between_two_tur
     // Z: Second-order correction term
     double Z = 1.0 / (pow(beta, 2) - 1)*((pow(beta, 2) - 2) * V - beta / 2) - std::numbers::pi / 4;
     
-    // Y1: Combined auxiliary function with insulation thickness correction
-    double Y1 = 1.0 / zeta * (V - std::numbers::pi / 4 + 1.0 / (2 * relativePermittivityWireCoating) * pow(distanceThroughLayers / (conductingRadius + wireCoatingThickness), 2) * Z / zeta);
+    // Y1: Combined auxiliary function with insulation thickness correction.
+    // The second-order term is a perturbation in the WIRE COATING thickness δ
+    // (cf. Koch eq. 7: (1/(8εr))·(2δ/r0)² — identical at leading order to
+    // (1/(2εr))·(δ/(r0+δ))² used here). It previously plugged in
+    // distanceThroughLayers (the inter-turn insulation stack): harmless for
+    // adjacent same-layer turns (0), but with millimetre layer stacks the
+    // "correction" dominated (Z < 0) and drove the capacitance NEGATIVE
+    // (ABT #173: -0.57 pF on the boundary turns of a separated-winding CMC).
+    double Y1 = 1.0 / zeta * (V - std::numbers::pi / 4 + 1.0 / (2 * relativePermittivityWireCoating) * pow(wireCoatingThickness / (conductingRadius + wireCoatingThickness), 2) * Z / zeta);
     
     // C0: Final capacitance with 2/3 geometric factor from Albach
     double C0 = 2.0 / 3 * vacuumPermittivity * averageTurnLength * Y1;
@@ -1304,6 +1321,25 @@ double StrayCapacitance::calculate_static_capacitance_between_two_turns(Turn fir
 }
 
 
+// Effective bare-conductor radius for the turn-to-core field-spreading integral.
+// Round/litz wires pass their true radius. Flat conductors (planar / foil /
+// rectangular) are modelled as an AREA-EQUIVALENT cylinder, r_eq = sqrt(w*h/pi):
+// the turn-to-core element is a fringing/curvature field that leaves the conductor
+// surface and spreads to the core, and calculate_turn_to_core_capacitance stays
+// finite at contact only because of that curvature. A true flat-face parallel
+// plate would diverge at zero separation (touching plates), and these planar parts
+// carry no modelled trace-to-core dielectric to bound it — so reusing the curvature
+// integral with an equivalent radius is the physically consistent, finite choice
+// (rather than fabricating a dielectric thickness absent from the data).
+static double turn_to_core_equivalent_radius(Wire wire) {
+    if (wire.get_type() == WireType::ROUND || wire.get_type() == WireType::LITZ) {
+        return wire.get_maximum_conducting_width() / 2.0;
+    }
+    double conductingWidth = wire.get_maximum_conducting_width();
+    double conductingHeight = wire.get_maximum_conducting_height();
+    return std::sqrt(conductingWidth * conductingHeight / std::numbers::pi);
+}
+
 double StrayCapacitance::calculate_turn_to_core_capacitance(double conductingRadius, double turnLength,
                                                             double wireCoatingThickness, double wireCoatingRelativePermittivity,
                                                             double airGapToCore,
@@ -1378,16 +1414,11 @@ double StrayCapacitance::calculate_winding_to_core_capacitance(Coil coil, Core c
     auto windingIndex = coil.get_winding_index_by_name(windingName);
     auto wire = wirePerWinding[windingIndex];
 
-    if (wire.get_type() != WireType::ROUND && wire.get_type() != WireType::LITZ) {
-        throw NotImplementedException("Turn-to-core capacitance is only modelled for ROUND/LITZ wires, got: " + std::string(magic_enum::enum_name(wire.get_type())));
-    }
-
-    // calculate_turn_to_core_capacitance / the Massarini model take the conducting
-    // RADIUS (the model computes Dc = 2*conductingRadius for the bare-conductor
-    // diameter); get_maximum_conducting_width returns the diameter, so halve it.
-    // (The turn-to-turn caller's own radius/diameter handling is separate and is
-    // intentionally left untouched here.)
-    double conductingRadius = wire.get_maximum_conducting_width() / 2.0;
+    // calculate_turn_to_core_capacitance takes the bare-conductor RADIUS. Round/litz
+    // wires use their true radius; flat conductors use an area-equivalent radius
+    // (see turn_to_core_equivalent_radius), so planar/foil/rectangular windings get a
+    // finite through-core element instead of throwing.
+    double conductingRadius = turn_to_core_equivalent_radius(wire);
     double wireCoatingThickness = wire.get_coating_thickness();
     double wireCoatingRelativePermittivity = get_wire_insulation_relative_permittivity(wire);
     constexpr double airGapToCore = 0.0;  // close-wound onto the coated core
@@ -1452,13 +1483,10 @@ double StrayCapacitance::calculate_through_core_capacitance(Coil coil, Core core
         }
 
         auto wire = wirePerWinding[coil.get_winding_index_by_name(windingName)];
-        if (wire.get_type() != WireType::ROUND && wire.get_type() != WireType::LITZ) {
-            throw NotImplementedException("Turn-to-core capacitance is only modelled for ROUND/LITZ wires, got: " + std::string(magic_enum::enum_name(wire.get_type())));
-        }
-        // Conducting RADIUS for the Massarini routine (Dc = 2*conductingRadius);
-        // get_maximum_conducting_width is the diameter, so halve it.
+        // Bare-conductor radius for the field-spreading integral; flat conductors
+        // use an area-equivalent radius (see turn_to_core_equivalent_radius).
         double capacitance = calculate_turn_to_core_capacitance(
-            wire.get_maximum_conducting_width() / 2.0, turns[turnIndex].get_length(),
+            turn_to_core_equivalent_radius(wire), turns[turnIndex].get_length(),
             wire.get_coating_thickness(), get_wire_insulation_relative_permittivity(wire),
             0.0 /* air gap: close-wound */,
             coreCoatingThickness, coreCoatingRelativePermittivity);
@@ -1588,37 +1616,12 @@ std::map<std::pair<size_t, size_t>, double> StrayCapacitance::calculate_capacita
  */
 ScalarMatrixAtFrequency StrayCapacitance::calculate_capacitance_matrix_between_windings(double energy, double voltageDrop, double relativeTurnsRatio) {
     ScalarMatrixAtFrequency scalarMatrixAtFrequency;
-    // C0: Total equivalent capacitance from energy method
-    // C = 2E/V² (from E = ½CV²)
+    // C0: Total equivalent capacitance from energy method, C = 2E/V² (from E = ½CV²).
+    // This assembles the internal three-input-multipole coefficients whose ["*"]["3"] entries drive
+    // the floating-node (V3) convergence in calculate_capacitance_with_voltages. It is an internal
+    // solver representation, NOT the terminal Maxwell matrix (see calculate_maxwell_capacitance_matrix).
     double C0 = energy * 2 / pow(voltageDrop, 2);
     scalarMatrixAtFrequency.set_frequency(0);  // Static result
-
-    // Six-capacitor network values (per Biela/Kolar Section V-A)
-    // Symmetric distribution of C0 among the six capacitors
-    auto gamma1 = -C0 / 6;  // Primary self-capacitance (negative)
-    auto gamma2 = -C0 / 6;  // Secondary self-capacitance (negative)
-    auto gamma3 = C0 / 3;   // Primary-to-secondary mutual (positive)
-    auto gamma4 = C0 / 3;   // Primary-to-secondary mutual (positive)
-    auto gamma5 = C0 / 6;   // Cross-coupling term
-    auto gamma6 = C0 / 6;   // Cross-coupling term
-
-    // Transform to 3x3 matrix with turns ratio scaling
-    // Note: Uses turns ratio (not inductance ratio) for voltage-dependent scaling
-    scalarMatrixAtFrequency.get_mutable_magnitude()["1"]["1"].set_nominal(gamma1 + relativeTurnsRatio * (gamma4 + gamma5));
-    scalarMatrixAtFrequency.get_mutable_magnitude()["1"]["2"].set_nominal(-2 * gamma4);
-    scalarMatrixAtFrequency.get_mutable_magnitude()["1"]["3"].set_nominal(2 * relativeTurnsRatio * gamma5);
-    scalarMatrixAtFrequency.get_mutable_magnitude()["2"]["2"].set_nominal(gamma2 + gamma4 + gamma6);
-    scalarMatrixAtFrequency.get_mutable_magnitude()["2"]["3"].set_nominal(2 * gamma6);
-    scalarMatrixAtFrequency.get_mutable_magnitude()["3"]["3"].set_nominal(gamma3 + gamma5 + gamma6);
-
-    return scalarMatrixAtFrequency;
-
-}
-
-std::pair<SixCapacitorNetworkPerWinding, TripoleCapacitancePerWinding> StrayCapacitance::calculate_capacitance_models_between_windings(double energy, double voltageDrop, double relativeTurnsRatio) {
-    std::map<std::string, double> result;
-
-    double C0 = energy * 2 / pow(voltageDrop, 2);
 
     auto gamma1 = -C0 / 6;
     auto gamma2 = -C0 / 6;
@@ -1627,24 +1630,38 @@ std::pair<SixCapacitorNetworkPerWinding, TripoleCapacitancePerWinding> StrayCapa
     auto gamma5 = C0 / 6;
     auto gamma6 = C0 / 6;
 
-    SixCapacitorNetworkPerWinding sixCapacitorNetworkPerWinding;
-    sixCapacitorNetworkPerWinding.set_c1(gamma1);
-    sixCapacitorNetworkPerWinding.set_c2(gamma2);
-    sixCapacitorNetworkPerWinding.set_c3(gamma3);
-    sixCapacitorNetworkPerWinding.set_c4(gamma4);
-    sixCapacitorNetworkPerWinding.set_c5(gamma5);
-    sixCapacitorNetworkPerWinding.set_c6(gamma6);
+    scalarMatrixAtFrequency.get_mutable_magnitude()["1"]["1"].set_nominal(gamma1 + relativeTurnsRatio * (gamma4 + gamma5));
+    scalarMatrixAtFrequency.get_mutable_magnitude()["1"]["2"].set_nominal(-2 * gamma4);
+    scalarMatrixAtFrequency.get_mutable_magnitude()["1"]["3"].set_nominal(2 * relativeTurnsRatio * gamma5);
+    scalarMatrixAtFrequency.get_mutable_magnitude()["2"]["2"].set_nominal(gamma2 + gamma4 + gamma6);
+    scalarMatrixAtFrequency.get_mutable_magnitude()["2"]["3"].set_nominal(2 * gamma6);
+    scalarMatrixAtFrequency.get_mutable_magnitude()["3"]["3"].set_nominal(gamma3 + gamma5 + gamma6);
 
-    auto C1 = gamma1 + relativeTurnsRatio * gamma2;
-    auto C2 = gamma5 + gamma6;
-    auto C3 = gamma3;
+    return scalarMatrixAtFrequency;
+}
 
-    TripoleCapacitancePerWinding tripoleCapacitancePerWinding;
-    tripoleCapacitancePerWinding.set_c1(C1);
-    tripoleCapacitancePerWinding.set_c2(C2);
-    tripoleCapacitancePerWinding.set_c3(C3);
-
-    return {sixCapacitorNetworkPerWinding, tripoleCapacitancePerWinding};
+// Canonical Biela & Kolar six-capacitor two-port network (IEEE Trans. Ind. Appl. 2008, eq. 30) for
+// a winding pair, from the static inter-winding capacitance C0 by the electrostatic energy method.
+// Node topology (their Fig. 16), terminals P1+ P1- P2+ P2-:
+//   C1: P1+ - P1-  (primary self)     = -C0/6
+//   C2: P2+ - P2-  (secondary self)   = -C0/6
+//   C3: P1+ - P2+  (top-to-top)       =  C0/3
+//   C4: P1- - P2-  (bottom-to-bottom) =  C0/3
+//   C5: P1+ - P2-  (cross)            =  C0/6
+//   C6: P1- - P2+  (cross)            =  C0/6
+// The -C0/6 self terms are INTRINSIC to this complete energy-equivalent representation (a valid
+// mathematical two-port, not a passive netlist). Do NOT emit this to transient SPICE — use the
+// positive three-capacitor pi/tripole model for simulation.
+SixCapacitorNetworkPerWinding StrayCapacitance::calculate_six_capacitor_network(double staticInterwindingCapacitance) {
+    const double C0 = staticInterwindingCapacitance;
+    SixCapacitorNetworkPerWinding n;
+    n.set_c1(-C0 / 6.0);
+    n.set_c2(-C0 / 6.0);
+    n.set_c3(C0 / 3.0);
+    n.set_c4(C0 / 3.0);
+    n.set_c5(C0 / 6.0);
+    n.set_c6(C0 / 6.0);
+    return n;
 }
 
 
@@ -1792,11 +1809,9 @@ StrayCapacitanceOutput StrayCapacitance::calculate_capacitance_with_voltages(Coi
             }
             capacitanceMatrix[firstWindingName][secondWindingName] = capacitanceMatrixBetweenWindings;
             capacitanceMatrix[secondWindingName][firstWindingName] = capacitanceMatrixBetweenWindings;
-            auto [sixCapacitorNetworkPerWindingBetweenWindings, tripoleCapacitancePerWindingBetweenWindings] = calculate_capacitance_models_between_windings(energyInBetweenTheseWindings, voltageDropBetweenWindings, relativeTurnsRatio);
-            sixCapacitorNetworkPerWinding[firstWindingName][secondWindingName] = sixCapacitorNetworkPerWindingBetweenWindings;
-            sixCapacitorNetworkPerWinding[secondWindingName][firstWindingName] = sixCapacitorNetworkPerWindingBetweenWindings;
-            tripoleCapacitancePerWinding[firstWindingName][secondWindingName] = tripoleCapacitancePerWindingBetweenWindings;
-            tripoleCapacitancePerWinding[secondWindingName][firstWindingName] = tripoleCapacitancePerWindingBetweenWindings;
+            // 6-capacitor network + positive 3-capacitor (tripole/pi) model are derived below, once
+            // the full positive self+inter capacitance map is available (the tripole needs BOTH
+            // windings' self-capacitances, which are only complete after this loop).
         }
     }
 
@@ -1817,6 +1832,37 @@ StrayCapacitanceOutput StrayCapacitance::calculate_capacitance_with_voltages(Coi
             auto capacitance = capacitanceMapPerWindings[windingsKey];
             staticCapacitanceMapPerWindings[firstWinding.get_name()][secondWinding.get_name()] = capacitance;
             staticCapacitanceMapPerWindings[secondWinding.get_name()][firstWinding.get_name()] = capacitance;
+        }
+    }
+
+    // Positive 3-capacitor (pi / tripole) model + canonical 6-capacitor network per winding PAIR,
+    // now that the full positive self+inter capacitance map is known. The tripole is the measurable,
+    // SPICE-friendly model (Lu/Zhu/Hui 2003; Coilcraft/OMICRON vendor models): C1 = self-capacitance
+    // of the first winding, C2 = self of the second, C3 = the inter-winding capacitance — all
+    // positive, straight from the energy method (the same values the SPICE export uses). The 6C is
+    // the complete Biela/Kolar energy-equivalent (with its intrinsic negative self terms) built from
+    // the inter-winding static capacitance.
+    for (size_t i = 0; i < windings.size(); ++i) {
+        std::string wi = windings[i].get_name();
+        for (size_t j = i + 1; j < windings.size(); ++j) {
+            std::string wj = windings[j].get_name();
+            if (!staticCapacitanceMapPerWindings.contains(wi) || !staticCapacitanceMapPerWindings.at(wi).contains(wj)) {
+                continue;
+            }
+            double cinter = staticCapacitanceMapPerWindings.at(wi).at(wj);
+            double cselfI = staticCapacitanceMapPerWindings.at(wi).contains(wi) ? staticCapacitanceMapPerWindings.at(wi).at(wi) : 0.0;
+            double cselfJ = staticCapacitanceMapPerWindings.at(wj).contains(wj) ? staticCapacitanceMapPerWindings.at(wj).at(wj) : 0.0;
+
+            TripoleCapacitancePerWinding tripole;
+            tripole.set_c1(cselfI);
+            tripole.set_c2(cselfJ);
+            tripole.set_c3(cinter);
+            tripoleCapacitancePerWinding[wi][wj] = tripole;
+            tripoleCapacitancePerWinding[wj][wi] = tripole;
+
+            auto sixCap = calculate_six_capacitor_network(cinter);
+            sixCapacitorNetworkPerWinding[wi][wj] = sixCap;
+            sixCapacitorNetworkPerWinding[wj][wi] = sixCap;
         }
     }
 
@@ -1960,6 +2006,31 @@ double StrayCapacitanceOneLayer::calculate_capacitance(Coil coil) {
             auto secondTurn = coil.get_turns_description().value()[1];
             centerSeparation = sqrt(pow(firstTurn.get_coordinates()[0] - secondTurn.get_coordinates()[0], 2) + pow(firstTurn.get_coordinates()[1] - secondTurn.get_coordinates()[1], 2));
         }
+    }
+
+    // The two building blocks are cylinder-to-cylinder / cylinder-to-plane
+    // capacitances, C ~ 1/acosh(x), valid only for x > 1 (conductors not touching):
+    //   turn-to-turn:   x = centerSeparation / (2*wireRadius)
+    //   turn-to-shield: x = distanceTurnsToCore / wireRadius
+    // x -> 1 is the contact singularity (acosh(1)=0 => C=inf => the cas/cab
+    // recursion produces NaN). This happens for a flat/planar conductor (whose
+    // half-WIDTH is used as "wireRadius" while the stacking pitch is the thin
+    // dimension) and for thick round Grade-1 wire flush to the core (proportionally
+    // thin coating + zero bobbin column thickness => distanceTurnsToCore == wireRadius).
+    // In those degenerate cases this fast single-layer round-wire approximation is
+    // outside its validity domain, so defer to the full StrayCapacitance model
+    // (parallel-plate for planar, Albach for round) which is finite and wire-type aware.
+    // The 1.001 margin matches the acosh-domain guard the Albach/Koch models use and
+    // also avoids the near-singular huge-but-finite value just above contact.
+    constexpr double acoshDomainFloor = 1.001;
+    auto wireType = coil.resolve_wire(0).get_type();
+    bool roundLike = (wireType == WireType::ROUND || wireType == WireType::LITZ);
+    double turnToTurnArg = centerSeparation / (2 * wireRadius);
+    double turnToShieldArg = distanceTurnsToCore / wireRadius;
+    if (!roundLike || turnToTurnArg <= acoshDomainFloor || turnToShieldArg <= acoshDomainFloor) {
+        auto capacitanceAmongWindings = StrayCapacitance().calculate_capacitance(coil).get_capacitance_among_windings().value();
+        auto firstWindingName = coil.get_functional_description()[0].get_name();
+        return capacitanceAmongWindings[firstWindingName][firstWindingName];
     }
 
     double ctt = capacitance_turn_to_turn(turnDiameter, wireRadius, centerSeparation);

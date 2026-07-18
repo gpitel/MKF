@@ -25,7 +25,10 @@ using nlohmann::json;
 // wins on name clash; Replace: only kinds the user provided are wiped, the
 // rest fall through to built-ins).
 //
-// Single-threaded only — same constraint as the existing globals.
+// Orchestrating-thread only: Scope swaps the SHARED global catalogs, so it
+// must be applied before set_databases_frozen(true) and destroyed after
+// unfreezing. Constructing a Scope while databases are frozen throws
+// (ABT #113 — see the THREAD-SAFETY CONTRACT in support/Utils.h).
 class LibraryContext {
 public:
     enum class LoadMode { Merge, Replace };
@@ -54,6 +57,12 @@ public:
     // destruction, restores them. Use via LibraryContext::applyScoped().
     class Scope {
     public:
+        // True while ANY Scope has the global databases swapped. Lazy catalog
+        // loaders (e.g. CoreAdviser's load_cores-on-empty) must not repopulate
+        // the swapped databases: inside a scope, an empty catalog is
+        // authoritative ("the context IS the library").
+        static bool anyActive();
+
         Scope() = default;
         Scope(const LibraryContext* ctx);
         ~Scope();

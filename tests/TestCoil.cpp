@@ -8,6 +8,7 @@
 #include "support/Utils.h"
 #include "TestingUtils.h"
 
+#include <cmath>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <filesystem>
@@ -34,10 +35,16 @@ auto outputFilePath = std::filesystem::path {std::source_location::current().fil
 bool plot = true;
 
 TEST_CASE("Test_Coil_Json_0", "[constructive-model][coil][bug][smoke-test]") {
-    std::string coilString = R"({"bobbin":"Dummy","functionalDescription":[{"isolationSide":"Primary","name":"Primary","numberParallels":1,"numberTurns":23,"wire":"Dummy"}]})";
+    std::string coilString = R"({"bobbin":"Dummy","functionalDescription":[{"isolationSide":"primary","name":"Primary","numberParallels":1,"numberTurns":23,"wire":"Dummy"}]})";
 
     auto coilJson = json::parse(coilString);
-    auto Coil(coilJson);
+    // The original line here was `auto Coil(coilJson);` — a most-vexing-parse variable
+    // declaration that just copied the json and never constructed a Coil at all.
+    OpenMagnetics::Coil coil(coilJson, false);
+    REQUIRE(coil.get_functional_description().size() == 1);
+    CHECK(coil.get_functional_description()[0].get_name() == "Primary");
+    CHECK(coil.get_functional_description()[0].get_number_turns() == 23);
+    CHECK(coil.get_functional_description()[0].get_number_parallels() == 1);
 }
 
 TEST_CASE("Test_Coil_Json_1", "[constructive-model][coil][bug][smoke-test]") {
@@ -289,15 +296,23 @@ TEST_CASE("Test_Coil_Json_8", "[constructive-model][coil][bug][smoke-test]") {
     json coilJson = json::parse(json_file_282);
     OpenMagnetics::Coil coil(coilJson, false);
     auto layers = coil.get_layers_description().value();
+    REQUIRE(layers.size() > 0);
 
+    // Repro point: resolving the insulation material of every insulation layer must work.
+    size_t insulationLayerCount = 0;
     for (auto layer : layers) {
         if (layer.get_type() == ElectricalType::INSULATION) {
+            insulationLayerCount++;
             auto material = OpenMagnetics::Coil::resolve_insulation_layer_insulation_material(coil, layer.get_name());
-            json mierda;
-            to_json(mierda, material);
+            json materialJson;
+            to_json(materialJson, material);
+            INFO("Layer: " << layer.get_name());
+            CHECK(!materialJson.empty());
         }
 
     }
+    // The fixture contains insulation layers; the loop above must not be vacuous.
+    REQUIRE(insulationLayerCount > 0);
 }
 
 TEST_CASE("Test_Coil_Json_9", "[constructive-model][coil][bug][smoke-test]") {
@@ -358,8 +373,13 @@ TEST_CASE("Test_Coil_Json_9", "[constructive-model][coil][bug][smoke-test]") {
         }
     }
 
+    // Repro point: winding by sections must actually produce a sections description.
+    REQUIRE(coil.get_sections_description());
+    CHECK(coil.get_sections_description_conduction().size() > 0);
+
     json result;
     to_json(result, coil);
+    CHECK(!result.empty());
 }
 
 TEST_CASE("Test_Coil_Json_10", "[constructive-model][coil][bug][smoke-test]") {
@@ -395,8 +415,13 @@ TEST_CASE("Test_Coil_Json_10", "[constructive-model][coil][bug][smoke-test]") {
     coil.set_layers_description(coilLayersDescription);
     coil.wind_by_turns();
 
+    // Repro point: winding by turns over preset sections/layers must produce turns.
+    REQUIRE(coil.get_turns_description());
+    CHECK(coil.get_turns_description()->size() > 0);
+
     json result;
     to_json(result, coil);
+    CHECK(!result.empty());
 }
 
 TEST_CASE("Test_Coil_Json_11", "[constructive-model][coil][bug][smoke-test]") {
@@ -5559,6 +5584,10 @@ TEST_CASE("Test_Wind_By_Section_With_Insulation_Sections", "[constructive-model]
     CoilAlignment turnsAlignment = CoilAlignment::CENTERED;
     
     auto coil = OpenMagneticsTesting::get_quick_coil_no_compact(numberTurns, numberParallels, bobbinHeight, bobbinWidth, bobbinCenterCoodinates, interleavingLevel, sectionOrientation, layersOrientation, turnsAlignment, sectionsAlignment, wires);
+    // This test re-winds the no-compact coil after construction; the no-compact
+    // environment is part of its intent, so set it explicitly (the builder no longer
+    // leaks the flag globally).
+    settings.set_coil_delimit_and_compact(false);
     double voltagePeakToPeak = 400;
     auto inputs = OpenMagnetics::Inputs::create_quick_operating_point(125000, 0.001, 25, WaveformLabel::SINUSOIDAL, voltagePeakToPeak, 0.5, 0, turnsRatios);
     coil.set_inputs(inputs);
@@ -5566,6 +5595,7 @@ TEST_CASE("Test_Wind_By_Section_With_Insulation_Sections", "[constructive-model]
     auto log = coil.read_log();
 
     OpenMagneticsTesting::check_sections_description(coil, numberTurns, numberParallels, interleavingLevel, sectionOrientation);
+    settings.reset();
 }
 
 TEST_CASE("Test_Wind_By_Section_Pattern", "[constructive-model][coil][rectangular-winding-window][smoke-test]") {
@@ -5580,9 +5610,14 @@ TEST_CASE("Test_Wind_By_Section_Pattern", "[constructive-model][coil][rectangula
     size_t repetitions = 2;
 
     auto coil = OpenMagneticsTesting::get_quick_coil_no_compact(numberTurns, numberParallels, bobbinHeight, bobbinWidth, bobbinCenterCoodinates, interleavingLevel);
+    // This test re-winds the no-compact coil after construction; the no-compact
+    // environment is part of its intent, so set it explicitly (the builder no longer
+    // leaks the flag globally).
+    settings.set_coil_delimit_and_compact(false);
 
     coil.wind_by_sections(pattern, repetitions);
     OpenMagneticsTesting::check_sections_description(coil, numberTurns, numberParallels, interleavingLevel);
+    settings.reset();
 }
 
 TEST_CASE("Test_Wind_By_Layers_Wind_One_Section_One_Layer", "[constructive-model][coil][rectangular-winding-window][smoke-test]") {
@@ -5602,6 +5637,7 @@ TEST_CASE("Test_Wind_By_Layers_Wind_One_Section_One_Layer", "[constructive-model
     auto coil = OpenMagneticsTesting::get_quick_coil_no_compact(numberTurns, numberParallels, bobbinHeight, bobbinWidth, bobbinCenterCoodinates, interleavingLevel);
     auto layersDescription = coil.get_layers_description().value();
     OpenMagneticsTesting::check_layers_description(coil);
+    settings.reset();
 }
 
 TEST_CASE("Test_Wind_By_Layers_Wind_One_Section_Two_Layers", "[constructive-model][coil][rectangular-winding-window][smoke-test]") {
@@ -5902,6 +5938,10 @@ TEST_CASE("Test_Wind_By_Layers_With_Insulation_Layers", "[constructive-model][co
     CoilAlignment turnsAlignment = CoilAlignment::CENTERED;
     
     auto coil = OpenMagneticsTesting::get_quick_coil_no_compact(numberTurns, numberParallels, bobbinHeight, bobbinWidth, bobbinCenterCoodinates, interleavingLevel, sectionOrientation, layersOrientation, turnsAlignment, sectionsAlignment, wires);
+    // This test re-winds the no-compact coil after construction; the no-compact
+    // environment is part of its intent, so set it explicitly (the builder no longer
+    // leaks the flag globally).
+    settings.set_coil_delimit_and_compact(false);
     double voltagePeakToPeak = 400;
     auto inputs = OpenMagnetics::Inputs::create_quick_operating_point(125000, 0.001, 25, WaveformLabel::SINUSOIDAL, voltagePeakToPeak, 0.5, 0, turnsRatios);
     coil.set_inputs(inputs);
@@ -5909,6 +5949,7 @@ TEST_CASE("Test_Wind_By_Layers_With_Insulation_Layers", "[constructive-model][co
     auto log = coil.read_log();
 
     OpenMagneticsTesting::check_layers_description(coil);
+    settings.reset();
 }
 
 TEST_CASE("Test_External_Insulation_Layers", "[constructive-model][coil][rectangular-winding-window][smoke-test]") {
@@ -5927,11 +5968,20 @@ TEST_CASE("Test_External_Insulation_Layers", "[constructive-model][coil][rectang
         insulationLayers[windingsMapKey] = layers;
     }
 
-    OpenMagnetics::Coil coil;
-
-    if (insulationLayers.size() > 0) {
-        coil.set_insulation_layers(insulationLayers);
+    // The fixture defines insulation layers for the (0,1), (1,2) and (2,0) winding pairs.
+    REQUIRE(insulationLayers.size() == 3);
+    for (auto& [windingsMapKey, layers] : insulationLayers) {
+        REQUIRE(layers.size() == 2);
+        for (auto& layer : layers) {
+            CHECK(layer.get_type() == ElectricalType::INSULATION);
+            REQUIRE(layer.get_dimensions().size() == 2);
+            CHECK(layer.get_dimensions()[0] > 0);
+            CHECK(layer.get_dimensions()[1] > 0);
+        }
     }
+
+    OpenMagnetics::Coil coil;
+    CHECK_NOTHROW(coil.set_insulation_layers(insulationLayers));
 }
 
 TEST_CASE("Test_Wind_By_Turn_Wind_One_Section_One_Layer", "[constructive-model][coil][rectangular-winding-window][smoke-test]") {
@@ -6022,7 +6072,7 @@ TEST_CASE("Test_Wind_By_Turn_Random_Multiwinding", "[constructive-model][coil][r
 
                 }
             }
-            catch (...) {
+            catch (const std::exception& e) {
                 for (size_t windingIndex = 0; windingIndex < numberTurns.size(); ++windingIndex) {
                     std::cout << "numberTurns: " << numberTurns[windingIndex] << std::endl;
                 }
@@ -6031,7 +6081,8 @@ TEST_CASE("Test_Wind_By_Turn_Random_Multiwinding", "[constructive-model][coil][r
                 }
                 std::cout << "interleavingLevel: " << double(interleavingLevel) << std::endl;
                 std::cout << "windingOrientationIndex: " << windingOrientationIndex << std::endl;
-                return;
+                // A throw used to be swallowed here (early return -> test passed). It must fail.
+                FAIL("get_quick_coil threw for the combination printed above: " << e.what());
             }
         }
     }
@@ -9243,6 +9294,50 @@ TEST_CASE("Test_Additiona_Turns_Bug", "[constructive-model][coil][round-winding-
     settings.reset();
 }
 
+TEST_CASE("Test_Toroidal_Rewind_Keeps_Additional_Coordinates", "[constructive-model][coil][round-winding-window][multi-column][bug]") {
+    // Winding-studio regression: rewind_layers_and_turns (the custom-rect
+    // re-flow) skipped delimit_and_compact_round_window, the only pass that
+    // generates the toroidal outer return crossings — every studio edit on a
+    // toroid silently dropped all additionalCoordinates.
+    clear_databases();
+    settings.set_use_toroidal_cores(true);
+    settings.set_coil_include_additional_coordinates(true);
+
+    std::vector<int64_t> numberTurns = {30, 30};
+    std::vector<int64_t> numberParallels = {1, 1};
+    uint8_t interleavingLevel = 1;
+    std::string coreShape = "T 25/15/10";
+
+    auto coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, coreShape, interleavingLevel,
+                                                     WindingOrientation::OVERLAPPING, WindingOrientation::OVERLAPPING,
+                                                     CoilAlignment::SPREAD, CoilAlignment::SPREAD);
+
+    auto woundTurns = coil.get_turns_description().value();
+    for (auto& turn : woundTurns) {
+        REQUIRE(turn.get_additional_coordinates());
+    }
+    size_t numberTurnsBefore = woundTurns.size();
+
+    REQUIRE(coil.rewind_layers_and_turns());
+
+    auto rewoundTurns = coil.get_turns_description().value();
+    CHECK(rewoundTurns.size() == numberTurnsBefore);
+    for (auto& turn : rewoundTurns) {
+        REQUIRE(turn.get_coordinate_system());
+        CHECK(turn.get_coordinate_system().value() == CoordinateSystem::CARTESIAN);
+        REQUIRE(turn.get_additional_coordinates());
+        // The outer crossing sits outside the ring: strictly farther from the
+        // axis than the in-window position.
+        auto coordinates = turn.get_coordinates();
+        auto additionalCoordinates = turn.get_additional_coordinates().value();
+        REQUIRE(additionalCoordinates.size() >= 1);
+        double innerRadius = std::hypot(coordinates[0], coordinates[1]);
+        double outerRadius = std::hypot(additionalCoordinates[0][0], additionalCoordinates[0][1]);
+        CHECK(outerRadius > innerRadius);
+    }
+    settings.reset();
+}
+
 TEST_CASE("Test_Wind_Three_Sections_Two_Layer_Toroidal_Overlapping_Spread_Top_Additional_Coordinates", "[constructive-model][coil][round-winding-window][smoke-test]") {
     clear_databases();
     settings.set_use_toroidal_cores(true);
@@ -10515,8 +10610,72 @@ TEST_CASE("Test_Toroidal_Delimit_And_Compact_Multilayer", "[toroidal][coil][comp
         }
     }
     REQUIRE(allTurnsValid);
-    
+
     settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Compaction_Syncs_Turn_Rotation_To_Polar_Angle", "[toroidal][coil][compaction]") {
+    // ABT #186: angular compaction (delimit_and_compact_round_window) shifts each toroidal turn's
+    // polar angle, but historically left turn.rotation at its creation value, so rotation -- the
+    // cross-section azimuth read by MagneticField's induced-image rotation and by the painters --
+    // went stale. A multi-winding contiguous toroid compacts each section by tens of degrees, so
+    // this exercises the shift; guard that rotation == polar angle for every turn afterwards.
+    auto angularDiffDeg = [](double a, double b) {
+        double d = std::fmod(a - b, 360.0);
+        if (d > 180.0) d -= 360.0;
+        if (d < -180.0) d += 360.0;
+        return std::abs(d);
+    };
+
+    std::vector<int64_t> numberTurns = {60, 42};
+    std::vector<int64_t> numberParallels = {1, 1};
+
+    // Reference wind WITHOUT compaction: rotation trivially equals the polar angle at creation.
+    clear_databases();
+    settings.set_use_toroidal_cores(true);
+    settings.set_coil_wind_even_if_not_fit(true);
+    settings.set_coil_delimit_and_compact(false);
+    auto coilNoCompact = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, "T 20/10/7", 1,
+                                                              WindingOrientation::CONTIGUOUS, WindingOrientation::OVERLAPPING,
+                                                              CoilAlignment::CENTERED, CoilAlignment::CENTERED);
+    coilNoCompact.convert_turns_to_polar_coordinates();
+    auto turnsNoCompact = coilNoCompact.get_turns_description().value();
+    std::map<std::string, double> uncompactedAngleByName;
+    for (const auto& turn : turnsNoCompact) {
+        uncompactedAngleByName[turn.get_name()] = turn.get_coordinates()[1];
+    }
+    settings.reset();
+
+    // Compacted wind: the path that used to leave rotation stale.
+    clear_databases();
+    settings.set_use_toroidal_cores(true);
+    settings.set_coil_wind_even_if_not_fit(true);
+    settings.set_coil_delimit_and_compact(true);
+    auto coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, "T 20/10/7", 1,
+                                                     WindingOrientation::CONTIGUOUS, WindingOrientation::OVERLAPPING,
+                                                     CoilAlignment::CENTERED, CoilAlignment::CENTERED);
+    coil.convert_turns_to_polar_coordinates();
+    auto turns = coil.get_turns_description().value();
+    settings.reset();
+
+    REQUIRE(turns.size() == uncompactedAngleByName.size());
+
+    bool rotationMatchesAngle = true;
+    size_t shiftedTurns = 0;
+    for (const auto& turn : turns) {
+        REQUIRE(turn.get_rotation());
+        double rotation = turn.get_rotation().value();
+        double polarAngle = turn.get_coordinates()[1];
+        rotationMatchesAngle &= angularDiffDeg(rotation, polarAngle) < 1e-3;
+
+        // Confirm compaction actually moved this turn's angle relative to the uncompacted wind,
+        // so this test genuinely exercises (and would fail on) the stale-rotation bug.
+        if (angularDiffDeg(polarAngle, uncompactedAngleByName.at(turn.get_name())) > 1e-3) {
+            shiftedTurns++;
+        }
+    }
+    CHECK(rotationMatchesAngle);
+    CHECK(shiftedTurns > 0);
 }
 
 TEST_CASE("Test_Coil_Compacting_Tertiary_Winding", "[constructive-model][coil][bug][visualization]") {
@@ -11057,7 +11216,8 @@ TEST_CASE("Test_Real_Geometry_Multifilar_N_Filar", "[constructive-model][coil][r
 
         INFO("K=" << K << " Z");
         REQUIRE(coil.get_turns_description());
-        CHECK(coil.get_turns_description().value().size() == size_t(18 * K));
+        // Real winding: N turns cross the window plane N+1 times, one extra slot per parallel.
+        CHECK(coil.get_turns_description().value().size() == size_t((18 + 1) * K));
         CHECK(distinct_parallels_with_terminal_leads(coil, "winding 0") == int(K));
         CHECK(layers_balanced_across_parallels(coil, "winding 0", K));
         CHECK(real_geometry_collisions(coil) == 0);
@@ -11094,7 +11254,8 @@ TEST_CASE("Test_Real_Geometry_Bifilar_Interleaved", "[constructive-model][coil][
     auto coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, "PQ 40/40", interleavingLevel);
 
     REQUIRE(coil.get_turns_description());
-    CHECK(coil.get_turns_description().value().size() == size_t(20 * 2 + 20 * 1));
+    // Real winding: one extra crossing per parallel ((20+1)*2 + (20+1)*1).
+    CHECK(coil.get_turns_description().value().size() == size_t((20 + 1) * 2 + (20 + 1) * 1));
     CHECK(distinct_parallels_with_terminal_leads(coil, "winding 0") == 2);
     CHECK(layers_balanced_across_parallels(coil, "winding 0", 2));
     CHECK(layers_balanced_across_parallels(coil, "winding 1", 1));
@@ -11116,7 +11277,8 @@ TEST_CASE("Test_Real_Geometry_Rectangular_Contiguous", "[constructive-model][coi
         WindingOrientation::CONTIGUOUS, WindingOrientation::CONTIGUOUS);
 
     REQUIRE(coil.get_turns_description());
-    CHECK(coil.get_turns_description().value().size() == size_t(12 * 2));
+    // Real winding: one extra crossing per parallel ((12+1)*2).
+    CHECK(coil.get_turns_description().value().size() == size_t((12 + 1) * 2));
     // The transposed model must produce connection leads for the contiguous winding.
     CHECK(!coil.get_connection_reserved_spaces().empty());
     CHECK(distinct_parallels_with_terminal_leads(coil, "winding 0") == 2);
@@ -11183,7 +11345,8 @@ TEST_CASE("Test_Real_Geometry_Toroidal", "[constructive-model][coil][real-geomet
         if (order == WindingOrder::U) rewindAs(coil, order);
         INFO("overlapping " << tag);
         REQUIRE(coil.get_turns_description());
-        CHECK(coil.get_turns_description().value().size() == size_t(40 * 2));
+        // Real winding: one extra crossing per parallel ((40+1)*2).
+        CHECK(coil.get_turns_description().value().size() == size_t((40 + 1) * 2));
         CHECK(toroidal_turn_overlaps(coil) == 0);
         CHECK(!coil.get_connection_reserved_spaces().empty());
         CHECK(distinct_parallels_with_terminal_leads(coil, "winding 0") == 2);
@@ -11268,6 +11431,21 @@ TEST_CASE("Demo_Real_Vs_Ideal_Connection_Geometry", "[real-geometry-demo]") {
     }
     std::cout << "  reserved connection rectangles: " << reserved.size() << "\n";
 
+    // Demo invariants: same sectioning, real geometry reserves connection space, and the
+    // real DC resistance stays close to the ideal one (turn repositioning around the
+    // reserved connection rectangles can move it slightly in EITHER direction, so only a
+    // broad 20% envelope is pinned, not a sign).
+    REQUIRE(sectionsIdeal.size() == sectionsReal.size());
+    REQUIRE(resistanceIdeal.size() == resistanceReal.size());
+    CHECK(reserved.size() > 0);
+    for (size_t w = 0; w < resistanceIdeal.size(); ++w) {
+        INFO("Winding " << w);
+        CHECK(std::isfinite(resistanceReal[w]));
+        CHECK(resistanceIdeal[w] > 0);
+        CHECK(resistanceReal[w] > 0);
+        CHECK(std::abs(resistanceReal[w] - resistanceIdeal[w]) < 0.2 * resistanceIdeal[w]);
+    }
+
     OpenMagnetics::Magnetic magneticIdeal; magneticIdeal.set_core(core); magneticIdeal.set_coil(coilIdeal);
     OpenMagnetics::Magnetic magneticReal;  magneticReal.set_core(core);  magneticReal.set_coil(coilReal);
 
@@ -11279,6 +11457,7 @@ TEST_CASE("Demo_Real_Vs_Ideal_Connection_Geometry", "[real-geometry-demo]") {
         painter.paint_bobbin(magneticIdeal);
         painter.paint_coil_turns(magneticIdeal);
         painter.export_svg();
+        OpenMagneticsTesting::check_svg(outFile);
     }
     {
         auto outFile = outputFilePath; outFile.append("Demo_Connection_Real.svg");
@@ -11289,6 +11468,7 @@ TEST_CASE("Demo_Real_Vs_Ideal_Connection_Geometry", "[real-geometry-demo]") {
         painter.paint_coil_turns(magneticReal);
         painter.paint_coil_connections(magneticReal);
         painter.export_svg();
+        OpenMagneticsTesting::check_svg(outFile);
     }
     std::cout << "  SVGs written to " << outputFilePath.string() << "/Demo_Connection_{Ideal,Real}.svg\n" << std::endl;
 
@@ -11390,6 +11570,67 @@ TEST_CASE("Test_Ideal_Winding_Unchanged_Multifilar", "[constructive-model][coil]
         CHECK(d.perLayerTurns == g.perLayerTurns);
     }
     settings.reset();
+}
+
+TEST_CASE("Test_Single_Layer_Winding_Emits_Terminal_Leads",
+          "[constructive-model][coil][real-geometry]") {
+    // A single-layer winding has no inter-layer links, but its entrance/exit TERMINAL
+    // leads exist all the same (drawn + connection loss). Regression for the early
+    // return that skipped ALL reserved spaces when fewer than two conduction layers.
+    std::vector<int64_t> numberTurns = {8};
+    std::vector<int64_t> numberParallels = {1};
+    auto coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels,
+                                                     "PQ 28/20", 1);
+    REQUIRE(coil.get_layers_description_conduction().size() == 1);
+
+    auto spaces = coil.get_connection_reserved_spaces();
+    size_t drawnTerminals = 0;
+    size_t links = 0;
+    for (const auto& s : spaces) {
+        if (!s.layer.empty()) continue;
+        if (s.isTerminal) ++drawnTerminals; else ++links;
+    }
+    // One entrance + one exit lead (each may be a single own-level rect or a stub+run L).
+    REQUIRE(drawnTerminals >= 2);
+    REQUIRE(links == 0);
+}
+
+TEST_CASE("Test_Centered_Single_Turn_Toroidal_Emits_Outer_Crossing",
+          "[constructive-model][coil][toroid][single-turn]") {
+    // Toroid whose single turn's wire OD exceeds the winding-window radial height ->
+    // wind() takes the build_centered_single_turn_toroidal() special path (skips the
+    // sections/layers fit pipeline). That path must still emit the outer XY-plane
+    // crossing (additionalCoordinates), with the same polar-mirror convention as
+    // wind_toroidal_additional_turns; without it downstream consumers (Painter, 3D
+    // builders) cannot know where the wire wraps the ring.
+    std::string coilString = R"({"bobbin":{"processedDescription":{"columnDepth":0.005,"columnShape":"round","columnThickness":0.0,"columnWidth":0.002625,"coordinates":[0.0,0.0,0.0],"wallThickness":0.0,"windingWindows":[{"angle":360.0,"coordinates":[0.0074,0.0,0.0],"radialHeight":0.0074,"sectionsOrientation":"overlapping","shape":"round"}]}},"functionalDescription":[{"isolationSide":"primary","name":"primary","numberParallels":1,"numberTurns":1,"wire":{"coating":{"grade":1,"type":"enamelled"},"conductingDiameter":{"nominal":0.0095},"material":"copper","name":"Round 9.50 - Custom","numberConductors":1,"outerDiameter":{"nominal":0.010},"type":"round"}}]})";
+
+    CoilWindingConfig config;
+    config.coilJsonStr = coilString;
+    config.pattern = {0};
+    config.repetitions = 1;
+    auto coil = prepare_and_wind_coil(config);
+
+    auto turnsOpt = coil.get_turns_description();
+    REQUIRE(turnsOpt.has_value());
+    REQUIRE(turnsOpt->size() == 1);
+    const auto& turn = (*turnsOpt)[0];
+
+    // Inner crossing: geometric centre of the hole, converted to cartesian.
+    REQUIRE(turn.get_coordinate_system() == CoordinateSystem::CARTESIAN);
+    REQUIRE_THAT(turn.get_coordinates()[0], Catch::Matchers::WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(turn.get_coordinates()[1], Catch::Matchers::WithinAbs(0.0, 1e-9));
+
+    // Outer crossing: polar mirror {-2*columnWidth - radialHeight, 0 deg} ->
+    // cartesian radius 2*radialHeight + 2*columnWidth at angle 0.
+    auto addOpt = turn.get_additional_coordinates();
+    REQUIRE(addOpt.has_value());
+    REQUIRE(addOpt->size() == 1);
+    const auto& outer = (*addOpt)[0];
+    REQUIRE(outer.size() >= 2);
+    const double expectedRadius = 2 * 0.0074 + 2 * 0.002625;
+    REQUIRE_THAT(outer[0], Catch::Matchers::WithinAbs(expectedRadius, 1e-9));
+    REQUIRE_THAT(outer[1], Catch::Matchers::WithinAbs(0.0, 1e-9));
 }
 
 

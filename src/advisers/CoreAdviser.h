@@ -216,6 +216,19 @@ class CoreAdviser {
 
         Mas post_process_core(Magnetic magnetic, Inputs inputs);
 
+        // ABT #126: post-process candidates in score order and keep the first
+        // maximumNumberResults that SURVIVE post-processing (backfilling from the
+        // scored pool), instead of cutting to top-N first and then dropping
+        // unwindable ones — which turned "the top-N are unwindable" into a silent
+        // zero-result while windable survivors had already been discarded.
+        // Honours unique-core-shapes (a shape is only burned by a SURVIVING
+        // candidate). withAlternativeMaterials additionally runs the
+        // alternative-materials lookup per kept candidate (STANDARD_CORES path).
+        std::vector<std::pair<Mas, double>> post_process_and_cut(std::vector<std::pair<Magnetic, double>>& magneticsWithScoring,
+                                                                 Inputs& inputs,
+                                                                 size_t maximumNumberResults,
+                                                                 bool withAlternativeMaterials = false);
+
         /**
          * @brief Calculate gap constraints for STANDARD_CORES mode.
          * @param inputs Operating conditions with design requirements.
@@ -285,46 +298,8 @@ class CoreAdviser {
          */
         void reject_winding_killing_gaps(std::vector<std::pair<Magnetic, double>>* magneticsWithScoring, Inputs inputs);
 
-        /**
-         * @brief Calculate optimal gap and turns using binary search with analytical cost function (Option 2).
-         * 
-         * Uses golden section search on gap, with analytical calculation of turns and flux density
-         * for each candidate gap. Much faster than simulation-based refinement.
-         * 
-         * @param inputs Operating conditions with design requirements.
-         * @param core Core to optimize (modified in place with optimal gap).
-         * @return std::pair<double, double> {optimal_gap, optimal_turns}, or {-1, -1} if no valid solution.
-         */
-        std::pair<double, double> optimize_gap_and_turns_binary_search(Inputs& inputs, Core& core);
 
-        /**
-         * @brief Analytical cost function for gap optimization.
-         * 
-         * For a given gap, calculates turns analytically and evaluates:
-         * - Saturation constraint (returns infinity if violated)
-         * - Core losses estimate
-         * - Fringing factor penalty
-         * 
-         * @param gap Gap length to evaluate.
-         * @param inputs Operating conditions.
-         * @param core Core with material properties.
-         * @param magnetizingInductance Reference to MagnetizingInductance for calculations.
-         * @return double Cost value (lower is better), or infinity if constraints violated.
-         */
-        double calculate_gap_cost_analytical(double gap, Inputs& inputs, Core& core, 
-                                             MagnetizingInductance& magnetizingInductance);
 
-        /**
-         * @brief Add optimized gapping and turns using binary search approach.
-         * 
-         * Replaces the iterative simulation-based approach with analytical optimization.
-         * For each core, finds optimal (gap, turns) pair using golden section search.
-         * 
-         * @param magneticsWithScoring Vector of magnetics to optimize.
-         * @param inputs Operating conditions.
-         */
-        void add_gapping_and_turns_analytical(std::vector<std::pair<Magnetic, double>>* magneticsWithScoring,
-                                               Inputs inputs);
 
         /**
          * @brief Filter pipeline for power inductor/transformer applications.
@@ -411,6 +386,12 @@ class CoreAdviser {
             MagneticCoreFilter(){
             }
             std::vector<std::pair<Magnetic, double>> filter_magnetics(std::vector<Magnetic> unfilteredMagnetics, Inputs inputs, double weight=1);
+
+            // Shared min-max normalized scoring for the given bucket, then sort (abt #103:
+            // extracted from the 11 copy-pasted filter_magnetics tails).
+            void apply_normalized_scoring(std::vector<std::pair<Magnetic, double>>* filteredMagneticsWithScoring,
+                                          std::vector<double>& newScoring, double weight,
+                                          CoreAdviser::CoreAdviserFilters bucket);
     };
     
     class MagneticCoreFilterAreaProduct : public MagneticCoreFilter {

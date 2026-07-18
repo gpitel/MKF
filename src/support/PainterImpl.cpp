@@ -5,6 +5,7 @@
 #include <cfloat>
 #include <cmath>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
@@ -126,6 +127,11 @@ void Painter::paint_litz_wire(double xCoordinate, double yCoordinate, Wire wire,
 
     bool simpleMode = settings.get_painter_simple_litz();
     auto coating = wire.resolve_coating();
+    // The branches below dereference the optional with ->; the old null-check at the
+    // coating-color block came AFTER those dereferences (UB on a coating-less litz).
+    if (!coating) {
+        throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Litz wire has no resolvable coating to paint");
+    }
     size_t numberConductors = wire.get_number_conductors().value();
 
     double outerDiameter = resolve_dimensional_values(wire.get_outer_diameter().value());
@@ -476,6 +482,15 @@ void Painter::paint_toroidal_coil_sections(Magnetic magnetic) {
 
     for (size_t i = 0; i < sections.size(); ++i){
         {
+            // Toroids never render insulation sections: they are the inter-winding gap (a
+            // visualization artifact), not a physical part the user added. Drawing them as
+            // radial arcs produces stray wedge/triangle shapes — especially with a core coating,
+            // which shrinks the winding window so the gap no longer collapses onto the axis.
+            // Only conduction sections draw here; user-defined margins draw separately in
+            // paint_toroidal_margin.
+            if (sections[i].get_type() != ElectricalType::CONDUCTION) {
+                continue;
+            }
             double strokeWidth = sections[i].get_dimensions()[0];
             double circleDiameter = (initialRadius - sections[i].get_coordinates()[0]) * 2;
 
@@ -569,6 +584,11 @@ void Painter::paint_toroidal_coil_layers(Magnetic magnetic) {
 
     for (size_t i = 0; i < layers.size(); ++i){
         {
+            // Toroids never render insulation layers — same rationale as
+            // paint_toroidal_coil_sections (inter-winding gap artifact, not a physical part).
+            if (layers[i].get_type() != ElectricalType::CONDUCTION) {
+                continue;
+            }
             double strokeWidth = layers[i].get_dimensions()[0];
             double circleDiameter = (initialRadius - layers[i].get_coordinates()[0]) * 2;
 
@@ -696,6 +716,30 @@ void Painter::paint_two_piece_set_coil_turns(Magnetic magnetic, bool skipMarginA
                 paint_rectangle(xCoordinate, yCoordinate, conductingWidth, conductingHeight, "copper", shapes, 0, {0, 0}, turns[i].get_name());
             }
         }
+
+        // Second cross-section crossing (multi-column winding): a turn intersects the
+        // drawing plane twice; draw the additional coordinates like the toroidal
+        // painter does for the outer halves.
+        if (turns[i].get_additional_coordinates()) {
+            auto additionalCoordinatesList = turns[i].get_additional_coordinates().value();
+            for (auto& additionalCoordinates : additionalCoordinatesList) {
+                if (additionalCoordinates.size() < 2) {
+                    continue;
+                }
+                if (wirePerWinding[windingIndex].get_type() == WireType::ROUND) {
+                    paint_round_wire(additionalCoordinates[0], additionalCoordinates[1], wirePerWinding[windingIndex], turns[i].get_name());
+                }
+                else if (wirePerWinding[windingIndex].get_type() == WireType::LITZ) {
+                    paint_litz_wire(additionalCoordinates[0], additionalCoordinates[1], wirePerWinding[windingIndex], turns[i].get_name());
+                }
+                else if (wire.get_outer_width() && wire.get_outer_height()) {
+                    paint_rectangle(additionalCoordinates[0], additionalCoordinates[1],
+                                    resolve_dimensional_values(wire.get_outer_width().value()),
+                                    resolve_dimensional_values(wire.get_outer_height().value()),
+                                    "turn_" + std::to_string(i), shapes, 0, {0, 0}, turns[i].get_name());
+                }
+            }
+        }
     }
 }
 
@@ -768,38 +812,11 @@ void Painter::paint_toroidal_coil_turns(Magnetic magnetic, bool skipMarginAndLay
 
     // Only paint insulation layers and margin if not skipped
     if (!skipMarginAndLayers) {
-        auto layers = winding.get_layers_description().value();
-
-        for (size_t i = 0; i < layers.size(); ++i){
-            if (layers[i].get_type() == ElectricalType::INSULATION) {
-
-                double strokeWidth = layers[i].get_dimensions()[0];
-                double circleDiameter = (initialRadius - layers[i].get_coordinates()[0]) * 2;
-                double angleProportion = layers[i].get_dimensions()[1] / 360;
-                std::string termination = angleProportion < 1? "butt" : "round";
-
-                // Wedge-at-origin collapse: when the insulation layer's radial
-                // thickness spans the full winding window, stroking the circle
-                // produces a pie-slice from origin to bobbin wall. This is the
-                // visualization artifact of an inter-winding gap (the spacer is
-                // already drawn by paint_toroidal_margin), not a physical part.
-                // Same pattern fixed in paint_toroidal_coil_sections / _layers
-                // by 385d2ba2; the turns view needs the same guard.
-                if (strokeWidth >= circleDiameter - 1e-12) {
-                    continue;
-                }
-
-                std::string cssClassName = generate_random_string();
-                _root.style("." + cssClassName).set_attr("stroke-width", strokeWidth * _scale).set_attr("fill", "none").set_attr("stroke", std::regex_replace(std::string(settings.get_painter_color_insulation()), std::regex("0x"), "#"));
-                paint_circle(0, 0, circleDiameter / 2, cssClassName, nullptr, layers[i].get_dimensions()[1], -(layers[i].get_coordinates()[1] + layers[i].get_dimensions()[1] / 2), {0, 0});
-
-                if (layers[i].get_additional_coordinates()) {
-                    circleDiameter = (initialRadius - layers[i].get_additional_coordinates().value()[0][0]) * 2;
-                    paint_circle(0, 0, circleDiameter / 2, cssClassName, nullptr, layers[i].get_dimensions()[1], -(layers[i].get_coordinates()[1] + layers[i].get_dimensions()[1] / 2), {0, 0});
-                }
-            }
-        }
-
+        // Toroids never render insulation layers: they are the inter-winding gap artifact, not a
+        // physical part the user added (any real spacer is drawn by paint_toroidal_margin below).
+        // Drawing them as radial arcs produced stray wedge/triangle shapes — worse with a core
+        // coating, which shrinks the winding window so the gap no longer collapses onto the axis
+        // and the old wedge-collapse guard (strokeWidth >= circleDiameter) missed it.
         paint_toroidal_margin(magnetic);
     }
     // _root.autoscale();
@@ -828,10 +845,74 @@ void Painter::paint_two_piece_set_bobbin(Magnetic magnetic) {
     double columnThickness = std::max(bobbinProcessedDescription.get_column_thickness(), minPixelData);
 
     double bobbinOuterWidth = bobbinCoordinates[0] + bobbinProcessedDescription.get_column_width().value() + bobbinProcessedDescription.get_winding_windows()[0].get_width().value();
+
+    // Multi-column winding: windows wrapping different columns are separate regions,
+    // not stacked chambers of one split bobbin — summing their heights would draw a
+    // bobbin several times too tall. Draw the main window's chamber and mirror it
+    // when any window sits on the negative-x side. Same-column multi-window bobbins
+    // (true split bobbins) keep the historical stacked-height sum.
+    auto bobbinWindingWindows = bobbinProcessedDescription.get_winding_windows();
+    bool perColumnWindows = false;
+    if (bobbinWindingWindows.size() > 1) {
+        std::set<int64_t> distinctColumns;
+        for (auto& windingWindow : bobbinWindingWindows) {
+            distinctColumns.insert(windingWindow.get_column().value_or(0));
+        }
+        perColumnWindows = distinctColumns.size() > 1;
+    }
+
+    // Only windows that actually host a winding get a bobbin drawn, and when the
+    // main column and a lateral column are BOTH wound they share the window region:
+    // each bobbin's flanges stop at the window midline (half the winding window
+    // width), matching the winder's region split, so the two bobbins cannot overlap.
+    std::set<size_t> usedWindowIndexes;
+    for (auto& winding : magnetic.get_coil().get_functional_description()) {
+        usedWindowIndexes.insert(winding.get_winding_window() ? static_cast<size_t>(winding.get_winding_window().value()) : 0);
+    }
+    if (magnetic.get_coil().get_sections_description()) {
+        auto placedSections = magnetic.get_coil().get_sections_description().value();
+        for (auto& section : placedSections) {
+            if (section.get_winding_window()) {
+                usedWindowIndexes.insert(static_cast<size_t>(section.get_winding_window().value()));
+            }
+        }
+    }
+    bool mainColumnWound = !perColumnWindows;
+    bool lateralColumnWound = false;
+    if (perColumnWindows) {
+        auto mainColumnEdgeForSharing = bobbinWindingWindows[0].get_column();
+        for (auto windowIndex : usedWindowIndexes) {
+            if (windowIndex >= bobbinWindingWindows.size()) {
+                continue;  // invalid placements throw in the winder, not while drawing
+            }
+            auto columnEdge = bobbinWindingWindows[windowIndex].get_column();
+            if (columnEdge && (!mainColumnEdgeForSharing || columnEdge.value() != mainColumnEdgeForSharing.value())) {
+                lateralColumnWound = true;
+            }
+            else {
+                mainColumnWound = true;
+            }
+        }
+    }
+    // The reflection axis that maps the main bobbin's wall face onto the leg face:
+    // the CORE window's midline. Reflecting the main polygon across it puts the
+    // lateral bobbin's wall on the WINDOW side of the leg (a wall reflected across
+    // the bobbin-window center would land inside the ferrite), and clipping the
+    // main flanges to it splits the shared region into equal winding spaces.
+    double coreWindowMidline = (bobbinCoordinates[0] + bobbinProcessedDescription.get_column_width().value() - columnThickness + bobbinOuterWidth) / 2;
+    if (perColumnWindows && mainColumnWound && lateralColumnWound) {
+        bobbinOuterWidth = coreWindowMidline;
+    }
+
     double bobbinOuterHeight = wallThickness;
-    for (auto& windingWindow: bobbinProcessedDescription.get_winding_windows()) {
-        bobbinOuterHeight += windingWindow.get_height().value();
-        bobbinOuterHeight += wallThickness;
+    if (perColumnWindows) {
+        bobbinOuterHeight += bobbinWindingWindows[0].get_height().value() + wallThickness;
+    }
+    else {
+        for (auto& windingWindow: bobbinWindingWindows) {
+            bobbinOuterHeight += windingWindow.get_height().value();
+            bobbinOuterHeight += wallThickness;
+        }
     }
 
     std::vector<SVG::Point> bobbinPoints = {};
@@ -852,15 +933,72 @@ void Painter::paint_two_piece_set_bobbin(Magnetic magnetic) {
     bobbinPoints.push_back(SVG::Point(bobbinCoordinates[0] + bobbinProcessedDescription.get_column_width().value() - columnThickness,
                                       bobbinCoordinates[1] - bobbinOuterHeight / 2));
 
-    *shapes << SVG::Polygon(scale_points(bobbinPoints, 0, _scale));
+    auto addBobbinPolygon = [&](const std::vector<SVG::Point>& points) {
+        *shapes << SVG::Polygon(scale_points(points, 0, _scale));
+        auto polygon = _root.get_children<SVG::Polygon>().back();
+        polygon->set_attr("class", _fieldPainted ? "bobbin_translucent" : "bobbin");
+    };
+    auto reflectAcross = [](const std::vector<SVG::Point>& points, double axisX) {
+        std::vector<SVG::Point> reflectedPoints;
+        for (auto& point : points) {
+            reflectedPoints.push_back(SVG::Point(2 * axisX - point.first, point.second));
+        }
+        return reflectedPoints;
+    };
+    auto mirrorSideOf = [](const std::vector<SVG::Point>& points) {
+        std::vector<SVG::Point> mirroredPoints;
+        for (auto& point : points) {
+            mirroredPoints.push_back(SVG::Point(-point.first, point.second));
+        }
+        return mirroredPoints;
+    };
 
-    auto sectionSvg = _root.get_children<SVG::Polygon>().back();
-    // sectionSvg->set_attr("class", "bobbin");
-    if (_fieldPainted) {
-        sectionSvg->set_attr("class", "bobbin_translucent");
+    // The historical polygon is only the +x HALF of the main bobbin (the column wall
+    // plus the flanges on one side of the leg). Whenever the drawing shows the whole
+    // leg — per-column multi-window plots and the asymmetric C/U/UR families — draw
+    // the other half too (its reflection across the leg axis at x=0).
+    auto coreShapeFamily = magnetic.get_mutable_core().get_shape_family();
+    bool fullMainLegDrawn = perColumnWindows || coreShapeFamily == MAS::CoreShapeFamily::C ||
+                            coreShapeFamily == MAS::CoreShapeFamily::U || coreShapeFamily == MAS::CoreShapeFamily::UR;
+    if (mainColumnWound) {
+        addBobbinPolygon(bobbinPoints);
+        if (fullMainLegDrawn) {
+            addBobbinPolygon(mirrorSideOf(bobbinPoints));
+        }
     }
-    else {
-        sectionSvg->set_attr("class", "bobbin");
+
+    if (perColumnWindows) {
+        // One bobbin per lateral-wound window, wrapping ITS column, drawn as BOTH
+        // halves: the window-side half (main polygon reflected across the window
+        // center so its column wall lands on the leg's inner face) and the
+        // outside-core half (that polygon reflected again across the leg's axis).
+        // Side-mirrored for negative-x windows.
+        auto mainColumnEdge = bobbinWindingWindows[0].get_column();
+        auto coreColumns = magnetic.get_mutable_core().get_columns();
+        for (size_t windowIndex = 1; windowIndex < bobbinWindingWindows.size(); ++windowIndex) {
+            auto& windingWindow = bobbinWindingWindows[windowIndex];
+            auto columnEdge = windingWindow.get_column();
+            bool lateralWound = columnEdge && (!mainColumnEdge || columnEdge.value() != mainColumnEdge.value());
+            if (!lateralWound || !windingWindow.get_coordinates() || !usedWindowIndexes.contains(windowIndex)) {
+                continue;
+            }
+            if (columnEdge.value() < 0 || static_cast<size_t>(columnEdge.value()) >= coreColumns.size()) {
+                throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                    "Winding window " + std::to_string(windowIndex) + " references core column " +
+                        std::to_string(columnEdge.value()) + " but the core has " + std::to_string(coreColumns.size()) + " columns");
+            }
+            double legAxisX = std::abs(coreColumns[static_cast<size_t>(columnEdge.value())].get_coordinates()[0]);
+            bool mirrorSide = windingWindow.get_coordinates().value()[0] < 0;
+
+            auto innerHalf = reflectAcross(bobbinPoints, coreWindowMidline);
+            auto outerHalf = reflectAcross(innerHalf, legAxisX);
+            if (mirrorSide) {
+                innerHalf = mirrorSideOf(innerHalf);
+                outerHalf = mirrorSideOf(outerHalf);
+            }
+            addBobbinPolygon(innerHalf);
+            addBobbinPolygon(outerHalf);
+        }
     }
 }
 
@@ -934,22 +1072,30 @@ void Painter::paint_two_piece_set_core(Core core) {
         }
     }
 
-    topPiecePoints.push_back(SVG::Point(0, topCoreOffset + processedDescription.get_height() / 2));
+    // C/U/UR draw the whole (asymmetric) core, so the main leg must be shown in
+    // full: its left face sits at -width/2 of the main column, not at the leg's
+    // axis. Symmetric families keep x=0 (the left half is drawn as a mirror).
+    double mainLegLeftEdge = 0;
+    if (family == MAS::CoreShapeFamily::C || family == MAS::CoreShapeFamily::U || family == MAS::CoreShapeFamily::UR) {
+        mainLegLeftEdge = -showingMainColumnWidth;
+    }
+
+    topPiecePoints.push_back(SVG::Point(mainLegLeftEdge, topCoreOffset + processedDescription.get_height() / 2));
     topPiecePoints.push_back(SVG::Point(showingCoreWidth, topCoreOffset + processedDescription.get_height() / 2));
     topPiecePoints.push_back(SVG::Point(showingCoreWidth, topCoreOffset + lowestHeightTopCoreRightColumn));
     topPiecePoints.push_back(SVG::Point(showingCoreWidth - rightColumnWidth, topCoreOffset + lowestHeightTopCoreRightColumn));
     topPiecePoints.push_back(SVG::Point(showingCoreWidth - rightColumnWidth, topCoreOffset + rightColumn.get_height() / 2));
     topPiecePoints.push_back(SVG::Point(showingMainColumnWidth, topCoreOffset + mainColumn.get_height() / 2));
     topPiecePoints.push_back(SVG::Point(showingMainColumnWidth, topCoreOffset + lowestHeightTopCoreMainColumn));
-    topPiecePoints.push_back(SVG::Point(0, topCoreOffset + lowestHeightTopCoreMainColumn));
+    topPiecePoints.push_back(SVG::Point(mainLegLeftEdge, topCoreOffset + lowestHeightTopCoreMainColumn));
 
     for (size_t i = 1; i < gapsInMainColumn.size(); ++i)
     {
         std::vector<SVG::Point> chunk;
-        chunk.push_back(SVG::Point(0, gapsInMainColumn[i - 1].get_coordinates().value()[1] - gapsInMainColumn[i - 1].get_length() / 2));
+        chunk.push_back(SVG::Point(mainLegLeftEdge, gapsInMainColumn[i - 1].get_coordinates().value()[1] - gapsInMainColumn[i - 1].get_length() / 2));
         chunk.push_back(SVG::Point(showingMainColumnWidth, gapsInMainColumn[i - 1].get_coordinates().value()[1] - gapsInMainColumn[i - 1].get_length() / 2));
         chunk.push_back(SVG::Point(showingMainColumnWidth, gapsInMainColumn[i].get_coordinates().value()[1] + gapsInMainColumn[i].get_length() / 2));
-        chunk.push_back(SVG::Point(0, gapsInMainColumn[i].get_coordinates().value()[1] + gapsInMainColumn[i].get_length() / 2));
+        chunk.push_back(SVG::Point(mainLegLeftEdge, gapsInMainColumn[i].get_coordinates().value()[1] + gapsInMainColumn[i].get_length() / 2));
         gapChunks.push_back(chunk);
     }
     for (size_t i = 1; i < gapsInRightColumn.size(); ++i)
@@ -962,26 +1108,47 @@ void Painter::paint_two_piece_set_core(Core core) {
         gapChunks.push_back(chunk);
     }
 
-    bottomPiecePoints.push_back(SVG::Point(0, bottomCoreOffset - processedDescription.get_height() / 2));
+    bottomPiecePoints.push_back(SVG::Point(mainLegLeftEdge, bottomCoreOffset - processedDescription.get_height() / 2));
     bottomPiecePoints.push_back(SVG::Point(showingCoreWidth, bottomCoreOffset - processedDescription.get_height() / 2));
     bottomPiecePoints.push_back(SVG::Point(showingCoreWidth, bottomCoreOffset + highestHeightBottomCoreRightColumn));
     bottomPiecePoints.push_back(SVG::Point(showingCoreWidth - rightColumnWidth, bottomCoreOffset + highestHeightBottomCoreRightColumn));
     bottomPiecePoints.push_back(SVG::Point(showingCoreWidth - rightColumnWidth, bottomCoreOffset - rightColumn.get_height() / 2));
     bottomPiecePoints.push_back(SVG::Point(showingMainColumnWidth, bottomCoreOffset - mainColumn.get_height() / 2));
     bottomPiecePoints.push_back(SVG::Point(showingMainColumnWidth, bottomCoreOffset + highestHeightBottomCoreMainColumn));
-    bottomPiecePoints.push_back(SVG::Point(0, bottomCoreOffset + highestHeightBottomCoreMainColumn));
+    bottomPiecePoints.push_back(SVG::Point(mainLegLeftEdge, bottomCoreOffset + highestHeightBottomCoreMainColumn));
+
+    // Multi-column winding: with per-column winding windows the coil can occupy the
+    // left window, so draw the full mirror-symmetric silhouette instead of the
+    // historical right half. C/U/UR shapes keep their asymmetric full drawing;
+    // single-window cores keep the historical half view untouched.
+    bool mirrorLeftHalf = processedDescription.get_winding_windows().size() > 1 &&
+                          family != MAS::CoreShapeFamily::C && family != MAS::CoreShapeFamily::U &&
+                          family != MAS::CoreShapeFamily::UR;
+    auto mirrorPoints = [](const std::vector<SVG::Point>& points) {
+        std::vector<SVG::Point> mirroredPoints;
+        for (auto& point : points) {
+            mirroredPoints.push_back(SVG::Point(-point.first, point.second));
+        }
+        return mirroredPoints;
+    };
 
     auto shapes = _root.add_child<SVG::Group>();
-    *shapes << SVG::Polygon(scale_points(topPiecePoints, 0, _scale));
-    auto topPiece = _root.get_children<SVG::Polygon>().back();
-    topPiece->set_attr("class", "ferrite");
-    *shapes << SVG::Polygon(scale_points(bottomPiecePoints, 0, _scale));
-    auto bottomPiece = _root.get_children<SVG::Polygon>().back();
-    bottomPiece->set_attr("class", "ferrite");
+    auto addFerritePolygon = [&](const std::vector<SVG::Point>& points) {
+        *shapes << SVG::Polygon(scale_points(points, 0, _scale));
+        auto polygon = _root.get_children<SVG::Polygon>().back();
+        polygon->set_attr("class", "ferrite");
+    };
+    addFerritePolygon(topPiecePoints);
+    addFerritePolygon(bottomPiecePoints);
     for (auto& chunk : gapChunks) {
-        *shapes << SVG::Polygon(scale_points(chunk, 0, _scale));
-        auto chunkPiece = _root.get_children<SVG::Polygon>().back();
-        chunkPiece->set_attr("class", "ferrite");
+        addFerritePolygon(chunk);
+    }
+    if (mirrorLeftHalf) {
+        addFerritePolygon(mirrorPoints(topPiecePoints));
+        addFerritePolygon(mirrorPoints(bottomPiecePoints));
+        for (auto& chunk : gapChunks) {
+            addFerritePolygon(mirrorPoints(chunk));
+        }
     }
 
     _root.autoscale();
@@ -993,6 +1160,18 @@ void Painter::paint_toroidal_core(Core core) {
 
     double strokeWidth = mainColumn.get_width();
     double circleDiameter = processedDescription.get_width() - strokeWidth;
+
+    // Draw the core coating (if any) as a ring UNDER the ferrite, sharing the same centre radius.
+    // The coating lines both the bore and the OD, so it widens the drawn cross-section by the
+    // coating thickness on EACH side (stroke += 2*coating). Without it the winding — which is
+    // wound over the coated bore/OD — appears to float over bare ferrite. Only an explicit
+    // catalogue coating is drawn; a no-op otherwise.
+    double coatingThickness = core.get_functional_description().get_coating() ? core.get_coating_thickness() : 0.0;
+    if (coatingThickness > 0) {
+        std::string coatingCssClassName = generate_random_string();
+        _root.style("." + coatingCssClassName).set_attr("stroke-width", (strokeWidth + 2 * coatingThickness) * _scale).set_attr("fill", "none").set_attr("stroke", std::regex_replace(std::string(settings.get_painter_color_insulation()), std::regex("0x"), "#"));
+        paint_circle(0, 0, circleDiameter / 2, coatingCssClassName, nullptr);
+    }
 
     std::string cssClassName = generate_random_string();
     _root.style("." + cssClassName).set_attr("stroke-width", strokeWidth * _scale).set_attr("fill", "none").set_attr("stroke", std::regex_replace(std::string(settings.get_painter_color_ferrite()), std::regex("0x"), "#"));

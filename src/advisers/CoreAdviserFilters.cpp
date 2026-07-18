@@ -10,6 +10,15 @@
 // resulting per-magnetic scores back through normalize_scoring +
 // sort_magnetics_by_scoring (shared via advisers/CoreAdviserInternal.h).
 //
+// July 2026 (abt #103): the per-filter evaluate -> catch/cull -> rebuild ->
+// size-check loop used to be copy-pasted verbatim 11 times. It now lives in
+// one shared `evaluate_and_cull` helper (with the abt #53 per-candidate
+// exception cull, now LOGGED per cull instead of silent). Each filter is a
+// thin wrapper that supplies its evaluate lambda + write-back / scoring-bucket
+// policy. The three real variations are preserved: write-back of the mutated
+// magnetic, the TURN_COUNT custom inverted-linear scoring, and the
+// Losses/Impedance/Inductance coil-compact settings restore.
+//
 // Sibling TU of CoreAdviser.cpp; declarations live in advisers/CoreAdviser.h.
 
 #include "advisers/CoreAdviser.h"
@@ -17,8 +26,11 @@
 #include "advisers/MagneticFilter.h"
 #include "physical_models/CoreTemperature.h"
 #include "support/Logger.h"
+#include "support/Settings.h"
 #include <algorithm>
 #include <cmath>
+#include <functional>
+#include <list>
 #include <map>
 #include <string>
 #include <utility>
@@ -26,28 +38,45 @@
 
 namespace OpenMagnetics {
 
-CoreAdviser::MagneticCoreFilterAreaProduct::MagneticCoreFilterAreaProduct(Inputs inputs) {
-    _filter = MagneticFilterAreaProduct(inputs);
-}
+namespace {
 
-std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterAreaProduct::filter_magnetics(std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics, Inputs inputs, double weight, bool firstFilter) {
-    if (weight <= 0) {
-        return *unfilteredMagnetics;
-    }
-    std::vector<std::pair<Magnetic, double>> filteredMagneticsWithScoring;
+using EvalFn = std::function<std::pair<bool, double>(Magnetic*, Inputs*)>;
+
+// Shared evaluate -> cull loop (abt #103). Runs `evaluate` on each candidate; a candidate
+// whose evaluation throws an OpenMagneticsException is culled (abt #53: per-candidate
+// infeasibility — e.g. a degenerate gap committed for an unreachable high-Lm transformer —
+// is not fatal), but the cull is now LOGGED (it used to be silent, hiding a whole pool being
+// emptied by a systematic input error). Returns {survivors, their scores}; on `writeBack` the
+// possibly-mutated magnetic is written back into `unfilteredMagnetics`.
+std::pair<std::vector<std::pair<Magnetic, double>>, std::vector<double>>
+evaluate_and_cull(std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics,
+                  Inputs& inputs, const EvalFn& evaluate, bool writeBack,
+                  const std::string& filterName) {
+    std::vector<std::pair<Magnetic, double>> filtered;
     std::vector<double> newScoring;
-
-    std::map<std::string, double> scaledMagneticFluxDensitiesPerMaterial;
-
     std::list<size_t> listOfIndexesToErase;
 
-    for (size_t magneticIndex = 0; magneticIndex < (*unfilteredMagnetics).size(); ++magneticIndex){
+    for (size_t magneticIndex = 0; magneticIndex < (*unfilteredMagnetics).size(); ++magneticIndex) {
         Magnetic magnetic = (*unfilteredMagnetics)[magneticIndex].first;
 
-        auto [valid, scoring] = _filter.evaluate_magnetic(&magnetic, &inputs);
+        bool valid = false;
+        double scoring = 0.0;
+        try {
+            auto evalResult = evaluate(&magnetic, &inputs);
+            valid = evalResult.first;
+            scoring = evalResult.second;
+        }
+        catch (const OpenMagneticsException& e) {
+            logEntry(std::string("CoreAdviser ") + filterName + ": culling infeasible candidate — " + e.what(),
+                     "CoreAdviser", 2);
+            valid = false;
+        }
 
         if (valid) {
             newScoring.push_back(scoring);
+            if (writeBack) {
+                (*unfilteredMagnetics)[magneticIndex].first = magnetic;
+            }
         }
         else {
             listOfIndexesToErase.push_back(magneticIndex);
@@ -59,22 +88,50 @@ std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterAreaProd
             listOfIndexesToErase.pop_front();
         }
         else {
-            filteredMagneticsWithScoring.push_back((*unfilteredMagnetics)[i]);
+            filtered.push_back((*unfilteredMagnetics)[i]);
         }
     }
-    // (*unfilteredMagnetics).clear();
 
-    if (filteredMagneticsWithScoring.size() != newScoring.size()) {
-        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Something wrong happened while filtering, size of unfilteredMagnetics: " + std::to_string(filteredMagneticsWithScoring.size()) + ", size of newScoring: " + std::to_string(newScoring.size()));
+    if (filtered.size() != newScoring.size()) {
+        throw CalculationException(ErrorCode::CALCULATION_ERROR,
+            "Something wrong happened while filtering (" + filterName + "), size of filtered: " +
+            std::to_string(filtered.size()) + ", size of newScoring: " + std::to_string(newScoring.size()));
     }
+    return {filtered, newScoring};
+}
 
+} // anonymous namespace
 
-    if (filteredMagneticsWithScoring.size() > 0) {
-        auto normalizedScoring = normalize_scoring(&filteredMagneticsWithScoring, newScoring, weight, (*_filterConfiguration)[CoreAdviser::CoreAdviserFilters::EFFICIENCY]);
-        for (size_t i = 0; i < filteredMagneticsWithScoring.size(); ++i) {
-            add_scoring(filteredMagneticsWithScoring[i].first.get_reference(), CoreAdviser::CoreAdviserFilters::EFFICIENCY, normalizedScoring[i]);
-        }
-        sort_magnetics_by_scoring(&filteredMagneticsWithScoring);
+// Applies the standard min-max normalized scoring for the given bucket, then sorts.
+// (Member of the base filter so it can reach add_scoring / _filterConfiguration.)
+void CoreAdviser::MagneticCoreFilter::apply_normalized_scoring(
+        std::vector<std::pair<Magnetic, double>>* filteredMagneticsWithScoring,
+        std::vector<double>& newScoring, double weight, CoreAdviser::CoreAdviserFilters bucket) {
+    if (filteredMagneticsWithScoring->size() == 0) {
+        return;
+    }
+    auto normalizedScoring = normalize_scoring(filteredMagneticsWithScoring, newScoring, weight,
+                                               (*_filterConfiguration)[bucket]);
+    for (size_t i = 0; i < filteredMagneticsWithScoring->size(); ++i) {
+        add_scoring((*filteredMagneticsWithScoring)[i].first.get_reference(), bucket, normalizedScoring[i]);
+    }
+    sort_magnetics_by_scoring(filteredMagneticsWithScoring);
+}
+
+CoreAdviser::MagneticCoreFilterAreaProduct::MagneticCoreFilterAreaProduct(Inputs inputs) {
+    _filter = MagneticFilterAreaProduct(inputs);
+}
+
+std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterAreaProduct::filter_magnetics(std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics, Inputs inputs, double weight, bool firstFilter) {
+    // ABT #121.1: the hard VALIDITY gate runs regardless of weight; only the
+    // SCORE contribution is preference-weighted. A zero user weight must drop
+    // this filter's ranking influence, NOT disable its feasibility cull.
+    auto [filteredMagneticsWithScoring, newScoring] = evaluate_and_cull(
+        unfilteredMagnetics, inputs,
+        [this](Magnetic* m, Inputs* i) { return _filter.evaluate_magnetic(m, i); },
+        /*writeBack=*/false, "AreaProduct");
+    if (weight > 0) {
+        apply_normalized_scoring(&filteredMagneticsWithScoring, newScoring, weight, CoreAdviser::CoreAdviserFilters::EFFICIENCY);
     }
     return filteredMagneticsWithScoring;
 }
@@ -84,48 +141,13 @@ CoreAdviser::MagneticCoreFilterEnergyStored::MagneticCoreFilterEnergyStored(Inpu
 }
 
 std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterEnergyStored::filter_magnetics(std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics, Inputs inputs, double weight, bool firstFilter) {
-    if (weight <= 0) {
-        return *unfilteredMagnetics;
-    }
-    std::vector<std::pair<Magnetic, double>> filteredMagneticsWithScoring;
-    std::vector<double> newScoring;
-
-    std::list<size_t> listOfIndexesToErase;
-    for (size_t magneticIndex = 0; magneticIndex < (*unfilteredMagnetics).size(); ++magneticIndex){  
-        Magnetic magnetic = (*unfilteredMagnetics)[magneticIndex].first;
-
-        auto [valid, scoring] = _filter.evaluate_magnetic(&magnetic, &inputs);
-
-        if (valid) {
-            newScoring.push_back(scoring);
-            (*unfilteredMagnetics)[magneticIndex].first = magnetic;
-        }
-        else {
-            listOfIndexesToErase.push_back(magneticIndex);
-        }
-    }
-
-
-    for (size_t i = 0; i < (*unfilteredMagnetics).size(); ++i) {
-        if (listOfIndexesToErase.size() > 0 && i == listOfIndexesToErase.front()) {
-            listOfIndexesToErase.pop_front();
-        }
-        else {
-            filteredMagneticsWithScoring.push_back((*unfilteredMagnetics)[i]);
-        }
-    }
-    // (*unfilteredMagnetics).clear();
-
-    if (filteredMagneticsWithScoring.size() != newScoring.size()) {
-        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Something wrong happened while filtering, size of unfilteredMagnetics: " + std::to_string(filteredMagneticsWithScoring.size()) + ", size of newScoring: " + std::to_string(newScoring.size()));
-    }
-
-    if (filteredMagneticsWithScoring.size() > 0) {
-        auto normalizedScoring = normalize_scoring(&filteredMagneticsWithScoring, newScoring, weight, (*_filterConfiguration)[CoreAdviser::CoreAdviserFilters::EFFICIENCY]);
-        for (size_t i = 0; i < filteredMagneticsWithScoring.size(); ++i) {
-            add_scoring(filteredMagneticsWithScoring[i].first.get_reference(), CoreAdviser::CoreAdviserFilters::EFFICIENCY, normalizedScoring[i]);
-        }
-        sort_magnetics_by_scoring(&filteredMagneticsWithScoring);
+    // ABT #121.1: validity gate always; score only when weighted (see AreaProduct).
+    auto [filteredMagneticsWithScoring, newScoring] = evaluate_and_cull(
+        unfilteredMagnetics, inputs,
+        [this](Magnetic* m, Inputs* i) { return _filter.evaluate_magnetic(m, i); },
+        /*writeBack=*/true, "EnergyStored");
+    if (weight > 0) {
+        apply_normalized_scoring(&filteredMagneticsWithScoring, newScoring, weight, CoreAdviser::CoreAdviserFilters::EFFICIENCY);
     }
     return filteredMagneticsWithScoring;
 }
@@ -135,48 +157,16 @@ CoreAdviser::MagneticCoreFilterFringingFactor::MagneticCoreFilterFringingFactor(
 }
 
 std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterFringingFactor::filter_magnetics(std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics, Inputs inputs, double weight, bool firstFilter) {
-    if (weight <= 0) {
-        return *unfilteredMagnetics;
-    }
-    std::vector<std::pair<Magnetic, double>> filteredMagneticsWithScoring;
-    std::vector<double> newScoring;
-
-    std::list<size_t> listOfIndexesToErase;
-    for (size_t magneticIndex = 0; magneticIndex < (*unfilteredMagnetics).size(); ++magneticIndex){  
-        Magnetic magnetic = (*unfilteredMagnetics)[magneticIndex].first;
-
-        auto [valid, scoring] = _filter.evaluate_magnetic(&magnetic, &inputs);
-
-        if (valid) {
-            newScoring.push_back(scoring);
-            (*unfilteredMagnetics)[magneticIndex].first = magnetic;
-        }
-        else {
-            listOfIndexesToErase.push_back(magneticIndex);
-        }
-    }
-
-
-    for (size_t i = 0; i < (*unfilteredMagnetics).size(); ++i) {
-        if (listOfIndexesToErase.size() > 0 && i == listOfIndexesToErase.front()) {
-            listOfIndexesToErase.pop_front();
-        }
-        else {
-            filteredMagneticsWithScoring.push_back((*unfilteredMagnetics)[i]);
-        }
-    }
-    // (*unfilteredMagnetics).clear();
-
-    if (filteredMagneticsWithScoring.size() != newScoring.size()) {
-        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Something wrong happened while filtering, size of unfilteredMagnetics: " + std::to_string(filteredMagneticsWithScoring.size()) + ", size of newScoring: " + std::to_string(newScoring.size()));
-    }
-
-    if (filteredMagneticsWithScoring.size() > 0) {
-        auto normalizedScoring = normalize_scoring(&filteredMagneticsWithScoring, newScoring, weight, (*_filterConfiguration)[CoreAdviser::CoreAdviserFilters::EFFICIENCY]);
-        for (size_t i = 0; i < filteredMagneticsWithScoring.size(); ++i) {
-            add_scoring(filteredMagneticsWithScoring[i].first.get_reference(), CoreAdviser::CoreAdviserFilters::EFFICIENCY, normalizedScoring[i]);
-        }
-        sort_magnetics_by_scoring(&filteredMagneticsWithScoring);
+    // ABT #121.1: the fringing-factor cull is a winding-killer feasibility gate
+    // (a gap so large the coil cannot be wound / proximity losses explode) —
+    // it must run even when the EFFICIENCY weight scaling it is zero. Score only
+    // when weighted.
+    auto [filteredMagneticsWithScoring, newScoring] = evaluate_and_cull(
+        unfilteredMagnetics, inputs,
+        [this](Magnetic* m, Inputs* i) { return _filter.evaluate_magnetic(m, i); },
+        /*writeBack=*/true, "FringingFactor");
+    if (weight > 0) {
+        apply_normalized_scoring(&filteredMagneticsWithScoring, newScoring, weight, CoreAdviser::CoreAdviserFilters::EFFICIENCY);
     }
     return filteredMagneticsWithScoring;
 }
@@ -186,47 +176,15 @@ CoreAdviser::MagneticCoreFilterCost::MagneticCoreFilterCost(Inputs inputs) {
 }
 
 std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterCost::filter_magnetics(std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics, Inputs inputs, double weight, bool firstFilter) {
-    if (weight <= 0) {
-        return *unfilteredMagnetics;
-    }
-    std::vector<std::pair<Magnetic, double>> filteredMagneticsWithScoring;
-    std::vector<double> newScoring;
-
-    std::list<size_t> listOfIndexesToErase;
-    for (size_t magneticIndex = 0; magneticIndex < (*unfilteredMagnetics).size(); ++magneticIndex){
-        Magnetic magnetic = (*unfilteredMagnetics)[magneticIndex].first;
-
-        auto [valid, scoring] = _filter.evaluate_magnetic(&magnetic, &inputs);
-
-        if (valid) {
-            newScoring.push_back(scoring);
-        }
-        else {
-            listOfIndexesToErase.push_back(magneticIndex);
-        }
-    }
-
-
-    for (size_t i = 0; i < (*unfilteredMagnetics).size(); ++i) {
-        if (listOfIndexesToErase.size() > 0 && i == listOfIndexesToErase.front()) {
-            listOfIndexesToErase.pop_front();
-        }
-        else {
-            filteredMagneticsWithScoring.push_back((*unfilteredMagnetics)[i]);
-        }
-    }
-    // (*unfilteredMagnetics).clear();
-
-    if (filteredMagneticsWithScoring.size() != newScoring.size()) {
-        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Something wrong happened while filtering, size of unfilteredMagnetics: " + std::to_string(filteredMagneticsWithScoring.size()) + ", size of newScoring: " + std::to_string(newScoring.size()));
-    }
-
-    if (filteredMagneticsWithScoring.size() > 0) {
-        auto normalizedScoring = normalize_scoring(&filteredMagneticsWithScoring, newScoring, weight, (*_filterConfiguration)[CoreAdviser::CoreAdviserFilters::COST]);
-        for (size_t i = 0; i < filteredMagneticsWithScoring.size(); ++i) {
-            add_scoring(filteredMagneticsWithScoring[i].first.get_reference(), CoreAdviser::CoreAdviserFilters::COST, normalizedScoring[i]);
-        }
-        sort_magnetics_by_scoring(&filteredMagneticsWithScoring);
+    // ABT #121.1: the Cost filter also carries the winding-window-fit feasibility
+    // gate (rejects candidates whose turns cannot physically fit the window).
+    // Run it regardless of the COST weight; score only when weighted.
+    auto [filteredMagneticsWithScoring, newScoring] = evaluate_and_cull(
+        unfilteredMagnetics, inputs,
+        [this](Magnetic* m, Inputs* i) { return _filter.evaluate_magnetic(m, i); },
+        /*writeBack=*/false, "Cost");
+    if (weight > 0) {
+        apply_normalized_scoring(&filteredMagneticsWithScoring, newScoring, weight, CoreAdviser::CoreAdviserFilters::COST);
     }
     return filteredMagneticsWithScoring;
 }
@@ -236,10 +194,24 @@ CoreAdviser::MagneticCoreFilterLosses::MagneticCoreFilterLosses(Inputs inputs, s
 }
 
 std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterLosses::filter_magnetics(std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics, Inputs inputs, double weight, bool firstFilter) {
-    auto coilDelimitAndCompactOld = settings.get_coil_delimit_and_compact();
     if (weight <= 0) {
+        // ABT #121.1: unlike the cheap gate filters above, the loss filter's
+        // "gate" is a per-candidate N-sweep simulation (seconds over the pool),
+        // and its only hard reject — the coil could not be wound — is already
+        // enforced upstream by the Cost filter's winding-window-fit gate, which
+        // now runs at any weight. Losses is therefore an efficiency-optimisation
+        // filter with no independent feasibility gate, so at zero EFFICIENCY
+        // weight we skip it (and its expensive simulation) rather than run it
+        // purely to reproduce a cull the pipeline already performed.
+        logEntry("Losses filter skipped at zero weight (optimisation-only; coil-fit "
+                 "feasibility is gated by the Cost filter).", "CoreAdviser", 2);
         return *unfilteredMagnetics;
     }
+    // Restore coil_delimit_and_compact even if the loss evaluation (which flips it) throws.
+    auto& settings = Settings::GetInstance();
+    SettingsGuard<bool> coilCompactGuard(settings, &Settings::get_coil_delimit_and_compact,
+                                         &Settings::set_coil_delimit_and_compact,
+                                         settings.get_coil_delimit_and_compact());
     // CAPABILITY GAP (tracked in FALLBACKS_REVIEW.md): the per-candidate loss
     // evaluators only support single-winding candidates, and the dataset stage
     // builds 1-winding dummy coils for everything except CMCs
@@ -259,83 +231,29 @@ std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterLosses::
                  "CoreAdviser");
         return *unfilteredMagnetics;
     }
-    std::vector<std::pair<Magnetic, double>> filteredMagneticsWithScoring;
-    std::vector<double> newScoring;
-
-    std::list<size_t> listOfIndexesToErase;
-    for (size_t magneticIndex = 0; magneticIndex < (*unfilteredMagnetics).size(); ++magneticIndex){
-        Magnetic magnetic = (*unfilteredMagnetics)[magneticIndex].first;
-
-        auto [valid, scoring] = _filter.evaluate_magnetic(&magnetic, &inputs);
-        if (valid) {
-            (*unfilteredMagnetics)[magneticIndex].first = magnetic;
-            newScoring.push_back(scoring);
-        }
-        else {
-            listOfIndexesToErase.push_back(magneticIndex);
-        }
-    }
 
     // NOTE: previously, when the loss model rejected EVERY candidate, this filter
     // silently returned the whole set unscored. That routed cores with
     // uncomputable losses into the ranking; now it returns empty like every
     // other filter (the pipeline's retry handles genuine zero-result cases).
-
-    for (size_t i = 0; i < (*unfilteredMagnetics).size(); ++i) {
-
-        if (listOfIndexesToErase.size() > 0 && i == listOfIndexesToErase.front()) {
-            listOfIndexesToErase.pop_front();
-        }
-        else {
-            filteredMagneticsWithScoring.push_back((*unfilteredMagnetics)[i]);
-        }
-    }
-    // (*unfilteredMagnetics).clear();
-
-    if (filteredMagneticsWithScoring.size() != newScoring.size()) {
-        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Something wrong happened while filtering, size of unfilteredMagnetics: " + std::to_string(filteredMagneticsWithScoring.size()) + ", size of newScoring: " + std::to_string(newScoring.size()));
-    }
-
-    if (filteredMagneticsWithScoring.size() > 0) {
-        auto normalizedScoring = normalize_scoring(&filteredMagneticsWithScoring, newScoring, weight, (*_filterConfiguration)[CoreAdviser::CoreAdviserFilters::EFFICIENCY]);
-        for (size_t i = 0; i < filteredMagneticsWithScoring.size(); ++i) {
-            add_scoring(filteredMagneticsWithScoring[i].first.get_reference(), CoreAdviser::CoreAdviserFilters::EFFICIENCY, normalizedScoring[i]);
-        }
-        sort_magnetics_by_scoring(&filteredMagneticsWithScoring);
-    }
-
-    settings.set_coil_delimit_and_compact(coilDelimitAndCompactOld);
+    auto [filteredMagneticsWithScoring, newScoring] = evaluate_and_cull(
+        unfilteredMagnetics, inputs,
+        [this](Magnetic* m, Inputs* i) { return _filter.evaluate_magnetic(m, i); },
+        /*writeBack=*/true, "Losses");
+    apply_normalized_scoring(&filteredMagneticsWithScoring, newScoring, weight, CoreAdviser::CoreAdviserFilters::EFFICIENCY);
     return filteredMagneticsWithScoring;
 }
 
 std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterDimensions::filter_magnetics(std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics, Inputs inputs, double weight, bool firstFilter) {
-    if (weight <= 0) {
-        return *unfilteredMagnetics;
-    }
-    std::vector<std::pair<Magnetic, double>> filteredMagneticsWithScoring;
-    std::vector<double> newScoring;
-
-    for (size_t magneticIndex = 0; magneticIndex < (*unfilteredMagnetics).size(); ++magneticIndex){
-        Magnetic magnetic = (*unfilteredMagnetics)[magneticIndex].first;
-
-        auto [valid, scoring] = _filter.evaluate_magnetic(&magnetic, &inputs);
-
-        if (valid) {
-            filteredMagneticsWithScoring.push_back((*unfilteredMagnetics)[magneticIndex]);
-            newScoring.push_back(scoring);
-        }
-    }
-
-    if (filteredMagneticsWithScoring.size() != newScoring.size()) {
-        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Something wrong happened while filtering, size of filteredMagnetics: " + std::to_string(filteredMagneticsWithScoring.size()) + ", size of newScoring: " + std::to_string(newScoring.size()));
-    }
-
-    if (filteredMagneticsWithScoring.size() > 0) {
-        auto normalizedScoring = normalize_scoring(&filteredMagneticsWithScoring, newScoring, weight, (*_filterConfiguration)[CoreAdviser::CoreAdviserFilters::DIMENSIONS]);
-        for (size_t i = 0; i < filteredMagneticsWithScoring.size(); ++i) {
-            add_scoring(filteredMagneticsWithScoring[i].first.get_reference(), CoreAdviser::CoreAdviserFilters::DIMENSIONS, normalizedScoring[i]);
-        }
-        sort_magnetics_by_scoring(&filteredMagneticsWithScoring);
+    // ABT #121.1: the Dimensions filter carries the planar-core-for-wound-wire
+    // hard reject. Run that feasibility gate regardless of the DIMENSIONS weight;
+    // score only when weighted.
+    auto [filteredMagneticsWithScoring, newScoring] = evaluate_and_cull(
+        unfilteredMagnetics, inputs,
+        [this](Magnetic* m, Inputs* i) { return _filter.evaluate_magnetic(m, i); },
+        /*writeBack=*/false, "Dimensions");
+    if (weight > 0) {
+        apply_normalized_scoring(&filteredMagneticsWithScoring, newScoring, weight, CoreAdviser::CoreAdviserFilters::DIMENSIONS);
     }
     return filteredMagneticsWithScoring;
 }
@@ -349,23 +267,10 @@ std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterTurnCoun
     if (weight <= 0) {
         return *unfilteredMagnetics;
     }
-    std::vector<std::pair<Magnetic, double>> filteredMagneticsWithScoring;
-    std::vector<double> newScoring;
-
-    for (size_t magneticIndex = 0; magneticIndex < (*unfilteredMagnetics).size(); ++magneticIndex){
-        Magnetic magnetic = (*unfilteredMagnetics)[magneticIndex].first;
-
-        auto [valid, scoring] = _filter.evaluate_magnetic(&magnetic, &inputs);
-
-        if (valid) {
-            filteredMagneticsWithScoring.push_back((*unfilteredMagnetics)[magneticIndex]);
-            newScoring.push_back(scoring);
-        }
-    }
-
-    if (filteredMagneticsWithScoring.size() != newScoring.size()) {
-        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Something wrong happened while filtering, size of filteredMagnetics: " + std::to_string(filteredMagneticsWithScoring.size()) + ", size of newScoring: " + std::to_string(newScoring.size()));
-    }
+    auto [filteredMagneticsWithScoring, newScoring] = evaluate_and_cull(
+        unfilteredMagnetics, inputs,
+        [this](Magnetic* m, Inputs* i) { return _filter.evaluate_magnetic(m, i); },
+        /*writeBack=*/false, "TurnCount");
 
     if (filteredMagneticsWithScoring.size() > 0) {
         // Compute inverted linear score directly to avoid the all-equal fallback (+1 ignoring
@@ -373,7 +278,6 @@ std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterTurnCoun
         // Raw score = totalTurns (higher is worse); we invert explicitly: contribution = weight*(1 - (N-min)/(max-min)).
         double minTurns = *std::min_element(newScoring.begin(), newScoring.end());
         double maxTurns = *std::max_element(newScoring.begin(), newScoring.end());
-        std::vector<double> normalizedScoring(filteredMagneticsWithScoring.size());
         for (size_t i = 0; i < filteredMagneticsWithScoring.size(); ++i) {
             double contrib;
             if (maxTurns > minTurns) {
@@ -383,7 +287,6 @@ std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterTurnCoun
                 contrib = weight * 0.5;
             }
             filteredMagneticsWithScoring[i].second += contrib;
-            normalizedScoring[i] = contrib;
             add_scoring(filteredMagneticsWithScoring[i].first.get_reference(), CoreAdviser::CoreAdviserFilters::TURN_COUNT, contrib);
         }
         sort_magnetics_by_scoring(&filteredMagneticsWithScoring);
@@ -392,148 +295,63 @@ std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterTurnCoun
 }
 
 std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterMinimumImpedance::filter_magnetics(std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics, Inputs inputs, double weight, bool firstFilter) {
-    auto coilDelimitAndCompactOld = settings.get_coil_delimit_and_compact();
     if (weight <= 0) {
+        // ABT #121.1: the minimum-impedance gate IS a hard feasibility check, but
+        // it is an expensive complex-permeability solve and the pipeline always
+        // invokes it with a fixed positive gating weight (0.001) — it is never
+        // user-zeroed. Guard defensively with a note rather than run the solve at
+        // zero weight; if a caller ever passes weight<=0 the impedance
+        // feasibility is intentionally not enforced here.
+        logEntry("MinimumImpedance filter skipped at zero weight (expensive solve; "
+                 "pipeline always gates it at a fixed positive weight).", "CoreAdviser", 2);
         return *unfilteredMagnetics;
     }
-    std::vector<std::pair<Magnetic, double>> filteredMagneticsWithScoring;
-    std::vector<double> newScoring;
-
-    std::list<size_t> listOfIndexesToErase;
-    for (size_t magneticIndex = 0; magneticIndex < (*unfilteredMagnetics).size(); ++magneticIndex){
-        Magnetic magnetic = (*unfilteredMagnetics)[magneticIndex].first;
-
-        auto [valid, scoring] = _filter.evaluate_magnetic(&magnetic, &inputs);
-
-        if (valid) {
-            (*unfilteredMagnetics)[magneticIndex].first = magnetic;
-            newScoring.push_back(scoring);
-        }
-        else {
-            listOfIndexesToErase.push_back(magneticIndex);
-        }
-
-    }
-
-    for (size_t i = 0; i < (*unfilteredMagnetics).size(); ++i) {
-        if (listOfIndexesToErase.size() > 0 && i == listOfIndexesToErase.front()) {
-            listOfIndexesToErase.pop_front();
-        }
-        else {
-            filteredMagneticsWithScoring.push_back((*unfilteredMagnetics)[i]);
-        }
-    }
-
-    if (filteredMagneticsWithScoring.size() != newScoring.size()) {
-        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Something wrong happened while filtering, size of unfilteredMagnetics: " + std::to_string(filteredMagneticsWithScoring.size()) + ", size of newScoring: " + std::to_string(newScoring.size()));
-    }
-
-    if (filteredMagneticsWithScoring.size() > 0) {
-        auto normalizedScoring = normalize_scoring(&filteredMagneticsWithScoring, newScoring, weight, (*_filterConfiguration)[CoreAdviser::CoreAdviserFilters::EFFICIENCY]);
-        for (size_t i = 0; i < filteredMagneticsWithScoring.size(); ++i) {
-            add_scoring(filteredMagneticsWithScoring[i].first.get_reference(), CoreAdviser::CoreAdviserFilters::EFFICIENCY, normalizedScoring[i]);
-        }
-        sort_magnetics_by_scoring(&filteredMagneticsWithScoring);
-    }
-
-
-    settings.set_coil_delimit_and_compact(coilDelimitAndCompactOld);
+    auto& settings = Settings::GetInstance();
+    SettingsGuard<bool> coilCompactGuard(settings, &Settings::get_coil_delimit_and_compact,
+                                         &Settings::set_coil_delimit_and_compact,
+                                         settings.get_coil_delimit_and_compact());
+    auto [filteredMagneticsWithScoring, newScoring] = evaluate_and_cull(
+        unfilteredMagnetics, inputs,
+        [this](Magnetic* m, Inputs* i) { return _filter.evaluate_magnetic(m, i); },
+        /*writeBack=*/true, "MinimumImpedance");
+    apply_normalized_scoring(&filteredMagneticsWithScoring, newScoring, weight, CoreAdviser::CoreAdviserFilters::EFFICIENCY);
     return filteredMagneticsWithScoring;
 }
 
 std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterMagneticInductance::filter_magnetics(std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics, Inputs inputs, double weight, bool firstFilter) {
-    auto coilDelimitAndCompactOld = settings.get_coil_delimit_and_compact();
-    if (weight <= 0) {
-        return *unfilteredMagnetics;
+    // ABT #121.1: meeting the magnetizing-inductance requirement is spec
+    // compliance, not an efficiency preference — the gate must run even when the
+    // (small) EFFICIENCY weight scaling it is zero, or the adviser would return
+    // cores that miss the required inductance. Run the gate always; score only
+    // when weighted. (This per-candidate solve is not free, but a correct answer
+    // outranks the runtime saved by skipping it at zero weight.)
+    auto& settings = Settings::GetInstance();
+    SettingsGuard<bool> coilCompactGuard(settings, &Settings::get_coil_delimit_and_compact,
+                                         &Settings::set_coil_delimit_and_compact,
+                                         settings.get_coil_delimit_and_compact());
+    auto [filteredMagneticsWithScoring, newScoring] = evaluate_and_cull(
+        unfilteredMagnetics, inputs,
+        [this](Magnetic* m, Inputs* i) { return _filter.evaluate_magnetic(m, i); },
+        /*writeBack=*/true, "MagneticInductance");
+    if (weight > 0) {
+        apply_normalized_scoring(&filteredMagneticsWithScoring, newScoring, weight, CoreAdviser::CoreAdviserFilters::EFFICIENCY);
     }
-    std::vector<std::pair<Magnetic, double>> filteredMagneticsWithScoring;
-    std::vector<double> newScoring;
-
-    std::list<size_t> listOfIndexesToErase;
-    for (size_t magneticIndex = 0; magneticIndex < (*unfilteredMagnetics).size(); ++magneticIndex){
-        Magnetic magnetic = (*unfilteredMagnetics)[magneticIndex].first;
-
-        auto [valid, scoring] = _filter.evaluate_magnetic(&magnetic, &inputs);
-
-        if (valid) {
-            (*unfilteredMagnetics)[magneticIndex].first = magnetic;
-            newScoring.push_back(scoring);
-        }
-        else {
-            listOfIndexesToErase.push_back(magneticIndex);
-        }
-
-    }
-
-    for (size_t i = 0; i < (*unfilteredMagnetics).size(); ++i) {
-        if (listOfIndexesToErase.size() > 0 && i == listOfIndexesToErase.front()) {
-            listOfIndexesToErase.pop_front();
-        }
-        else {
-            filteredMagneticsWithScoring.push_back((*unfilteredMagnetics)[i]);
-        }
-    }
-
-    if (filteredMagneticsWithScoring.size() != newScoring.size()) {
-        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Something wrong happened while filtering, size of unfilteredMagnetics: " + std::to_string(filteredMagneticsWithScoring.size()) + ", size of newScoring: " + std::to_string(newScoring.size()));
-    }
-
-    if (filteredMagneticsWithScoring.size() > 0) {
-        auto normalizedScoring = normalize_scoring(&filteredMagneticsWithScoring, newScoring, weight, (*_filterConfiguration)[CoreAdviser::CoreAdviserFilters::EFFICIENCY]);
-        for (size_t i = 0; i < filteredMagneticsWithScoring.size(); ++i) {
-            add_scoring(filteredMagneticsWithScoring[i].first.get_reference(), CoreAdviser::CoreAdviserFilters::EFFICIENCY, normalizedScoring[i]);
-        }
-        sort_magnetics_by_scoring(&filteredMagneticsWithScoring);
-    }
-
-
-    settings.set_coil_delimit_and_compact(coilDelimitAndCompactOld);
     return filteredMagneticsWithScoring;
 }
 
 std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterSaturation::filter_magnetics(std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics, Inputs inputs, double weight, bool firstFilter) {
-    if (weight <= 0) {
-        return *unfilteredMagnetics;
+    // ABT #121.1: the saturation cull (B_peak under the safe flux ceiling) is a
+    // hard feasibility gate — a saturating core is never a valid design — so it
+    // runs regardless of weight. Score only when weighted AND not the first
+    // (pure-gating) pass.
+    auto [filteredMagneticsWithScoring, newScoring] = evaluate_and_cull(
+        unfilteredMagnetics, inputs,
+        [this](Magnetic* m, Inputs* i) { return _filter.evaluate_magnetic(m, i); },
+        /*writeBack=*/true, "Saturation");
+    // Saturation only contributes a headroom SCORE when it is not the first (gating) pass.
+    if (!firstFilter && weight > 0) {
+        apply_normalized_scoring(&filteredMagneticsWithScoring, newScoring, weight, CoreAdviser::CoreAdviserFilters::EFFICIENCY);
     }
-    std::vector<std::pair<Magnetic, double>> filteredMagneticsWithScoring;
-    std::vector<double> newScoring;
-
-    std::list<size_t> listOfIndexesToErase;
-    for (size_t magneticIndex = 0; magneticIndex < (*unfilteredMagnetics).size(); ++magneticIndex){
-        Magnetic magnetic = (*unfilteredMagnetics)[magneticIndex].first;
-
-        auto [valid, scoring] = _filter.evaluate_magnetic(&magnetic, &inputs);
-
-        if (valid) {
-            (*unfilteredMagnetics)[magneticIndex].first = magnetic;
-            newScoring.push_back(scoring);
-        }
-        else {
-            listOfIndexesToErase.push_back(magneticIndex);
-        }
-    }
-
-    for (size_t i = 0; i < (*unfilteredMagnetics).size(); ++i) {
-        if (listOfIndexesToErase.size() > 0 && i == listOfIndexesToErase.front()) {
-            listOfIndexesToErase.pop_front();
-        }
-        else {
-            filteredMagneticsWithScoring.push_back((*unfilteredMagnetics)[i]);
-        }
-    }
-
-    if (filteredMagneticsWithScoring.size() != newScoring.size()) {
-        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Something wrong happened while filtering saturation, size of unfilteredMagnetics: " + std::to_string(filteredMagneticsWithScoring.size()) + ", size of newScoring: " + std::to_string(newScoring.size()));
-    }
-
-    if (filteredMagneticsWithScoring.size() > 0 && !firstFilter) {
-        auto normalizedScoring = normalize_scoring(&filteredMagneticsWithScoring, newScoring, weight, (*_filterConfiguration)[CoreAdviser::CoreAdviserFilters::EFFICIENCY]);
-        for (size_t i = 0; i < filteredMagneticsWithScoring.size(); ++i) {
-            add_scoring(filteredMagneticsWithScoring[i].first.get_reference(), CoreAdviser::CoreAdviserFilters::EFFICIENCY, normalizedScoring[i]);
-        }
-        sort_magnetics_by_scoring(&filteredMagneticsWithScoring);
-    }
-
     return filteredMagneticsWithScoring;
 }
 
@@ -547,47 +365,20 @@ std::vector<std::pair<Magnetic, double>> CoreAdviser::MagneticCoreFilterTemperat
     std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics, Inputs inputs, double weight, bool firstFilter)
 {
     if (weight <= 0) {
+        // ABT #121.1: the temperature-rise cull is a full thermal solve per
+        // candidate (expensive) and is itself gated off by default
+        // (core_adviser_enable_temperature_filter). It is an efficiency-scoped
+        // preference, so at zero EFFICIENCY weight we skip it (and its solve)
+        // rather than run it purely to gate.
+        logEntry("Temperature filter skipped at zero weight (expensive thermal solve; "
+                 "efficiency-scoped preference).", "CoreAdviser", 2);
         return *unfilteredMagnetics;
     }
-    std::vector<std::pair<Magnetic, double>> filteredMagneticsWithScoring;
-    std::vector<double> newScoring;
-
-    std::list<size_t> listOfIndexesToErase;
-    for (size_t magneticIndex = 0; magneticIndex < (*unfilteredMagnetics).size(); ++magneticIndex) {
-        Magnetic magnetic = (*unfilteredMagnetics)[magneticIndex].first;
-
-        auto [valid, scoring] = _filter.evaluate_magnetic(&magnetic, &inputs);
-
-        if (valid) {
-            (*unfilteredMagnetics)[magneticIndex].first = magnetic;
-            newScoring.push_back(scoring);
-        }
-        else {
-            listOfIndexesToErase.push_back(magneticIndex);
-        }
-    }
-
-    for (size_t i = 0; i < (*unfilteredMagnetics).size(); ++i) {
-        if (listOfIndexesToErase.size() > 0 && i == listOfIndexesToErase.front()) {
-            listOfIndexesToErase.pop_front();
-        }
-        else {
-            filteredMagneticsWithScoring.push_back((*unfilteredMagnetics)[i]);
-        }
-    }
-
-    if (filteredMagneticsWithScoring.size() != newScoring.size()) {
-        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Something wrong happened while filtering temperature, size of unfilteredMagnetics: " + std::to_string(filteredMagneticsWithScoring.size()) + ", size of newScoring: " + std::to_string(newScoring.size()));
-    }
-
-    if (filteredMagneticsWithScoring.size() > 0) {
-        auto normalizedScoring = normalize_scoring(&filteredMagneticsWithScoring, newScoring, weight, (*_filterConfiguration)[CoreAdviser::CoreAdviserFilters::EFFICIENCY]);
-        for (size_t i = 0; i < filteredMagneticsWithScoring.size(); ++i) {
-            add_scoring(filteredMagneticsWithScoring[i].first.get_reference(), CoreAdviser::CoreAdviserFilters::EFFICIENCY, normalizedScoring[i]);
-        }
-        sort_magnetics_by_scoring(&filteredMagneticsWithScoring);
-    }
-
+    auto [filteredMagneticsWithScoring, newScoring] = evaluate_and_cull(
+        unfilteredMagnetics, inputs,
+        [this](Magnetic* m, Inputs* i) { return _filter.evaluate_magnetic(m, i); },
+        /*writeBack=*/true, "Temperature");
+    apply_normalized_scoring(&filteredMagneticsWithScoring, newScoring, weight, CoreAdviser::CoreAdviserFilters::EFFICIENCY);
     return filteredMagneticsWithScoring;
 }
 

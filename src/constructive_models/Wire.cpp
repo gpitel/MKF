@@ -144,8 +144,10 @@ namespace OpenMagnetics {
         }
 
         if (!get_material()) {
-            set_material(defaults.defaultConductorMaterial);
-            // throw std::runtime_error("Wire is missing material information");
+            // ABT #114/A2: a silent copper default gives wrong resistivity (=> wrong
+            // ohmic/skin losses) for any wire that is really aluminium/etc. but simply
+            // omits its material tag. Fail loudly instead of substituting copper.
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Wire is missing material information");
         }
 
         auto material = get_material().value();
@@ -160,14 +162,14 @@ namespace OpenMagnetics {
         }
     }
 
-    WireMaterial Wire::resolve_material(Wire wire) { 
+    WireMaterial Wire::resolve_material(Wire wire) {
         if (wire.get_type() == WireType::LITZ) {
             auto strand = wire.resolve_strand();
             return resolve_material(strand);
         }
         if (!wire.get_material()) {
-            wire.set_material(defaults.defaultConductorMaterial);
-            // throw std::runtime_error("Wire is missing material information");
+            // ABT #114/A2: no silent copper default (see resolve_material()).
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Wire is missing material information");
         }
 
         auto material = wire.get_material().value();
@@ -183,10 +185,10 @@ namespace OpenMagnetics {
     }
 
 
-    WireMaterial Wire::resolve_material(WireRound wire) { 
+    WireMaterial Wire::resolve_material(WireRound wire) {
         if (!wire.get_material()) {
-            wire.set_material(defaults.defaultConductorMaterial);
-            // throw std::runtime_error("Wire is missing material information");
+            // ABT #114/A2: no silent copper default (see resolve_material()).
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Wire is missing material information");
         }
 
         auto material = wire.get_material().value();
@@ -2332,6 +2334,10 @@ Wire Wire::create_quick_litz_wire(double conductingDiameter, int64_t numberStran
     wire.set_number_conductors(numberStrands);
     wire.set_type(WireType::LITZ);
     wire.set_coating(coating);
+    // ABT #158: the quick-create contract is a standard copper wire — set the
+    // material explicitly at construction (resolve_material() throws on absent
+    // material since ABT #114/A2; it must not be left to a silent default).
+    wire.set_material("copper");
     return wire;
 }
 
@@ -2351,6 +2357,8 @@ Wire Wire::create_quick_rectangular_wire(double conductingWidth, double conducti
     wire.set_number_conductors(1);
     wire.set_type(WireType::RECTANGULAR);
     wire.set_coating(coating);
+    // ABT #158: see create_quick_litz_wire — explicit copper at construction.
+    wire.set_material("copper");
     return wire;
 }
 

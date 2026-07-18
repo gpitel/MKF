@@ -5,7 +5,7 @@ if (POLICY CMP0141)
   set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<IF:$<AND:$<C_COMPILER_ID:MSVC>,$<CXX_COMPILER_ID:MSVC>>,$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
 endif()
 
-project ("MKF_Project" VERSION 1.0.0 LANGUAGES CXX)
+project ("MKF_Project" VERSION 2.0.0 LANGUAGES CXX)
 
 # ============================================================================
 # C++ Standard and Compiler Settings
@@ -108,6 +108,91 @@ FetchContent_Declare(magic-enum
     GIT_TAG  tags/v0.9.6)
 FetchContent_MakeAvailable(magic-enum)
 include_directories("${CMAKE_BINARY_DIR}/_deps/magic-enum-src/include/magic_enum")
+
+
+# ============================================================================
+# Kirchhoff — the exportable converter-model library that replaces MKF's converter_models (and carries the
+# ngspice simulator, which is why MKF no longer builds its own: MKF's ENABLE_NGSPICE stays OFF by default
+# and any circuit that must be solved goes through Kirchhoff::api::simulate_ngspice via KirchhoffBridge).
+#
+# Built ISOLATED with ExternalProject so KH's own dependency targets — critically its `namespace MAS`
+# types, plus CAS/SAS/RAS/… — are configured in a SEPARATE CMake context and can never collide with MKF's
+# identically-named ones. KH is consumed as libKirchhoffApi.so: a shared lib that exports ONLY the
+# Kirchhoff::api string/JSON facade (KH's MAS:: symbols are hidden), so nothing but JSON strings crosses the
+# boundary. No MAS material DB is pulled (KH has none; MKF's EMBED_MAS_* is independent and only for HS).
+# ============================================================================
+# Default ON natively, but OFF under Emscripten: the KirchhoffBridge links libKirchhoffApi.so (a native
+# hidden-visibility shared lib) which has no wasm equivalent, and in the browser the converter surface is a
+# SEPARATE module (webKirchhoff) — webMKF is magnetics-only. So the wasm MKF must not pull Kirchhoff.
+if(EMSCRIPTEN)
+    set(_mkf_use_kirchhoff_default OFF)
+else()
+    set(_mkf_use_kirchhoff_default ON)
+endif()
+option(MKF_USE_KIRCHHOFF "Link the Kirchhoff converter-model library (libKirchhoffApi.so)" ${_mkf_use_kirchhoff_default})
+if(MKF_USE_KIRCHHOFF)
+    include(ExternalProject)
+    # Kirchhoff is configured in its OWN CMake context (isolated from MKF's targets). Two ways to provide it:
+    #   * a GitHub clone (DEFAULT — GIT_REPOSITORY/GIT_TAG below; recursive, so KH's submodules come too), or
+    #   * a local working tree by setting KIRCHHOFF_SOURCE_DIR to a path.
+    # The github-fetch default became usable once Kirchhoff's `AAS` submodule was published on GitHub
+    # (its siblings PEAS/RAS/CAS/SAS/MAS/CIAS/TAS/CONAS/CTAS and deps/MKF all resolve). To develop against
+    # a local KH checkout instead, pass -DKIRCHHOFF_SOURCE_DIR=/path/to/Kirchhoff.
+    set(KIRCHHOFF_GIT_TAG "main" CACHE STRING "Kirchhoff git tag/branch to build (when fetching from GitHub)")
+    set(KIRCHHOFF_SOURCE_DIR "" CACHE PATH "Local Kirchhoff working tree (leave empty to fetch from GitHub)")
+    set(KIRCHHOFF_BUILD_DIR "${CMAKE_BINARY_DIR}/kirchhoff-build")
+    set(KIRCHHOFF_API_LIB "${KIRCHHOFF_BUILD_DIR}/libKirchhoffApi.so")
+    if(KIRCHHOFF_SOURCE_DIR)
+        set(_kirchhoff_src SOURCE_DIR "${KIRCHHOFF_SOURCE_DIR}")
+    else()
+        set(_kirchhoff_src GIT_REPOSITORY "https://github.com/OpenConverters/Kirchhoff.git"
+                           GIT_TAG "${KIRCHHOFF_GIT_TAG}"
+                           # KH's deps/MKF submodule is the circular back-reference to THIS repo, and its
+                           # recorded pin can be a commit that never reached origin ("not our ref"). KH only
+                           # needs MKF for the shared WaveformProcessor.cpp, which we hand it directly via
+                           # -DMKF_DIR below — so init every KH submodule EXCEPT deps/MKF.
+                           GIT_SUBMODULES "deps/PEAS;deps/RAS;deps/CAS;deps/SAS;deps/MAS;deps/CIAS;deps/TAS;deps/AAS;deps/CONAS;deps/CTAS")
+    endif()
+
+    # Kelvin — KH's shared TAS component selector (consumed via src/KelvinBridge.cpp). Since ~mid-2026 KH
+    # requires it (add_subdirectory(KELVIN_DIR)), but it is NOT a KH submodule, so MKF must supply the
+    # source. KH builds it in-tree reusing KH's own PEAS, so we only need the checkout, not a separate
+    # build. MKF itself uses NOTHING from Kelvin (it is behind the libKirchhoffApi.so facade); this only
+    # exists to let KH configure. Point -DKIRCHHOFF_KELVIN_DIR at a local checkout, else it is fetched.
+    set(KIRCHHOFF_KELVIN_DIR "" CACHE PATH "Local Kelvin checkout for the Kirchhoff build (empty = fetch)")
+    if(NOT KIRCHHOFF_KELVIN_DIR)
+        set(KIRCHHOFF_KELVIN_GIT_TAG "main" CACHE STRING "Kelvin git tag/branch (when fetched for Kirchhoff)")
+        include(FetchContent)
+        FetchContent_Declare(kirchhoff_kelvin
+            GIT_REPOSITORY "https://github.com/OpenConverters/Kelvin.git"
+            GIT_TAG "${KIRCHHOFF_KELVIN_GIT_TAG}"
+            GIT_SUBMODULES ""   # KH overrides KELVIN_PEAS_DIR to its own PEAS; Kelvin's own submodules are unused
+            SOURCE_DIR "${CMAKE_BINARY_DIR}/kirchhoff-kelvin-src")
+        # Download only — KH does the add_subdirectory(KELVIN_DIR) in its own context.
+        FetchContent_GetProperties(kirchhoff_kelvin)
+        if(NOT kirchhoff_kelvin_POPULATED)
+            FetchContent_Populate(kirchhoff_kelvin)
+        endif()
+        set(KIRCHHOFF_KELVIN_DIR "${kirchhoff_kelvin_SOURCE_DIR}")
+    endif()
+
+    ExternalProject_Add(kirchhoff_ext
+        ${_kirchhoff_src}
+        BINARY_DIR "${KIRCHHOFF_BUILD_DIR}"
+        CMAKE_ARGS
+            -DCMAKE_BUILD_TYPE=Release
+            -DKIRCHHOFF_BUILD_SHARED_API=ON   # emit libKirchhoffApi.so (string facade, hidden internals)
+            -DKIRCHHOFF_BUILD_PYBIND=OFF
+            -DENABLE_NGSPICE=ON               # KH carries the simulator MKF stopped building
+            -DMKF_DIR=${CMAKE_CURRENT_SOURCE_DIR}          # this MKF checkout supplies KH's shared WaveformProcessor
+            -DKELVIN_DIR=${KIRCHHOFF_KELVIN_DIR}           # Kelvin source (fetched above or a local checkout)
+        BUILD_ALWAYS OFF
+        INSTALL_COMMAND ""
+        BUILD_BYPRODUCTS "${KIRCHHOFF_API_LIB}")
+    add_library(KirchhoffApi SHARED IMPORTED)
+    set_target_properties(KirchhoffApi PROPERTIES IMPORTED_LOCATION "${KIRCHHOFF_API_LIB}")
+    add_dependencies(KirchhoffApi kirchhoff_ext)
+endif()
 
 
 # Make profiling and ASan opt-in so users can build fast Release binaries by default
@@ -350,8 +435,11 @@ if(INCLUDE_MKF_TESTS)
 endif()
 
 # MAS
-find_program(NAMES quicktype REQUIRED)
-find_program(NAMES libgtest-dev REQUIRED)
+# NOTE: the previous form `find_program(NAMES quicktype REQUIRED)` was malformed — the
+# result variable was literally named "NAMES", so REQUIRED never actually verified quicktype
+# existed. The libgtest-dev probe was doubly wrong (gtest isn't used — Catch2 is — and it is
+# a package, not a program) and has been dropped.
+find_program(QUICKTYPE_EXECUTABLE NAMES quicktype REQUIRED)
 
 if(NOT DEFINED MAS_DIRECTORY)
     set(MAS_DIRECTORY "${CMAKE_BINARY_DIR}/MAS/")
@@ -366,6 +454,11 @@ if(NOT DEFINED PEAS_DIR)
 endif()
 
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/MAS")
+
+# Regenerate MAS.hpp whenever any schema changes. Without DEPENDS the custom
+# command has no input edges, so a stale MAS.hpp silently survives schema updates.
+file(GLOB_RECURSE MAS_SCHEMA_SOURCES CONFIGURE_DEPENDS "${MAS_DIR}/schemas/*.json")
+file(GLOB_RECURSE PEAS_SCHEMA_SOURCES CONFIGURE_DEPENDS "${PEAS_DIR}/schemas/*.json")
 
 add_custom_command(
   OUTPUT "${MAS_DIRECTORY}/MAS.hpp"
@@ -400,7 +493,6 @@ add_custom_command(
     -S ${MAS_DIR}/schemas/inputs/designRequirements.json
     -S ${MAS_DIR}/schemas/inputs/operatingConditions.json
     -S ${MAS_DIR}/schemas/inputs/operatingPoint.json
-    -S ${MAS_DIR}/schemas/inputs/operatingPointExcitation.json
     -S ${MAS_DIR}/schemas/inputs/topologies/flyback.json
     -S ${MAS_DIR}/schemas/inputs/topologies/currentTransformer.json
     -S ${MAS_DIR}/schemas/inputs/topologies/boost.json
@@ -435,6 +527,7 @@ add_custom_command(
     # quicktype resolves it by $id (relative-path resolution fails on Windows).
     -S ${PEAS_DIR}/schemas/outputs/outputBase.json
     -o ${MAS_DIRECTORY}/MAS.hpp --namespace MAS --source-style single-source --type-style pascal-case --member-style underscore-case --enumerator-style upper-underscore-case --no-boost
+  DEPENDS ${MAS_SCHEMA_SOURCES} ${PEAS_SCHEMA_SOURCES}
   USES_TERMINAL)
 
 add_custom_target(MAS ALL
@@ -513,6 +606,18 @@ file(GLOB SOURCES CONFIGURE_DEPENDS
     "src/support/*.cpp")
 list(APPEND SOURCES "${CCI_GENERATED_CPP}")
 
+# The only surviving src/converter_models/*.cpp is KirchhoffBridge.cpp — it #includes KirchhoffApi.hpp and
+# links libKirchhoffApi.so, so it can only be compiled when Kirchhoff is linked. Drop it otherwise (e.g. the
+# Emscripten/webMKF build, MKF_USE_KIRCHHOFF=OFF).
+if(NOT MKF_USE_KIRCHHOFF)
+    list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/converter_models/KirchhoffBridge.cpp")
+endif()
+
+# The old converter_models were DELETED — replaced by Kirchhoff (linked via KirchhoffBridge, the only
+# remaining src/converter_models/*.cpp). MKF's core never instantiated a converter class (the
+# MagneticAdviser converter path is generic templates the CALLER feeds a converter to); the converter
+# physics now lives in Kirchhoff and its reference designs are SPICE-gated there.
+
 SET(LIBS data::insulation_standards)
 
 # REMOVED: LINK_DIRECTORIES for LAPACKBLAS (no longer needed, levmar replaced by Eigen)
@@ -538,6 +643,25 @@ target_include_directories(MKF PUBLIC "${CMAKE_BINARY_DIR}/generated")
 cmrc_add_resource_library(insulation_standards ALIAS data::insulation_standards NAMESPACE insulationData src/data/insulation_standards/IEC_60664-1.json src/data/insulation_standards/IEC_60664-4.json src/data/insulation_standards/IEC_60664-5.json src/data/insulation_standards/IEC_62368-1.json src/data/insulation_standards/IEC_61558-1.json src/data/insulation_standards/IEC_61558-2-16.json src/data/insulation_standards/IEC_60335-1.json)
 cmrc_add_resource_library(core_losses_data ALIAS data::core_losses_data NAMESPACE coreLossesData src/data/core_losses/ciGSE_coefficients.json)
 target_link_libraries(MKF PUBLIC ${LIBS})
+
+# Kirchhoff bridge: MKF links libKirchhoffApi.so and includes ONLY KirchhoffApi.hpp (the string facade),
+# so KH's `namespace MAS` types never enter an MKF TU. src/converter_models/KirchhoffBridge.cpp is picked
+# up by the SOURCES glob; here we add the include path + the imported .so + the build-order dependency.
+if(MKF_USE_KIRCHHOFF)
+    add_dependencies(MKF kirchhoff_ext)
+    # The KH source tree lives at KIRCHHOFF_SOURCE_DIR when a local checkout is passed, or at the
+    # ExternalProject fetch location when we clone from GitHub (the default). Pick the right one so the
+    # KirchhoffApi.hpp include resolves in BOTH modes — an empty KIRCHHOFF_SOURCE_DIR must NOT collapse
+    # to "/src" (which silently drops the include and breaks the KirchhoffBridge.cpp compile).
+    if(KIRCHHOFF_SOURCE_DIR)
+        set(_kirchhoff_include_dir "${KIRCHHOFF_SOURCE_DIR}/src")
+    else()
+        set(_kirchhoff_include_dir "${CMAKE_BINARY_DIR}/kirchhoff_ext-prefix/src/kirchhoff_ext/src")
+    endif()
+    # PUBLIC so consumers/tests that include KirchhoffBridge.h (-> KirchhoffApi.hpp) find it too.
+    target_include_directories(MKF PUBLIC "${_kirchhoff_include_dir}")
+    target_link_libraries(MKF PUBLIC KirchhoffApi)
+endif()
 
 set(DATA_LIST "")
 if(EMBED_MAS_DATA)
@@ -565,7 +689,7 @@ if(EMBED_MAS_DATA)
     endif()
 endif()
 
-message(${DATA_LIST})
+message(STATUS "MKF embedded MAS data files: ${DATA_LIST}")
 cmrc_add_resource_library(data ALIAS data::data NAMESPACE data ${DATA_LIST})
 target_link_libraries(MKF PUBLIC data::data)
 target_link_libraries(MKF PUBLIC data::core_losses_data)
@@ -605,6 +729,18 @@ if(INCLUDE_MKF_TESTS)
     target_link_libraries(MKF_tests PRIVATE Catch2::Catch2WithMain)
     target_link_libraries(MKF_tests PUBLIC MKF)
     target_include_directories(MKF_tests PUBLIC "${PROJECT_SOURCE_DIR}/src/")
+
+    # tests/KirchhoffNgspiceRunnerShim.cpp compiles Kirchhoff's in-process libngspice runner
+    # (Kirchhoff::run_ngspice_in_process) into the test binary: libKirchhoffApi.so hides it
+    # (only the api:: string facade is exported), and the export-verification tests (abt #76)
+    # must run an emitted magnetic subcircuit deck — not a TAS — through the integrated
+    # engine. Link the same libngspice the Kirchhoff build found.
+    if(MKF_USE_KIRCHHOFF)
+        find_library(MKF_TESTS_NGSPICE_LIB ngspice REQUIRED)
+        find_path(MKF_TESTS_NGSPICE_INCLUDE_DIR ngspice/sharedspice.h REQUIRED)
+        target_include_directories(MKF_tests PRIVATE "${MKF_TESTS_NGSPICE_INCLUDE_DIR}")
+        target_link_libraries(MKF_tests PRIVATE "${MKF_TESTS_NGSPICE_LIB}")
+    endif()
 
     # Precompiled header for the test target.
     #

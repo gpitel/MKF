@@ -356,7 +356,10 @@ std::vector<std::pair<OpenMagnetics::Winding, double>> WireAdviser::get_advised_
     std::vector<Wire> wires;
     auto& settings = OpenMagnetics::Settings::GetInstance();
 
-    if (wireDatabase.empty()) {
+    // See CoilAdviser::get_advised_coil: never lazily refill wireDatabase
+    // while a LibraryContext scope is active — the scoped contents ARE the
+    // library, even when empty.
+    if (wireDatabase.empty() && !LibraryContext::Scope::anyActive()) {
         load_wires();
     }
 
@@ -394,7 +397,7 @@ std::vector<std::pair<Winding, double>> WireAdviser::get_advised_wire(
                                 numberSections, maximumNumberResults);
     }
 
-    if (wireDatabase.empty()) load_wires();
+    if (wireDatabase.empty() && !LibraryContext::Scope::anyActive()) load_wires();
 
     std::vector<Wire> wires;
     for (auto& [name, wire] : wireDatabase) {
@@ -775,6 +778,9 @@ std::vector<std::pair<Winding, double>> WireAdviser::get_advised_wire(std::vecto
                                                                                         double temperature,
                                                                                         uint8_t numberSections,
                                                                                         size_t maximumNumberResults){
+    // WireAdviser instances are long-lived (CoilAdviser holds one across cores);
+    // without this reset the reported maximum accumulates across advise calls.
+    _maximumOuterAreaProportion = 0;
     auto coilsWithScoring = create_dataset(winding, wires, section, current, temperature);
 
 

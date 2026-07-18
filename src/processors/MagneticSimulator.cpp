@@ -56,24 +56,19 @@ LeakageInductanceOutput MagneticSimulator::calculate_leakage_inductance(Operatin
 }
 
 LeakageInductanceOutput MagneticSimulator::calculate_leakage_inductance(Magnetic magnetic, double frequency){
-    LeakageInductanceOutput leakageInductanceOutput; 
-    for (size_t windingIndex = 1; windingIndex < magnetic.get_coil().get_functional_description().size(); ++windingIndex) {
-        auto aux = OpenMagnetics::LeakageInductance().calculate_leakage_inductance(magnetic, frequency, 0, windingIndex);
-        if (windingIndex == 1) {
-            leakageInductanceOutput = aux;
-            leakageInductanceOutput.set_leakage_inductance_per_winding(std::vector<DimensionWithTolerance>());
-        }
-        auto currentLeakageInductancePerWinding = leakageInductanceOutput.get_leakage_inductance_per_winding();
-        currentLeakageInductancePerWinding.push_back(aux.get_leakage_inductance_per_winding()[0]);
-        leakageInductanceOutput.set_leakage_inductance_per_winding(currentLeakageInductancePerWinding);
-    }
-    return leakageInductanceOutput;
+    // Same shape as the public calculate_leakage_inductance WASM/Python API: one entry
+    // per winding, index = winding index, 0 at the source (primary) slot, every value
+    // referred to the primary. The previous hand-rolled loop emitted a secondaries-only
+    // (N-1) array into the same MAS field, so consumers could not tell which shape they
+    // were reading (web bug reports 125/139: the UI showed the primary's 0 as "Llk").
+    return OpenMagnetics::LeakageInductance().calculate_leakage_inductance_all_windings(magnetic, frequency);
 }
 
 WindingLossesOutput MagneticSimulator::calculate_winding_losses(OperatingPoint& operatingPoint, Magnetic magnetic, std::optional<double> temperature){
     auto& settings = OpenMagnetics::Settings::GetInstance();
-    auto oldMagneticFieldMirroringDimension = settings.get_magnetic_field_mirroring_dimension();
-    settings.set_magnetic_field_mirroring_dimension(1);
+    // RAII: if calculate_losses throws, the manual restore below never ran and the
+    // process kept mirroring=1 for every subsequent computation.
+    SettingsGuard<int> mirroringGuard(settings, &Settings::get_magnetic_field_mirroring_dimension, &Settings::set_magnetic_field_mirroring_dimension, 1);
 
     double simulationTemperature;
     if (!temperature) {
@@ -85,7 +80,6 @@ WindingLossesOutput MagneticSimulator::calculate_winding_losses(OperatingPoint& 
     WindingLosses windingLosses;
     // windingLosses.set_winding_losses_harmonic_amplitude_threshold(0.01);
     auto losses = windingLosses.calculate_losses(magnetic, operatingPoint, simulationTemperature);
-    settings.set_magnetic_field_mirroring_dimension(oldMagneticFieldMirroringDimension);
     return losses;
 }
 
@@ -187,10 +181,12 @@ MagneticManufacturerInfo MagneticSimulator::build_datasheet(Mas& mas) {
         auto inductanceOutput = outputs[0].get_inductance().value();
         electrical.set_inductance(inductanceOutput.get_magnetizing_inductance().get_magnetizing_inductance());
 
+        // Per-winding leakage array is winding-indexed with 0 at the primary slot, so the
+        // first secondary lives at index 1.
         if (inductanceOutput.get_leakage_inductance() &&
-            !inductanceOutput.get_leakage_inductance()->get_leakage_inductance_per_winding().empty()) {
+            inductanceOutput.get_leakage_inductance()->get_leakage_inductance_per_winding().size() > 1) {
             electrical.set_leakage_inductance(
-                inductanceOutput.get_leakage_inductance()->get_leakage_inductance_per_winding()[0]);
+                inductanceOutput.get_leakage_inductance()->get_leakage_inductance_per_winding()[1]);
         }
     }
 

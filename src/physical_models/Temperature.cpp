@@ -161,14 +161,20 @@ double CoolingUtils::calculateMixedConvectionCoefficient(
 
 TemperatureConfig TemperatureConfig::fromMasOperatingConditions(
     const MAS::OperatingConditions& conditions) {
-    
+
+    // NOTE: this only populates the OPERATING-CONDITION inputs (ambient temperature and
+    // cooling) that live on MAS::OperatingConditions. It intentionally does NOT set the
+    // loss inputs (coreLosses / windingLosses / windingLossesOutput): those come from a
+    // separate loss simulation and must be assigned by the caller. A config built here
+    // and solved without setting losses will (correctly) report an unpowered component
+    // at ambient temperature.
     TemperatureConfig config;
     config.ambientTemperature = conditions.get_ambient_temperature();
-    
+
     if (conditions.get_cooling().has_value()) {
         config.masCooling = conditions.get_cooling().value();
     }
-    
+
     return config;
 }
 
@@ -259,6 +265,40 @@ ThermalResult Temperature::calculateTemperatures() {
 // Wire Property Extraction
 // ============================================================================
 
+// Transverse (radial) effective thermal conductivity of a litz bundle.
+// Radial heat spreading across a litz turn is governed by the TRANSVERSE conductivity,
+// which is far below solid copper (~0.5-1.5 vs ~385 W/m.K) because heat must cross the
+// strand enamel between conductors. Uses the composite-cylinder-assemblage /
+// Maxwell-Garnett model for aligned cylindrical fibres:
+//     k_t = k_m * [g(1+F) + (1-F)] / [g(1-F) + (1+F)],   g = k_copper / k_matrix
+// with F the copper fill factor (conducting area / bundle area) and k_m the inter-strand
+// (strand-enamel) matrix conductivity. Refs: Simpson, Wrobel & Mellor, "Estimation of
+// equivalent thermal parameters of impregnated electrical windings", IEEE Trans. Ind.
+// Appl. 2013; composite-cylinder-assemblage transverse-conductivity model.
+static double litzTransverseThermalConductivity(Wire litzWire, double copperThermalCond) {
+    double outerDiameter = litzWire.calculate_outer_diameter();
+    double bundleArea = M_PI / 4.0 * outerDiameter * outerDiameter;
+    double conductingArea = litzWire.calculate_conducting_area();
+    if (bundleArea <= 0.0 || conductingArea <= 0.0) {
+        throw std::runtime_error("Temperature: litz wire has non-positive bundle or conducting area; "
+                                 "cannot compute effective thermal conductivity.");
+    }
+    double fillFactor = conductingArea / bundleArea;
+    if (fillFactor <= 0.0 || fillFactor >= 1.0) {
+        throw std::runtime_error("Temperature: litz copper fill factor out of range (0,1): " +
+                                 std::to_string(fillFactor));
+    }
+    // Inter-strand matrix conductivity: the strand enamel/insulation that heat must cross
+    // between conductors (resolved from the litz wire's coating grade).
+    double matrixThermalCond = litzWire.get_coating_thermal_conductivity();
+    if (matrixThermalCond <= 0.0) {
+        throw std::runtime_error("Temperature: litz coating thermal conductivity is non-positive.");
+    }
+    double g = copperThermalCond / matrixThermalCond;
+    return matrixThermalCond * (g * (1.0 + fillFactor) + (1.0 - fillFactor)) /
+                               (g * (1.0 - fillFactor) + (1.0 + fillFactor));
+}
+
 void Temperature::extractWireProperties() {
     auto coil = _magnetic.get_coil();
     auto windings = coil.get_functional_description();
@@ -313,17 +353,23 @@ void Temperature::extractWireProperties() {
             std::string materialName = std::get<std::string>(materialVariant);
             try {
                 auto wireMaterial = find_wire_material_by_name(materialName);
-                auto thermalCond = wireMaterial.get_thermal_conductivity();
-                if (thermalCond && !thermalCond->empty()) {
-                    _wireThermalCond = (*thermalCond)[0].get_value();
-                }
+                // Use the temperature-interpolating helper instead of blindly taking the
+                // first conductivity-table entry (which ignored temperature dependence).
+                _wireThermalCond = ThermalResistance::getWireMaterialThermalConductivity(
+                    wireMaterial, _config.ambientTemperature);
             } catch (const std::exception& e) {
-                throw std::runtime_error("Temperature::extractWireProperties: Failed to lookup wire material '" + 
+                throw std::runtime_error("Temperature::extractWireProperties: Failed to lookup wire material '" +
                                          materialName + "' for thermal conductivity: " + e.what());
             }
         }
     }
-    
+
+    // Litz: the value above is the strand (copper) conductivity, but radial heat spreading
+    // across the bundle is governed by the much lower transverse effective conductivity.
+    if (wire.get_type() == WireType::LITZ) {
+        _wireThermalCond = litzTransverseThermalConductivity(wire, _wireThermalCond);
+    }
+
     // Get wire coating for thermal calculations
     _wireCoating = wire.resolve_coating();
     
@@ -383,17 +429,20 @@ void Temperature::extractWireProperties() {
                 if (std::holds_alternative<std::string>(materialVariant)) {
                     try {
                         auto wireMaterial = find_wire_material_by_name(std::get<std::string>(materialVariant));
-                        auto thermalCond = wireMaterial.get_thermal_conductivity();
-                        if (thermalCond && !thermalCond->empty()) {
-                            wProps.wireThermalCond = (*thermalCond)[0].get_value();
-                        }
+                        wProps.wireThermalCond = ThermalResistance::getWireMaterialThermalConductivity(
+                            wireMaterial, _config.ambientTemperature);
                     } catch (const std::exception& e) {
-                        throw std::runtime_error("Temperature::extractWireProperties: Failed to lookup wire material for winding " + 
+                        throw std::runtime_error("Temperature::extractWireProperties: Failed to lookup wire material for winding " +
                                                  std::to_string(wIdx) + ": " + e.what());
                     }
                 }
             }
-            
+
+            // Litz: use the transverse effective conductivity for radial heat spreading.
+            if (w.get_type() == WireType::LITZ) {
+                wProps.wireThermalCond = litzTransverseThermalConductivity(w, wProps.wireThermalCond);
+            }
+
             wProps.wireCoating = w.resolve_coating();
             _perWindingWireProps[wIdx] = wProps;
         }
@@ -1663,10 +1712,17 @@ void Temperature::createConcentricCoreConnections() {
         _resistances.push_back(r);
     };
     
-    // Helper to get appropriate cross-sectional area based on connection direction
+    // Helper to get the column footprint: the cross-section perpendicular to the column
+    // axis (vertical/Y), through which heat conducts between a column and the yokes it
+    // joins. dimensions.height is the column's vertical extent (the flow direction itself),
+    // so the area is width * depth, NOT height * depth (which is a side face).
     auto getColumnCrossSection = [&](size_t idx) -> double {
-        // For columns, use the area perpendicular to the column axis (x-axis for central, y for lateral)
-        return _nodes[idx].dimensions.height * _nodes[idx].dimensions.depth;
+        // Full-core conduction footprint (width * full depth). Core nodes carry HALF the
+        // core depth (half-core symmetry model), so the node footprint (width * halfDepth)
+        // is doubled here to represent the full-core cross-section — mirroring the
+        // symmetry doubling applied to convection. Without this, half-depth conduction
+        // area must carry the FULL core loss, which inflates the internal core gradient.
+        return _nodes[idx].dimensions.width * _nodes[idx].dimensions.depth * 2.0;
     };
     
     // Helper to find closest node in a list
@@ -2465,10 +2521,6 @@ void Temperature::createBobbinYokeToTurnConnections(size_t bobbinTopYokeIdx, siz
     // Helper to create bobbin-to-turn connection
     auto createBobbinToTurnConnection = [&](size_t bobbinIdx, ThermalNodeFace bobbinFace, 
                                             size_t turnIdx, double dist) {
-        const auto& turnNode = _nodes[turnIdx];
-        double turnWidth = turnNode.dimensions.width;
-        double turnHeight = turnNode.dimensions.height;
-        
         ThermalResistanceElement r;
         r.nodeFromId = bobbinIdx;
         r.quadrantFrom = bobbinFace;
@@ -2479,7 +2531,11 @@ void Temperature::createBobbinYokeToTurnConnections(size_t bobbinTopYokeIdx, siz
         
         // Calculate resistance through air/bobbin gap - use quadrant surface area
         auto* turnQuadrant = _nodes[turnIdx].getQuadrant(r.quadrantTo);
-        double contactArea = turnQuadrant ? turnQuadrant->surfaceArea : (turnWidth * turnHeight * 0.5);
+        if (!turnQuadrant) {
+            throw std::runtime_error("Temperature: bobbin-yoke-to-turn connection: turn node is missing the "
+                                     "expected quadrant; cannot determine contact area.");
+        }
+        double contactArea = turnQuadrant->surfaceArea;
         // Issue 15: Use configurable interface conductivity for turn-to-bobbin contact
         double k_interface = _config.turnToBobbinInterfaceConductivity;
         r.resistance = dist / (k_interface * contactArea);
@@ -2665,7 +2721,11 @@ void Temperature::createTurnToBobbinConnections() {
                     r.type = HeatTransferType::CONDUCTION;
                     
                     auto* q = turnNode.getQuadrant(quadrant.face);
-                    double contactArea = q ? q->surfaceArea : (turnWidth * turnHeight * 0.5);
+                    if (!q) {
+                        throw std::runtime_error("Temperature: turn-to-bobbin connection: turn node is missing the "
+                                                 "expected quadrant; cannot determine contact area.");
+                    }
+                    double contactArea = q->surfaceArea;
                     double distance = std::max(dist, 1e-6);
                     
                     // IMP-NEW-05: Configurable interface conductivity (was k_air=0.025)
@@ -2823,7 +2883,11 @@ void Temperature::createTurnToInsulationConnections() {
                 r.type = HeatTransferType::CONDUCTION;
                 
                 auto* leftQ = turnNode.getQuadrant(ThermalNodeFace::RADIAL_INNER);
-                double contactArea = leftQ ? leftQ->surfaceArea : (turnWidth * turnHeight * 0.5);
+                if (!leftQ) {
+                    throw std::runtime_error("Temperature: turn-to-insulation connection: turn node is missing the "
+                                             "RADIAL_INNER quadrant; cannot determine contact area.");
+                }
+                double contactArea = leftQ->surfaceArea;
                 double conductionDistance = leftCandidate.insulationWidth / 2.0;
                 
                 r.resistance = ThermalResistance::calculateConductionResistance(
@@ -2852,7 +2916,11 @@ void Temperature::createTurnToInsulationConnections() {
                 r.type = HeatTransferType::CONDUCTION;
                 
                 auto* rightQ = turnNode.getQuadrant(ThermalNodeFace::RADIAL_OUTER);
-                double contactArea = rightQ ? rightQ->surfaceArea : (turnWidth * turnHeight * 0.5);
+                if (!rightQ) {
+                    throw std::runtime_error("Temperature: turn-to-insulation connection: turn node is missing the "
+                                             "RADIAL_OUTER quadrant; cannot determine contact area.");
+                }
+                double contactArea = rightQ->surfaceArea;
                 double conductionDistance = rightCandidate.insulationWidth / 2.0;
                 
                 r.resistance = ThermalResistance::calculateConductionResistance(
@@ -3295,16 +3363,15 @@ void Temperature::createTurnToSolidConnections() {
                     double copperResistance = ThermalResistance::calculateConductionResistance(
                         copperLength, qOuter->thermalConductivity, qOuter->surfaceArea);
                     
-                    // Insulation/enamel resistance
+                    // Insulation/enamel resistance.
+                    // getInsulationLayerThermalResistance(turnIdx, -1, …) already returns the
+                    // wire's coating/enamel resistance (computed from the wire's coating
+                    // thickness & conductivity), so the coating must NOT be added a second
+                    // time via WireCoatingUtils — doing so double-counted the enamel and
+                    // over-insulated the turn-to-core path.
                     double enamelResistance = getInsulationLayerThermalResistance(turnIdx, -1, qOuter->surfaceArea);
-                    
-                    // Coating resistance
-                    double coatingResistance = 0.0;
-                    if (qOuter->coating.has_value()) {
-                        coatingResistance = WireCoatingUtils::calculateCoatingResistance(qOuter->coating.value(), qOuter->surfaceArea);
-                    }
-                    
-                    double totalResistance = copperResistance + enamelResistance + coatingResistance;
+
+                    double totalResistance = copperResistance + enamelResistance;
                     r.resistance = totalResistance;
                     
                     // Add turn-to-core insulation from config if enabled
@@ -3381,16 +3448,12 @@ void Temperature::createTurnToSolidConnections() {
                     double copperResistance = ThermalResistance::calculateConductionResistance(
                         copperLength, qInner->thermalConductivity, qInner->surfaceArea);
                     
-                    // Insulation/enamel resistance
+                    // Insulation/enamel resistance (see note above: do NOT also add the
+                    // WireCoatingUtils coating term — getInsulationLayerThermalResistance
+                    // already accounts for the wire coating, and adding both double-counts it).
                     double enamelResistance = getInsulationLayerThermalResistance(turnIdx, -1, qInner->surfaceArea);
-                    
-                    // Coating resistance
-                    double coatingResistance = 0.0;
-                    if (qInner->coating.has_value()) {
-                        coatingResistance = WireCoatingUtils::calculateCoatingResistance(qInner->coating.value(), qInner->surfaceArea);
-                    }
-                    
-                    double totalResistance = copperResistance + enamelResistance + coatingResistance;
+
+                    double totalResistance = copperResistance + enamelResistance;
                     r.resistance = totalResistance;
                     
                     // Add turn-to-core insulation from config if enabled
@@ -3436,12 +3499,12 @@ void Temperature::createConvectionConnections() {
             surfaceTemp, _config.ambientTemperature, wireWidth, SurfaceOrientation::VERTICAL);
     }
     
-    if (_config.includeRadiation) {
-        double h_rad = ThermalResistance::calculateRadiationCoefficient(
-            surfaceTemp, _config.ambientTemperature, _config.surfaceEmissivity);
-        h_conv += h_rad;
-    }
-    
+    // NOTE: h_conv is now PURE convection. Radiation used to be lumped in here
+    // (h_conv += h_rad), but that made it a no-op: recalculateConvectionResistances
+    // recomputes a pure-convection coefficient every iteration and overwrote the lumped
+    // value, so radiation silently vanished from the converged solution. Radiation is now
+    // modelled as its own parallel path below.
+
     // IMP-4: Dispatch to geometry-specific method
     if (_isToroidal) {
         createToroidalConvectionConnections(ambientIdx, h_conv);
@@ -3449,6 +3512,78 @@ void Temperature::createConvectionConnections() {
         createPlanarConvectionConnections(ambientIdx, h_conv);
     } else {
         createConcentricConvectionConnections(ambientIdx, h_conv);
+    }
+
+    // Radiation as a SEPARATE parallel path from each exposed winding surface to the
+    // ferrite CORE part it faces (NOT to ambient). The dominant radiative exchange inside
+    // a magnetic component is between the exposed turns and the core surfaces opposite them
+    // across the winding window; both bodies are hot, so the NET exchange is modest.
+    // Radiating winding surfaces straight to ambient (a previous approach) grossly
+    // over-counted cooling. Each exposed turn surface therefore gets a RADIATION-typed
+    // resistor to its nearest core node; the iterative solver
+    // (recalculateConvectionResistances) updates h_rad from BOTH endpoint temperatures.
+    if (_config.includeRadiation) {
+        std::vector<size_t> coreNodeIndices;
+        for (size_t ci = 0; ci < _nodes.size(); ++ci) {
+            const auto part = _nodes[ci].part;
+            if (part == ThermalNodePartType::CORE_CENTRAL_COLUMN ||
+                part == ThermalNodePartType::CORE_LATERAL_COLUMN ||
+                part == ThermalNodePartType::CORE_TOP_YOKE ||
+                part == ThermalNodePartType::CORE_BOTTOM_YOKE ||
+                part == ThermalNodePartType::CORE_TOROIDAL_SEGMENT) {
+                coreNodeIndices.push_back(ci);
+            }
+        }
+
+        if (!coreNodeIndices.empty()) {
+            const size_t existingResistorCount = _resistances.size();
+            for (size_t k = 0; k < existingResistorCount; ++k) {
+                // Copy (not reference): push_back below may reallocate _resistances.
+                const ThermalResistanceElement convectionResistor = _resistances[k];
+                const bool isExposedTurnSurface =
+                    convectionResistor.nodeToId == ambientIdx && convectionResistor.area > 0 &&
+                    convectionResistor.nodeFromId < _nodes.size() &&
+                    _nodes[convectionResistor.nodeFromId].part == ThermalNodePartType::TURN &&
+                    (convectionResistor.type == HeatTransferType::NATURAL_CONVECTION ||
+                     convectionResistor.type == HeatTransferType::FORCED_CONVECTION);
+                if (!isExposedTurnSurface) continue;
+
+                // Find the nearest core node ("opposite ferrite core part").
+                const auto& sourceNode = _nodes[convectionResistor.nodeFromId];
+                size_t nearestCoreIdx = coreNodeIndices[0];
+                double bestDistanceSquared = std::numeric_limits<double>::max();
+                for (size_t ci : coreNodeIndices) {
+                    double distanceSquared = 0.0;
+                    const size_t dims = std::min(sourceNode.physicalCoordinates.size(),
+                                                 _nodes[ci].physicalCoordinates.size());
+                    for (size_t d = 0; d < dims; ++d) {
+                        double diff = sourceNode.physicalCoordinates[d] - _nodes[ci].physicalCoordinates[d];
+                        distanceSquared += diff * diff;
+                    }
+                    if (distanceSquared < bestDistanceSquared) {
+                        bestDistanceSquared = distanceSquared;
+                        nearestCoreIdx = ci;
+                    }
+                }
+
+                // Initial guess: surface at surfaceTemp, core at ambient. The iterative
+                // solver replaces this with both converged endpoint temperatures.
+                double h_rad = ThermalResistance::calculateRadiationCoefficient(
+                    surfaceTemp, _config.ambientTemperature, _config.surfaceEmissivity);
+                if (h_rad <= 0) continue;
+
+                ThermalResistanceElement radiationResistor;
+                radiationResistor.nodeFromId = convectionResistor.nodeFromId;
+                radiationResistor.quadrantFrom = convectionResistor.quadrantFrom;
+                radiationResistor.nodeToId = nearestCoreIdx;
+                radiationResistor.quadrantTo = ThermalNodeFace::NONE;
+                radiationResistor.type = HeatTransferType::RADIATION;
+                radiationResistor.area = convectionResistor.area;
+                radiationResistor.orientation = convectionResistor.orientation;
+                radiationResistor.resistance = 1.0 / (h_rad * convectionResistor.area);
+                _resistances.push_back(radiationResistor);
+            }
+        }
     }
 }
 
@@ -3597,13 +3732,20 @@ void Temperature::createToroidalConvectionConnections(size_t ambientIdx, double 
                             
                             bool isLeft = (face == ThermalNodeFace::TANGENTIAL_LEFT);
                             double distAlongTangent = std::abs(angleDiff) * nodeR;
-                            
-                            // Check if there's a turn blocking this direction
-                            if (isLeft && angleDiff < 0 && distAlongTangent < maxConvectionDist) {
+
+                            // Block if a turn sits in this face's tangential direction.
+                            // initializeToroidalQuadrants assigns TANGENTIAL_LEFT to +pi/2
+                            // (CCW, larger angle) and TANGENTIAL_RIGHT to -pi/2 (CW, smaller
+                            // angle), and angleDiff = otherAngle - nodeAngle. So a LEFT face
+                            // is blocked by a neighbour at LARGER angle (angleDiff > 0) and a
+                            // RIGHT face by one at SMALLER angle. The previous signs were
+                            // reversed (they disagreed with the insulation-layer block below,
+                            // which already used the correct convention).
+                            if (isLeft && angleDiff > 0 && distAlongTangent < maxConvectionDist) {
                                 isExposed = false;
                                 break;
                             }
-                            if (!isLeft && angleDiff > 0 && distAlongTangent < maxConvectionDist) {
+                            if (!isLeft && angleDiff < 0 && distAlongTangent < maxConvectionDist) {
                                 isExposed = false;
                                 break;
                             }
@@ -3751,10 +3893,11 @@ void Temperature::createToroidalConvectionConnections(size_t ambientIdx, double 
                         r.quadrantFrom = ThermalNodeFace::RADIAL_INNER;
                         r.nodeToId = ambientIdx;
                         r.quadrantTo = ThermalNodeFace::NONE;
-                        r.type = _config.includeForcedConvection ? 
-                                 HeatTransferType::FORCED_CONVECTION : 
+                        r.type = _config.includeForcedConvection ?
+                                 HeatTransferType::FORCED_CONVECTION :
                                  HeatTransferType::NATURAL_CONVECTION;
                         r.resistance = q->calculateConvectionResistance(h_conv);
+                        r.area = q->surfaceArea;  // Store area so recalc updates this face (mirrors RADIAL_OUTER)
                         _resistances.push_back(r);
                     }
                 }
@@ -4358,13 +4501,19 @@ void Temperature::createConcentricConvectionConnections(size_t ambientIdx, doubl
             }
         }
     
-    // Half-core symmetry correction: the model uses half the core depth,
-    // so convection areas represent only one half. The real core has double
-    // the convection area (both halves), so halve all convection resistances
-    // created in this method (R = 1/(h*A), double A => R/2)
+    // Half-core symmetry correction: the CORE is modelled at half its depth, so its
+    // convection surfaces represent only one half — double their area (halve R) to
+    // account for the symmetric other half. Turns are NOT halved: they come from the
+    // real winding at full geometry (a round turn is a full 2*pi*r loop independent of
+    // core depth), so doubling their convection would over-cool the winding. Skip
+    // turn-sourced convection resistors.
     for (size_t i = initialResistanceCount; i < _resistances.size(); ++i) {
         if (_resistances[i].type == HeatTransferType::NATURAL_CONVECTION ||
             _resistances[i].type == HeatTransferType::FORCED_CONVECTION) {
+            size_t fromId = _resistances[i].nodeFromId;
+            if (fromId < _nodes.size() && _nodes[fromId].part == ThermalNodePartType::TURN) {
+                continue;  // turns are full-geometry, not half-depth
+            }
             _resistances[i].resistance /= 2.0;
             _resistances[i].area *= 2.0;
         }
@@ -4611,6 +4760,14 @@ void Temperature::plotSchematic() {
 
 // IMP-5: Recalculate temperature-dependent convection/radiation resistances
 void Temperature::recalculateConvectionResistances(const std::vector<double>& temperatures) {
+    // NOTE (radiation): build (createConvectionConnections) lumps a radiation coefficient
+    // into h_conv for every exposed convection surface, but this recalc deliberately does
+    // NOT re-add it — re-adding indiscriminate, view-factor-1, full-emissivity radiation to
+    // every surface over-cools the model badly (concentric_transformer core fell to ~45C vs
+    // the Icepak reference of 67.88C). Correctly modelling radiation requires per-surface
+    // view factors / exposed-outer-surface-only treatment and an Icepak re-baseline; that is
+    // a pending design decision, tracked separately. Until then convection-only here keeps
+    // the converged model in agreement with the calibrated Icepak references.
     for (auto& res : _resistances) {
         if (res.nodeFromId >= temperatures.size()) continue;
         double surfaceTemp = temperatures[res.nodeFromId];
@@ -4618,9 +4775,6 @@ void Temperature::recalculateConvectionResistances(const std::vector<double>& te
         if (res.type == HeatTransferType::NATURAL_CONVECTION && res.area > 0) {
             double charLength = std::sqrt(std::max(res.area, 1e-9));
             double h_new = ThermalResistance::calculateNaturalConvectionCoefficient(
-                // IMP-NEW-04: Use stored orientation instead of always VERTICAL
-                // WHY: Horizontal surfaces have very different h values.
-                // PREVIOUS: SurfaceOrientation::VERTICAL (hardcoded)
                 surfaceTemp, ambientTemp, charLength, res.orientation);
             if (h_new > 0) res.resistance = 1.0 / (h_new * res.area);
         } else if (res.type == HeatTransferType::FORCED_CONVECTION && res.area > 0) {
@@ -4629,8 +4783,13 @@ void Temperature::recalculateConvectionResistances(const std::vector<double>& te
                 _config.airVelocity, charLength, surfaceTemp);
             if (h_new > 0) res.resistance = 1.0 / (h_new * res.area);
         } else if (res.type == HeatTransferType::RADIATION && res.area > 0) {
+            // Radiation connects a winding surface to the facing core node (not ambient),
+            // so evaluate the coefficient from BOTH endpoint temperatures.
+            double otherTemp = (res.nodeToId < temperatures.size())
+                                   ? temperatures[res.nodeToId]
+                                   : _config.ambientTemperature;
             double h_rad = ThermalResistance::calculateRadiationCoefficient(
-                surfaceTemp, ambientTemp, _config.surfaceEmissivity);
+                surfaceTemp, otherTemp, _config.surfaceEmissivity);
             if (h_rad > 0) res.resistance = 1.0 / (h_rad * res.area);
         }
     }
@@ -4670,17 +4829,26 @@ ThermalResult Temperature::solveThermalCircuit() {
         SimpleMatrix G(n, n, 0.0);
 
         for (const auto& res : _resistances) {
-            double g = 1.0 / std::max(res.resistance, 1e-9);
-
             size_t i = res.nodeFromId;
             size_t j = res.nodeToId;
 
-            G(i, i) += g;
-            if (j < n) {
-                G(j, j) += g;
-                G(i, j) -= g;
-                G(j, i) -= g;
+            // Both endpoints must reference real nodes. The previous code guarded only
+            // `if (j < n)` and, when j was out of range, added g to G(i,i) with no
+            // off-diagonal term — silently grounding node i to an implicit 0 K reference
+            // (0 °C, not ambient), corrupting the solution. A resistor pointing outside the
+            // node set is a build inconsistency, so fail loudly instead.
+            if (i >= n || j >= n) {
+                throw std::runtime_error(
+                    "Temperature::solveThermalCircuit: resistance references a node index out of range (from=" +
+                    std::to_string(i) + ", to=" + std::to_string(j) + ", node count=" + std::to_string(n) +
+                    "). The thermal network was built inconsistently.");
             }
+
+            double g = 1.0 / std::max(res.resistance, 1e-9);
+            G(i, i) += g;
+            G(j, j) += g;
+            G(i, j) -= g;
+            G(j, i) -= g;
         }
 
         // Set ambient node as fixed temperature
@@ -4751,7 +4919,7 @@ ThermalResult Temperature::solveThermalCircuit() {
             throw std::runtime_error("Temperature::solveThermalCircuit: Solver produced NaN or infinite temperatures at iteration " +
                                      std::to_string(iteration) + ". This indicates a numerical instability in the thermal network.");
         }
-        
+
         converged = true;
         for (size_t i = 0; i < n; ++i) {
             if (std::abs(temperatures[i] - oldTemperatures[i]) > _config.convergenceTolerance) {
@@ -4759,7 +4927,7 @@ ThermalResult Temperature::solveThermalCircuit() {
                 break;
             }
         }
-        
+
         oldTemperatures = temperatures;
         iteration++;
     }
@@ -4774,7 +4942,12 @@ ThermalResult Temperature::solveThermalCircuit() {
     result.thermalResistances = _resistances;
     
     result.maximumTemperature = _config.ambientTemperature;
-    for (size_t i = 0; i < n - 1; ++i) {
+    for (size_t i = 0; i < n; ++i) {
+        // Skip the ambient node by IDENTITY, not by position: the previous `i < n - 1`
+        // assumed ambient was the last node, but applyHeatsinkCooling / applyColdPlateCooling
+        // append their nodes AFTER ambient, so the old loop both omitted a real node and
+        // (when cooling was applied) scanned the ambient node into the maximum.
+        if (_nodes[i].part == ThermalNodePartType::AMBIENT) continue;
         result.nodeTemperatures[_nodes[i].name] = temperatures[i];
         if (temperatures[i] > result.maximumTemperature) {
             result.maximumTemperature = temperatures[i];
@@ -4979,8 +5152,16 @@ void Temperature::applyForcedConvection(const MAS::Cooling& cooling) {
         throw std::runtime_error("Temperature::applyForcedConvection: Forced convection requested but velocity is missing or empty.");
     }
     
-    double velocity = cooling.get_velocity().value()[0]; // m/s
-    
+    // Use the MAGNITUDE of the velocity vector, not just the x-component: airflow
+    // specified along y or z (or any diagonal) previously collapsed to ~0 and silently
+    // degraded forced convection to natural.
+    const std::vector<double> velocityComponents = cooling.get_velocity().value();
+    double velocity = 0.0;
+    for (double component : velocityComponents) {
+        velocity += component * component;
+    }
+    velocity = std::sqrt(velocity); // m/s, vector magnitude
+
     // Store velocity in config so recalculateConvectionResistances can use it
     _config.airVelocity = velocity;
     _config.includeForcedConvection = true;
@@ -5055,12 +5236,15 @@ void Temperature::applyHeatsinkCooling(const MAS::Cooling& cooling) {
     size_t heatsinkIdx = _nodes.size();
     _nodes.push_back(heatsinkNode);
     
-    // Create TIM resistance if interface properties provided
+    // Create TIM resistance from the provided area-specific interface resistance.
+    // Gate ONLY on interface_thermal_resistance: it is the value actually used
+    // (R_total = R_specific / area). The previous code also required
+    // interface_thickness, which is never used in the computation, so a user who
+    // supplied only the (correct) area-specific resistance had it silently dropped
+    // in favour of the default.
     double timResistance = kTIM_DefaultResistance;
-    if (cooling.get_interface_thickness().has_value() && 
-        cooling.get_interface_thermal_resistance().has_value()) {
-        // Issue 25: interface_thermal_resistance is area-specific resistance (K*m^2/W)
-        // R_total = R_specific / area
+    if (cooling.get_interface_thermal_resistance().has_value()) {
+        // interface_thermal_resistance is area-specific resistance (K*m^2/W).
         double areaSpecificResistance = cooling.get_interface_thermal_resistance().value();
         double area = _nodes[topYokeIdx].getTotalSurfaceArea();
         if (area > 0) {

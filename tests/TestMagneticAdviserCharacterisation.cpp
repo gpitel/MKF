@@ -167,16 +167,28 @@ void check_top_n(const std::string& label,
 // valid pool for this 507 kHz spec, so the former INVALID-penalised fallback
 // (95 E 8.3/4, 0.85) is replaced by a genuinely VALID third design
 // (79 E 8/2 3 stacks, 0.75) — the thin-pool note below no longer applies.
+// Refreshed 2026-06-27 (ABT #10): the core names now annotate the solved gap
+// ("gapped 0.03 mm" on the E 10/3, "gapped 0.00 mm" on the E 8/2 — i.e. still
+// physically ungapped, just rendered with the gap field). This is a pure
+// naming/representation change from the gap-labelling rework: the shapes, turn
+// counts, winding order, margins, wires AND scores are byte-identical to the
+// previous snapshot, so the advised designs are unchanged — only the reference
+// strings gained the gap suffix.
 const std::vector<MagneticEntry> kTopThreeWinding = {
-    {"79 E 10/3, Turns: 20, Order: 012, Non-Interleaved, Margin Taped 00",
+    // Refreshed 2026-07-07 (ABT #126 investigation): the health-pass MagneticEnergy
+    // min/max interval fix (energy target at L_max) re-solves the E 10/3 to a
+    // 0.04 mm gap needing 21 turns (conservative sizing for L at +tolerance) and
+    // re-ranks slot 3 to the 95-material 9-turn stack. Regenerated on main
+    // 17e1f850, user-approved.
+    {"79 E 10/3 gapped 0.04 mm, Turns: 21, Order: 012, Non-Interleaved, Margin Taped 00",
      "Round 33.0 - Single Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
-     2.996808299681307},
-    {"79 E 10/3, Turns: 20, Order: 012, Non-Interleaved, Margin Taped 01",
-     "Round 33.0 - Single Build || Round 41.0 - Heavy Build || Round 41.0 - Single Build",
-     1.9199759326110142},
-    {"79 E 8/2 3 stacks, Turns: 10, Order: 012, Non-Interleaved, Margin Taped 00",
-     "Round 36.0 - Single Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
-     0.75054151624567389},
+     2.3096063643920681},
+    {"79 E 10/3 gapped 0.04 mm, Turns: 21, Order: 012, Non-Interleaved, Margin Taped 01",
+     "Round 33.0 - Heavy Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
+     1.8851853877283165},
+    {"95 E 8/2 3 stacks gapped 0.01 mm, Turns: 9, Order: 021, Non-Interleaved, Margin Taped 00",
+     "Round 33.0 - Single Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
+     0.70004336813583523},
 };
 
 } // namespace
@@ -186,7 +198,7 @@ const std::vector<MagneticEntry> kTopThreeWinding = {
 // =============================================================================
 
 TEST_CASE("MagneticAdviser 3-winding end-to-end top-3 snapshot",
-          "[adviser][magnetic-adviser][characterisation][end-to-end]") {
+          "[adviser][magnetic-adviser][characterisation][heavy][end-to-end]") {
     settings.reset();
     settings.set_coil_allow_margin_tape(true);
     settings.set_coil_allow_insulated_wire(false);

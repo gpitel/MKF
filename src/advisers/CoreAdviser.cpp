@@ -36,6 +36,35 @@ CMRC_DECLARE(data);
 
 namespace OpenMagnetics {
 
+namespace {
+// ABT #153: marker appended to a result's manufacturer reference and core name
+// when the synthetic STANDARD_CORES catalogue produced nothing and the adviser
+// fell through to the AVAILABLE_CORES manufacturer catalogue. The whole point of
+// the STANDARD_CORES catalogue is a broad synthesised set, yet it only pairs
+// ferrite materials with concentric (E/U/PQ…) shapes and powder materials with
+// toroids — so an off-the-shelf powder concentric core (e.g. a Kool Mµ E-core,
+// the natural pick for a high-energy line-frequency PFC boost inductor) is never
+// synthesised, even though AVAILABLE_CORES lists exactly such parts. Rather than
+// returning "no core can be advised", fall through to the real manufacturer
+// catalogue and TAG every result so the mode substitution is explicit in the
+// returned MAS — never a silent fallback (house rule).
+const std::string kAvailableFallbackTag =
+    " [advised from available-cores catalogue: no standard core met this spec]";
+
+void tag_results_as_available_fallback(std::vector<std::pair<Mas, double>>& results) {
+    for (auto& [mas, scoring] : results) {
+        auto& magnetic = mas.get_mutable_magnetic();
+        if (magnetic.get_manufacturer_info()) {
+            auto info = magnetic.get_manufacturer_info().value();
+            info.set_reference(info.get_reference().value_or("unnamed") + kAvailableFallbackTag);
+            magnetic.set_manufacturer_info(info);
+        }
+        auto& core = magnetic.get_mutable_core();
+        core.set_name(core.get_name().value_or("unnamed") + kAvailableFallbackTag);
+    }
+}
+}  // namespace
+
 
 void CoreAdviser::set_unique_core_shapes(bool value) {
     _uniqueCoreShapes = value;
@@ -129,7 +158,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(
     // filtering coreShapeDatabase indirectly via constraints on the cores
     // dataset later in the flow (see filter inside the shapes branch).
     if (get_mode() == CoreAdviserModes::AVAILABLE_CORES) {
-        if (coreDatabase.empty()) {
+        if (coreDatabase.empty() && !LibraryContext::Scope::anyActive()) {
             load_cores();
         }
         auto filtered = filterCoresByConstraints(coreDatabase, constraints);
@@ -167,7 +196,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(
 
 std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs, std::map<CoreAdviserFilters, double> weights, size_t maximumNumberResults){
     if (get_mode() == CoreAdviserModes::AVAILABLE_CORES) {
-        if (coreDatabase.empty()) {
+        if (coreDatabase.empty() && !LibraryContext::Scope::anyActive()) {
             load_cores();
         }
         return get_advised_core(inputs, weights, &coreDatabase, maximumNumberResults);
@@ -199,7 +228,24 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
             shapes.push_back(shape);
         }
         _weights = weights; // the shapes overload consumes _weights
-        return get_advised_core(inputs, &shapes, maximumNumberResults);
+        auto standardResults = get_advised_core(inputs, &shapes, maximumNumberResults);
+        // ABT #153: if the synthetic standard-core catalogue served the design,
+        // return it. Otherwise (a POWER design the standard synthesis cannot
+        // build — see kAvailableFallbackTag) fall through to the AVAILABLE_CORES
+        // manufacturer catalogue and tag the results loudly instead of returning
+        // an empty set ("No core can be advised. You are on your own.").
+        if (!standardResults.empty() || get_application() != MAS::MagneticApplication::POWER) {
+            return standardResults;
+        }
+        logEntry("STANDARD_CORES synthesis returned no candidates for this power design; "
+                 "falling through to the AVAILABLE_CORES manufacturer catalogue "
+                 "(results are tagged to make the mode substitution explicit).", "CoreAdviser");
+        if (coreDatabase.empty() && !LibraryContext::Scope::anyActive()) {
+            load_cores();
+        }
+        auto fallbackResults = get_advised_core(inputs, weights, &coreDatabase, maximumNumberResults);
+        tag_results_as_available_fallback(fallbackResults);
+        return fallbackResults;
     }
     else if (get_mode() == CoreAdviserModes::CUSTOM_CORES) {
         if (coreMaterialDatabase.empty()) {
@@ -245,8 +291,15 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
         std::vector<Core> partialCores;
         partialCores.reserve(last - i);
 
-        move((*cores).begin() + i, (*cores).begin() + last, std::back_inserter(partialCores));
-        
+        // ABT #164: COPY (not move) the batch out of the caller's vector. The
+        // batching entry point is fed &coreDatabase (the process-shared core
+        // catalog) by get_advised_core(...) above, so moving elements out gutted
+        // the shared database for every subsequent caller — even a sequential
+        // same-thread reuse — and silently corrupted the parallel fan-out. The
+        // extra memory is bounded to ONE batch (<= maximumNumberCores cores),
+        // transient per iteration, not a full-database copy.
+        std::copy((*cores).begin() + i, (*cores).begin() + last, std::back_inserter(partialCores));
+
         auto partialResult = get_advised_core(inputs, weights, &partialCores, maximumNumberResults);
         std::move(partialResult.begin(), partialResult.end(), std::back_inserter(results));
     }

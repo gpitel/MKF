@@ -15,9 +15,11 @@ double linear_table_interpolation(std::vector<std::pair<double, double>> table, 
         return (x - table.back().first) * slope + table.back().second;
     }
     if (x < table.front().first) {
-        if (table.size() < 2) return table.front().second;
-        double slope = (table[1].second - table[0].second) / (table[1].first - table[0].first);
-        return table.front().second + (x - table[0].first) * slope; // FIX H-INS-1: Correct extrapolation direction
+        // ABT #108: standards distance/withstand tables are floors — below the lowest
+        // tabulated stress the first row's value applies. Linear extrapolation below
+        // the first row (former H-INS-1 behaviour) produced NEGATIVE clearances and
+        // creepages at low voltages (e.g. IEC 60664-1 G.13 below ~41 V).
+        return table.front().second;
     }
 
 
@@ -1031,7 +1033,11 @@ double InsulationIEC62368Model::get_creepage_distance_table_18(double voltageRms
 }
 
 double InsulationIEC62368Model::get_altitude_factor(double altitude){
-    double result = linear_table_interpolation(table16, altitude);
+    // Table 16 starts at 2000 m with factor 1.0; linear_table_interpolation extrapolates
+    // BELOW the first row, so declaring altitude < 2000 m silently REDUCED the clearance
+    // (0.72x at sea level) — the unsafe direction. The 60664/61558 siblings guard with
+    // altitude > lowerAltitudeLimit; clamp to >= 1.0 here for the same effect.
+    double result = std::max(1.0, linear_table_interpolation(table16, altitude));
     return ceilFloat(result, 5);
 }
 
@@ -1505,7 +1511,7 @@ double InsulationIEC60335Model::get_rated_impulse_withstand_voltage(OvervoltageC
     throw std::invalid_argument("Too much voltage for IEC 60335-1: " + std::to_string(ratedVoltage));
 }
 
-double InsulationIEC60335Model::get_clearance_table_16(PollutionDegree pollutionDegree, WiringTechnology wiringType, IsolationClass insulationType, double ratedImpulseWithstandVoltage){
+double InsulationIEC60335Model::get_clearance_table_16(PollutionDegree pollutionDegree, std::optional<WiringTechnology> wiringType, IsolationClass insulationType, double ratedImpulseWithstandVoltage){
     for (size_t voltagesIndex = 0; voltagesIndex < table16.size(); voltagesIndex++) {
         if (ratedImpulseWithstandVoltage <= table16[voltagesIndex].first) {
             double result = DBL_MAX;
@@ -1555,8 +1561,23 @@ double InsulationIEC60335Model::get_distance_through_insulation_table_19(Overvol
 }
 
 double InsulationIEC60335Model::get_withstand_voltage_table_7(IsolationClass insulationType, double ratedVoltage){
-    std::string insulationTypeString = to_string(insulationType);
-    auto aux = table7[insulationTypeString];
+    // The bundled IEC_60335-1.json keys Table 7 with TitleCase ("Basic", "Supplementary",
+    // "Reinforced", "Double") while to_string(IsolationClass) yields lowercase — the old
+    // map[] lookup inserted an empty vector, so EVERY class always fell through to the
+    // "Too much voltage" throw. Map the enum explicitly like the IEC 62368 lookups do.
+    std::string insulationTypeString;
+    switch (insulationType) {
+        case IsolationClass::BASIC: insulationTypeString = "Basic"; break;
+        case IsolationClass::SUPPLEMENTARY: insulationTypeString = "Supplementary"; break;
+        case IsolationClass::REINFORCED: insulationTypeString = "Reinforced"; break;
+        case IsolationClass::DOUBLE: insulationTypeString = "Double"; break;
+        default:
+            throw std::invalid_argument("IEC 60335-1 Table 7 does not cover insulation class: " + to_string(insulationType));
+    }
+    if (!table7.contains(insulationTypeString)) {
+        throw std::runtime_error("IEC 60335-1 Table 7 data is missing insulation class: " + insulationTypeString);
+    }
+    auto aux = table7.at(insulationTypeString);
     for (size_t voltagesIndex = 0; voltagesIndex < aux.size(); voltagesIndex++) {
         if (ratedVoltage <= aux[voltagesIndex].first) {
             return aux[voltagesIndex].second;
@@ -1644,7 +1665,9 @@ double InsulationIEC60335Model::calculate_withstand_voltage(Inputs& inputs) {
 }
 
 double InsulationIEC60335Model::calculate_clearance(Inputs& inputs) {
-    auto wiringTechnology = inputs.get_design_requirements().get_wiring_technology().value();
+    // Keep the optional: siblings (60664/61558/62368) compare it directly; .value()
+    // here crashed with bad_optional_access when wiringTechnology was null.
+    auto wiringTechnology = inputs.get_design_requirements().get_wiring_technology();
     auto pollutionDegree = inputs.get_pollution_degree();
     double mainSupplyVoltage = resolve_dimensional_values(inputs.get_main_supply_voltage());
     double maximumPrimaryVoltageRms = inputs.get_maximum_voltage_rms(0);

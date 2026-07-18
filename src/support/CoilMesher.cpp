@@ -4,6 +4,7 @@
 #include "support/Utils.h"
 
 #include <cmath>
+#include <limits>
 #include <complex>
 #include <filesystem>
 #include <fstream>
@@ -32,6 +33,27 @@ std::shared_ptr<CoilMesherModel> CoilMesherModel::factory(CoilMesherModels model
 
 std::vector<size_t> CoilMesher::get_common_harmonic_indexes(OperatingPoint operatingPoint, double windingLossesHarmonicAmplitudeThreshold) {
     auto commonHarmonicIndexes = get_main_harmonic_indexes(operatingPoint, windingLossesHarmonicAmplitudeThreshold);
+    if (commonHarmonicIndexes.empty()) {
+        // An empty selection means every winding's current has zero AC content
+        // (a DC-only excitation, e.g. a choke bias point). That is a valid
+        // operating point whose AC inducing field — and thus proximity losses —
+        // is exactly zero, not an error. Mesh the fundamental with its zero
+        // amplitude so both the inducing and induced meshes keep one consistent
+        // harmonic and downstream consumers don't see COIL_NOT_PROCESSED.
+        // Only degrade this way when a fundamental with a real frequency exists;
+        // otherwise the excitation is genuinely malformed and the mesher throws.
+        for (auto& excitation : operatingPoint.get_excitations_per_winding()) {
+            auto current = excitation.get_current();
+            if (!current || !current->get_harmonics()) {
+                continue;
+            }
+            auto frequencies = current->get_harmonics().value().get_frequencies();
+            if (frequencies.size() > 1 && frequencies[1] > 0) {
+                return {1};
+            }
+        }
+        return commonHarmonicIndexes;
+    }
     if (commonHarmonicIndexes.size() > operatingPoint.get_excitations_per_winding()[0].get_current()->get_harmonics().value().get_amplitudes().size() * _quickModeForManyHarmonicsThreshold) {
         return get_common_harmonic_indexes(operatingPoint, windingLossesHarmonicAmplitudeThreshold * 3);
     }
@@ -137,30 +159,77 @@ bool is_passed_from_all_turns(std::vector<Turn> turns, double pointX, double poi
     return noTurnsBelow ^ noTurnsAbove;
 }
 
-std::pair<Field, double> CoilMesher::generate_mesh_induced_grid(Magnetic magnetic, double frequency, size_t numberPointsX, size_t numberPointsY, bool ignoreTurns, bool includeInsideTurns) {
+std::pair<Field, double> CoilMesher::generate_mesh_induced_grid(Magnetic magnetic, double frequency, size_t numberPointsX, size_t numberPointsY, bool ignoreTurns, bool includeInsideTurns, bool meshAllWindows) {
     auto bobbin = magnetic.get_mutable_coil().resolve_bobbin();
 
     std::vector<FieldPoint> points;
     auto extraDimension = Coil::calculate_external_proportion_for_wires_in_toroidal_cores(magnetic.get_core(), magnetic.get_coil());
     auto bobbinWindingWindowShape = bobbin.get_winding_window_shape();
-    std::vector<double> bobbinPointsX;
-    std::vector<double> bobbinPointsY;
+    // One (xPoints, yPoints) grid per meshed region.
+    std::vector<std::pair<std::vector<double>, std::vector<double>>> regionGrids;
     double coreWidth = magnetic.get_mutable_core().get_width();
     double coreHeight = magnetic.get_mutable_core().get_height();
     double dA;
 
-    if (bobbinWindingWindowShape == WindingWindowShape::RECTANGULAR) {
-        double bobbinWidthStart = magnetic.get_mutable_coil().resolve_bobbin().get_processed_description().value().get_winding_windows()[0].get_coordinates().value()[0] - magnetic.get_mutable_coil().resolve_bobbin().get_processed_description().value().get_winding_windows()[0].get_width().value() / 2;
-        double bobbinWidth = magnetic.get_mutable_coil().resolve_bobbin().get_processed_description().value().get_winding_windows()[0].get_width().value();
+    auto bobbinWindingWindows = bobbin.get_processed_description().value().get_winding_windows();
+    if (bobbinWindingWindowShape == WindingWindowShape::RECTANGULAR &&
+        meshAllWindows && bobbinWindingWindows.size() > 1) {
+        // Multi-column cores: mesh every DISTINCT winding-window region. Windows
+        // sharing one region (the same region wound from two different columns)
+        // are meshed once; the regions of today's multi-window cores are congruent
+        // (mirrors or duplicates of window 0), which keeps dA uniform.
+        std::vector<std::vector<double>> meshedRegionCenters;
+        std::optional<double> commonPixelArea;
+        for (auto& windingWindow : bobbinWindingWindows) {
+            if (!windingWindow.get_coordinates() || !windingWindow.get_width() || !windingWindow.get_height()) {
+                continue;
+            }
+            auto regionCenter = windingWindow.get_coordinates().value();
+            bool alreadyMeshed = false;
+            for (auto& meshedCenter : meshedRegionCenters) {
+                if (std::abs(meshedCenter[0] - regionCenter[0]) < 1e-9 && std::abs(meshedCenter[1] - regionCenter[1]) < 1e-9) {
+                    alreadyMeshed = true;
+                    break;
+                }
+            }
+            if (alreadyMeshed) {
+                continue;
+            }
+            meshedRegionCenters.push_back(regionCenter);
+            double regionWidth = windingWindow.get_width().value();
+            double regionHeight = windingWindow.get_height().value();
+            double pixelXDimension = regionWidth / numberPointsX;
+            double pixelYDimension = regionHeight / numberPointsY;
+            double pixelArea = pixelXDimension * pixelYDimension;
+            if (!commonPixelArea) {
+                commonPixelArea = pixelArea;
+            }
+            else if (std::abs(pixelArea - commonPixelArea.value()) > commonPixelArea.value() * 1e-6) {
+                throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+                                            "Cannot mesh winding windows of different sizes with a uniform grid");
+            }
+            regionGrids.push_back({linspace(regionCenter[0] - regionWidth / 2 + pixelXDimension / 2,
+                                            regionCenter[0] + regionWidth / 2 - pixelXDimension / 2, numberPointsX),
+                                   linspace(regionCenter[1] - regionHeight / 2 + pixelYDimension / 2,
+                                            regionCenter[1] + regionHeight / 2 - pixelYDimension / 2, numberPointsY)});
+        }
+        if (!commonPixelArea) {
+            throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA, "No meshable winding window found");
+        }
+        dA = commonPixelArea.value();
+    }
+    else if (bobbinWindingWindowShape == WindingWindowShape::RECTANGULAR) {
+        double bobbinWidthStart = bobbinWindingWindows[0].get_coordinates().value()[0] - bobbinWindingWindows[0].get_width().value() / 2;
+        double bobbinWidth = bobbinWindingWindows[0].get_width().value();
         double coreColumnWidth = magnetic.get_mutable_core().get_columns()[0].get_width();
         double coreColumnHeight = magnetic.get_mutable_core().get_columns()[0].get_height();
 
         double totalWidthInGrid = bobbinWidthStart + bobbinWidth - coreColumnWidth / 2;
         double pixelXDimension = totalWidthInGrid / numberPointsX;
         double pixelYDimension = coreColumnHeight / numberPointsY;
-        
-        bobbinPointsX = linspace(coreColumnWidth / 2 + pixelXDimension / 2, bobbinWidthStart + bobbinWidth - pixelXDimension / 2, numberPointsX);
-        bobbinPointsY = linspace(-coreColumnHeight / 2 + pixelYDimension / 2, coreColumnHeight / 2 - pixelYDimension / 2, numberPointsY);
+
+        regionGrids.push_back({linspace(coreColumnWidth / 2 + pixelXDimension / 2, bobbinWidthStart + bobbinWidth - pixelXDimension / 2, numberPointsX),
+                               linspace(-coreColumnHeight / 2 + pixelYDimension / 2, coreColumnHeight / 2 - pixelYDimension / 2, numberPointsY)});
 
         double dx = totalWidthInGrid / numberPointsX;
         double dy = coreColumnHeight / numberPointsY;
@@ -169,9 +238,8 @@ std::pair<Field, double> CoilMesher::generate_mesh_induced_grid(Magnetic magneti
     else {
         // For toroidal cores with round winding windows, use standard Cartesian grid
         // This provides consistent behavior across all core types
-        auto windingWindows = bobbin.get_processed_description().value().get_winding_windows();
-        bobbinPointsX = linspace(-coreWidth / 2 * extraDimension, coreWidth / 2 * extraDimension, numberPointsX);
-        bobbinPointsY = linspace(-coreHeight / 2 * extraDimension, coreHeight / 2 * extraDimension, numberPointsY);
+        regionGrids.push_back({linspace(-coreWidth / 2 * extraDimension, coreWidth / 2 * extraDimension, numberPointsX),
+                               linspace(-coreHeight / 2 * extraDimension, coreHeight / 2 * extraDimension, numberPointsY)});
         double dx = coreWidth * extraDimension / numberPointsX;
         double dy = coreHeight * extraDimension / numberPointsY;
         dA = dx * dy;
@@ -188,30 +256,32 @@ std::pair<Field, double> CoilMesher::generate_mesh_induced_grid(Magnetic magneti
     if (windingOrientation && windingOrientation.value() == WindingOrientation::CONTIGUOUS) {
         checkOnlyDistance = false;
     }
-    for (size_t j = 0; j < bobbinPointsY.size(); ++j) {
-        for (size_t i = 0; i < bobbinPointsX.size(); ++i) {
-            if (!ignoreTurns) {
-                if (is_far_from_turns(turns, bobbinPointsX[i], bobbinPointsY[j]) && (checkOnlyDistance || is_passed_from_all_turns(turns, bobbinPointsX[i], bobbinPointsY[j]))) {
-                    continue;
-                }
-            }
-            if (isPlanar) {
+    for (auto& [bobbinPointsX, bobbinPointsY] : regionGrids) {
+        for (size_t j = 0; j < bobbinPointsY.size(); ++j) {
+            for (size_t i = 0; i < bobbinPointsX.size(); ++i) {
                 if (!ignoreTurns) {
-                    // Planar are so thin and can be so close, that we need to remove he copper part to avoid having a much larger value
-                    // TODO: Evaluate for other wires
+                    if (is_far_from_turns(turns, bobbinPointsX[i], bobbinPointsY[j]) && (checkOnlyDistance || is_passed_from_all_turns(turns, bobbinPointsX[i], bobbinPointsY[j]))) {
+                        continue;
+                    }
+                }
+                if (isPlanar) {
+                    if (!ignoreTurns) {
+                        // Planar are so thin and can be so close, that we need to remove he copper part to avoid having a much larger value
+                        // TODO: Evaluate for other wires
+                        if (is_inside_turns(turns, bobbinPointsX[i], bobbinPointsY[j])) {
+                            continue;
+                        }
+                    }
+                }
+                else if (!includeInsideTurns) {
                     if (is_inside_turns(turns, bobbinPointsX[i], bobbinPointsY[j])) {
                         continue;
                     }
                 }
+                FieldPoint fieldPoint;
+                fieldPoint.set_point(std::vector<double>{bobbinPointsX[i], bobbinPointsY[j]});
+                points.push_back(fieldPoint);
             }
-            else if (!includeInsideTurns) {
-                if (is_inside_turns(turns, bobbinPointsX[i], bobbinPointsY[j])) {
-                    continue;
-                }
-            }
-            FieldPoint fieldPoint;
-            fieldPoint.set_point(std::vector<double>{bobbinPointsX[i], bobbinPointsY[j]});
-            points.push_back(fieldPoint);
         }
     }
     Field inducedField;
@@ -457,45 +527,128 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(Turn 
     auto processedDescription = core.get_processed_description().value();
     auto coreFamily = core.get_shape_family();
 
-    WindingWindowElement windingWindow = processedDescription.get_winding_windows()[0]; // Hardcoded
+    // Mirror against the winding window that CONTAINS the turn (multi-column winding
+    // support). Single-window cores keep the historical frame: window 0's inner edge
+    // coincides with the main column surface, so the expressions below reduce exactly
+    // to the old columnWidth/2-based ones.
+    auto windingWindows = processedDescription.get_winding_windows();
+    WindingWindowElement windingWindow = windingWindows[0];
+    if (windingWindows.size() > 1 && coreFamily != CoreShapeFamily::T) {
+        double turnX = turn.get_coordinates()[0];
+        double bestDistance = std::numeric_limits<double>::max();
+        for (auto& candidate : windingWindows) {
+            if (!candidate.get_coordinates() || !candidate.get_width()) {
+                continue;
+            }
+            double distance = std::abs(turnX - candidate.get_coordinates().value()[0]);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                windingWindow = candidate;
+            }
+        }
+    }
 
     if (coreFamily != CoreShapeFamily::T) {
         double A = windingWindow.get_width().value();
         double B = windingWindow.get_height().value();
-        double coreColumnWidth = core.get_columns()[0].get_width();
 
-        double turnA = turn.get_coordinates()[0] - coreColumnWidth / 2;
-        double turnB = turn.get_coordinates()[1] + B / 2;
+        double windowLeftEdgeX;
+        double windowBottomY;
+        if (windingWindows.size() > 1 && windingWindow.get_coordinates()) {
+            windowLeftEdgeX = windingWindow.get_coordinates().value()[0] - A / 2;
+            windowBottomY = windingWindow.get_coordinates().value()[1] - B / 2;
+        }
+        else {
+            // Historical single-window frame: window bounded left by the main column
+            // surface, vertically centered. Kept by construction so single-window
+            // magnetics are bit-identical to the pre-multi-column behavior.
+            double coreColumnWidth = core.get_columns()[0].get_width();
+            windowLeftEdgeX = coreColumnWidth / 2;
+            windowBottomY = -B / 2;
+        }
 
-        for (int m = -M; m <= M; ++m)
-        {
-            for (int n = -N; n <= N; ++n)
+        auto appendImageLattice = [&](const std::vector<double>& crossingPoint, double frameA, double frameB,
+                                      double frameLeftEdgeX, double frameBottomY, double signMultiplier) {
+            double crossingA = crossingPoint[0] - frameLeftEdgeX;
+            double crossingB = crossingPoint[1] - frameBottomY;
+            for (int m = -M; m <= M; ++m)
             {
-                FieldPoint mirroredFieldPoint;
-                double currentMultiplier = (corePermeability - std::max(fabs(m), fabs(n))) / (corePermeability + std::max(fabs(m), fabs(n)));
-                mirroredFieldPoint.set_value(currentMultiplier);  // Will be multiplied later
-                if (turnLength) {
-                    mirroredFieldPoint.set_turn_length(turnLength.value());
+                for (int n = -N; n <= N; ++n)
+                {
+                    FieldPoint mirroredFieldPoint;
+                    double currentMultiplier = (corePermeability - std::max(fabs(m), fabs(n))) / (corePermeability + std::max(fabs(m), fabs(n)));
+                    mirroredFieldPoint.set_value(signMultiplier * currentMultiplier);  // Will be multiplied later
+                    if (turnLength) {
+                        mirroredFieldPoint.set_turn_length(turnLength.value());
+                    }
+                    if (turnIndex) {
+                        mirroredFieldPoint.set_turn_index(turnIndex.value());
+                    }
+                    double a;
+                    double b;
+                    if (m % 2 == 0) {
+                        a = m * frameA + crossingA;
+                    }
+                    else {
+                        a = m * frameA + frameA - crossingA;
+                    }
+                    if (n % 2 == 0) {
+                        b = n * frameB + crossingB;
+                    }
+                    else {
+                        b = n * frameB + frameB - crossingB;
+                    }
+                    mirroredFieldPoint.set_point(std::vector<double>{a + frameLeftEdgeX, b + frameBottomY});
+                    fieldPoints.push_back(mirroredFieldPoint);
                 }
-                if (turnIndex) {
-                    mirroredFieldPoint.set_turn_index(turnIndex.value());
+            }
+        };
+
+        appendImageLattice(turn.get_coordinates(), A, B, windowLeftEdgeX, windowBottomY, 1.0);
+
+        // Multi-column winding: the turn's SECOND cross-section crossing carries the
+        // same current with the opposite out-of-plane direction. A crossing inside
+        // another window gets THAT window's mirror images (the main winding's
+        // annulus crossings seen in the far window); a crossing outside the core (a
+        // lateral winding's return conductor) sits in open air and gets a single
+        // unmirrored filament.
+        if (turn.get_additional_coordinates()) {
+            auto additionalCoordinatesList = turn.get_additional_coordinates().value();
+            for (auto& additionalCoordinates : additionalCoordinatesList) {
+                if (additionalCoordinates.size() < 2) {
+                    continue;
                 }
-                double a;
-                double b;
-                if (m % 2 == 0) {
-                    a = m * A + turnA;
+                std::optional<WindingWindowElement> containingWindow;
+                for (auto& candidate : windingWindows) {
+                    if (!candidate.get_coordinates() || !candidate.get_width() || !candidate.get_height()) {
+                        continue;
+                    }
+                    if (std::abs(additionalCoordinates[0] - candidate.get_coordinates().value()[0]) <= candidate.get_width().value() / 2 &&
+                        std::abs(additionalCoordinates[1] - candidate.get_coordinates().value()[1]) <= candidate.get_height().value() / 2) {
+                        containingWindow = candidate;
+                        break;
+                    }
+                }
+                if (containingWindow) {
+                    appendImageLattice(additionalCoordinates,
+                                       containingWindow->get_width().value(),
+                                       containingWindow->get_height().value(),
+                                       containingWindow->get_coordinates().value()[0] - containingWindow->get_width().value() / 2,
+                                       containingWindow->get_coordinates().value()[1] - containingWindow->get_height().value() / 2,
+                                       -1.0);
                 }
                 else {
-                    a = m * A + A - turnA;
+                    FieldPoint returnConductorPoint;
+                    returnConductorPoint.set_value(-1.0);  // Will be multiplied later
+                    if (turnLength) {
+                        returnConductorPoint.set_turn_length(turnLength.value());
+                    }
+                    if (turnIndex) {
+                        returnConductorPoint.set_turn_index(turnIndex.value());
+                    }
+                    returnConductorPoint.set_point(std::vector<double>{additionalCoordinates[0], additionalCoordinates[1]});
+                    fieldPoints.push_back(returnConductorPoint);
                 }
-                if (n % 2 == 0) {
-                    b = n * B + turnB;
-                }
-                else {
-                    b = n * B + B - turnB;
-                }
-                mirroredFieldPoint.set_point(std::vector<double>{a + coreColumnWidth / 2, b - B / 2});
-                fieldPoints.push_back(mirroredFieldPoint);
             }
         }
     }
@@ -633,6 +786,34 @@ std::vector<FieldPoint> CoilMesherWangModel::generate_mesh_induced_turn(Turn tur
     fieldPoint.set_label("bottom");
     fieldPoints.push_back(fieldPoint);
 
+    // Width-resolved samples across the wide face, consumed by the Wang proximity
+    // model's perpendicular-field integral (Roshen 2007 gap fringing + thin-strip
+    // screening bridge). The gap-fringing field varies strongly (up to ~50x) across
+    // a wide flat conductor, so the 4 lumped surface points cannot represent
+    // integral(Hperp(x)^2 dx); these samples make the superposed total field
+    // (proximity + fringing, including their cross term) available along the width.
+    // Only generated when fringing is enabled: without a gap field the lumped
+    // mesh is sufficient and much cheaper.
+    if (settings.get_magnetic_field_include_fringing()) {
+        bool wideAlongY = (wire.get_type() == WireType::FOIL);
+        double wideDimension = wideAlongY ? wire.get_maximum_conducting_height() : wire.get_maximum_conducting_width();
+        double thinDimension = wideAlongY ? wire.get_maximum_conducting_width() : wire.get_maximum_conducting_height();
+        // Self-scaling sample count: enough to resolve the near-gap field decay on
+        // wide traces, cheap on near-square conductors.
+        size_t numberSamples = std::min(size_t(32), std::max(size_t(8), size_t(std::round(wideDimension / thinDimension))));
+        double sampleStep = wideDimension / double(numberSamples);
+        for (size_t sampleIndex = 0; sampleIndex < numberSamples; ++sampleIndex) {
+            double offset = -wideDimension / 2 + (sampleIndex + 0.5) * sampleStep;
+            if (wideAlongY) {
+                fieldPoint.set_point({turn.get_coordinates()[0], turn.get_coordinates()[1] + offset});
+            }
+            else {
+                fieldPoint.set_point({turn.get_coordinates()[0] + offset, turn.get_coordinates()[1]});
+            }
+            fieldPoint.set_label("widthsample");
+            fieldPoints.push_back(fieldPoint);
+        }
+    }
 
     return fieldPoints;
 }

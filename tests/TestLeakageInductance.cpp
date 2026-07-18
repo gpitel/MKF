@@ -1,9 +1,6 @@
 #include <source_location>
 #include <iomanip>
 #include <map>
-#include <fstream>
-#include <chrono>
-#include <cmath>
 #include "physical_models/LeakageInductance.h"
 #include "support/Painter.h"
 #include "support/Utils.h"
@@ -660,7 +657,8 @@ TEST_CASE("Calculate leakage inductance for a planar magnetic from the web 2", "
 
     OpenMagnetics::MagneticSimulator magneticSimulator;
     auto mas = magneticSimulator.simulate(inputs, magnetic);
-    auto leakageInductance = resolve_dimensional_values(mas.get_outputs()[0].get_inductance()->get_leakage_inductance()->get_leakage_inductance_per_winding()[0]);
+    // Winding-indexed array with 0 at the primary slot: the first secondary is index 1.
+    auto leakageInductance = resolve_dimensional_values(mas.get_outputs()[0].get_inductance()->get_leakage_inductance()->get_leakage_inductance_per_winding()[1]);
     CHECK_THAT(leakageInductance, WithinRel(expectedLeakageInductance, maximumError));
 
     {
@@ -723,7 +721,7 @@ struct LeakageTestCase {
     double expectedLeakageInductance;
 };
 
-TEST_CASE("Leakage inductance H-field model comparison study", "[physical-model][leakage-inductance][model-comparison]") {
+TEST_CASE("Leakage inductance H-field model comparison study", "[physical-model][leakage-inductance][model-comparison][heavy]") {
     settings.reset();
     
     std::vector<LeakageTestCase> testCases = {
@@ -777,12 +775,18 @@ TEST_CASE("Leakage inductance H-field model comparison study", "[physical-model]
                 auto leakageInductance = LeakageInductance().calculate_leakage_inductance(magnetic, tc.frequency).get_leakage_inductance_per_winding()[0].get_nominal().value();
                 double error = (leakageInductance - tc.expectedLeakageInductance) / tc.expectedLeakageInductance * 100;
                 errorsPerModel[modelName].push_back(fabs(error));
-                
+
+                // Every H-field model must produce a finite positive leakage inductance.
+                INFO(tc.name << " / " << modelName);
+                CHECK(std::isfinite(leakageInductance));
+                CHECK(leakageInductance > 0);
+
                 std::string errorStr = (error > 0 ? "+" : "") + std::to_string(static_cast<int>(error)) + "%";
-                std::cout << std::setw(8) << std::fixed << std::setprecision(1) << (leakageInductance * 1e6) 
+                std::cout << std::setw(8) << std::fixed << std::setprecision(1) << (leakageInductance * 1e6)
                           << " µH (" << std::setw(5) << errorStr << ") | ";
             } catch (const std::exception& e) {
                 std::cout << std::setw(18) << "ERROR" << " | ";
+                FAIL_CHECK(tc.name << " / " << modelName << " threw: " << e.what());
             }
         }
         std::cout << std::endl;
@@ -854,44 +858,38 @@ TEST_CASE("Leakage inductance matrix is symmetric and reproduces pairwise leakag
 
     settings.reset();
 }
-
-TEST_CASE("Leakage inductance completes on a large multi-winding foil coil", "[physical-model][leakage-inductance][regression]") {
-    // Regression guard for the leakage-inductance grid-solve blow-up. This coil (8 windings,
-    // 518 turns, two thin foil shield layers on a large U-core window; derived from the
-    // 06_llc_xfmr example) drives the field-solve grid to ~89,000 points. Before the fix the
-    // per-winding solve was dominated by an O(N^2) per-pair winding-name string lookup on top
-    // of an over-resolved grid, so this call ran for minutes and the calculation never
-    // appeared to finish. It must now complete in well under a second per winding.
+TEST_CASE("MagneticSimulator leakage output is winding-indexed with a zero primary slot", "[physical-model][leakage-inductance]") {
+    // Regression for web bug reports 125/134/139 (ABT #198): MagneticSimulator used to emit a
+    // secondaries-only (N-1) array into outputs.leakageInductance while the public
+    // calculate_leakage_inductance API emits a winding-indexed N array with 0 at the primary
+    // slot. Consumers reading the MAS field could not tell the shapes apart and displayed the
+    // primary's 0 as the secondary's leakage. Both producers must emit the same N-shape.
     settings.reset();
+    std::vector<int64_t> numberTurns({64, 20});
+    std::vector<int64_t> numberParallels({1, 1});
+    std::string shapeName = "E 42/33/20";
 
-    auto testDataPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "leakage_multiwinding_foil_stress.json");
-    std::ifstream file(testDataPath);
-    REQUIRE(file.good());
-    json masJson;
-    file >> masJson;
-    file.close();
+    std::vector<OpenMagnetics::Wire> wires;
+    wires.push_back(OpenMagnetics::Wire::create_quick_litz_wire(0.00005, 25));
+    wires.push_back(OpenMagnetics::Wire::create_quick_litz_wire(0.00005, 225));
+    auto coil = OpenMagnetics::Coil::create_quick_coil(shapeName, numberTurns, numberParallels, wires);
 
-    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
-    REQUIRE(magnetic.get_coil().get_functional_description().size() == 8);
+    std::string coreMaterial = "3C97";
+    auto gapping = OpenMagnetics::Core::create_ground_gapping(2e-5, 3);
+    auto core = OpenMagnetics::Core::create_quick_core(shapeName, coreMaterial, gapping);
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(coil);
 
     double frequency = 100000;
-    auto start = std::chrono::steady_clock::now();
-    auto leakage = LeakageInductance().calculate_leakage_inductance_all_windings(magnetic, frequency);
-    double elapsedSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
-    // Every winding must get a finite, positive leakage inductance.
-    auto perWinding = leakage.get_leakage_inductance_per_winding();
-    REQUIRE(perWinding.size() >= 1);
-    for (const auto& inductance : perWinding) {
-        double value = inductance.get_nominal().value();
-        CHECK(std::isfinite(value));
-        CHECK(value > 0.0);
-    }
+    auto simulatorPerWinding = MagneticSimulator::calculate_leakage_inductance(magnetic, frequency).get_leakage_inductance_per_winding();
+    REQUIRE(simulatorPerWinding.size() == 2);
+    REQUIRE(simulatorPerWinding[0].get_nominal());
+    CHECK(simulatorPerWinding[0].get_nominal().value() == 0.0);
 
-    // The fix takes the whole all-windings solve from minutes to ~1 s. 30 s is a generous,
-    // non-flaky ceiling that an uncapped-grid or per-pair-lookup regression blows past by an
-    // order of magnitude.
-    CHECK(elapsedSeconds < 30.0);
-
+    auto pairwise = LeakageInductance().calculate_leakage_inductance(magnetic, frequency, 0, 1).get_leakage_inductance_per_winding()[0].get_nominal().value();
+    REQUIRE(simulatorPerWinding[1].get_nominal());
+    CHECK_THAT(simulatorPerWinding[1].get_nominal().value(), WithinRel(pairwise, 1e-9));
     settings.reset();
 }

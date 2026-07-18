@@ -36,7 +36,7 @@ static std::string emit_saturating_inductor_ltspice(
     const double mu0 = 4e-7 * M_PI;
 
     // Calculate saturation current and flux linkage
-    double Isat = sat.Isat();
+    double Isat = sat.Isat;
     double lambdaSat = sat.fluxLinkageSat();
 
     // Calculate gap contribution
@@ -83,14 +83,14 @@ std::string CircuitSimulatorExporterLtspiceModel::export_magnetic_as_subcircuit(
     auto leakageInductances = LeakageInductance().calculate_leakage_inductance_all_windings(magnetic, Defaults().measurementFrequency).get_leakage_inductance_per_winding();
 
     std::vector<FractionalPoleNetwork> fracpoleNets_lt;
-    std::optional<FractionalPoleNetwork> coreFracNet_lt;
     if (resolvedMode_lt == CircuitSimulatorExporterCurveFittingModes::FRACPOLE) {
         fracpoleNets_lt = CircuitSimulatorExporter::calculate_fracpole_networks_per_winding(magnetic, temperature);
-        try { coreFracNet_lt = CircuitSimulatorExporter::calculate_core_fracpole_network(magnetic, temperature); }
-        catch (...) {}
+        // NOTE: the core fracpole network used to be computed here too, swallowed
+        // failures with catch(...){}, and was never emitted by anyone (the emitter is
+        // #if 0). Removed: an expensive sweep whose result was always discarded.
     }
 
-    parametersString += ".param MagnetizingInductance_Value=" + std::to_string(magnetizingInductance) + "\n";
+    parametersString += ".param MagnetizingInductance_Value=" + to_string(magnetizingInductance, 15) + "\n";
     parametersString += ".param Permeance=MagnetizingInductance_Value/NumberTurns_1**2\n";
 
     // Check if saturation modeling is enabled
@@ -135,9 +135,12 @@ std::string CircuitSimulatorExporterLtspiceModel::export_magnetic_as_subcircuit(
             if (leakageInductance < 0 || leakageInductance >= magnetizingInductance) {
                 throw std::runtime_error("Unphysical leakage inductance (" + std::to_string(leakageInductance) + " H vs Lmag " + std::to_string(magnetizingInductance) + " H) for winding " + is);
             }
-            double couplingCoefficient = sqrt((magnetizingInductance - leakageInductance) / magnetizingInductance);
-            parametersString += ".param Llk_" + is + "_Value=" + std::to_string(leakageInductance) + "\n";
-            parametersString += ".param CouplingCoefficient_1" + is + "_Value=" + std::to_string(couplingCoefficient) + "\n";
+            // Clamp below 1: a coupling that rounds/prints as exactly 1 makes the SPICE
+            // coupling matrix singular (ngspice already clamps in the multi-winding path;
+            // the param emission and LTspice did not).
+            double couplingCoefficient = std::min(0.999999, sqrt((magnetizingInductance - leakageInductance) / magnetizingInductance));
+            parametersString += ".param Llk_" + is + "_Value=" + to_string(leakageInductance, 15) + "\n";
+            parametersString += ".param CouplingCoefficient_1" + is + "_Value=" + to_string(couplingCoefficient, 12) + "\n";
         }
 
         std::vector<std::string> c = to_string(acResistanceCoefficientsPerWinding[index], 12);
@@ -157,7 +160,13 @@ std::string CircuitSimulatorExporterLtspiceModel::export_magnetic_as_subcircuit(
             }
         }
         else if (resolvedMode_lt == CircuitSimulatorExporterCurveFittingModes::ANALYTICAL) {
-            circuitString += "E" + is + " P" + is + "+ Node_R_Lmag_" + is + " P" + is + "+ Node_R_Lmag_" + is + " Laplace = 1 /(" + c[0] + " + " + c[1] + " * sqrt(abs(s)/(2*pi)) + " + c[2] + " * abs(s)/(2*pi))\n";
+            // ABT #120.2: G-element (VCCS), not an E-source. A self-referenced VCCS
+            // with I = Y(s)·V(across itself) IS a two-terminal impedance Z = 1/Y —
+            // the standard LTspice behavioural-impedance idiom. The previous E-source
+            // (VCVS with output nodes equal to its control nodes) was an algebraic
+            // self-loop, not a series impedance. The Laplace expression is already
+            // the admittance of Z(f) = c0 + c1*sqrt(f) + c2*f (skin-effect fit).
+            circuitString += "G" + is + " P" + is + "+ Node_R_Lmag_" + is + " P" + is + "+ Node_R_Lmag_" + is + " Laplace = 1 /(" + c[0] + " + " + c[1] + " * sqrt(abs(s)/(2*pi)) + " + c[2] + " * abs(s)/(2*pi))\n";
             // Emit magnetizing inductance (saturating or linear)
             if (includeSaturation && satParams.valid) {
                 circuitString += emit_saturating_inductor_ltspice(satParams, is, "P" + is + "-", "Node_R_Lmag_" + is);
@@ -248,9 +257,23 @@ std::string CircuitSimulatorExporterLtspiceModel::export_magnetic_as_subcircuit(
         }
     }
 
+    // Core losses. Opt-in LARGE-SIGNAL behavioural GSE element (tracks instantaneous dB/dt + flux,
+    // so the loss follows Steinmetz f^alpha*B^beta under any waveform); LTspice accepts the same
+    // B/G/C constructs as ngspice, only the B-source expression is emitted unquoted. It REPLACES the
+    // small-signal mu(f) resistance ladder (default) on the main winding's magnetizing branch.
+    GseCoreLossParams gseParams_lt;
+    if (settings.get_circuit_simulator_include_steinmetz_core_loss()) {
+        gseParams_lt = CircuitSimulatorExporter::calculate_gse_core_loss_params(magnetic, frequency, temperature);
+    }
+    if (gseParams_lt.valid) {
+        circuitString += emit_gse_core_loss_spice(gseParams_lt, "1", "Node_R_Lmag_1", "P1-", /*quote=*/false);
+    }
+
     // Core losses: frequency-dependent resistance network in parallel with Lmag
     auto coreLossTopology_lt = static_cast<CoreLossTopology>(settings.get_circuit_simulator_core_loss_topology());
-    auto coreResistanceCoefficients = CircuitSimulatorExporter::calculate_core_resistance_coefficients(magnetic, temperature, coreLossTopology_lt);
+    auto coreResistanceCoefficients = gseParams_lt.valid
+        ? std::vector<double>{}  // the behavioural GSE element replaces the small-signal ladder
+        : CircuitSimulatorExporter::calculate_core_resistance_coefficients(magnetic, temperature, coreLossTopology_lt);
     if (!coreResistanceCoefficients.empty()) {
         if (coreLossTopology_lt == CoreLossTopology::ROSANO) {
             circuitString += emit_core_rosano_spice(coreResistanceCoefficients, coil.get_functional_description().size());
@@ -269,6 +292,10 @@ std::string CircuitSimulatorExporterLtspiceModel::export_magnetic_as_subcircuit(
             circuitString += emit_mutual_resistance_network_spice(mutualResistanceCoeffs, magnetizingInductance, numWindings);
         }
     }
+
+    // Stray/parasitic capacitance (positive 3-cap model) — same shared emitter as ngspice; the
+    // frontend's SPICE downloads use the LTspice format, so this is where users actually get it.
+    circuitString += emit_stray_capacitance_spice(coil, numWindings);
 
     return headerString + "\n" + circuitString + "\n" + parametersString + "\n" + footerString;
 }

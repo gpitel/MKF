@@ -4,6 +4,7 @@
 #include "physical_models/ExtendedCantilever.h"
 #include "physical_models/MagnetizingInductance.h"
 #include "physical_models/WindingLosses.h"
+#include "physical_models/StrayCapacitance.h"
 #include "support/Settings.h"
 #include "support/Utils.h"
 #include "Defaults.h"
@@ -33,57 +34,51 @@ static std::string emit_saturating_inductor_ngspice(
     }
 
     std::string s;
-    const double mu0 = 4e-7 * M_PI;
 
-    // Calculate saturation current and flux linkage
-    double Isat = sat.Isat();
-    double lambdaSat = sat.fluxLinkageSat();
-
-    // The model uses: V = d(Lambda)/dt where Lambda = Lambda_sat * tanh(I/I_sat) + L_gap * I
-    // L_gap is the linear component (from air gap), approximately L_mag * (1 - 1/effective_permeability)
-    // For a typical gapped core, most inductance comes from the gap, so L_gap ≈ L_mag
-    double effectiveMuR = sat.Lmag / (mu0 * sat.primaryTurns * sat.primaryTurns * sat.Ae / sat.le);
-    double gapFactor = 1.0 / effectiveMuR;  // Fraction of reluctance from gap
-    double Lgap = sat.Lmag * gapFactor;  // Linear (gap) component
-
-    // Ensure reasonable values
-    if (Isat < 1e-6) Isat = 1e-6;
-    if (lambdaSat < 1e-9) lambdaSat = 1e-9;
-    if (Lgap < 1e-12) Lgap = sat.Lmag * 0.5;  // Fallback
+    double Isat = sat.Isat;
+    if (Isat < 1e-6) Isat = 1e-6;            // numerical floor
 
     s += "* Saturating magnetizing inductance (winding " + windingIndex + ")\n";
     s += "* Bsat=" + to_string(sat.Bsat, 4) + "T, Isat=" + to_string(Isat, 4) + "A\n";
 
-    // ngspice behavioral inductor using flux linkage
-    // V = dLambda/dt = dLambda/dI * dI/dt
-    // For Lambda = Lsat*tanh(I/Isat) + Lgap*I:
-    // dLambda/dI = Lsat/Isat * sech²(I/Isat) + Lgap
-    //            = Lsat/Isat * (1 - tanh²(I/Isat)) + Lgap
-    // We use the GVALUE element with Laplace to model this
-
-    // Simpler approach: Use the inductor with polynomial current dependence
-    // L(I) = L0 / (1 + (I/Isat)^2) gives smooth saturation
+    // Smooth-saturation behavioural inductor: L(I) = L0 / (1 + (I/Isat)^2), realized below in a numerically
+    // stable flux-integral form (NOT V = L*dI/dt, which is ddt-unstable in ngspice). Needs only L0 and Isat. (The flux-linkage / air-gap quantities
+    // the LTspice and NL5 exporters use — Lambda_sat = N*Ae*Bsat, L_gap = Lmag/effective_mu_r — belong to
+    // THEIR tanh model; ngspice does not use them, so they are not computed here.)
     double L0 = sat.Lmag;
 
     s += ".param Lmag_" + windingIndex + "_L0=" + to_string(L0, 12) + "\n";
     s += ".param Lmag_" + windingIndex + "_Isat=" + to_string(Isat, 6) + "\n";
 
-    // Use behavioral source: V = L(I) * dI/dt
-    // L(I) = L0 / (1 + (abs(I)/Isat)^2)
-    // Note: ngspice behavioral sources use I() for current through voltage source
-    std::string senseName = "Vmag_sense_" + windingIndex;
+    // Flux-integral realization (numerically stable). The flux linkage of
+    // L(I)=L0/(1+(I/Isat)^2) is lambda = integral_0^I L(i) di = L0*Isat*atan(I/Isat),
+    // so the constitutive winding current is I(lambda) = Isat*tan(lambda/(L0*Isat)).
+    // We drive the current from the INTEGRATED winding voltage (a flux state node)
+    // instead of a behavioural V = L(I)*dI/dt source: a numerical current derivative
+    // ddt(I) inside a B-source is numerically unstable in ngspice (Gear cannot start
+    // it -> "timestep too small" at t~0; trapezoidal rings and runs away to nonsense
+    // currents). Only the SPICE realization changes here; the physics (L0, Isat) are
+    // the authoritative MKF values. Single-winding only (saturation is disabled for
+    // coupled transformers above, whose K coupling needs linear inductors).
     std::string fluxName = "Lmag_flux_" + windingIndex;
+    std::string L0p = "Lmag_" + windingIndex + "_L0";
+    std::string Isp = "Lmag_" + windingIndex + "_Isat";
 
-    // Current sense (zero volt source)
-    s += senseName + " " + nodeIn + " " + fluxName + " 0\n";
+    // lambda = integral(V(nodeIn,nodeOut)) dt : a VCCS of the winding voltage into a
+    // 1 F capacitor makes V(fluxName) the time-integral of the winding voltage.
+    s += "Gflux_" + windingIndex + " 0 " + fluxName + " " + nodeIn + " " + nodeOut + " 1\n";
+    s += "Cflux_" + windingIndex + " " + fluxName + " 0 1\n";
+    s += "Rflux_" + windingIndex + " " + fluxName + " 0 1e12\n";  // DC leak: keep the flux node non-floating
 
-    // Behavioral inductor: V = L(I) * dI/dt
-    // Using EL (behavioral voltage source) with ddt() function
-    s += "BLmag_" + windingIndex + " " + fluxName + " " + nodeOut;
-    s += " V='Lmag_" + windingIndex + "_L0/(1+pow(abs(I(" + senseName + "))/Lmag_" + windingIndex + "_Isat,2))*ddt(I(" + senseName + "))'\n";
+    // winding current I(lambda) = Isat * tan(lambda / (L0*Isat))
+    s += "Bind_" + windingIndex + " " + nodeIn + " " + nodeOut +
+         " I='" + Isp + "*tan(V(" + fluxName + ")/(" + L0p + "*" + Isp + "))'\n";
 
     return s;
 }
+
+// Behavioural large-signal core loss (Generalized Steinmetz Equation) is emitted by the shared
+// emit_gse_core_loss_spice (CircuitSimulatorInterface.cpp); ngspice quotes the B-source expression.
 
 std::string CircuitSimulatorExporterNgspiceModel::export_magnetic_as_subcircuit(Magnetic magnetic, double frequency, double temperature, std::optional<std::string> filePathOrFile, CircuitSimulatorExporterCurveFittingModes mode) {
     std::string headerString = "* Magnetic model made with OpenMagnetics\n";
@@ -103,14 +98,14 @@ std::string CircuitSimulatorExporterNgspiceModel::export_magnetic_as_subcircuit(
     auto leakageInductances = LeakageInductance().calculate_leakage_inductance_all_windings(magnetic, Defaults().measurementFrequency).get_leakage_inductance_per_winding();
 
     std::vector<FractionalPoleNetwork> fracpoleNets;
-    std::optional<FractionalPoleNetwork> coreFracNet;
     if (resolvedMode == CircuitSimulatorExporterCurveFittingModes::FRACPOLE) {
         fracpoleNets = CircuitSimulatorExporter::calculate_fracpole_networks_per_winding(magnetic, temperature);
-        try { coreFracNet = CircuitSimulatorExporter::calculate_core_fracpole_network(magnetic, temperature); }
-        catch (...) {}
+        // NOTE: the core fracpole network used to be computed here too, swallowed
+        // failures with catch(...){}, and was never emitted by anyone (the emitter is
+        // #if 0). Removed: an expensive sweep whose result was always discarded.
     }
 
-    parametersString += ".param MagnetizingInductance_Value=" + std::to_string(magnetizingInductance) + "\n";
+    parametersString += ".param MagnetizingInductance_Value=" + to_string(magnetizingInductance, 15) + "\n";
     parametersString += ".param Permeance=MagnetizingInductance_Value/NumberTurns_1**2\n";
 
     // Check if saturation modeling is enabled
@@ -149,6 +144,30 @@ std::string CircuitSimulatorExporterNgspiceModel::export_magnetic_as_subcircuit(
         return "NumberTurns_" + is + "**2*Permeance";
     };
 
+    // Mutual (cross-coupling) resistance — the off-diagonal Hesterman winding-loss
+    // term. The old auxiliary-winding realization is skipped for n>=3 because its
+    // shared-but-uncoupled auxiliaries make the coupled-L matrix non-positive-definite
+    // in ngspice (abt #50). We now use a PD-SAFE BEHAVIOURAL realization for n>=2
+    // (grounded uncoupled ladders + sense/behavioural sources; no coupled inductors),
+    // which routes each winding's P{k}+ through a series sense+drop node — so it must
+    // be decided BEFORE the windings are emitted. For n==2 this REPLACES the auxiliary
+    // ladder, whose emitted topology did not reproduce its own fitted mutual-resistance
+    // model (its DC impedance was the last-stage R, not dcMutualResistance — abt #76);
+    // the behavioural Hmut CCVS realizes the fitted R_ij(f_export) exactly. Wired for
+    // LADDER mode only (the default); the other curve-fit modes emit the winding series
+    // path through fixed P{k}+ nodes and keep the historical auxiliary/skip path (abt #72).
+    bool includeMutualResistance = settings.get_circuit_simulator_include_mutual_resistance();
+    std::vector<CircuitSimulatorExporter::MutualResistanceCoefficients> mutualResistanceCoeffs;
+    if (includeMutualResistance && numWindings >= 2) {
+        mutualResistanceCoeffs = CircuitSimulatorExporter::calculate_mutual_resistance_coefficients(magnetic, temperature);
+    }
+    bool behaviouralMutualResistance =
+        includeMutualResistance && numWindings >= 2 && !mutualResistanceCoeffs.empty() &&
+        resolvedMode == CircuitSimulatorExporterCurveFittingModes::LADDER;
+    auto windingTopNode = [&](const std::string& is) -> std::string {
+        return behaviouralMutualResistance ? ("Node_Wtop_" + is) : ("P" + is + "+");
+    };
+
     for (size_t index = 0; index < numWindings; index++) {
         auto effectiveResistanceThisWinding = WindingLosses::calculate_effective_resistance_of_winding(magnetic, index, 0.1, temperature);
         std::string is = std::to_string(index + 1);
@@ -159,10 +178,13 @@ std::string CircuitSimulatorExporterNgspiceModel::export_magnetic_as_subcircuit(
             if (leakageInductance < 0 || leakageInductance >= magnetizingInductance) {
                 throw std::runtime_error("Unphysical leakage inductance (" + std::to_string(leakageInductance) + " H vs Lmag " + std::to_string(magnetizingInductance) + " H) for winding " + is);
             }
-            double couplingCoefficient = sqrt((magnetizingInductance - leakageInductance) / magnetizingInductance);
+            // Clamp below 1: a coupling that rounds/prints as exactly 1 makes the SPICE
+            // coupling matrix singular (ngspice already clamps in the multi-winding path;
+            // the param emission and LTspice did not).
+            double couplingCoefficient = std::min(0.999999, sqrt((magnetizingInductance - leakageInductance) / magnetizingInductance));
             couplingCoeffs.push_back(couplingCoefficient);
-            parametersString += ".param Llk_" + is + "_Value=" + std::to_string(leakageInductance) + "\n";
-            parametersString += ".param CouplingCoefficient_1" + is + "_Value=" + std::to_string(couplingCoefficient) + "\n";
+            parametersString += ".param Llk_" + is + "_Value=" + to_string(leakageInductance, 15) + "\n";
+            parametersString += ".param CouplingCoefficient_1" + is + "_Value=" + to_string(couplingCoefficient, 12) + "\n";
         }
 
         std::vector<std::string> c = to_string(acResistanceCoefficientsPerWinding[index], 12);
@@ -220,7 +242,7 @@ std::string CircuitSimulatorExporterNgspiceModel::export_magnetic_as_subcircuit(
                 // Fitted model (ladder_model): Z = Rdc + L1||(R1 + L2||(R2 + ...))
                 // Rdc in series first, then nested L||(R + rest) stages.
                 size_t numStages = acResistanceCoefficientsPerWinding[index].size() / 2;
-                circuitString += "Rdc" + is + " P" + is + "+ Node_Lladder_" + is + "_0 {Rdc_" + is + "_Value}\n";
+                circuitString += "Rdc" + is + " " + windingTopNode(is) + " Node_Lladder_" + is + "_0 {Rdc_" + is + "_Value}\n";
                 for (size_t stage = 0; stage < numStages; ++stage) {
                     std::string stageNode = "Node_Lladder_" + is + "_" + std::to_string(stage);
                     std::string nextNode = (stage + 1 == numStages) ? ("Node_R_Lmag_" + is)
@@ -230,7 +252,7 @@ std::string CircuitSimulatorExporterNgspiceModel::export_magnetic_as_subcircuit(
                     circuitString += "Rladder" + is + "_" + std::to_string(stage) + " " + stageNode + " " + nextNode + " " + c[stage * 2] + "\n";
                 }
             } else {
-                circuitString += "Rdc" + is + " P" + is + "+ Node_R_Lmag_" + is + " {Rdc_" + is + "_Value}\n";
+                circuitString += "Rdc" + is + " " + windingTopNode(is) + " Node_R_Lmag_" + is + " {Rdc_" + is + "_Value}\n";
             }
             // Emit magnetizing inductance (saturating or linear)
             if (includeSaturation && satParams.valid) {
@@ -249,8 +271,13 @@ std::string CircuitSimulatorExporterNgspiceModel::export_magnetic_as_subcircuit(
     // Each K statement gets a unique name (K12, K13, K23, etc.)
     // Use per-pair leakage inductance calculation for accurate coupling coefficients
     if (numWindings == 2) {
-        // Simple 2-winding case - use already calculated coupling, capped at 0.98 for stability
-        double k12 = couplingCoeffs.size() > 0 ? std::min(0.98, couplingCoeffs[0]) : 0.98;
+        // Simple 2-winding case - use the coupling computed from the measured leakage above.
+        // Earlier this was hard-capped at 0.98 "for stability", which injected ~2% ARTIFICIAL
+        // leakage: for a low-leakage transformer the real K is ~0.9998, and forcing it to 0.98
+        // adds a large series leakage reactance that strangles power transfer (AHB vout capped
+        // ~3 V instead of 12 V; PSFB/PSHB decks transferred ~0 power — abt #56/#61). ngspice only
+        // needs K strictly below 1 (k=1.0 is a singular coupling matrix), so clamp just under 1.
+        double k12 = couplingCoeffs.size() > 0 ? std::min(0.999999, couplingCoeffs[0]) : 0.98;
         circuitString += "K Lmag_1 Lmag_2 " + std::to_string(k12) + "\n";
     } else if (numWindings >= 3) {
         // Consistent coupling from the full inductance matrix L = M + Λ (positive-definite):
@@ -276,10 +303,25 @@ std::string CircuitSimulatorExporterNgspiceModel::export_magnetic_as_subcircuit(
         }
     }
 
+    // Core losses. Two mutually-exclusive models in parallel with Lmag:
+    //  * LARGE-SIGNAL behavioural GSE (opt-in): tracks instantaneous dB/dt + flux, so the loss
+    //    follows Steinmetz f^alpha*B^beta under any waveform/amplitude. ngspice/LTspice/NL5 only
+    //    (needs a behavioural source); injected on the MAIN winding's magnetizing branch.
+    //  * SMALL-SIGNAL mu(f) resistance network (default): a frequency-dependent R-L(-C) ladder.
+    GseCoreLossParams gseParams;
+    if (settings.get_circuit_simulator_include_steinmetz_core_loss()) {
+        gseParams = CircuitSimulatorExporter::calculate_gse_core_loss_params(magnetic, frequency, temperature);
+    }
+    if (gseParams.valid) {
+        circuitString += emit_gse_core_loss_spice(gseParams, "1", "Node_R_Lmag_1", "P1-", /*quote=*/true);
+    }
+
     // Core losses: frequency-dependent resistance network in parallel with Lmag
     // The network impedance must be >> Lmag impedance, otherwise it shorts the magnetizing inductance
     auto coreLossTopology = static_cast<CoreLossTopology>(settings.get_circuit_simulator_core_loss_topology());
-    auto coreResistanceCoefficients = CircuitSimulatorExporter::calculate_core_resistance_coefficients(magnetic, temperature, coreLossTopology);
+    auto coreResistanceCoefficients = gseParams.valid
+        ? std::vector<double>{}  // the behavioural GSE element replaces the small-signal ladder
+        : CircuitSimulatorExporter::calculate_core_resistance_coefficients(magnetic, temperature, coreLossTopology);
     if (!coreResistanceCoefficients.empty()) {
         // Sanity check: core loss impedance at mid-frequency must be > 10x Lmag impedance
         // Otherwise the network shorts the magnetizing inductance instead of modeling losses
@@ -304,15 +346,31 @@ std::string CircuitSimulatorExporterNgspiceModel::export_magnetic_as_subcircuit(
         // If zCoreLoss <= 10*zLmag, skip core loss network to avoid shorting Lmag
     }
 
-    // Mutual resistance: auxiliary winding network for cross-coupling losses (Hesterman 2020)
-    // Only for multi-winding transformers when setting is enabled
-    bool includeMutualResistance = settings.get_circuit_simulator_include_mutual_resistance();
-    if (includeMutualResistance && numWindings >= 2) {
-        auto mutualResistanceCoeffs = CircuitSimulatorExporter::calculate_mutual_resistance_coefficients(magnetic, temperature);
-        if (!mutualResistanceCoeffs.empty()) {
+    // Mutual resistance cross-coupling loss (Hesterman 2020). In LADDER mode (default)
+    // n>=2 uses the PD-safe BEHAVIOURAL realization (keeps the cross term, adds no
+    // coupled inductors, and — unlike the old n==2 auxiliary ladder — reproduces the
+    // fitted R_ij(f) at DC and HF, abt #76). Other (non-LADDER) modes fall through to
+    // the network helper: n==2 emits the auxiliary ladder (also used by LTspice), n>=3
+    // takes the historical loud skip. The coefficients were computed once, before the
+    // winding loop, so the winding series path could be routed through the behavioural
+    // sense/drop nodes.
+    if (includeMutualResistance && numWindings >= 2 && !mutualResistanceCoeffs.empty()) {
+        if (behaviouralMutualResistance) {
+            circuitString += emit_mutual_resistance_behavioural_spice(mutualResistanceCoeffs, numWindings, frequency);
+        } else {
             circuitString += emit_mutual_resistance_network_spice(mutualResistanceCoeffs, magnetizingInductance, numWindings);
         }
     }
+
+    // Stray / parasitic capacitance: per-winding SELF capacitance (sets the winding
+    // self-resonance with Lmag/leakage) and INTER-winding capacitance (the common-mode /
+    // HF coupling path). Lumped positive scalars from StrayCapacitance's energy method
+    // (capacitance_among_windings), placed across each winding (Cself, P<i>+ -> P<i>-) and
+    // between winding pairs (Cwind, P<i>+ -> P<j>+). These are linear passive caps, so they
+    // add no convergence risk and behave identically in AC and transient; being terminal-
+    // referenced they need no core/ground pin. Gated (default off) like the saturation and
+    // mutual-resistance terms; only wired when the coil is wound.
+    circuitString += emit_stray_capacitance_spice(coil, numWindings);
 
     return headerString + "\n" + circuitString + "\n" + parametersString + "\n" + footerString;
 }

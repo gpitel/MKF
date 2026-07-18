@@ -3,9 +3,9 @@
 #include "processors/MagneticSimulator.h"
 #include "support/Utils.h"
 #include "support/Logger.h"
-#include "support/DatabaseManager.h"
 #include "json.hpp"
 
+#include <atomic>
 #include <math.h>
 #include <cmath>
 #include <filesystem>
@@ -108,6 +108,54 @@ static std::string load_ndjson_data(const std::string& resourcePath, std::option
 
 namespace OpenMagnetics {
 
+// ABT #113: freeze flag for the shared read-only catalogs (see the
+// THREAD-SAFETY CONTRACT in Utils.h). Atomic so workers can read it without
+// synchronization; only the orchestrating thread toggles it.
+static std::atomic<bool> _databasesFrozen{false};
+
+bool databases_frozen() {
+    return _databasesFrozen.load(std::memory_order_acquire);
+}
+
+void set_databases_frozen(bool frozen) {
+    _databasesFrozen.store(frozen, std::memory_order_release);
+}
+
+static void throw_if_databases_frozen(const char* operation) {
+    if (databases_frozen()) {
+        throw std::runtime_error(
+            std::string("ABT #113: '") + operation +
+            "' would mutate a shared catalog while databases are frozen (a parallel "
+            "region is active). Call load_all_databases() BEFORE set_databases_frozen(true), "
+            "and never lazy-load, reload, or clear catalogs from worker threads.");
+    }
+}
+
+void load_all_databases() {
+    throw_if_databases_frozen("load_all_databases");
+    if (coreDatabase.empty()) {
+        load_cores();
+    }
+    if (coreMaterialDatabase.empty()) {
+        load_core_materials();
+    }
+    if (coreShapeDatabase.empty()) {
+        load_core_shapes();
+    }
+    if (wireDatabase.empty()) {
+        load_wires();
+    }
+    if (bobbinDatabase.empty()) {
+        load_bobbins();
+    }
+    if (insulationMaterialDatabase.empty()) {
+        load_insulation_materials();
+    }
+    if (wireMaterialDatabase.empty()) {
+        load_wire_materials();
+    }
+}
+
 void clear_scoring() {
     _scorings.clear();
     _inductanceFluxCache.clear();
@@ -178,6 +226,7 @@ void logEntry(std::string entry, std::string module, uint8_t entryVerbosity) {
 }
 
 void load_cores(std::optional<std::string> fileToLoad) {
+    throw_if_databases_frozen("load_cores");
     bool includeToroidalCores = settings.get_use_toroidal_cores();
     bool includeConcentricCores = settings.get_use_concentric_cores();
     bool useOnlyCoresInStock = settings.get_use_only_cores_in_stock();
@@ -208,15 +257,18 @@ void load_cores(std::optional<std::string> fileToLoad) {
 }
 
 void clear_loaded_cores() {
+    throw_if_databases_frozen("clear_loaded_cores");
     coreDatabase.clear();
 }
 
 void clear_loaded_core_shapes() {
+    throw_if_databases_frozen("clear_loaded_core_shapes");
     coreShapeDatabase.clear();
     coreShapeFamiliesInDatabase.clear();
 }
 
 void clear_databases() {
+    throw_if_databases_frozen("clear_databases");
     coreDatabase.clear();
     coreMaterialDatabase.clear();
     coreShapeDatabase.clear();
@@ -228,6 +280,7 @@ void clear_databases() {
 }
 
 void load_core_materials(std::optional<std::string> fileToLoad) {
+    throw_if_databases_frozen("load_core_materials");
     if (!_addInternalData) {
         return;
     }
@@ -239,6 +292,7 @@ void load_core_materials(std::optional<std::string> fileToLoad) {
 }
 
 void load_advanced_core_materials(std::string fileToLoad, bool onlyDataFromManufacturer) {
+    throw_if_databases_frozen("load_advanced_core_materials");
     parse_ndjson(fileToLoad, [onlyDataFromManufacturer](const json& jf) {
         auto it = coreMaterialDatabase.find(jf["name"]);
         if (it == coreMaterialDatabase.end()) return;
@@ -252,20 +306,50 @@ void load_advanced_core_materials(std::string fileToLoad, bool onlyDataFromManuf
             material.set_bh_cycle(bhCycle);
         }
         if (jf.contains("volumetricLosses")) {
-            std::vector<VolumetricLossesPoint> volumetricLosses;
-            from_json(jf["volumetricLosses"]["default"][0], volumetricLosses);
-            if (onlyDataFromManufacturer) {
-                std::vector<VolumetricLossesPoint> onlyManufacturerVolumetricLosses;
-                for (auto datum : volumetricLosses) {
-                    if (datum.get_origin() == "manufacturer") {
-                        onlyManufacturerVolumetricLosses.push_back(datum);
+            if (!jf["volumetricLosses"].contains("default") || jf["volumetricLosses"]["default"].empty()) {
+                throw std::runtime_error("Advanced core material '" + std::string(jf["name"]) +
+                                         "' carries volumetricLosses without a non-empty \"default\" method list");
+            }
+            for (const auto& methodEntry : jf["volumetricLosses"]["default"]) {
+                std::vector<VolumetricLossesPoint> volumetricLosses;
+                from_json(methodEntry, volumetricLosses);
+                if (onlyDataFromManufacturer) {
+                    std::vector<VolumetricLossesPoint> onlyManufacturerVolumetricLosses;
+                    for (auto datum : volumetricLosses) {
+                        if (datum.get_origin() == "manufacturer") {
+                            onlyManufacturerVolumetricLosses.push_back(datum);
+                        }
                     }
+                    material.get_mutable_volumetric_losses()["default"].push_back(onlyManufacturerVolumetricLosses);
                 }
-                material.get_mutable_volumetric_losses()["default"].push_back(onlyManufacturerVolumetricLosses);
+                else {
+                    material.get_mutable_volumetric_losses()["default"].push_back(volumetricLosses);
+                }
             }
-            else {
-                material.get_mutable_volumetric_losses()["default"].push_back(volumetricLosses);
+        }
+        if (jf.contains("massLosses")) {
+            if (!jf["massLosses"].contains("default") || jf["massLosses"]["default"].empty()) {
+                throw std::runtime_error("Advanced core material '" + std::string(jf["name"]) +
+                                         "' carries massLosses without a non-empty \"default\" method list");
             }
+            auto materialMassLosses = material.get_mass_losses().value_or(std::map<std::string, std::vector<MassLossesMethod>>());
+            for (const auto& methodEntry : jf["massLosses"]["default"]) {
+                std::vector<MassLossesPoint> massLosses;
+                from_json(methodEntry, massLosses);
+                if (onlyDataFromManufacturer) {
+                    std::vector<MassLossesPoint> onlyManufacturerMassLosses;
+                    for (auto datum : massLosses) {
+                        if (datum.get_origin() == "manufacturer") {
+                            onlyManufacturerMassLosses.push_back(datum);
+                        }
+                    }
+                    materialMassLosses["default"].push_back(onlyManufacturerMassLosses);
+                }
+                else {
+                    materialMassLosses["default"].push_back(massLosses);
+                }
+            }
+            material.set_mass_losses(materialMassLosses);
         }
         if (jf.contains("permeability")) {
             if (jf["permeability"].contains("amplitude")) {
@@ -277,6 +361,7 @@ void load_advanced_core_materials(std::string fileToLoad, bool onlyDataFromManuf
 }
 
 void load_core_shapes(bool withAliases, std::optional<std::string> fileToLoad) {
+    throw_if_databases_frozen("load_core_shapes");
     if (!_addInternalData) {
         return;
     }
@@ -301,6 +386,7 @@ void load_core_shapes(bool withAliases, std::optional<std::string> fileToLoad) {
 }
 
 void load_wires(std::optional<std::string> fileToLoad) {
+    throw_if_databases_frozen("load_wires");
     if (!_addInternalData) {
         return;
     }
@@ -312,6 +398,7 @@ void load_wires(std::optional<std::string> fileToLoad) {
 }
 
 void load_bobbins() {
+    throw_if_databases_frozen("load_bobbins");
     if (!_addInternalData) {
         return;
     }
@@ -323,6 +410,7 @@ void load_bobbins() {
 }
 
 void load_insulation_materials() {
+    throw_if_databases_frozen("load_insulation_materials");
     if (!_addInternalData) {
         return;
     }
@@ -334,6 +422,7 @@ void load_insulation_materials() {
 }
 
 void load_wire_materials() {
+    throw_if_databases_frozen("load_wire_materials");
     if (!_addInternalData) {
         return;
     }
@@ -345,6 +434,7 @@ void load_wire_materials() {
 }
 
 void load_databases(json data, bool withAliases, bool addInternalData) {
+    throw_if_databases_frozen("load_databases");
     _addInternalData = addInternalData;
     if (addInternalData) {
         if (coreMaterialDatabase.empty()) {
@@ -782,8 +872,9 @@ std::vector<Wire> get_wires(std::optional<WireType> wireType, std::optional<Wire
     // The wireDatabase is loaded once and immutable, so the filtered+copied
     // list is safe to memoize by (type, standard).
     using CacheKey = std::pair<int, int>;
-    static std::map<CacheKey, std::vector<Wire>> filteredWiresCache;
-    static size_t cachedDatabaseSize = 0;
+    // ABT #113: thread_local — per-thread memo over the frozen wireDatabase.
+    static thread_local std::map<CacheKey, std::vector<Wire>> filteredWiresCache;
+    static thread_local size_t cachedDatabaseSize = 0;
     if (cachedDatabaseSize != wireDatabase.size()) {
         // Database was reloaded since we last cached; invalidate.
         filteredWiresCache.clear();
@@ -2478,6 +2569,11 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
         bobbin.set_processed_description(processedDescription);
     }
     magnetic.get_mutable_coil().set_bobbin(bobbin);
+    // Multi-column winding support: give the coil the core columns so turn lengths
+    // around non-main columns can be computed when placement uses non-main windows.
+    if (magnetic.get_mutable_core().get_processed_description()) {
+        magnetic.get_mutable_coil().set_core_columns(magnetic.get_mutable_core().get_processed_description()->get_columns());
+    }
 
     if (!magnetic.get_mutable_coil().get_turns_description()) {
         if (configuration.contains("interleavingLevel")) {
@@ -2563,6 +2659,11 @@ std::map<std::string, double> normalize_scoring(std::map<std::string, double> sc
         if (std::isnan(value)) {
             throw std::invalid_argument("scoring cannot be nan in normalize_scoring");
         }
+        // A raw score of exactly 0 under log would be log10(0) = -inf; clamp to the
+        // same floor as minimumScoring so the batch stays finite.
+        if (log && value == 0) {
+            value = 1e-10;
+        }
         double normalizedScoring = 0;
         if (maximumScoring != minimumScoring) {
 
@@ -2608,27 +2709,37 @@ std::vector<double> normalize_scoring(std::vector<double> scoring, double weight
     double minimumScoring = *std::min_element(scoring.begin(), scoring.end());
     std::vector<double> normalizedScorings;
 
+    // Same log-of-zero clamp as the map overload above: without it one raw score of
+    // exactly 0 under log makes the whole batch -inf/NaN and silently poisons the sort.
+    if (log && minimumScoring == 0) {
+        minimumScoring = 1e-10;
+    }
+
     for (size_t i = 0; i < scoring.size(); ++i) {
         double normalizedScoring = 0;
         if (std::isnan(scoring[i])) {
             throw std::invalid_argument("scoring cannot be nan in normalize_scoring");
         }
+        double value = scoring[i];
+        if (log && value == 0) {
+            value = 1e-10;
+        }
         if (maximumScoring != minimumScoring) {
 
             if (log){
                 if (invert) {
-                    normalizedScoring += weight * (1 - (std::log10(scoring[i]) - std::log10(minimumScoring)) / (std::log10(maximumScoring) - std::log10(minimumScoring)));
+                    normalizedScoring += weight * (1 - (std::log10(value) - std::log10(minimumScoring)) / (std::log10(maximumScoring) - std::log10(minimumScoring)));
                 }
                 else {
-                    normalizedScoring += weight * (std::log10(scoring[i]) - std::log10(minimumScoring)) / (std::log10(maximumScoring) - std::log10(minimumScoring));
+                    normalizedScoring += weight * (std::log10(value) - std::log10(minimumScoring)) / (std::log10(maximumScoring) - std::log10(minimumScoring));
                 }
             }
             else {
                 if (invert) {
-                    normalizedScoring += weight * (1 - (scoring[i] - minimumScoring) / (maximumScoring - minimumScoring));
+                    normalizedScoring += weight * (1 - (value - minimumScoring) / (maximumScoring - minimumScoring));
                 }
                 else {
-                    normalizedScoring += weight * (scoring[i] - minimumScoring) / (maximumScoring - minimumScoring);
+                    normalizedScoring += weight * (value - minimumScoring) / (maximumScoring - minimumScoring);
                 }
             }
         }
@@ -2869,7 +2980,11 @@ Inputs get_defaults_inputs(OpenMagnetics::Magnetic magnetic) {
     auto turnsRatios = magnetic.get_turns_ratios();
     for (auto turnsRatio : turnsRatios) {
         MAS::DimensionWithTolerance turnsRatioWithTolerance;
-        turnsRatioWithTolerance.set_nominal(OpenMagnetics::roundFloat(turnsRatio, 2));
+        // Floor (not round) the realized turns ratio to 2 decimals: the reflected secondary voltage and
+        // hence the required duty RISE with the turns ratio, so a maximum-duty-constrained design sits at
+        // the largest ratio meeting D <= maximumDutyCycle. Rounding UP would push the recomputed duty past
+        // the ceiling and trip the duty check; flooring keeps the realized design within the ceiling.
+        turnsRatioWithTolerance.set_nominal(OpenMagnetics::floorFloat(turnsRatio, 2));
         designRequirements.get_mutable_turns_ratios().push_back(turnsRatioWithTolerance);
     }
     auto operatingPoint = OpenMagnetics::Inputs::create_quick_operating_point_only_current(100000, 100e-6, 25, MAS::WaveformLabel::SINUSOIDAL, 0.01, 0.5, 0, turnsRatios).get_operating_points()[0];

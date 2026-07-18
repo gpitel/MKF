@@ -16,6 +16,7 @@
 #include "support/Exceptions.h"
 #include "physical_models/CoreLosses.h"
 #include "physical_models/InitialPermeability.h"
+#include "physical_models/StrayCapacitance.h"
 
 namespace OpenMagnetics {
 
@@ -23,7 +24,8 @@ namespace OpenMagnetics {
 SaturationParameters get_saturation_parameters(const Magnetic& magnetic, double temperature) {
     SaturationParameters params;
     params.valid = false;
-    
+    params.Isat = 0;
+
     try {
         auto core = magnetic.get_core();
         auto coil = magnetic.get_coil();
@@ -46,10 +48,18 @@ SaturationParameters get_saturation_parameters(const Magnetic& magnetic, double 
             MagnetizingInductance().calculate_inductance_from_number_turns_and_gapping(magnetic)
                 .get_magnetizing_inductance());
         
-        // Validate
+        // Saturation current comes from the authoritative physical model
+        // (Magnetic::calculate_saturation_current = gapped B_sat*N*A_e/L), NOT a
+        // formula reimplemented here -- that is what drifted and produced the
+        // ungapped, ~10x too-low I_sat in ABT #40. proportion=true matches the
+        // proportioned B_sat used above and by the model internally. A mutable
+        // copy is needed because calculate_saturation_current uses the mutable
+        // core/coil accessors.
         if (params.Bsat > 0 && params.mu_r > 0 && params.Ae > 0 &&
             params.le > 0 && params.primaryTurns > 0 && params.Lmag > 0) {
-            params.valid = true;
+            Magnetic mutableMagnetic = magnetic;
+            params.Isat = mutableMagnetic.calculate_saturation_current(temperature, true);
+            params.valid = params.Isat > 0;
         }
     } catch (const std::exception& e) {
         // Silently exporting a LINEAR inductor when saturation was requested hid
@@ -133,6 +143,24 @@ double CircuitSimulatorExporter::ladder_model(double x[], double frequency, doub
     for(int i=0; i<10; ++i) {
         if (x[i] < 0) {
             return 1e30;  // Large penalty value instead of 0
+        }
+    }
+    // Reject ladder stages whose L/R SETTLING TIME is too long for a transient
+    // sim to reach steady state. levmar can otherwise fit a physically-absurd
+    // inductor (e.g. ~10 mH with a ~19 Ω stage -> ~550 µs settling) that shapes
+    // the broadband curve on average but never settles in the transient regulate
+    // window, so pin/efficiency are grossly mismeasured (a 50 W transformer read
+    // as ~150 W, 24.7% "efficiency"). The bound is the physical quantity that
+    // caused the bug — the AC-resistance dynamics of a switching magnetic settle
+    // within a handful of switching periods (<<100 µs); a stage slower than that
+    // is a fit artifact, not physics. The operating-band resistance is unchanged.
+    // See abt #71.
+    const double maxSettlingTime = 1e-4;  // 100 µs: >> a few switching periods
+    for (int k = 0; k < 10; k += 2) {
+        const double R = x[k];
+        const double L = x[k + 1];
+        if (R > 0.0 && L / R > maxSettlingTime) {
+            return 1e30;
         }
     }
 
@@ -1142,8 +1170,13 @@ std::shared_ptr<CircuitSimulatorExporterModel> CircuitSimulatorExporterModel::fa
     else if (programName == CircuitSimulatorExporterModels::PLECS) {
         return std::make_shared<CircuitSimulatorExporterPlecsModel>();
     }
+    else if (programName == CircuitSimulatorExporterModels::NL5) {
+        // ABT #120.1: was missing — NL5 is in the enum with a full exporter class,
+        // but the factory threw "Unknown program" for it.
+        return std::make_shared<CircuitSimulatorExporterNl5Model>();
+    }
     else
-        throw ModelNotAvailableException("Unknown Circuit Simulator program, available options are: {SIMBA, NGSPICE, LTSPICE, PLECS}");
+        throw ModelNotAvailableException("Unknown Circuit Simulator program, available options are: {SIMBA, NGSPICE, LTSPICE, PLECS, NL5}");
 }
 
 std::string CircuitSimulatorExporter::export_magnetic_as_subcircuit(Magnetic magnetic, double frequency, double temperature, std::optional<std::string> outputFilename, std::optional<std::string> filePathOrFile, CircuitSimulatorExporterCurveFittingModes mode) {
@@ -1344,38 +1377,43 @@ std::string emit_core_rosano_spice(
     double L2 = coeffs[4];
     double C1 = coeffs[5];
 
+    // The network can only be terminated to P1- (ground) through the RLC
+    // stage 3 (L2 || (R3+C1)). Every coefficient must be finite and positive
+    // for the R + RL + RLC topology to be well-formed. If the fit is
+    // degenerate, DO NOT close the branch with the old `Rcore_gnd .. 1e-6`
+    // fallback: with stages 1/2 also skipped that dropped a ~1 uOhm resistor
+    // straight across Node_R_Lmag_1..P1- and SHORTED the magnetizing
+    // inductance (ABT #120.3). Return "" so the caller simply omits the
+    // core-loss branch (Lmag stands alone) rather than shorting it.
+    if (!std::isfinite(R1) || !std::isfinite(R2) || !std::isfinite(L1) ||
+        !std::isfinite(R3) || !std::isfinite(L2) || !std::isfinite(C1) ||
+        R1 <= 0 || R2 <= 0 || L1 <= 0 || R3 <= 0 || L2 <= 0 || C1 <= 0) {
+        return "";
+    }
+
     std::string s;
     s += "* Core loss Rosano network (R + RL + RLC series stages)\n";
 
     // Stage 1 (R): series R from core node
     std::string prevNode = "Node_R_Lmag_1";
     std::string nextNode = "Node_core_s1";
-    if (R1 > 0) {
-        s += "Rcore_s1 " + prevNode + " " + nextNode + " " + to_string(R1, 12) + "\n";
-        prevNode = nextNode;
-    }
+    s += "Rcore_s1 " + prevNode + " " + nextNode + " " + to_string(R1, 12) + "\n";
+    prevNode = nextNode;
 
     // Stage 2 (RL): L1 || R2 between prevNode and nextNode
     nextNode = "Node_core_s2";
-    if (R2 > 0 && L1 > 0) {
-        // R2 path
-        s += "Rcore_s2 " + prevNode + " " + nextNode + " " + to_string(R2, 12) + "\n";
-        // L1 in parallel (same two nodes)
-        s += "Lcore_s2 " + prevNode + " " + nextNode + " " + to_string(L1, 12) + "\n";
-        prevNode = nextNode;
-    }
+    // R2 path
+    s += "Rcore_s2 " + prevNode + " " + nextNode + " " + to_string(R2, 12) + "\n";
+    // L1 in parallel (same two nodes)
+    s += "Lcore_s2 " + prevNode + " " + nextNode + " " + to_string(L1, 12) + "\n";
+    prevNode = nextNode;
 
     // Stage 3 (RLC): L2 || (R3 + C1) between prevNode and ground
-    if (R3 > 0 && L2 > 0 && C1 > 0) {
-        // L2 path: prevNode to ground
-        s += "Lcore_s3 " + prevNode + " P1- " + to_string(L2, 12) + "\n";
-        // R3 + C1 path (in series): prevNode → R3 → C1 → ground
-        s += "Rcore_s3 " + prevNode + " Node_core_s3c " + to_string(R3, 12) + "\n";
-        s += "Ccore_s3 Node_core_s3c P1- " + to_string(C1, 12) + "\n";
-    } else {
-        // If RLC stage invalid, just connect to ground
-        s += "Rcore_gnd " + prevNode + " P1- 1e-6\n";
-    }
+    // L2 path: prevNode to ground
+    s += "Lcore_s3 " + prevNode + " P1- " + to_string(L2, 12) + "\n";
+    // R3 + C1 path (in series): prevNode → R3 → C1 → ground
+    s += "Rcore_s3 " + prevNode + " Node_core_s3c " + to_string(R3, 12) + "\n";
+    s += "Ccore_s3 Node_core_s3c P1- " + to_string(C1, 12) + "\n";
 
     return s;
 }
@@ -1474,7 +1512,27 @@ std::string emit_mutual_resistance_network_spice(
     if (mutualCoeffs.empty() || numWindings < 2) {
         return "";  // No mutual resistance to model
     }
-    
+
+    // The auxiliary-winding mutual-resistance model couples an extra inductor LA_ij (k=0.1)
+    // into BOTH magnetizing inductors of every winding pair. For a 2-winding transformer the
+    // resulting coupled-inductor system {Lmag_1, Lmag_2, LA_12} is small and positive-definite,
+    // so ngspice solves it. For n >= 3 windings the pairs share the magnetizing inductors
+    // (LA_12 and LA_13 both couple Lmag_1) but carry NO direct LA-LA coupling, so ngspice sees a
+    // single coupled system whose K matrix is INCOMPLETE (the missing entries are implicitly 0)
+    // and NOT positive definite -> the transient collapses ("Timestep too small"). The mutual
+    // (cross-coupling) resistance is a SECOND-ORDER loss term; the dominant per-winding self AC
+    // resistance (Rdc + ladder) is emitted separately and is unaffected. Rather than emit an
+    // unsimulatable deck, skip this term for n >= 3 and say so loudly. (A PD-safe behavioural
+    // current-controlled implementation that keeps the term for n >= 3 is follow-up — abt #50.)
+    if (numWindings >= 3) {
+        return "\n* ==== MUTUAL RESISTANCE NETWORK: SKIPPED ====\n"
+               "* Skipped for " + std::to_string(numWindings) + "-winding transformer: the "
+               "auxiliary-winding (Hesterman 2020) coupled-inductor realization yields a "
+               "non-positive-definite\n* coupled-L matrix in ngspice for >=3 windings (incomplete "
+               "LA-LA K couplings). The dominant per-winding\n* self AC resistance is still "
+               "modelled; only the second-order cross-coupling loss term is omitted (abt #50).\n";
+    }
+
     std::string s;
     s += "\n* ==== MUTUAL RESISTANCE NETWORK ====\n";
     s += "* Based on Hesterman (2020) - Auxiliary windings for cross-coupling losses\n";
@@ -1551,11 +1609,152 @@ std::string emit_mutual_resistance_network_spice(
         
         s += "KA_" + std::to_string(i) + "_" + ij + " Lmag_" + std::to_string(i) + " LA_" + ij + " " + to_string(k_i_aux, 6) + "\n";
         s += "KA_" + std::to_string(j) + "_" + ij + " Lmag_" + std::to_string(j) + " LA_" + ij + " " + to_string(k_j_aux, 6) + "\n";
-        
+
         s += "\n";
     }
-    
+
     return s;
+}
+
+
+std::string emit_mutual_resistance_behavioural_spice(
+    const std::vector<CircuitSimulatorExporter::MutualResistanceCoefficients>& mutualCoeffs,
+    size_t numWindings,
+    double frequency) {
+
+    if (mutualCoeffs.empty() || numWindings < 2) {
+        return "";  // No winding pair to couple
+    }
+
+    // PD-safe behavioural realization of the cross-coupling (mutual) resistance loss for
+    // n>=2 windings (abt #50/#72/#76). The auxiliary-winding (Hesterman 2020) model couples an
+    // extra inductor into TWO magnetizing inductors at once; for n>=3 the shared-but-
+    // uncoupled auxiliaries leave the coupled-L matrix non-positive-definite and ngspice
+    // collapses ("Timestep too small"), so it was skipped, and for n==2 the emitted ladder did
+    // not reproduce its own fitted model (DC impedance was the last-stage R, not
+    // dcMutualResistance — abt #76). Here each winding i instead
+    // carries a series voltage drop sum_{j!=i} R_ij*I_j realized with LINEAR current-
+    // controlled voltage sources (H), so NO inductor and NO coupling is added: the Lmag
+    // coupled-L matrix is byte-identical to the no-mutual case and stays positive-definite.
+    //
+    //   * Vsns_<i>      : a 0 V sense source, so i(Vsns_<i>) = the winding-i terminal current
+    //   * Hmut_<i>_<j>  : a CCVS = R_ij * i(Vsns_<j>), chained in series into the drop
+    // R_ij is the PURELY RESISTIVE mutual resistance at the export frequency (the real part
+    // of the fitted ladder impedance, mutual_resistance_real_at). Using a scalar resistance
+    // rather than the raw R-L ladder keeps the loss WITHOUT the ladder's reactance, which
+    // would otherwise add a spurious series inductance and detune the winding — the reactive
+    // coupling already lives in the Lmag K statements. The winding emission routes
+    // P<i>+ -> Vsns_<i> -> H chain -> Node_Wtop_<i> -> Rdc. Power: the H drop in winding i
+    // absorbs (R_ij*I_j)*I_i and in winding j absorbs (R_ij*I_i)*I_j — the full
+    // 2*R_ij*I_i*I_j Hesterman cross term, at the winding terminals.
+
+    // Per receiver winding (0-indexed): list of (driving winding, signed R_ij) drops.
+    std::vector<std::vector<std::pair<size_t, double>>> drops(numWindings);
+
+    std::string s;
+    s += "\n* ==== MUTUAL RESISTANCE NETWORK (PD-safe behavioural, n>=2) ====\n";
+    s += "* Cross-coupling loss sum_{i!=j} R_ij*I_i*I_j via linear current-controlled\n";
+    s += "* voltage sources (no inductors, no coupling) so the Lmag matrix stays\n";
+    s += "* positive-definite (abt #50/#72/#76). R_ij is the mutual resistance at the export\n";
+    s += "* frequency (real part of the fitted ladder; the reactance lives in the K's).\n\n";
+
+    for (const auto& mc : mutualCoeffs) {
+        if (mc.coefficients.size() < 2) {
+            continue;
+        }
+        if (mc.windingIndex1 >= numWindings || mc.windingIndex2 >= numWindings ||
+            mc.windingIndex1 == mc.windingIndex2) {
+            continue;
+        }
+        size_t i = mc.windingIndex1;   // 0-indexed
+        size_t j = mc.windingIndex2;
+        // Mutual resistance (signed) at the export frequency, evaluated with the SAME
+        // model the coefficients were fitted to (mutual_resistance_ladder_model). This is
+        // a pure scalar resistance carrying the DC term and the correct sign — no ladder,
+        // so no spurious reactance (that reactive coupling already lives in the K's).
+        if (mc.coefficients.size() < 6) {
+            continue;  // the fit always emits 6 coefficients; skip a malformed pair
+        }
+        double rij = mutual_resistance_ladder_model(
+            const_cast<double*>(mc.coefficients.data()), frequency, mc.dcMutualResistance);
+        if (!std::isfinite(rij) || rij == 0.0) {
+            continue;
+        }
+        s += "* Mutual R" + std::to_string(i + 1) + std::to_string(j + 1) +
+             " = " + to_string(rij, 9) + " Ohm @ " + to_string(frequency, 1) + " Hz\n";
+        drops[i].emplace_back(j, rij);
+        drops[j].emplace_back(i, rij);
+    }
+
+    // Per-winding series sense (Vsns) + a chain of CCVS drops (Hmut), routing P<k>+ into
+    // the Node_Wtop_<k> node the winding emission consumes. Every winding gets a
+    // Node_Wtop_<k> (a straight 0 V wire when it has no mutual term) so the winding side
+    // never references an undefined node.
+    for (size_t k = 0; k < numWindings; ++k) {
+        std::string ks = std::to_string(k + 1);
+        s += "Vsns_" + ks + " P" + ks + "+ Node_Wsns_" + ks + " 0\n";
+        const auto& kdrops = drops[k];
+        if (kdrops.empty()) {
+            s += "Vwire_" + ks + " Node_Wsns_" + ks + " Node_Wtop_" + ks + " 0\n";
+            continue;
+        }
+        std::string node = "Node_Wsns_" + ks;
+        for (size_t d = 0; d < kdrops.size(); ++d) {
+            std::string otherS = std::to_string(kdrops[d].first + 1);
+            std::string next = (d + 1 == kdrops.size())
+                                   ? ("Node_Wtop_" + ks)
+                                   : ("Node_Hmut_" + ks + "_" + std::to_string(d));
+            s += "Hmut_" + ks + "_" + otherS + " " + node + " " + next + " Vsns_" + otherS +
+                 " " + to_string(kdrops[d].second, 9) + "\n";
+            node = next;
+        }
+    }
+    s += "\n";
+    return s;
+}
+
+// Stray/parasitic capacitance network (positive 3-capacitor / pi-model). Shared verbatim by the
+// ngspice and LTspice exporters — the caps are plain `C…` terminal elements with identical syntax
+// in both. See the header for the model rationale.
+std::string emit_stray_capacitance_spice(const Coil& coil, size_t numWindings) {
+    auto& settings = Settings::GetInstance();
+    if (!settings.get_circuit_simulator_include_stray_capacitance() || !coil.get_turns_description()) {
+        return "";
+    }
+    auto capAmongWindings = StrayCapacitance().calculate_capacitance(coil).get_capacitance_among_windings();
+    if (!capAmongWindings) {
+        return "";
+    }
+    const auto& capMap = capAmongWindings.value();
+    const auto& fd = coil.get_functional_description();
+    std::string capString = "\n* ==== STRAY CAPACITANCE NETWORK ====\n";
+    capString += "* Per-winding self-capacitance (self-resonance) + inter-winding\n";
+    capString += "* capacitance (CM coupling), lumped positive caps from StrayCapacitance.\n";
+    bool emittedAny = false;
+    for (size_t a = 0; a < numWindings; ++a) {
+        std::string an = fd[a].get_name();
+        std::string as = std::to_string(a + 1);
+        if (capMap.contains(an) && capMap.at(an).contains(an)) {
+            double cself = capMap.at(an).at(an);
+            if (std::isfinite(cself) && cself > 0) {
+                capString += "Cself_" + as + " P" + as + "+ P" + as + "- " + to_string(cself, 18) + "\n";
+                emittedAny = true;
+            }
+        }
+        for (size_t b = a + 1; b < numWindings; ++b) {
+            std::string bn = fd[b].get_name();
+            if (capMap.contains(an) && capMap.at(an).contains(bn)) {
+                double cinter = capMap.at(an).at(bn);
+                if (std::isfinite(cinter) && cinter > 0) {
+                    capString += "Cwind_" + as + "_" + std::to_string(b + 1) +
+                                 " P" + as + "+ P" + std::to_string(b + 1) + "+ " +
+                                 to_string(cinter, 18) + "\n";
+                    emittedAny = true;
+                }
+            }
+        }
+    }
+    return emittedAny ? capString : "";
 }
 
 
@@ -1595,17 +1794,48 @@ static void strip_utf8_bom(std::string& s) {
     }
 }
 
+std::vector<std::string> CircuitSimulationReader::split_fields(const std::string& line, char separator) {
+    // Mirrors getline(ss, token, separator) but treats a separator as literal
+    // when it sits inside a double-quoted field or inside balanced parentheses.
+    // Parenthesis-awareness is what keeps LTspice differential probes like
+    // V(N009,d) from being split into two columns on a comma-separated file.
+    std::vector<std::string> fields;
+    std::string current;
+    bool inQuotes = false;
+    int parenDepth = 0;
+    for (char c : line) {
+        if (c == '"') {
+            inQuotes = !inQuotes;
+            current.push_back(c);  // keep quotes; the caller strips surrounding ones
+            continue;
+        }
+        if (!inQuotes) {
+            if (c == '(') {
+                parenDepth++;
+            }
+            else if (c == ')' && parenDepth > 0) {
+                parenDepth--;
+            }
+        }
+        if (c == separator && !inQuotes && parenDepth == 0) {
+            fields.push_back(current);
+            current.clear();
+            continue;
+        }
+        current.push_back(c);
+    }
+    fields.push_back(current);
+    return fields;
+}
+
 void CircuitSimulationReader::process_line(std::string line, char separator) {
     process_line_with_context(line, separator, 0);
 }
 
 void CircuitSimulationReader::process_line_with_context(const std::string& line, char separator, size_t lineNumber) {
-    std::stringstream ss(line);
-    std::string token;
-
     if (_columns.size() == 0) {
         // Header row: collect column names. Strip CR and surrounding quotes from each token.
-        while(getline(ss, token, separator)) {
+        for (std::string token : split_fields(line, separator)) {
             // Strip CR anywhere in the token (handles CRLF files).
             token.erase(std::remove(token.begin(), token.end(), '\r'), token.end());
             // Strip surrounding quotes only (preserves quoted commas/separators within names).
@@ -1622,7 +1852,7 @@ void CircuitSimulationReader::process_line_with_context(const std::string& line,
     }
     else {
         size_t currentColumnIndex = 0;
-        while(getline(ss, token, separator)) {
+        for (std::string token : split_fields(line, separator)) {
             // Same CR/quote/whitespace cleanup as the header so a stray CR in the
             // last field of a CRLF file does not break std::stod.
             token.erase(std::remove(token.begin(), token.end(), '\r'), token.end());
@@ -1837,22 +2067,34 @@ bool CircuitSimulationReader::can_be_current(std::vector<double> data, double li
 
 char CircuitSimulationReader::guess_separator(std::string line){
     // Pick the candidate that produces the most columns (≥2), counting only
-    // separator characters that appear *outside* double-quoted fields. This
-    // lets us correctly detect ';' as the separator in
+    // separator characters that appear *outside* double-quoted fields AND
+    // outside balanced parentheses. This lets us correctly detect ';' as the
+    // separator in
     //     "Voltage, primary";"Current, primary";"Time / s"
-    // which a naive std::count would mis-detect as ',' because it would also
-    // count the commas inside the quoted column names.
+    // (commas live inside quotes) and ',' as the separator in an LTspice header
+    //     time,V(N009,d),V(n016),I(L1)
+    // where the comma inside the differential probe V(N009,d) must not be
+    // counted — a naive std::count would over-count commas in both cases.
     static const std::vector<char> possibleSeparators = {',', ';', '\t', '|'};
 
-    auto count_outside_quotes = [&](char sep) -> size_t {
+    auto count_separators = [&](char sep) -> size_t {
         size_t count = 0;
         bool inQuotes = false;
+        int parenDepth = 0;
         for (char c : line) {
             if (c == '"') {
                 inQuotes = !inQuotes;
                 continue;
             }
-            if (!inQuotes && c == sep) {
+            if (!inQuotes) {
+                if (c == '(') {
+                    parenDepth++;
+                }
+                else if (c == ')' && parenDepth > 0) {
+                    parenDepth--;
+                }
+            }
+            if (!inQuotes && parenDepth == 0 && c == sep) {
                 ++count;
             }
         }
@@ -1863,7 +2105,7 @@ char CircuitSimulationReader::guess_separator(std::string line){
     size_t bestColumns = 1;
 
     for (auto separator : possibleSeparators) {
-        size_t numberColumns = count_outside_quotes(separator) + 1;
+        size_t numberColumns = count_separators(separator) + 1;
         if (numberColumns > bestColumns) {
             bestColumns = numberColumns;
             bestSeparator = separator;
@@ -2473,6 +2715,121 @@ FractionalPoleNetwork CircuitSimulatorExporter::calculate_core_fracpole_network(
         opts.lumpsPerDecade, opts.profile);
 
     return FractionalPole::generate(opts);
+}
+
+
+GseCoreLossParams CircuitSimulatorExporter::calculate_gse_core_loss_params(
+    Magnetic magnetic, double frequency, double temperature) {
+
+    GseCoreLossParams p;
+
+    auto core = magnetic.get_core();
+    auto material = core.resolve_material();
+    // Steinmetz k / alpha / beta for the material at this frequency band. A material without
+    // Steinmetz data cannot supply a large-signal core-loss model -> report invalid and let the
+    // caller keep the linear small-signal ladder.
+    SteinmetzCoreLossesMethodRangeDatum steinmetzDatum;
+    try {
+        steinmetzDatum = CoreLossesModel::get_steinmetz_coefficients(material, frequency);
+    } catch (...) {
+        return p;
+    }
+    double alpha = steinmetzDatum.get_alpha();
+    double beta = steinmetzDatum.get_beta();
+    double k = steinmetzDatum.get_k();
+    if (!(std::isfinite(alpha) && std::isfinite(beta) && std::isfinite(k) &&
+          alpha > 0 && beta > 0 && k > 0 && beta >= alpha)) {
+        return p;  // beta < alpha would make |B|^(beta-alpha) singular at B=0; refuse it
+    }
+
+    // GSE coefficient k1: calibrated so that for a sinusoidal B the cycle-average of
+    // p(t) = k1*|dB/dt|^alpha*|B|^(beta-alpha) equals the Steinmetz loss k*f^alpha*B_peak^beta.
+    //   k1 = k / [ (2*pi)^(alpha-1) * integral_0^{2*pi} |cos t|^alpha * |sin t|^(beta-alpha) dt ]
+    // (identical construction to CoreLossesIGSEModel::get_ki, but with |sin t|^(beta-alpha) in the
+    // integrand instead of the constant 2^(beta-alpha): GSE uses the instantaneous |B|, iGSE the
+    // per-cycle peak-to-peak swing.)
+    auto& settings = Settings::GetInstance();
+    size_t nPoints = settings.get_inputs_number_points_sampled_waveforms();
+    if (nPoints < 8) nPoints = 128;
+    double integral = 0.0;
+    for (size_t i = 0; i < nPoints; ++i) {
+        double theta = static_cast<double>(i) * 2.0 * std::numbers::pi / static_cast<double>(nPoints);
+        integral += std::pow(std::fabs(std::cos(theta)), alpha) *
+                    std::pow(std::fabs(std::sin(theta)), beta - alpha) *
+                    2.0 * std::numbers::pi / static_cast<double>(nPoints);
+    }
+    if (!(integral > 0.0)) {
+        return p;
+    }
+    double k1 = k / (std::pow(2.0 * std::numbers::pi, alpha - 1.0) * integral);
+
+    // Core geometry: effective volume + effective area, and the main-winding turns.
+    auto processedDescription = core.get_processed_description();
+    if (!processedDescription) {
+        return p;
+    }
+    auto effectiveParameters = processedDescription.value().get_effective_parameters();
+    double A_e = effectiveParameters.get_effective_area();
+    double V_e = effectiveParameters.get_effective_volume();
+    auto coil = magnetic.get_coil();
+    if (coil.get_functional_description().empty()) {
+        return p;
+    }
+    double N = static_cast<double>(coil.get_functional_description()[0].get_number_turns());
+    if (!(A_e > 0 && V_e > 0 && N > 0)) {
+        return p;
+    }
+
+    // I_loss = P/V_L with P = V_e*k1*|dB/dt|^alpha*|B|^(beta-alpha), dB/dt = V_L/(N*A_e),
+    // B = lambda/(N*A_e):  I_loss = [V_e*k1/(N*A_e)^beta] * sgn(V_L)*|V_L|^(alpha-1)*|lambda|^(beta-alpha).
+    p.gc = V_e * k1 / std::pow(N * A_e, beta);
+    p.alpha = alpha;
+    p.beta = beta;
+    p.nTurns = N;
+    p.effectiveArea = A_e;
+    p.valid = std::isfinite(p.gc) && p.gc > 0;
+    return p;
+}
+
+
+std::string emit_gse_core_loss_spice(
+    const GseCoreLossParams& params,
+    const std::string& windingIndex,
+    const std::string& nodeIn,
+    const std::string& nodeOut,
+    bool quoteExpression) {
+
+    if (!params.valid) {
+        return "";
+    }
+    std::string fluxNode = "Node_Bflux_" + windingIndex;
+    // Smooth (Lipschitz) realization of I = gc*sgn(V_L)*|V_L|^(alpha-1)*|lambda|^(beta-alpha),
+    // written as V_L*(V_L^2+epsV^2)^((alpha-2)/2) * (lambda^2+epsL^2)^((beta-alpha)/2). The raw
+    // |V_L|^(alpha-1) has an infinite slope at V_L=0 (every voltage zero-crossing) and stalls the
+    // transient ("timestep too small"); the +eps^2 forms are bounded everywhere with negligible
+    // bias (eps << any real winding voltage / flux linkage), so the element converges at full speed.
+    double halfAlphaM2 = (params.alpha - 2.0) / 2.0;
+    double halfBetaMAlpha = (params.beta - params.alpha) / 2.0;
+    const double epsV2 = 1e-6;   // (1 mV)^2 voltage floor
+    const double epsL2 = 1e-18;  // (1 nWb)^2 flux-linkage floor
+    std::string vL = "V(" + nodeIn + "," + nodeOut + ")";
+    std::string expr = to_string(params.gc, 15) + "*" + vL +
+        "*pow(" + vL + "*" + vL + "+" + to_string(epsV2, 12) + "," + to_string(halfAlphaM2, 9) + ")" +
+        "*pow(V(" + fluxNode + ")*V(" + fluxNode + ")+" + to_string(epsL2, 21) + "," +
+        to_string(halfBetaMAlpha, 9) + ")";
+    std::string q = quoteExpression ? "'" : "";
+
+    std::string s;
+    s += "* Behavioural GSE core loss (winding " + windingIndex +
+         "): p=k1*|dB/dt|^alpha*|B|^(beta-alpha)\n";
+    s += "* alpha=" + to_string(params.alpha, 4) + " beta=" + to_string(params.beta, 4) +
+         " gc=" + to_string(params.gc, 15) + "\n";
+    // Flux linkage lambda = integral(V_L) dt : winding voltage integrated into a 1 F cap node.
+    s += "Gcl_flux_" + windingIndex + " 0 " + fluxNode + " " + nodeIn + " " + nodeOut + " 1\n";
+    s += "Ccl_flux_" + windingIndex + " " + fluxNode + " 0 1\n";
+    s += "Rcl_flux_" + windingIndex + " " + fluxNode + " 0 1e12\n";  // keep the flux node non-floating
+    s += "Bcloss_" + windingIndex + " " + nodeIn + " " + nodeOut + " I=" + q + expr + q + "\n";
+    return s;
 }
 
 

@@ -166,9 +166,13 @@ OpenMagnetics::Coil get_quick_coil_no_compact(std::vector<int64_t> numberTurns,
         coilJson["functionalDescription"].push_back(individualcoilJson);
     }
 
+    // Build without delimit-and-compact (that is what "no_compact" means), but restore the
+    // global setting afterwards: leaving it flipped leaked into every later test in the run.
+    bool previousDelimitAndCompact = settings.get_coil_delimit_and_compact();
     settings.set_coil_delimit_and_compact(false);
 
     OpenMagnetics::Coil coil(coilJson, interleavingLevel, windingOrientation, layersOrientation, turnsAlignment, sectionsAlignment);
+    settings.set_coil_delimit_and_compact(previousDelimitAndCompact);
     return coil;
 }
 
@@ -218,9 +222,13 @@ OpenMagnetics::Coil get_quick_toroidal_coil_no_compact(std::vector<int64_t> numb
         coilJson["functionalDescription"].push_back(individualcoilJson);
     }
 
+    // Build without delimit-and-compact (that is what "no_compact" means), but restore the
+    // global setting afterwards: leaving it flipped leaked into every later test in the run.
+    bool previousDelimitAndCompact = settings.get_coil_delimit_and_compact();
     settings.set_coil_delimit_and_compact(false);
 
     OpenMagnetics::Coil coil(coilJson, interleavingLevel, windingOrientation, layersOrientation, turnsAlignment, sectionsAlignment);
+    settings.set_coil_delimit_and_compact(previousDelimitAndCompact);
     return coil;
 }
 
@@ -512,7 +520,10 @@ void check_sections_description(OpenMagnetics::Coil coil,
     }
 
     CHECK(roundFloat(bobbinArea, 6) == roundFloat(sectionsArea, 6));
-    for (size_t i = 0; i < numberAssignedParallels.size() - 1; ++i){
+    // Per-element check: the old `- 1` bound was a copy-paste from the adjacent-pair loop
+    // above and silently skipped the LAST winding (for single-winding coils it skipped the
+    // check entirely, so parallels/physical-turns consistency was never validated).
+    for (size_t i = 0; i < numberAssignedParallels.size(); ++i){
         CHECK(round(numberAssignedParallels[i]) == round(numberParallels[i]));
         CHECK(round(numberAssignedPhysicalTurns[i]) == round(numberTurns[i] * numberParallels[i]));
     }
@@ -786,6 +797,23 @@ void check_winding_losses(OpenMagnetics::Mas mas) {
         REQUIRE_THAT(totalWindingLosses, Catch::Matchers::WithinAbs(totalWindingLossesBySection, totalWindingLosses * 0.001));
         REQUIRE_THAT(totalWindingLosses, Catch::Matchers::WithinAbs(totalWindingLossesByWinding, totalWindingLosses * 0.001));
     }
+}
+
+void check_svg(const std::filesystem::path& svgPath) {
+    INFO("SVG file: " << svgPath.string());
+    REQUIRE(std::filesystem::exists(svgPath));
+    REQUIRE(std::filesystem::file_size(svgPath) > 0);
+    std::ifstream svgFile(svgPath);
+    std::string content((std::istreambuf_iterator<char>(svgFile)), std::istreambuf_iterator<char>());
+    CHECK(content.find("<svg") != std::string::npos);
+    bool hasDrawnElement = content.find("<path") != std::string::npos ||
+                           content.find("<circle") != std::string::npos ||
+                           content.find("<rect") != std::string::npos ||
+                           content.find("<line") != std::string::npos ||
+                           content.find("<polygon") != std::string::npos ||
+                           content.find("<polyline") != std::string::npos ||
+                           content.find("<ellipse") != std::string::npos;
+    CHECK(hasDrawnElement);
 }
 
 OpenMagnetics::Mas mas_loader(const std::filesystem::path& path) {

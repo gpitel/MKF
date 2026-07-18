@@ -19,9 +19,8 @@
 
 namespace OpenMagnetics {
 
-MagneticFilterCoreAndDcLosses::MagneticFilterCoreAndDcLosses(Inputs inputs) {
-    MagneticFilterCoreAndDcLosses(inputs, default_loss_filter_models());
-}
+MagneticFilterCoreAndDcLosses::MagneticFilterCoreAndDcLosses(Inputs inputs)
+    : MagneticFilterCoreAndDcLosses(inputs, default_loss_filter_models()) {}
 
 MagneticFilterCoreAndDcLosses::MagneticFilterCoreAndDcLosses() {
     auto models = default_loss_filter_models();
@@ -97,6 +96,18 @@ std::pair<bool, double> MagneticFilterCoreAndDcLosses::evaluate_magnetic(Magneti
                                         && excitation.get_current()->get_processed()->get_peak())
                                        ? std::abs(excitation.get_current()->get_processed()->get_peak().value()) : 0.0;
         size_t numberTimeouts = 0;
+
+        // Track the loss-minimum across the sweep. The do-while only gates progress;
+        // it exits once losses STOP improving, so the coil state at break time is the
+        // first WORSE point, not the optimum. Remember the best and restore it after
+        // the loop (ABT #105 — ported from the CoreDcAndSkin twin, which already did
+        // this; the CoreAndDc twin was pushing the last, worse iteration).
+        double bestTotalLosses = std::numeric_limits<double>::infinity();
+        uint64_t bestNumberTurnsPrimary = currentNumberTurns;
+        CoreLossesOutput bestCoreLossesOutput;
+        WindingLossesOutput bestWindingLossesOutput;
+        bestWindingLossesOutput.set_origin(ResultOrigin::SIMULATION);
+
         do {
             currentTotalLosses = newTotalLosses;
             auto numberTurnsCombination = numberTurns.get_next_number_turns_combination();
@@ -113,7 +124,13 @@ std::pair<bool, double> MagneticFilterCoreAndDcLosses::evaluate_magnetic(Magneti
                 saturationMagnetic.set_coil(coil);
                 double saturationCurrent = 0;
                 try { saturationCurrent = saturationMagnetic.calculate_saturation_current(temperature, /*proportion=*/false); }
-                catch (const std::exception&) { saturationCurrent = 0; }
+                catch (const std::exception& e) {
+                    // ABT #121.4: was silent — with saturationCurrent = 0 the
+                    // saturation cap on the turns sweep is disabled, so say so.
+                    logEntry(std::string("Losses filter: saturation current failed during turns sweep: ") +
+                             e.what() + " — saturation cap disabled for this sweep step", "CoreAdviser", 2);
+                    saturationCurrent = 0;
+                }
                 if (saturationCurrent > 0 && saturationCurrent < saturationMargin * saturationPeakCurrent) {
                     coil.get_mutable_functional_description()[0].set_number_turns(previousNumberTurnsPrimary);
                     settings.set_coil_delimit_and_compact(false);
@@ -194,6 +211,14 @@ std::pair<bool, double> MagneticFilterCoreAndDcLosses::evaluate_magnetic(Magneti
                 throw CalculationException(ErrorCode::CALCULATION_DIVERGED, "Too large losses");
             }
 
+            // Record the best point seen so far in this operating-point sweep.
+            if (newTotalLosses < bestTotalLosses) {
+                bestTotalLosses = newTotalLosses;
+                bestNumberTurnsPrimary = numberTurnsCombination[0];
+                bestCoreLossesOutput = coreLossesOutput;
+                bestWindingLossesOutput = windingLossesOutput;
+            }
+
             iteration--;
             if (iteration <=0) {
                 numberTimeouts++;
@@ -202,10 +227,22 @@ std::pair<bool, double> MagneticFilterCoreAndDcLosses::evaluate_magnetic(Magneti
         }
         while(newTotalLosses < currentTotalLosses * defaults.coreAdviserThresholdValidity);
 
+        // Restore the best N from the sweep so downstream code sees the loss-optimal coil.
+        if (std::isfinite(bestTotalLosses) &&
+            coil.get_functional_description()[0].get_number_turns() != static_cast<double>(bestNumberTurnsPrimary)) {
+            coil.get_mutable_functional_description()[0].set_number_turns(bestNumberTurnsPrimary);
+            coil.fast_wind();  // delimit/compact disabled by coilDelimitGuard above
+        }
 
-        if (std::isfinite(coreLosses) && coreLosses > 0) {
+        if (std::isfinite(bestTotalLosses)) {
             magnetic->set_coil(coil);
-
+            totalLossesPerOperatingPoint.push_back(bestTotalLosses);
+            coreLossesPerOperatingPoint.push_back(bestCoreLossesOutput);
+            windingLossesPerOperatingPoint.push_back(bestWindingLossesOutput);
+        }
+        else if (std::isfinite(coreLosses) && coreLosses > 0) {
+            // Fallback: no point ever became finite (e.g. PQI/UI shortcut path with only core losses).
+            magnetic->set_coil(coil);
             currentTotalLosses = newTotalLosses;
             totalLossesPerOperatingPoint.push_back(currentTotalLosses);
             coreLossesPerOperatingPoint.push_back(coreLossesOutput);
@@ -217,9 +254,8 @@ std::pair<bool, double> MagneticFilterCoreAndDcLosses::evaluate_magnetic(Magneti
                                     magnetic, inputs, outputs, _maximumPowerMean);
 }
 
-MagneticFilterCoreDcAndSkinLosses::MagneticFilterCoreDcAndSkinLosses(Inputs inputs) {
-    MagneticFilterCoreDcAndSkinLosses(inputs, default_loss_filter_models());
-}
+MagneticFilterCoreDcAndSkinLosses::MagneticFilterCoreDcAndSkinLosses(Inputs inputs)
+    : MagneticFilterCoreDcAndSkinLosses(inputs, default_loss_filter_models()) {}
 
 MagneticFilterCoreDcAndSkinLosses::MagneticFilterCoreDcAndSkinLosses() {
     auto models = default_loss_filter_models();
@@ -327,7 +363,13 @@ std::pair<bool, double> MagneticFilterCoreDcAndSkinLosses::evaluate_magnetic(Mag
                 saturationMagnetic.set_coil(coil);
                 double saturationCurrent = 0;
                 try { saturationCurrent = saturationMagnetic.calculate_saturation_current(temperature, /*proportion=*/false); }
-                catch (const std::exception&) { saturationCurrent = 0; }
+                catch (const std::exception& e) {
+                    // ABT #121.4: was silent — with saturationCurrent = 0 the
+                    // saturation cap on the turns sweep is disabled, so say so.
+                    logEntry(std::string("Losses filter: saturation current failed during turns sweep: ") +
+                             e.what() + " — saturation cap disabled for this sweep step", "CoreAdviser", 2);
+                    saturationCurrent = 0;
+                }
                 if (saturationCurrent > 0 && saturationCurrent < saturationMargin * saturationPeakCurrent) {
                     coil.get_mutable_functional_description()[0].set_number_turns(previousNumberTurnsPrimary);
                     settings.set_coil_delimit_and_compact(false);

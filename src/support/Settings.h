@@ -1,5 +1,4 @@
 #pragma once
-#include <source_location>
 #include "MAS.hpp"
 #include "Definitions.h"
 #include "Models.h"
@@ -28,7 +27,6 @@ class Settings
 {
     private:
         Settings();
-        std::string selfFilePath = std::source_location::current().file_name();
 
         bool _useToroidalCores = true;
         bool _useConcentricCores = true;
@@ -55,6 +53,17 @@ class Settings
 
         bool _useOnlyCoresInStock = true;
         bool _usePowderCores = true;
+        // When true, Core::process_data emits one winding-window entry per wound-column
+        // candidate: window[0] keeps its historical geometry and gains the explicit `column`
+        // edge, and every other window-adjacent column gets an entry with the geometry of
+        // its adjacent window region and its own `column`. Default off: the processed
+        // description stays byte-identical to the historical single-window output (no
+        // `column` stamped), so existing consumers and persisted data are unaffected.
+        bool _corePerColumnWindingWindows = false;
+        // Opt-in: CoilAdviser additionally proposes two-winding candidates with the
+        // secondary wound on a lateral leg (integrated-leakage designs). Off by
+        // default so the adviser surface is unchanged unless explicitly requested.
+        bool _coilAdviserAllowLateralPlacement = false;
         EffectiveParameterStandard _effectiveParameterStandard = EffectiveParameterStandard::IEC_60205;
         double _nanocrystallineStackingFactor = 0.80;  // Stacking factor for tape-wound nanocrystalline cores (0.75-0.85 typical)
 
@@ -85,7 +94,13 @@ class Settings
         std::string _painterColorLines = "0x010000";
         std::string _painterColorText = "0x000000";
         std::string _painterColorCurrentDensity = "0x0892D0";
-        std::string _painterCciCoordinatesPath = std::string{selfFilePath}.substr(0, std::string{selfFilePath}.rfind("/")).append("/../../cci_coords/coordinates/");
+        // CCI strand-coordinate directory for the painter. Resolved AT USE
+        // TIME by get_painter_cci_coordinates_path() (explicit set > env
+        // MKF_CCI_COORDINATES_PATH > dev-checkout source location > cwd);
+        // nullopt = "not explicitly set". The previous initializer baked
+        // std::source_location::current().file_name() — the BUILD machine's
+        // absolute path — into the value, which broke relocated wheels/WASM.
+        std::optional<std::string> _painterCciCoordinatesPath = std::nullopt;
         std::string _painterColorMagneticFieldMinimum = "0x2b35f5";
         std::string _painterColorMagneticFieldMaximum = "0xe84922";
         std::optional<MagneticFieldStrengthModels> _painterMagneticFieldStrengthModel = std::nullopt;
@@ -169,6 +184,19 @@ class Settings
         // Based on Hesterman (2020) "Mutual Resistance" - models cross-coupling AC losses between windings
         bool _circuitSimulatorIncludeMutualResistance = false;  // Default to disabled
 
+        // Circuit simulator stray/parasitic capacitance (false = no capacitance, true = include the
+        // per-winding self and inter-winding lumped capacitances from StrayCapacitance). Adds terminal
+        // capacitors that set self-resonance and inter-winding (CM) coupling. Default to ENABLED — must
+        // match reset() (Settings.cpp), since the singleton is constructed without calling reset(): a
+        // stale `false` here silently disables stray-cap emission in the SPICE export at runtime.
+        bool _circuitSimulatorIncludeStrayCapacitance = true;
+
+        // Circuit simulator large-signal core loss (false = small-signal mu(f) resistance ladder,
+        // true = a behavioural GSE/Steinmetz core-loss element that tracks the instantaneous dB/dt and
+        // flux). Only the behavioural-capable exporters (ngspice/LTspice/NL5) emit the nonlinear element;
+        // Simba/Plecs keep the linear ladder. Default to disabled.
+        bool _circuitSimulatorIncludeSteinmetzCoreLoss = false;
+
         // Circuit simulator core loss topology (0=RIDLEY RL stages, 1=ROSANO R/RL/RLC branches)
         int _circuitSimulatorCoreLossTopology = 1;  // Default to ROSANO
 
@@ -181,11 +209,21 @@ class Settings
 
     public:
         bool _debug = false;
-        Settings(Settings &other) = delete;
-        void operator=(const Settings &) = delete;
-        Settings(Settings &&other) = delete;
-        void operator=(Settings &&) = delete;
+        // ABT #113: Settings is COPYABLE so worker threads can inherit the
+        // spawning thread's configuration (GetInstance() is a thread_local
+        // singleton — new threads start default-constructed):
+        //     const Settings parentSnapshot = Settings::GetInstance(); // parent
+        //     Settings::GetInstance() = parentSnapshot;                // worker
+        // Direct construction stays private: instances other than snapshots
+        // of GetInstance() are not meant to exist.
+        Settings(const Settings& other) = default;
+        Settings& operator=(const Settings& other) = default;
+        Settings(Settings&& other) = delete;
+        void operator=(Settings&&) = delete;
 
+        // Returns the CALLING THREAD's Settings instance (thread_local
+        // Meyers singleton, see Settings.cpp for the worker-thread
+        // inheritance recipe).
         static Settings& GetInstance();
 
         void reset();
@@ -246,6 +284,12 @@ class Settings
 
         bool get_use_powder_cores() const;
         void set_use_powder_cores(bool value);
+
+        bool get_core_per_column_winding_windows() const;
+        void set_core_per_column_winding_windows(bool value);
+
+        bool get_coil_adviser_allow_lateral_placement() const;
+        void set_coil_adviser_allow_lateral_placement(bool value);
 
     EffectiveParameterStandard get_effective_parameter_standard() const;
     void set_effective_parameter_standard(EffectiveParameterStandard value);
@@ -480,6 +524,12 @@ class Settings
         
         bool get_circuit_simulator_include_mutual_resistance() const;
         void set_circuit_simulator_include_mutual_resistance(bool value);
+
+        bool get_circuit_simulator_include_stray_capacitance() const;
+        void set_circuit_simulator_include_stray_capacitance(bool value);
+
+        bool get_circuit_simulator_include_steinmetz_core_loss() const;
+        void set_circuit_simulator_include_steinmetz_core_loss(bool value);
 
         int get_circuit_simulator_core_loss_topology() const;
         void set_circuit_simulator_core_loss_topology(int value);

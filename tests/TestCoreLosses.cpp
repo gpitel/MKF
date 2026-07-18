@@ -8,10 +8,14 @@
 #include "processors/CircuitSimulatorInterface.h"
 #include "physical_models/Reluctance.h"
 #include "TestingUtils.h"
+#include "Fixtures.h"
 #include <magic_enum.hpp>
 
+#include <cmath>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -1776,56 +1780,132 @@ void test_core_losses_magnet_data(CoreLossesModels modelName,
     export_test_result_for_material(testResult, coreMaterial, modelName);
 }
 
-TEST_CASE("Test_PQ_20_20_3F4_Steinmetz", "[physical-model][core-losses][steinmetz-core-losses-model]") {
-    test_core_losses_magnet_verification_3F4(CoreLossesModels::STEINMETZ);
+// ------------------------------------------------------------------
+// Model-matrix tests: each fixture below (a material's magnet-datasheet
+// verification set, or its Magnet-sample CSV) used to be duplicated once
+// per core-losses model as a 3-line TEST_CASE. One TEST_CASE per fixture
+// now GENERATEs over the models; INFO names the model so a failure is
+// still attributable. The tag lists keep every per-model tag so
+// tag-based selection still works. Roshen has no 3F4/N30 coefficients,
+// so those fixtures generate over the 7 remaining models, and the
+// combinations that were SKIP'd as standalone TEST_CASEs keep skipping
+// (SKIP only aborts the current generator iteration).
+// ------------------------------------------------------------------
+
+#define ALL_CORE_LOSSES_MODEL_TAGS                                                         \
+    "[steinmetz-core-losses-model][igse-core-losses-model][cigse-core-losses-model]"       \
+    "[albach-core-losses-model][mse-core-losses-model][nse-core-losses-model]"             \
+    "[barg-core-losses-model][roshen-core-losses-model]"
+
+#define CORE_LOSSES_MODEL_TAGS_NO_ROSHEN                                                   \
+    "[steinmetz-core-losses-model][igse-core-losses-model][cigse-core-losses-model]"       \
+    "[albach-core-losses-model][mse-core-losses-model][nse-core-losses-model]"             \
+    "[barg-core-losses-model]"
+
+CoreLossesModels generate_all_core_losses_models() {
+    return GENERATE(CoreLossesModels::STEINMETZ,
+                    CoreLossesModels::IGSE,
+                    CoreLossesModels::CIGSE,
+                    CoreLossesModels::ALBACH,
+                    CoreLossesModels::MSE,
+                    CoreLossesModels::NSE,
+                    CoreLossesModels::BARG,
+                    CoreLossesModels::ROSHEN);
 }
 
-TEST_CASE("Test_PQ_20_20_N49_Steinmetz", "[physical-model][core-losses][steinmetz-core-losses-model]") {
-    test_core_losses_magnet_verification_N49(CoreLossesModels::STEINMETZ);
+CoreLossesModels generate_core_losses_models_without_roshen() {
+    return GENERATE(CoreLossesModels::STEINMETZ,
+                    CoreLossesModels::IGSE,
+                    CoreLossesModels::CIGSE,
+                    CoreLossesModels::ALBACH,
+                    CoreLossesModels::MSE,
+                    CoreLossesModels::NSE,
+                    CoreLossesModels::BARG);
 }
 
-TEST_CASE("Test_PQ_20_20_3C94_Steinmetz", "[physical-model][core-losses][steinmetz-core-losses-model]") {
-    test_core_losses_magnet_verification_3C94(CoreLossesModels::STEINMETZ);
+TEST_CASE("Test_PQ_20_20_3F4", "[physical-model][core-losses]" CORE_LOSSES_MODEL_TAGS_NO_ROSHEN) {
+    auto modelName = generate_core_losses_models_without_roshen();
+    INFO("Model: " << magic_enum::enum_name(modelName));
+    test_core_losses_magnet_verification_3F4(modelName);
 }
 
-TEST_CASE("Test_PQ_20_20_N27_Steinmetz", "[physical-model][core-losses][steinmetz-core-losses-model]") {
-    test_core_losses_magnet_verification_N27(CoreLossesModels::STEINMETZ);
+TEST_CASE("Test_PQ_20_20_N49", "[physical-model][core-losses]" ALL_CORE_LOSSES_MODEL_TAGS) {
+    auto modelName = generate_all_core_losses_models();
+    INFO("Model: " << magic_enum::enum_name(modelName));
+    test_core_losses_magnet_verification_N49(modelName);
 }
 
-TEST_CASE("Test_PQ_20_20_N87_Steinmetz", "[physical-model][core-losses][steinmetz-core-losses-model]") {
-    test_core_losses_magnet_verification_N87(CoreLossesModels::STEINMETZ);
+TEST_CASE("Test_PQ_20_20_3C94", "[physical-model][core-losses]" ALL_CORE_LOSSES_MODEL_TAGS) {
+    auto modelName = generate_all_core_losses_models();
+    INFO("Model: " << magic_enum::enum_name(modelName));
+    test_core_losses_magnet_verification_3C94(modelName);
 }
 
-TEST_CASE("Test_PQ_20_20_3C90_Steinmetz", "[physical-model][core-losses][steinmetz-core-losses-model]") {
-    test_core_losses_magnet_verification_3C90(CoreLossesModels::STEINMETZ);
+TEST_CASE("Test_PQ_20_20_N27", "[physical-model][core-losses]" ALL_CORE_LOSSES_MODEL_TAGS) {
+    auto modelName = generate_all_core_losses_models();
+    INFO("Model: " << magic_enum::enum_name(modelName));
+    test_core_losses_magnet_verification_N27(modelName);
 }
 
-TEST_CASE("Test_Magnet_3C90_Steinmetz", "[physical-model][core-losses][steinmetz-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::STEINMETZ, "3C90");
+TEST_CASE("Test_PQ_20_20_N87", "[physical-model][core-losses]" ALL_CORE_LOSSES_MODEL_TAGS) {
+    auto modelName = generate_all_core_losses_models();
+    INFO("Model: " << magic_enum::enum_name(modelName));
+    test_core_losses_magnet_verification_N87(modelName);
 }
 
-TEST_CASE("Test_Magnet_3C94_Steinmetz", "[physical-model][core-losses][steinmetz-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::STEINMETZ, "3C94");
+TEST_CASE("Test_PQ_20_20_3C90", "[physical-model][core-losses]" ALL_CORE_LOSSES_MODEL_TAGS) {
+    auto modelName = generate_all_core_losses_models();
+    INFO("Model: " << magic_enum::enum_name(modelName));
+    test_core_losses_magnet_verification_3C90(modelName);
 }
 
-TEST_CASE("Test_Magnet_3F4_Steinmetz", "[physical-model][core-losses][steinmetz-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::STEINMETZ, "3F4");
+TEST_CASE("Test_Magnet_3C90", "[physical-model][core-losses]" ALL_CORE_LOSSES_MODEL_TAGS) {
+    auto modelName = generate_all_core_losses_models();
+    INFO("Model: " << magic_enum::enum_name(modelName));
+    test_core_losses_magnet_data(modelName, "3C90");
 }
 
-TEST_CASE("Test_Magnet_N27_Steinmetz", "[physical-model][core-losses][steinmetz-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::STEINMETZ, "N27");
+TEST_CASE("Test_Magnet_3C94", "[physical-model][core-losses]" ALL_CORE_LOSSES_MODEL_TAGS) {
+    auto modelName = generate_all_core_losses_models();
+    INFO("Model: " << magic_enum::enum_name(modelName));
+    test_core_losses_magnet_data(modelName, "3C94");
 }
 
-TEST_CASE("Test_Magnet_N30_Steinmetz", "[physical-model][core-losses][steinmetz-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::STEINMETZ, "N30");
+TEST_CASE("Test_Magnet_3F4", "[physical-model][core-losses]" CORE_LOSSES_MODEL_TAGS_NO_ROSHEN) {
+    auto modelName = generate_core_losses_models_without_roshen();
+    INFO("Model: " << magic_enum::enum_name(modelName));
+    if (modelName == CoreLossesModels::ALBACH || modelName == CoreLossesModels::MSE ||
+        modelName == CoreLossesModels::NSE || modelName == CoreLossesModels::BARG) {
+        SKIP("Test needs investigation");
+    }
+    test_core_losses_magnet_data(modelName, "3F4");
 }
 
-TEST_CASE("Test_Magnet_N49_Steinmetz", "[physical-model][core-losses][steinmetz-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::STEINMETZ, "N49");
+TEST_CASE("Test_Magnet_N27", "[physical-model][core-losses]" ALL_CORE_LOSSES_MODEL_TAGS) {
+    auto modelName = generate_all_core_losses_models();
+    INFO("Model: " << magic_enum::enum_name(modelName));
+    if (modelName == CoreLossesModels::IGSE || modelName == CoreLossesModels::CIGSE) {
+        SKIP("Test needs investigation");
+    }
+    test_core_losses_magnet_data(modelName, "N27");
 }
 
-TEST_CASE("Test_Magnet_N87_Steinmetz", "[physical-model][core-losses][steinmetz-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::STEINMETZ, "N87");
+TEST_CASE("Test_Magnet_N30", "[physical-model][core-losses]" CORE_LOSSES_MODEL_TAGS_NO_ROSHEN) {
+    auto modelName = generate_core_losses_models_without_roshen();
+    INFO("Model: " << magic_enum::enum_name(modelName));
+    test_core_losses_magnet_data(modelName, "N30");
+}
+
+TEST_CASE("Test_Magnet_N49", "[physical-model][core-losses]" ALL_CORE_LOSSES_MODEL_TAGS) {
+    auto modelName = generate_all_core_losses_models();
+    INFO("Model: " << magic_enum::enum_name(modelName));
+    test_core_losses_magnet_data(modelName, "N49");
+}
+
+TEST_CASE("Test_Magnet_N87", "[physical-model][core-losses]" ALL_CORE_LOSSES_MODEL_TAGS) {
+    auto modelName = generate_all_core_losses_models();
+    INFO("Model: " << magic_enum::enum_name(modelName));
+    test_core_losses_magnet_data(modelName, "N87");
 }
 
 TEST_CASE("Test_Ki_3C95_Steinmetz", "[physical-model][core-losses][igse-core-losses-model]") {
@@ -1841,59 +1921,6 @@ TEST_CASE("Test_Ki_3C95_Steinmetz", "[physical-model][core-losses][igse-core-los
     double expectedKi = 0.0635;
 
     REQUIRE_THAT(ki, Catch::Matchers::WithinAbs(expectedKi, expectedKi * 0.1));
-}
-
-TEST_CASE("Test_PQ_20_20_3F4_IGSE", "[physical-model][core-losses][igse-core-losses-model]") {
-    test_core_losses_magnet_verification_3F4(CoreLossesModels::IGSE);
-}
-
-TEST_CASE("Test_PQ_20_20_N49_IGSE", "[physical-model][core-losses][igse-core-losses-model]") {
-    test_core_losses_magnet_verification_N49(CoreLossesModels::IGSE);
-}
-
-TEST_CASE("Test_PQ_20_20_3C94_IGSE", "[physical-model][core-losses][igse-core-losses-model]") {
-    test_core_losses_magnet_verification_3C94(CoreLossesModels::IGSE);
-}
-
-TEST_CASE("Test_PQ_20_20_N27_IGSE", "[physical-model][core-losses][igse-core-losses-model]") {
-    test_core_losses_magnet_verification_N27(CoreLossesModels::IGSE);
-}
-
-TEST_CASE("Test_PQ_20_20_N87_IGSE", "[physical-model][core-losses][igse-core-losses-model]") {
-    test_core_losses_magnet_verification_N87(CoreLossesModels::IGSE);
-}
-
-TEST_CASE("Test_PQ_20_20_3C90_IGSE", "[physical-model][core-losses][igse-core-losses-model]") {
-    test_core_losses_magnet_verification_3C90(CoreLossesModels::IGSE);
-}
-
-TEST_CASE("Test_Magnet_3C90_IGSE", "[physical-model][core-losses][igse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::IGSE, "3C90");
-}
-
-TEST_CASE("Test_Magnet_3C94_IGSE", "[physical-model][core-losses][igse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::IGSE, "3C94");
-}
-
-TEST_CASE("Test_Magnet_3F4_IGSE", "[physical-model][core-losses][igse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::IGSE, "3F4");
-}
-
-TEST_CASE("Test_Magnet_N27_IGSE", "[physical-model][core-losses][igse-core-losses-model]") {
-    SKIP("Test needs investigation");
-    test_core_losses_magnet_data(CoreLossesModels::IGSE, "N27");
-}
-
-TEST_CASE("Test_Magnet_N30_IGSE", "[physical-model][core-losses][igse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::IGSE, "N30");
-}
-
-TEST_CASE("Test_Magnet_N49_IGSE", "[physical-model][core-losses][igse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::IGSE, "N49");
-}
-
-TEST_CASE("Test_Magnet_N87_IGSE", "[physical-model][core-losses][igse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::IGSE, "N87");
 }
 
 // Regression test for composite waveforms where excitation frequency (e.g. 60 Hz)
@@ -1963,311 +1990,6 @@ TEST_CASE("Test_IGSE_composite_waveform_low_excitation_frequency", "[physical-mo
     REQUIRE(volumetricLosses > 0);
 }
 
-TEST_CASE("Test_PQ_20_20_3F4_ciGSE", "[physical-model][core-losses][cigse-core-losses-model]") {
-    test_core_losses_magnet_verification_3F4(CoreLossesModels::CIGSE);
-}
-
-TEST_CASE("Test_PQ_20_20_N49_ciGSE", "[physical-model][core-losses][cigse-core-losses-model]") {
-    test_core_losses_magnet_verification_N49(CoreLossesModels::CIGSE);
-}
-
-TEST_CASE("Test_PQ_20_20_3C94_ciGSE", "[physical-model][core-losses][cigse-core-losses-model]") {
-    test_core_losses_magnet_verification_3C94(CoreLossesModels::CIGSE);
-}
-
-TEST_CASE("Test_PQ_20_20_N27_ciGSE", "[physical-model][core-losses][cigse-core-losses-model]") {
-    test_core_losses_magnet_verification_N27(CoreLossesModels::CIGSE);
-}
-
-TEST_CASE("Test_PQ_20_20_N87_ciGSE", "[physical-model][core-losses][cigse-core-losses-model]") {
-    test_core_losses_magnet_verification_N87(CoreLossesModels::CIGSE);
-}
-
-TEST_CASE("Test_PQ_20_20_3C90_ciGSE", "[physical-model][core-losses][cigse-core-losses-model]") {
-    test_core_losses_magnet_verification_3C90(CoreLossesModels::CIGSE);
-}
-
-TEST_CASE("Test_Magnet_3C90_ciGSE", "[physical-model][core-losses][cigse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::CIGSE, "3C90");
-}
-
-TEST_CASE("Test_Magnet_3C94_ciGSE", "[physical-model][core-losses][cigse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::CIGSE, "3C94");
-}
-
-TEST_CASE("Test_Magnet_3F4_ciGSE", "[physical-model][core-losses][cigse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::CIGSE, "3F4");
-}
-
-TEST_CASE("Test_Magnet_N27_ciGSE", "[physical-model][core-losses][cigse-core-losses-model]") {
-    SKIP("Test needs investigation");
-    test_core_losses_magnet_data(CoreLossesModels::CIGSE, "N27");
-}
-
-TEST_CASE("Test_Magnet_N30_ciGSE", "[physical-model][core-losses][cigse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::CIGSE, "N30");
-}
-
-TEST_CASE("Test_Magnet_N49_ciGSE", "[physical-model][core-losses][cigse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::CIGSE, "N49");
-}
-
-TEST_CASE("Test_Magnet_N87_ciGSE", "[physical-model][core-losses][cigse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::CIGSE, "N87");
-}
-
-TEST_CASE("Test_PQ_20_20_3F4_Albach", "[physical-model][core-losses][albach-core-losses-model]") {
-    test_core_losses_magnet_verification_3F4(CoreLossesModels::ALBACH);
-}
-
-TEST_CASE("Test_PQ_20_20_N49_Albach", "[physical-model][core-losses][albach-core-losses-model]") {
-    test_core_losses_magnet_verification_N49(CoreLossesModels::ALBACH);
-}
-
-TEST_CASE("Test_PQ_20_20_3C94_Albach", "[physical-model][core-losses][albach-core-losses-model]") {
-    test_core_losses_magnet_verification_3C94(CoreLossesModels::ALBACH);
-}
-
-TEST_CASE("Test_PQ_20_20_N27_Albach", "[physical-model][core-losses][albach-core-losses-model]") {
-    test_core_losses_magnet_verification_N27(CoreLossesModels::ALBACH);
-}
-
-TEST_CASE("Test_PQ_20_20_N87_Albach", "[physical-model][core-losses][albach-core-losses-model]") {
-    test_core_losses_magnet_verification_N87(CoreLossesModels::ALBACH);
-}
-
-TEST_CASE("Test_PQ_20_20_3C90_Albach", "[physical-model][core-losses][albach-core-losses-model]") {
-    test_core_losses_magnet_verification_3C90(CoreLossesModels::ALBACH);
-}
-
-TEST_CASE("Test_Magnet_3C90_Albach", "[physical-model][core-losses][albach-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::ALBACH, "3C90");
-}
-
-TEST_CASE("Test_Magnet_3C94_Albach", "[physical-model][core-losses][albach-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::ALBACH, "3C94");
-}
-
-TEST_CASE("Test_Magnet_3F4_Albach", "[physical-model][core-losses][albach-core-losses-model]") {
-    SKIP("Test needs investigation");
-    test_core_losses_magnet_data(CoreLossesModels::ALBACH, "3F4");
-}
-
-TEST_CASE("Test_Magnet_N27_Albach", "[physical-model][core-losses][albach-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::ALBACH, "N27");
-}
-
-TEST_CASE("Test_Magnet_N30_Albach", "[physical-model][core-losses][albach-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::ALBACH, "N30");
-}
-
-TEST_CASE("Test_Magnet_N49_Albach", "[physical-model][core-losses][albach-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::ALBACH, "N49");
-}
-
-TEST_CASE("Test_Magnet_N87_Albach", "[physical-model][core-losses][albach-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::ALBACH, "N87");
-}
-
-TEST_CASE("Test_PQ_20_20_3F4_MSE", "[physical-model][core-losses][mse-core-losses-model]") {
-    test_core_losses_magnet_verification_3F4(CoreLossesModels::MSE);
-}
-
-TEST_CASE("Test_PQ_20_20_N49_MSE", "[physical-model][core-losses][mse-core-losses-model]") {
-    test_core_losses_magnet_verification_N49(CoreLossesModels::MSE);
-}
-
-TEST_CASE("Test_PQ_20_20_3C94_MSE", "[physical-model][core-losses][mse-core-losses-model]") {
-    test_core_losses_magnet_verification_3C94(CoreLossesModels::MSE);
-}
-
-TEST_CASE("Test_PQ_20_20_N27_MSE", "[physical-model][core-losses][mse-core-losses-model]") {
-    test_core_losses_magnet_verification_N27(CoreLossesModels::MSE);
-}
-
-TEST_CASE("Test_PQ_20_20_N87_MSE", "[physical-model][core-losses][mse-core-losses-model]") {
-    test_core_losses_magnet_verification_N87(CoreLossesModels::MSE);
-}
-
-TEST_CASE("Test_PQ_20_20_3C90_MSE", "[physical-model][core-losses][mse-core-losses-model]") {
-    test_core_losses_magnet_verification_3C90(CoreLossesModels::MSE);
-}
-
-TEST_CASE("Test_Magnet_3C90_MSE", "[physical-model][core-losses][mse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::MSE, "3C90");
-}
-
-TEST_CASE("Test_Magnet_3C94_MSE", "[physical-model][core-losses][mse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::MSE, "3C94");
-}
-
-TEST_CASE("Test_Magnet_3F4_MSE", "[physical-model][core-losses][mse-core-losses-model]") {
-    SKIP("Test needs investigation");
-    test_core_losses_magnet_data(CoreLossesModels::MSE, "3F4");
-}
-
-TEST_CASE("Test_Magnet_N27_MSE", "[physical-model][core-losses][mse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::MSE, "N27");
-}
-
-TEST_CASE("Test_Magnet_N30_MSE", "[physical-model][core-losses][mse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::MSE, "N30");
-}
-
-TEST_CASE("Test_Magnet_N49_MSE", "[physical-model][core-losses][mse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::MSE, "N49");
-}
-
-TEST_CASE("Test_Magnet_N87_MSE", "[physical-model][core-losses][mse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::MSE, "N87");
-}
-
-TEST_CASE("Test_PQ_20_20_3F4_NSE", "[physical-model][core-losses][nse-core-losses-model]") {
-    test_core_losses_magnet_verification_3F4(CoreLossesModels::NSE);
-}
-
-TEST_CASE("Test_PQ_20_20_N49_NSE", "[physical-model][core-losses][nse-core-losses-model]") {
-    test_core_losses_magnet_verification_N49(CoreLossesModels::NSE);
-}
-
-TEST_CASE("Test_PQ_20_20_3C94_NSE", "[physical-model][core-losses][nse-core-losses-model]") {
-    test_core_losses_magnet_verification_3C94(CoreLossesModels::NSE);
-}
-
-TEST_CASE("Test_PQ_20_20_N27_NSE", "[physical-model][core-losses][nse-core-losses-model]") {
-    test_core_losses_magnet_verification_N27(CoreLossesModels::NSE);
-}
-
-TEST_CASE("Test_PQ_20_20_N87_NSE", "[physical-model][core-losses][nse-core-losses-model]") {
-    test_core_losses_magnet_verification_N87(CoreLossesModels::NSE);
-}
-
-TEST_CASE("Test_PQ_20_20_3C90_NSE", "[physical-model][core-losses][nse-core-losses-model]") {
-    test_core_losses_magnet_verification_3C90(CoreLossesModels::NSE);
-}
-
-TEST_CASE("Test_Magnet_3C90_NSE", "[physical-model][core-losses][nse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::NSE, "3C90");
-}
-
-TEST_CASE("Test_Magnet_3C94_NSE", "[physical-model][core-losses][nse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::NSE, "3C94");
-}
-
-TEST_CASE("Test_Magnet_3F4_NSE", "[physical-model][core-losses][nse-core-losses-model]") {
-    SKIP("Test needs investigation");
-    test_core_losses_magnet_data(CoreLossesModels::NSE, "3F4");
-}
-
-TEST_CASE("Test_Magnet_N27_NSE", "[physical-model][core-losses][nse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::NSE, "N27");
-}
-
-TEST_CASE("Test_Magnet_N30_NSE", "[physical-model][core-losses][nse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::NSE, "N30");
-}
-
-TEST_CASE("Test_Magnet_N49_NSE", "[physical-model][core-losses][nse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::NSE, "N49");
-}
-
-TEST_CASE("Test_Magnet_N87_NSE", "[physical-model][core-losses][nse-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::NSE, "N87");
-}
-
-TEST_CASE("Test_PQ_20_20_3F4_Barg", "[physical-model][core-losses][barg-core-losses-model]") {
-    test_core_losses_magnet_verification_3F4(CoreLossesModels::BARG);
-}
-
-TEST_CASE("Test_PQ_20_20_N49_Barg", "[physical-model][core-losses][barg-core-losses-model]") {
-    test_core_losses_magnet_verification_N49(CoreLossesModels::BARG);
-}
-
-TEST_CASE("Test_PQ_20_20_3C94_Barg", "[physical-model][core-losses][barg-core-losses-model]") {
-    test_core_losses_magnet_verification_3C94(CoreLossesModels::BARG);
-}
-
-TEST_CASE("Test_PQ_20_20_N27_Barg", "[physical-model][core-losses][barg-core-losses-model]") {
-    test_core_losses_magnet_verification_N27(CoreLossesModels::BARG);
-}
-
-TEST_CASE("Test_PQ_20_20_N87_Barg", "[physical-model][core-losses][barg-core-losses-model]") {
-    test_core_losses_magnet_verification_N87(CoreLossesModels::BARG);
-}
-
-TEST_CASE("Test_PQ_20_20_3C90_Barg", "[physical-model][core-losses][barg-core-losses-model]") {
-    test_core_losses_magnet_verification_3C90(CoreLossesModels::BARG);
-}
-
-TEST_CASE("Test_Magnet_3C90_Barg", "[physical-model][core-losses][barg-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::BARG, "3C90");
-}
-
-TEST_CASE("Test_Magnet_3C94_Barg", "[physical-model][core-losses][barg-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::BARG, "3C94");
-}
-
-TEST_CASE("Test_Magnet_3F4_Barg", "[physical-model][core-losses][barg-core-losses-model]") {
-    SKIP("Test needs investigation");
-    test_core_losses_magnet_data(CoreLossesModels::BARG, "3F4");
-}
-
-TEST_CASE("Test_Magnet_N27_Barg", "[physical-model][core-losses][barg-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::BARG, "N27");
-}
-
-TEST_CASE("Test_Magnet_N30_Barg", "[physical-model][core-losses][barg-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::BARG, "N30");
-}
-
-TEST_CASE("Test_Magnet_N49_Barg", "[physical-model][core-losses][barg-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::BARG, "N49");
-}
-
-TEST_CASE("Test_Magnet_N87_Barg", "[physical-model][core-losses][barg-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::BARG, "N87");
-}
-
-TEST_CASE("Test_PQ_20_20_N49_Roshen", "[physical-model][core-losses][roshen-core-losses-model]") {
-    test_core_losses_magnet_verification_N49(CoreLossesModels::ROSHEN);
-}
-
-TEST_CASE("Test_PQ_20_20_3C94_Roshen", "[physical-model][core-losses][roshen-core-losses-model]") {
-    test_core_losses_magnet_verification_3C94(CoreLossesModels::ROSHEN);
-}
-
-TEST_CASE("Test_PQ_20_20_N27_Roshen", "[physical-model][core-losses][roshen-core-losses-model]") {
-    test_core_losses_magnet_verification_N27(CoreLossesModels::ROSHEN);
-}
-
-TEST_CASE("Test_PQ_20_20_N87_Roshen", "[physical-model][core-losses][roshen-core-losses-model]") {
-    test_core_losses_magnet_verification_N87(CoreLossesModels::ROSHEN);
-}
-
-TEST_CASE("Test_PQ_20_20_3C90_Roshen", "[physical-model][core-losses][roshen-core-losses-model]") {
-    test_core_losses_magnet_verification_3C90(CoreLossesModels::ROSHEN);
-}
-
-TEST_CASE("Test_Magnet_3C90_Roshen", "[physical-model][core-losses][roshen-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::ROSHEN, "3C90");
-}
-
-TEST_CASE("Test_Magnet_3C94_Roshen", "[physical-model][core-losses][roshen-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::ROSHEN, "3C94");
-}
-
-TEST_CASE("Test_Magnet_N27_Roshen", "[physical-model][core-losses][roshen-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::ROSHEN, "N27");
-}
-
-TEST_CASE("Test_Magnet_N49_Roshen", "[physical-model][core-losses][roshen-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::ROSHEN, "N49");
-}
-
-TEST_CASE("Test_Magnet_N87_Roshen", "[physical-model][core-losses][roshen-core-losses-model]") {
-    test_core_losses_magnet_data(CoreLossesModels::ROSHEN, "N87");
-}
-
 TEST_CASE("Voltage_And_Current", "[physical-model][core-losses][smoke-test]") {
     auto models = json::parse("{\"coreLosses\": \"IGSE\", \"gapReluctance\": \"BALAKRISHNAN\"}");
     auto core = Core(json::parse(
@@ -2311,6 +2033,9 @@ TEST_CASE("Voltage_And_Current", "[physical-model][core-losses][smoke-test]") {
 
     auto coreLossesModel = CoreLossesModel::factory(models);
     auto coreLosses = coreLossesModel->get_core_losses(core, excitation, temperature);
+    // Repro point: the computed core losses must be finite and positive.
+    CHECK(std::isfinite(coreLosses.get_core_losses()));
+    CHECK(coreLosses.get_core_losses() > 0);
 }
 
 TEST_CASE("Only_Current_0", "[physical-model][core-losses][smoke-test]") {
@@ -2500,6 +2225,9 @@ TEST_CASE("Crash_Losses", "[physical-model][core-losses][bug][smoke-test]") {
 
     auto coreLossesModel = CoreLossesModel::factory(models);
     auto coreLosses = coreLossesModel->get_core_losses(core, excitation, temperature);
+    // Repro point: the computed core losses must be finite and positive.
+    CHECK(std::isfinite(coreLosses.get_core_losses()));
+    CHECK(coreLosses.get_core_losses() > 0);
 }
 
 TEST_CASE("Crash_Toroids", "[physical-model][core-losses][bug][smoke-test]") {
@@ -2648,6 +2376,42 @@ TEST_CASE("Test_Manufacturer_Magnetec", "[physical-model][core-losses][smoke-tes
     REQUIRE_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinAbs(29685.6, 29685.6 * maxError));
 }
 
+TEST_CASE("Test_Manufacturer_Magnetec_Obfuscated_Manufacturer", "[physical-model][core-losses][smoke-test]") {
+    // Regression: downstream consumers (e.g. El Choker's supplier obfuscation) may rebrand a
+    // core material's manufacturer to a single house name while leaving the loss METHOD intact.
+    // Proprietary loss dispatch must key on the declared method, not the manufacturer string, so
+    // an obfuscated Magnetec part still computes losses identically instead of throwing
+    // MATERIAL_DATA_MISSING ("No proprietary mass losses method for manufacturer: ...").
+    auto models =
+        json::parse(R"({"coreLosses": "PROPRIETARY", "coreTemperature": "MANIKTALA", "gapReluctance": "ZHANG"})");
+    auto core = Core(json::parse(R"({"functionalDescription": {"gapping": [], "material": "Nanoperm 80000", "numberStacks": 1, "shape": {"magneticCircuit": "closed", "type": "custom", "family": "t", "aliases": [], "name": "T 63/50/30", "dimensions": {"A": {"nominal": 0.063}, "B": {"nominal": 0.050}, "C": {"nominal": 0.030}}}, "type": "toroidal"}, "manufacturerInfo": null, "name": "My Core"})"));
+
+    // Load the real Nanoperm 80000 (manufacturer "Magnetec") and rebrand it, then embed the
+    // rebranded material object in the core so resolve_material() returns the obfuscated version.
+    auto obfuscatedMaterial = find_core_material_by_name("Nanoperm 80000");
+    ManufacturerInfo rebranded;
+    rebranded.set_name("Würth Elektronik");
+    obfuscatedMaterial.set_manufacturer_info(rebranded);
+    REQUIRE(obfuscatedMaterial.get_manufacturer_info().get_name() == "Würth Elektronik");
+    core.set_material(obfuscatedMaterial);
+
+    auto winding = OpenMagnetics::Coil(json::parse(R"({"bobbin": "Dummy", "functionalDescription": [{"isolationSide": "primary", "name": "Primary", "numberParallels": 1, "numberTurns": 1, "wire": "Dummy"}], "layersDescription": null, "sectionsDescription": null, "turnsDescription": null})"));
+    auto operatingPoint = OperatingPoint(json::parse(R"({"conditions": {"ambientRelativeHumidity": null, "ambientTemperature": 25.0, "cooling": null, "name": null}, "excitationsPerWinding": [{"frequency": 100000.0, "magneticFieldStrength": null, "magneticFluxDensity": null, "magnetizingCurrent": null, "name": "My Operating Point", "voltage": {"harmonics": null, "processed": null, "waveform": {"ancillaryLabel": null, "data": [688.5, 688.5, -229.49999999999995, -229.49999999999995, 688.5], "numberPeriods": null, "time": [0.0, 2.4999999999999998e-06, 2.4999999999999998e-06, 1e-05, 1e-05]}}}], "name": null})"));
+
+    MagnetizingInductance magnetizingInductanceModel(std::string{models["gapReluctance"]});
+    OperatingPointExcitation excitation = operatingPoint.get_excitations_per_winding()[0];
+    auto aux = magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(core, winding, &operatingPoint);
+    auto magneticFluxDensity = aux.second;
+    excitation.set_magnetic_flux_density(magneticFluxDensity);
+    double temperature = operatingPoint.get_conditions().get_ambient_temperature();
+
+    auto coreLossesModel = CoreLossesModel::factory(models);
+    auto coreLosses = coreLossesModel->get_core_losses(core, excitation, temperature);
+
+    // Identical to Test_Manufacturer_Magnetec: obfuscating the manufacturer must not change the physics.
+    REQUIRE_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinAbs(29685.6, 29685.6 * maxError));
+}
+
 TEST_CASE("Test_XFlux_19", "[physical-model][core-losses][smoke-test]") {
     auto models = json::parse("{\"coreLosses\": \"PROPRIETARY\", \"gapReluctance\": \"BALAKRISHNAN\"}");
     auto core = Core(json::parse(
@@ -2702,7 +2466,7 @@ TEST_CASE("Test_A07", "[physical-model][core-losses]") {
     SKIP("Test needs investigation");
     auto models = json::parse("{\"coreLosses\": \"lossFactor\", \"gapReluctance\": \"BALAKRISHNAN\"}");
     auto core = Core(json::parse(R"({"distributorsInfo": [], "functionalDescription": {"coating": null, "gapping": [{"area": 0.000078, "coordinates": [0, 0.0003, 0 ], "distanceClosestNormalSurface": 0.00865, "distanceClosestParallelSurface": 0.005325, "length": 0.0006, "sectionDimensions": [0.00725, 0.01075 ], "shape": "rectangular", "type": "subtractive" }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" } ], "material": "A07", "numberStacks": 1, "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "twoPieceSet", "magneticCircuit": "open" }, "geometricalDescription": [{"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": [{"coordinates": [0, 0.0003, 0 ], "length": 0.0006 } ], "material": "A07", "rotation": [3.141592653589793, 3.141592653589793, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" }, {"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": null, "material": "A07", "rotation": [0, 0, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" } ], "manufacturerInfo": null, "name": "custom", "processedDescription": {"columns": [{"area": 0.000078, "coordinates": [0, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "central", "width": 0.00725 }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 } ], "depth": 0.01075, "effectiveParameters": {"effectiveArea": 0.00007739519022938956, "effectiveLength": 0.05775787070464925, "effectiveVolume": 0.000004470181390430815, "minimumArea": 0.00007686249999999999 }, "height": 0.0251, "width": 0.02505, "windingWindows": [{"angle": null, "area": 0.00009531749999999999, "coordinates": [0.0036249999999999998, 0 ], "height": 0.0179, "radialHeight": null, "sectionsAlignment": null, "sectionsOrientation": null, "shape": null, "width": 0.005325 } ] } })"));
-    auto winding = OpenMagnetics::Coil(json::parse(R"({"bobbin": {"distributorsInfo": null, "functionalDescription": null, "manufacturerInfo": null, "name": null, "processedDescription": {"columnDepth": 0.0065, "columnShape": "rectangular", "columnThickness": 0.0011250000000000001, "columnWidth": 0.004750000000000001, "coordinates": [0, 0, 0 ], "pins": null, "wallThickness": 0.0010499999999999989, "windingWindows": [{"angle": null, "area": 0.00006636000000000001, "coordinates": [0.00685, 0, 0 ], "height": 0.0158, "radialHeight": null, "sectionsAlignment": "innerOrTop", "sectionsOrientation": "overlapping", "shape": "rectangular", "width": 0.0042 } ] } }, "functionalDescription": [{"connections": null, "isolationSide": "primary", "name": "Primary", "numberParallels": 1, "numberTurns": 32, "wire": {"coating": {"breakdownVoltage": 2700, "grade": 1, "material": null, "numberLayers": null, "temperatureRating": null, "thickness": null, "thicknessLayers": null, "type": "enamelled" }, "conductingArea": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 3.6637960384511227e-7 }, "conductingDiameter": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 0.000683 }, "conductingHeight": null, "conductingWidth": null, "edgeRadius": null, "manufacturerInfo": {"cost": null, "datasheetUrl": null, "family": null, "name": "Nearson", "orderCode": null, "reference": null, "status": null }, "material": "copper", "name": "Round 21.5 - Single Build", "numberConductors": 1, "outerDiameter": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 0.000716 }, "outerHeight": null, "outerWidth": null, "standard": "NEMA MW 1000 C", "standardName": "21.5 AWG", "strand": null, "type": "round" } } ], "layersDescription": [{"additionalCoordinates": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0 ], "dimensions": [0.000716, 0.015528500000000004 ], "fillingFactor": 0.7250632911392404, "insulationMaterial": null, "name": "Primary section 0 layer 0", "orientation": "overlapping", "partialWindings": [{"connections": null, "parallelsProportion": [0.5 ], "winding": "Primary" } ], "section": "Primary section 0", "turnsAlignment": "spread", "type": "conduction", "windingStyle": "windByConsecutiveTurns" }, {"additionalCoordinates": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0 ], "dimensions": [0.000716, 0.015528500000000004 ], "fillingFactor": 0.7250632911392404, "insulationMaterial": null, "name": "Primary section 0 layer 1", "orientation": "overlapping", "partialWindings": [{"connections": null, "parallelsProportion": [0.5 ], "winding": "Primary" } ], "section": "Primary section 0", "turnsAlignment": "spread", "type": "conduction", "windingStyle": "windByConsecutiveTurns" } ], "sectionsDescription": [{"coordinateSystem": "cartesian", "coordinates": [0.005466000000000001, 0 ], "dimensions": [0.0014320000000000003, 0.015528500000000004 ], "fillingFactor": 0.24721205545509337, "layersAlignment": null, "layersOrientation": "overlapping", "margin": [0, 0 ], "name": "Primary section 0", "partialWindings": [{"connections": null, "parallelsProportion": [1 ], "winding": "Primary" } ], "type": "conduction", "windingStyle": "windByConsecutiveTurns" } ], "turnsDescription": [{"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.007406250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 0", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.006418750000000003 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 1", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.005431250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 2", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0044437500000000015 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 3", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0034562500000000014 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 4", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0024687500000000013 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 5", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0014812500000000012 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 6", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0004937500000000011 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 7", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.000493749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 8", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.001481249999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 9", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.002468749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 10", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.0034562499999999993 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 11", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.00444375 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 12", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.00543125 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 13", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.006418750000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 14", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.007406250000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 15", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.007406250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 16", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.006418750000000003 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 17", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.005431250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 18", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0044437500000000015 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 19", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0034562500000000014 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 20", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0024687500000000013 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 21", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0014812500000000012 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 22", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0004937500000000011 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 23", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.000493749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 24", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.001481249999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 25", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.002468749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 26", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.0034562499999999993 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 27", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.00444375 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 28", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.00543125 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 29", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.006418750000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 30", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.007406250000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 31", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" } ] })"));
+    auto winding = OpenMagnetics::Coil(OpenMagneticsTesting::fixtures::get_json("coil-e25-13-11-32-turn-round"));
     auto operatingPoint = OperatingPoint(json::parse(R"({"name": "Operating Point No. 1", "conditions": {"ambientTemperature": 42 }, "excitationsPerWinding": [{"name": "Primary winding excitation", "frequency": 100000, "current": {"waveform": {"data": [-5, 5, -5 ], "time": [0, 0.000005, 0.00001 ] }, "processed": {"dutyCycle": 0.5, "peakToPeak": 10, "offset": 0, "label": "triangular", "acEffectiveFrequency": 110746.40291779551, "effectiveFrequency": 110746.40291779551, "peak": 5, "rms": 2.8874560332150576, "thd": 0.12151487440704967 }, "harmonics": {"amplitudes": [1.1608769501236793e-14, 4.05366124583194, 1.787369544444173e-15, 0.4511310569983995, 9.749053004706756e-16, 0.16293015292554872, 4.036157626725542e-16, 0.08352979924600704, 3.4998295008010614e-16, 0.0508569581336163, 3.1489164048780735e-16, 0.034320410449418075, 3.142469873118059e-16, 0.024811988673843106, 2.3653352035940994e-16, 0.018849001010678823, 2.9306524147249266e-16, 0.014866633059596499, 1.796485796132569e-16, 0.012077180559557785, 1.6247782523152451e-16, 0.010049063750920609, 1.5324769149805092e-16, 0.008529750975091871, 1.0558579733068502e-16, 0.007363501410705499, 7.513269775674661e-17, 0.006450045785294609, 5.871414177162291e-17, 0.005722473794997712, 9.294731722001391e-17, 0.005134763398167541, 1.194820309200107e-16, 0.004654430423785411, 8.2422739080512e-17, 0.004258029771397032, 9.5067306351894e-17, 0.0039283108282380024, 1.7540347128474968e-16, 0.0036523670873925395, 9.623794010508822e-17, 0.0034204021424253787, 1.4083470894369491e-16, 0.0032248884817922927, 1.4749333016985644e-16, 0.0030599828465501895, 1.0448590642474364e-16, 0.002921112944200383, 7.575487373767413e-18, 0.002804680975178716, 7.419510610361002e-17, 0.0027078483284668376, 3.924741709073613e-17, 0.0026283777262804953, 2.2684279102637236e-17, 0.0025645167846443107, 8.997077625295079e-17, 0.0025149120164513483, 7.131074184849219e-17, 0.0024785457043284276, 9.354417496250849e-17, 0.0024546904085875065, 1.2488589642405877e-16, 0.0024428775264784264 ], "frequencies": [0, 100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000, 1100000, 1200000, 1300000, 1400000, 1500000, 1600000, 1700000, 1800000, 1900000, 2000000, 2100000, 2200000, 2300000, 2400000, 2500000, 2600000, 2700000, 2800000, 2900000, 3000000, 3100000, 3200000, 3300000, 3400000, 3500000, 3600000, 3700000, 3800000, 3900000, 4000000, 4100000, 4200000, 4300000, 4400000, 4500000, 4600000, 4700000, 4800000, 4900000, 5000000, 5100000, 5200000, 5300000, 5400000, 5500000, 5600000, 5700000, 5800000, 5900000, 6000000, 6100000, 6200000, 6300000 ] } }, "voltage": {"waveform": {"data": [-20.5, 70.5, 70.5, -20.5, -20.5 ], "time": [0, 0, 0.000005, 0.000005, 0.00001 ] }, "processed": {"dutyCycle": 0.5, "peakToPeak": 100, "offset": 0, "label": "rectangular", "acEffectiveFrequency": 591485.5360118389, "effectiveFrequency": 553357.3374711702, "peak": 70.5, "rms": 51.572309672924284, "thd": 0.4833151484524849 }, "harmonics": {"amplitudes": [24.2890625, 57.92076613061847, 1.421875, 19.27588907896988, 1.421875, 11.528257939603122, 1.421875, 8.194467538528329, 1.421875, 6.331896912839248, 1.421875, 5.137996046859012, 1.421875, 4.304077056139349, 1.421875, 3.6860723299088454, 1.421875, 3.207698601961777, 1.421875, 2.8247804703632298, 1.421875, 2.509960393415185, 1.421875, 2.2453859950684323, 1.421875, 2.01890737840567, 1.421875, 1.8219644341144872, 1.421875, 1.6483482744897402, 1.421875, 1.4934420157473332, 1.421875, 1.3537375367153817, 1.421875, 1.2265178099275544, 1.421875, 1.1096421410704556, 1.421875, 1.0013973584174929, 1.421875, 0.9003924136274832, 1.421875, 0.8054822382572133, 1.421875, 0.7157117294021269, 1.421875, 0.6302738400635857, 1.421875, 0.5484777114167545, 1.421875, 0.46972405216147894, 1.421875, 0.3934858059809043, 1.421875, 0.31929270856030145, 1.421875, 0.24671871675852053, 1.421875, 0.17537155450693565, 1.421875, 0.10488380107099537, 1.421875, 0.034905072061178544 ], "frequencies": [0, 100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000, 1100000, 1200000, 1300000, 1400000, 1500000, 1600000, 1700000, 1800000, 1900000, 2000000, 2100000, 2200000, 2300000, 2400000, 2500000, 2600000, 2700000, 2800000, 2900000, 3000000, 3100000, 3200000, 3300000, 3400000, 3500000, 3600000, 3700000, 3800000, 3900000, 4000000, 4100000, 4200000, 4300000, 4400000, 4500000, 4600000, 4700000, 4800000, 4900000, 5000000, 5100000, 5200000, 5300000, 5400000, 5500000, 5600000, 5700000, 5800000, 5900000, 6000000, 6100000, 6200000, 6300000 ] } } } ]})"));
 
     MagnetizingInductance magnetizingInductanceModel(std::string{models["gapReluctance"]});
@@ -2887,10 +2651,17 @@ TEST_CASE("Test_Core_Losses_Simple_Inductor", "[physical-model][core-losses][smo
     auto magneticFluxDensity = magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(core, coil, &operatingPoint).second;
     excitation.set_magnetic_flux_density(magneticFluxDensity);
 
-    [[maybe_unused]] double magneticFluxDensityPeak = magneticFluxDensity.get_processed().value().get_peak().value();
+    double magneticFluxDensityPeak = magneticFluxDensity.get_processed().value().get_peak().value();
 
     double frequency = OpenMagnetics::Inputs::get_switching_frequency(excitation);
-    [[maybe_unused]] double magneticFluxDensityAcPeakToPeak = OpenMagnetics::Inputs::get_magnetic_flux_density_peak_to_peak(excitation, frequency);
+    double magneticFluxDensityAcPeakToPeak = OpenMagnetics::Inputs::get_magnetic_flux_density_peak_to_peak(excitation, frequency);
+
+    // The derived excitation quantities must be finite and positive.
+    CHECK(std::isfinite(magneticFluxDensityPeak));
+    CHECK(magneticFluxDensityPeak > 0);
+    CHECK(frequency > 0);
+    CHECK(std::isfinite(magneticFluxDensityAcPeakToPeak));
+    CHECK(magneticFluxDensityAcPeakToPeak > 0);
 }
 
 TEST_CASE("Test_Core_Losses_Hoganas", "[physical-model][core-losses]") {
@@ -2978,16 +2749,20 @@ TEST_CASE("Test_MagnetizingInductanceModel_From_Excitation", "[physical-model][c
 
 TEST_CASE("Test_CoreLosses_Model_3C95", "[physical-model][core-losses][smoke-test]") {
     auto coreLossesModel = CoreLosses().get_core_losses_model("3C95");
+    // A loss model must exist for this stock ferrite material.
+    REQUIRE(coreLossesModel != nullptr);
 }
 
 TEST_CASE("Test_CoreLosses_Model_Nanoperm_8000", "[physical-model][core-losses][smoke-test]") {
     auto coreLossesModel = CoreLosses().get_core_losses_model("Nanoperm 8000");
+    // A loss model must exist for this nanocrystalline material (proprietary-method repro).
+    REQUIRE(coreLossesModel != nullptr);
 }
 
 TEST_CASE("Test_Core_Losses_Nanoperm_8000", "[physical-model][core-losses][smoke-test]") {
     auto models = json::parse("{\"coreLosses\": \"PROPRIETARY\", \"gapReluctance\": \"BALAKRISHNAN\"}");
     auto core = Core(json::parse(R"({"distributorsInfo": [], "functionalDescription": {"coating": null, "gapping": [{"area": 0.000078, "coordinates": [0, 0.0003, 0 ], "distanceClosestNormalSurface": 0.00865, "distanceClosestParallelSurface": 0.005325, "length": 0.0006, "sectionDimensions": [0.00725, 0.01075 ], "shape": "rectangular", "type": "subtractive" }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" } ], "material": "Nanoperm 8000", "numberStacks": 1, "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "twoPieceSet", "magneticCircuit": "open" }, "geometricalDescription": [{"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": [{"coordinates": [0, 0.0003, 0 ], "length": 0.0006 } ], "material": "A07", "rotation": [3.141592653589793, 3.141592653589793, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" }, {"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": null, "material": "A07", "rotation": [0, 0, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" } ], "manufacturerInfo": null, "name": "custom", "processedDescription": {"columns": [{"area": 0.000078, "coordinates": [0, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "central", "width": 0.00725 }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 } ], "depth": 0.01075, "effectiveParameters": {"effectiveArea": 0.00007739519022938956, "effectiveLength": 0.05775787070464925, "effectiveVolume": 0.000004470181390430815, "minimumArea": 0.00007686249999999999 }, "height": 0.0251, "width": 0.02505, "windingWindows": [{"angle": null, "area": 0.00009531749999999999, "coordinates": [0.0036249999999999998, 0 ], "height": 0.0179, "radialHeight": null, "sectionsAlignment": null, "sectionsOrientation": null, "shape": null, "width": 0.005325 } ] } })"));
-    auto winding = OpenMagnetics::Coil(json::parse(R"({"bobbin": {"distributorsInfo": null, "functionalDescription": null, "manufacturerInfo": null, "name": null, "processedDescription": {"columnDepth": 0.0065, "columnShape": "rectangular", "columnThickness": 0.0011250000000000001, "columnWidth": 0.004750000000000001, "coordinates": [0, 0, 0 ], "pins": null, "wallThickness": 0.0010499999999999989, "windingWindows": [{"angle": null, "area": 0.00006636000000000001, "coordinates": [0.00685, 0, 0 ], "height": 0.0158, "radialHeight": null, "sectionsAlignment": "innerOrTop", "sectionsOrientation": "overlapping", "shape": "rectangular", "width": 0.0042 } ] } }, "functionalDescription": [{"connections": null, "isolationSide": "primary", "name": "Primary", "numberParallels": 1, "numberTurns": 32, "wire": {"coating": {"breakdownVoltage": 2700, "grade": 1, "material": null, "numberLayers": null, "temperatureRating": null, "thickness": null, "thicknessLayers": null, "type": "enamelled" }, "conductingArea": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 3.6637960384511227e-7 }, "conductingDiameter": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 0.000683 }, "conductingHeight": null, "conductingWidth": null, "edgeRadius": null, "manufacturerInfo": {"cost": null, "datasheetUrl": null, "family": null, "name": "Nearson", "orderCode": null, "reference": null, "status": null }, "material": "copper", "name": "Round 21.5 - Single Build", "numberConductors": 1, "outerDiameter": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 0.000716 }, "outerHeight": null, "outerWidth": null, "standard": "NEMA MW 1000 C", "standardName": "21.5 AWG", "strand": null, "type": "round" } } ], "layersDescription": [{"additionalCoordinates": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0 ], "dimensions": [0.000716, 0.015528500000000004 ], "fillingFactor": 0.7250632911392404, "insulationMaterial": null, "name": "Primary section 0 layer 0", "orientation": "overlapping", "partialWindings": [{"connections": null, "parallelsProportion": [0.5 ], "winding": "Primary" } ], "section": "Primary section 0", "turnsAlignment": "spread", "type": "conduction", "windingStyle": "windByConsecutiveTurns" }, {"additionalCoordinates": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0 ], "dimensions": [0.000716, 0.015528500000000004 ], "fillingFactor": 0.7250632911392404, "insulationMaterial": null, "name": "Primary section 0 layer 1", "orientation": "overlapping", "partialWindings": [{"connections": null, "parallelsProportion": [0.5 ], "winding": "Primary" } ], "section": "Primary section 0", "turnsAlignment": "spread", "type": "conduction", "windingStyle": "windByConsecutiveTurns" } ], "sectionsDescription": [{"coordinateSystem": "cartesian", "coordinates": [0.005466000000000001, 0 ], "dimensions": [0.0014320000000000003, 0.015528500000000004 ], "fillingFactor": 0.24721205545509337, "layersAlignment": null, "layersOrientation": "overlapping", "margin": [0, 0 ], "name": "Primary section 0", "partialWindings": [{"connections": null, "parallelsProportion": [1 ], "winding": "Primary" } ], "type": "conduction", "windingStyle": "windByConsecutiveTurns" } ], "turnsDescription": [{"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.007406250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 0", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.006418750000000003 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 1", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.005431250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 2", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0044437500000000015 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 3", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0034562500000000014 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 4", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0024687500000000013 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 5", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0014812500000000012 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 6", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0004937500000000011 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 7", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.000493749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 8", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.001481249999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 9", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.002468749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 10", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.0034562499999999993 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 11", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.00444375 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 12", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.00543125 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 13", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.006418750000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 14", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.007406250000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 15", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.007406250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 16", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.006418750000000003 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 17", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.005431250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 18", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0044437500000000015 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 19", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0034562500000000014 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 20", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0024687500000000013 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 21", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0014812500000000012 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 22", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0004937500000000011 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 23", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.000493749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 24", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.001481249999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 25", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.002468749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 26", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.0034562499999999993 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 27", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.00444375 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 28", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.00543125 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 29", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.006418750000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 30", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.007406250000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 31", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" } ] })"));
+    auto winding = OpenMagnetics::Coil(OpenMagneticsTesting::fixtures::get_json("coil-e25-13-11-32-turn-round"));
     auto operatingPoint = OperatingPoint(json::parse(R"({"name": "Operating Point No. 1", "conditions": {"ambientTemperature": 42 }, "excitationsPerWinding": [{"name": "Primary winding excitation", "frequency": 100000, "current": {"waveform": {"data": [-5, 5, -5 ], "time": [0, 0.000005, 0.00001 ] }, "processed": {"dutyCycle": 0.5, "peakToPeak": 10, "offset": 0, "label": "triangular", "acEffectiveFrequency": 110746.40291779551, "effectiveFrequency": 110746.40291779551, "peak": 5, "rms": 2.8874560332150576, "thd": 0.12151487440704967 }, "harmonics": {"amplitudes": [1.1608769501236793e-14, 4.05366124583194, 1.787369544444173e-15, 0.4511310569983995, 9.749053004706756e-16, 0.16293015292554872, 4.036157626725542e-16, 0.08352979924600704, 3.4998295008010614e-16, 0.0508569581336163, 3.1489164048780735e-16, 0.034320410449418075, 3.142469873118059e-16, 0.024811988673843106, 2.3653352035940994e-16, 0.018849001010678823, 2.9306524147249266e-16, 0.014866633059596499, 1.796485796132569e-16, 0.012077180559557785, 1.6247782523152451e-16, 0.010049063750920609, 1.5324769149805092e-16, 0.008529750975091871, 1.0558579733068502e-16, 0.007363501410705499, 7.513269775674661e-17, 0.006450045785294609, 5.871414177162291e-17, 0.005722473794997712, 9.294731722001391e-17, 0.005134763398167541, 1.194820309200107e-16, 0.004654430423785411, 8.2422739080512e-17, 0.004258029771397032, 9.5067306351894e-17, 0.0039283108282380024, 1.7540347128474968e-16, 0.0036523670873925395, 9.623794010508822e-17, 0.0034204021424253787, 1.4083470894369491e-16, 0.0032248884817922927, 1.4749333016985644e-16, 0.0030599828465501895, 1.0448590642474364e-16, 0.002921112944200383, 7.575487373767413e-18, 0.002804680975178716, 7.419510610361002e-17, 0.0027078483284668376, 3.924741709073613e-17, 0.0026283777262804953, 2.2684279102637236e-17, 0.0025645167846443107, 8.997077625295079e-17, 0.0025149120164513483, 7.131074184849219e-17, 0.0024785457043284276, 9.354417496250849e-17, 0.0024546904085875065, 1.2488589642405877e-16, 0.0024428775264784264 ], "frequencies": [0, 100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000, 1100000, 1200000, 1300000, 1400000, 1500000, 1600000, 1700000, 1800000, 1900000, 2000000, 2100000, 2200000, 2300000, 2400000, 2500000, 2600000, 2700000, 2800000, 2900000, 3000000, 3100000, 3200000, 3300000, 3400000, 3500000, 3600000, 3700000, 3800000, 3900000, 4000000, 4100000, 4200000, 4300000, 4400000, 4500000, 4600000, 4700000, 4800000, 4900000, 5000000, 5100000, 5200000, 5300000, 5400000, 5500000, 5600000, 5700000, 5800000, 5900000, 6000000, 6100000, 6200000, 6300000 ] } }, "voltage": {"waveform": {"data": [-20.5, 70.5, 70.5, -20.5, -20.5 ], "time": [0, 0, 0.000005, 0.000005, 0.00001 ] }, "processed": {"dutyCycle": 0.5, "peakToPeak": 100, "offset": 0, "label": "rectangular", "acEffectiveFrequency": 591485.5360118389, "effectiveFrequency": 553357.3374711702, "peak": 70.5, "rms": 51.572309672924284, "thd": 0.4833151484524849 }, "harmonics": {"amplitudes": [24.2890625, 57.92076613061847, 1.421875, 19.27588907896988, 1.421875, 11.528257939603122, 1.421875, 8.194467538528329, 1.421875, 6.331896912839248, 1.421875, 5.137996046859012, 1.421875, 4.304077056139349, 1.421875, 3.6860723299088454, 1.421875, 3.207698601961777, 1.421875, 2.8247804703632298, 1.421875, 2.509960393415185, 1.421875, 2.2453859950684323, 1.421875, 2.01890737840567, 1.421875, 1.8219644341144872, 1.421875, 1.6483482744897402, 1.421875, 1.4934420157473332, 1.421875, 1.3537375367153817, 1.421875, 1.2265178099275544, 1.421875, 1.1096421410704556, 1.421875, 1.0013973584174929, 1.421875, 0.9003924136274832, 1.421875, 0.8054822382572133, 1.421875, 0.7157117294021269, 1.421875, 0.6302738400635857, 1.421875, 0.5484777114167545, 1.421875, 0.46972405216147894, 1.421875, 0.3934858059809043, 1.421875, 0.31929270856030145, 1.421875, 0.24671871675852053, 1.421875, 0.17537155450693565, 1.421875, 0.10488380107099537, 1.421875, 0.034905072061178544 ], "frequencies": [0, 100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000, 1100000, 1200000, 1300000, 1400000, 1500000, 1600000, 1700000, 1800000, 1900000, 2000000, 2100000, 2200000, 2300000, 2400000, 2500000, 2600000, 2700000, 2800000, 2900000, 3000000, 3100000, 3200000, 3300000, 3400000, 3500000, 3600000, 3700000, 3800000, 3900000, 4000000, 4100000, 4200000, 4300000, 4400000, 4500000, 4600000, 4700000, 4800000, 4900000, 5000000, 5100000, 5200000, 5300000, 5400000, 5500000, 5600000, 5700000, 5800000, 5900000, 6000000, 6100000, 6200000, 6300000 ] } } } ]})"));
 
     MagnetizingInductance magnetizingInductanceModel(std::string{models["gapReluctance"]});
@@ -3065,7 +2840,7 @@ TEST_CASE("Test_Core_Losses_Web_2", "[physical-model][core-losses][bug]") {
 TEST_CASE("Test_Core_Losses_DMEGC_DMR51W", "[physical-model][core-losses][bug][smoke-test]") {
     auto models = json::parse("{\"coreLosses\": \"STEINMETZ\", \"gapReluctance\": \"BALAKRISHNAN\"}");
     auto core = Core(json::parse(R"({"distributorsInfo": [], "functionalDescription": {"coating": null, "gapping": [{"area": 0.000078, "coordinates": [0, 0.0003, 0 ], "distanceClosestNormalSurface": 0.00865, "distanceClosestParallelSurface": 0.005325, "length": 0.0006, "sectionDimensions": [0.00725, 0.01075 ], "shape": "rectangular", "type": "subtractive" }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" } ], "material": "DMR51W", "numberStacks": 1, "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "twoPieceSet", "magneticCircuit": "open" }, "geometricalDescription": [{"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": [{"coordinates": [0, 0.0003, 0 ], "length": 0.0006 } ], "material": "DMR51W", "rotation": [3.141592653589793, 3.141592653589793, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" }, {"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": null, "material": "DMR51W", "rotation": [0, 0, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" } ], "manufacturerInfo": null, "name": "custom", "processedDescription": {"columns": [{"area": 0.000078, "coordinates": [0, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "central", "width": 0.00725 }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 } ], "depth": 0.01075, "effectiveParameters": {"effectiveArea": 0.00007739519022938956, "effectiveLength": 0.05775787070464925, "effectiveVolume": 0.000004470181390430815, "minimumArea": 0.00007686249999999999 }, "height": 0.0251, "width": 0.02505, "windingWindows": [{"angle": null, "area": 0.00009531749999999999, "coordinates": [0.0036249999999999998, 0 ], "height": 0.0179, "radialHeight": null, "sectionsAlignment": null, "sectionsOrientation": null, "shape": null, "width": 0.005325 } ] } })"));
-    auto coil = OpenMagnetics::Coil(json::parse(R"({"bobbin": {"distributorsInfo": null, "functionalDescription": null, "manufacturerInfo": null, "name": null, "processedDescription": {"columnDepth": 0.0065, "columnShape": "rectangular", "columnThickness": 0.0011250000000000001, "columnWidth": 0.004750000000000001, "coordinates": [0, 0, 0 ], "pins": null, "wallThickness": 0.0010499999999999989, "windingWindows": [{"angle": null, "area": 0.00006636000000000001, "coordinates": [0.00685, 0, 0 ], "height": 0.0158, "radialHeight": null, "sectionsAlignment": "innerOrTop", "sectionsOrientation": "overlapping", "shape": "rectangular", "width": 0.0042 } ] } }, "functionalDescription": [{"connections": null, "isolationSide": "primary", "name": "Primary", "numberParallels": 1, "numberTurns": 32, "wire": {"coating": {"breakdownVoltage": 2700, "grade": 1, "material": null, "numberLayers": null, "temperatureRating": null, "thickness": null, "thicknessLayers": null, "type": "enamelled" }, "conductingArea": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 3.6637960384511227e-7 }, "conductingDiameter": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 0.000683 }, "conductingHeight": null, "conductingWidth": null, "edgeRadius": null, "manufacturerInfo": {"cost": null, "datasheetUrl": null, "family": null, "name": "Nearson", "orderCode": null, "reference": null, "status": null }, "material": "copper", "name": "Round 21.5 - Single Build", "numberConductors": 1, "outerDiameter": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 0.000716 }, "outerHeight": null, "outerWidth": null, "standard": "NEMA MW 1000 C", "standardName": "21.5 AWG", "strand": null, "type": "round" } } ], "layersDescription": [{"additionalCoordinates": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0 ], "dimensions": [0.000716, 0.015528500000000004 ], "fillingFactor": 0.7250632911392404, "insulationMaterial": null, "name": "Primary section 0 layer 0", "orientation": "overlapping", "partialWindings": [{"connections": null, "parallelsProportion": [0.5 ], "winding": "Primary" } ], "section": "Primary section 0", "turnsAlignment": "spread", "type": "conduction", "windingStyle": "windByConsecutiveTurns" }, {"additionalCoordinates": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0 ], "dimensions": [0.000716, 0.015528500000000004 ], "fillingFactor": 0.7250632911392404, "insulationMaterial": null, "name": "Primary section 0 layer 1", "orientation": "overlapping", "partialWindings": [{"connections": null, "parallelsProportion": [0.5 ], "winding": "Primary" } ], "section": "Primary section 0", "turnsAlignment": "spread", "type": "conduction", "windingStyle": "windByConsecutiveTurns" } ], "sectionsDescription": [{"coordinateSystem": "cartesian", "coordinates": [0.005466000000000001, 0 ], "dimensions": [0.0014320000000000003, 0.015528500000000004 ], "fillingFactor": 0.24721205545509337, "layersAlignment": null, "layersOrientation": "overlapping", "margin": [0, 0 ], "name": "Primary section 0", "partialWindings": [{"connections": null, "parallelsProportion": [1 ], "winding": "Primary" } ], "type": "conduction", "windingStyle": "windByConsecutiveTurns" } ], "turnsDescription": [{"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.007406250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 0", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.006418750000000003 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 1", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.005431250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 2", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0044437500000000015 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 3", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0034562500000000014 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 4", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0024687500000000013 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 5", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0014812500000000012 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 6", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0004937500000000011 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 7", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.000493749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 8", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.001481249999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 9", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.002468749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 10", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.0034562499999999993 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 11", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.00444375 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 12", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.00543125 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 13", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.006418750000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 14", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.007406250000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 15", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.007406250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 16", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.006418750000000003 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 17", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.005431250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 18", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0044437500000000015 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 19", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0034562500000000014 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 20", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0024687500000000013 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 21", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0014812500000000012 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 22", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0004937500000000011 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 23", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.000493749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 24", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.001481249999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 25", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.002468749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 26", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.0034562499999999993 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 27", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.00444375 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 28", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.00543125 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 29", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.006418750000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 30", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.007406250000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 31", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" } ] })"));
+    auto coil = OpenMagnetics::Coil(OpenMagneticsTesting::fixtures::get_json("coil-e25-13-11-32-turn-round"));
 
     json excitationJson = json();
     excitationJson["frequency"] = 700000;
@@ -3092,7 +2867,7 @@ TEST_CASE("Test_Core_Losses_DMEGC_DMR51W", "[physical-model][core-losses][bug][s
 TEST_CASE("Test_Core_Losses_DMEGC_DMR52W", "[physical-model][core-losses][bug][smoke-test]") {
     auto models = json::parse("{\"coreLosses\": \"STEINMETZ\", \"gapReluctance\": \"BALAKRISHNAN\"}");
     auto core = Core(json::parse(R"({"distributorsInfo": [], "functionalDescription": {"coating": null, "gapping": [{"area": 0.000078, "coordinates": [0, 0.0003, 0 ], "distanceClosestNormalSurface": 0.00865, "distanceClosestParallelSurface": 0.005325, "length": 0.0006, "sectionDimensions": [0.00725, 0.01075 ], "shape": "rectangular", "type": "subtractive" }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" } ], "material": "DMR52W", "numberStacks": 1, "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "twoPieceSet", "magneticCircuit": "open" }, "geometricalDescription": [{"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": [{"coordinates": [0, 0.0003, 0 ], "length": 0.0006 } ], "material": "DMR52W", "rotation": [3.141592653589793, 3.141592653589793, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" }, {"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": null, "material": "DMR52W", "rotation": [0, 0, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" } ], "manufacturerInfo": null, "name": "custom", "processedDescription": {"columns": [{"area": 0.000078, "coordinates": [0, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "central", "width": 0.00725 }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 } ], "depth": 0.01075, "effectiveParameters": {"effectiveArea": 0.00007739519022938956, "effectiveLength": 0.05775787070464925, "effectiveVolume": 0.000004470181390430815, "minimumArea": 0.00007686249999999999 }, "height": 0.0251, "width": 0.02505, "windingWindows": [{"angle": null, "area": 0.00009531749999999999, "coordinates": [0.0036249999999999998, 0 ], "height": 0.0179, "radialHeight": null, "sectionsAlignment": null, "sectionsOrientation": null, "shape": null, "width": 0.005325 } ] } })"));
-    auto coil = OpenMagnetics::Coil(json::parse(R"({"bobbin": {"distributorsInfo": null, "functionalDescription": null, "manufacturerInfo": null, "name": null, "processedDescription": {"columnDepth": 0.0065, "columnShape": "rectangular", "columnThickness": 0.0011250000000000001, "columnWidth": 0.004750000000000001, "coordinates": [0, 0, 0 ], "pins": null, "wallThickness": 0.0010499999999999989, "windingWindows": [{"angle": null, "area": 0.00006636000000000001, "coordinates": [0.00685, 0, 0 ], "height": 0.0158, "radialHeight": null, "sectionsAlignment": "innerOrTop", "sectionsOrientation": "overlapping", "shape": "rectangular", "width": 0.0042 } ] } }, "functionalDescription": [{"connections": null, "isolationSide": "primary", "name": "Primary", "numberParallels": 1, "numberTurns": 32, "wire": {"coating": {"breakdownVoltage": 2700, "grade": 1, "material": null, "numberLayers": null, "temperatureRating": null, "thickness": null, "thicknessLayers": null, "type": "enamelled" }, "conductingArea": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 3.6637960384511227e-7 }, "conductingDiameter": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 0.000683 }, "conductingHeight": null, "conductingWidth": null, "edgeRadius": null, "manufacturerInfo": {"cost": null, "datasheetUrl": null, "family": null, "name": "Nearson", "orderCode": null, "reference": null, "status": null }, "material": "copper", "name": "Round 21.5 - Single Build", "numberConductors": 1, "outerDiameter": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 0.000716 }, "outerHeight": null, "outerWidth": null, "standard": "NEMA MW 1000 C", "standardName": "21.5 AWG", "strand": null, "type": "round" } } ], "layersDescription": [{"additionalCoordinates": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0 ], "dimensions": [0.000716, 0.015528500000000004 ], "fillingFactor": 0.7250632911392404, "insulationMaterial": null, "name": "Primary section 0 layer 0", "orientation": "overlapping", "partialWindings": [{"connections": null, "parallelsProportion": [0.5 ], "winding": "Primary" } ], "section": "Primary section 0", "turnsAlignment": "spread", "type": "conduction", "windingStyle": "windByConsecutiveTurns" }, {"additionalCoordinates": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0 ], "dimensions": [0.000716, 0.015528500000000004 ], "fillingFactor": 0.7250632911392404, "insulationMaterial": null, "name": "Primary section 0 layer 1", "orientation": "overlapping", "partialWindings": [{"connections": null, "parallelsProportion": [0.5 ], "winding": "Primary" } ], "section": "Primary section 0", "turnsAlignment": "spread", "type": "conduction", "windingStyle": "windByConsecutiveTurns" } ], "sectionsDescription": [{"coordinateSystem": "cartesian", "coordinates": [0.005466000000000001, 0 ], "dimensions": [0.0014320000000000003, 0.015528500000000004 ], "fillingFactor": 0.24721205545509337, "layersAlignment": null, "layersOrientation": "overlapping", "margin": [0, 0 ], "name": "Primary section 0", "partialWindings": [{"connections": null, "parallelsProportion": [1 ], "winding": "Primary" } ], "type": "conduction", "windingStyle": "windByConsecutiveTurns" } ], "turnsDescription": [{"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.007406250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 0", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.006418750000000003 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 1", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.005431250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 2", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0044437500000000015 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 3", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0034562500000000014 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 4", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0024687500000000013 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 5", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0014812500000000012 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 6", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0004937500000000011 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 7", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.000493749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 8", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.001481249999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 9", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.002468749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 10", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.0034562499999999993 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 11", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.00444375 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 12", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.00543125 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 13", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.006418750000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 14", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.007406250000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 15", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.007406250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 16", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.006418750000000003 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 17", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.005431250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 18", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0044437500000000015 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 19", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0034562500000000014 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 20", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0024687500000000013 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 21", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0014812500000000012 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 22", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0004937500000000011 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 23", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.000493749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 24", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.001481249999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 25", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.002468749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 26", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.0034562499999999993 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 27", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.00444375 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 28", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.00543125 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 29", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.006418750000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 30", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.007406250000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 31", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" } ] })"));
+    auto coil = OpenMagnetics::Coil(OpenMagneticsTesting::fixtures::get_json("coil-e25-13-11-32-turn-round"));
 
     json excitationJson = json();
     excitationJson["frequency"] = 3000000;
@@ -3120,7 +2895,7 @@ TEST_CASE("Test_Core_Losses_DMEGC_DMR51", "[physical-model][core-losses][bug]") 
     SKIP("Test needs investigation");
     auto models = json::parse("{\"coreLosses\": \"STEINMETZ\", \"gapReluctance\": \"BALAKRISHNAN\"}");
     auto core = Core(json::parse(R"({"distributorsInfo": [], "functionalDescription": {"coating": null, "gapping": [{"area": 0.000078, "coordinates": [0, 0.0003, 0 ], "distanceClosestNormalSurface": 0.00865, "distanceClosestParallelSurface": 0.005325, "length": 0.0006, "sectionDimensions": [0.00725, 0.01075 ], "shape": "rectangular", "type": "subtractive" }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" } ], "material": "DMR51", "numberStacks": 1, "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "twoPieceSet", "magneticCircuit": "open" }, "geometricalDescription": [{"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": [{"coordinates": [0, 0.0003, 0 ], "length": 0.0006 } ], "material": "DMR51", "rotation": [3.141592653589793, 3.141592653589793, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" }, {"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": null, "material": "DMR51", "rotation": [0, 0, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" } ], "manufacturerInfo": null, "name": "custom", "processedDescription": {"columns": [{"area": 0.000078, "coordinates": [0, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "central", "width": 0.00725 }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 } ], "depth": 0.01075, "effectiveParameters": {"effectiveArea": 0.00007739519022938956, "effectiveLength": 0.05775787070464925, "effectiveVolume": 0.000004470181390430815, "minimumArea": 0.00007686249999999999 }, "height": 0.0251, "width": 0.02505, "windingWindows": [{"angle": null, "area": 0.00009531749999999999, "coordinates": [0.0036249999999999998, 0 ], "height": 0.0179, "radialHeight": null, "sectionsAlignment": null, "sectionsOrientation": null, "shape": null, "width": 0.005325 } ] } })"));
-    auto coil = OpenMagnetics::Coil(json::parse(R"({"bobbin": {"distributorsInfo": null, "functionalDescription": null, "manufacturerInfo": null, "name": null, "processedDescription": {"columnDepth": 0.0065, "columnShape": "rectangular", "columnThickness": 0.0011250000000000001, "columnWidth": 0.004750000000000001, "coordinates": [0, 0, 0 ], "pins": null, "wallThickness": 0.0010499999999999989, "windingWindows": [{"angle": null, "area": 0.00006636000000000001, "coordinates": [0.00685, 0, 0 ], "height": 0.0158, "radialHeight": null, "sectionsAlignment": "innerOrTop", "sectionsOrientation": "overlapping", "shape": "rectangular", "width": 0.0042 } ] } }, "functionalDescription": [{"connections": null, "isolationSide": "primary", "name": "Primary", "numberParallels": 1, "numberTurns": 32, "wire": {"coating": {"breakdownVoltage": 2700, "grade": 1, "material": null, "numberLayers": null, "temperatureRating": null, "thickness": null, "thicknessLayers": null, "type": "enamelled" }, "conductingArea": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 3.6637960384511227e-7 }, "conductingDiameter": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 0.000683 }, "conductingHeight": null, "conductingWidth": null, "edgeRadius": null, "manufacturerInfo": {"cost": null, "datasheetUrl": null, "family": null, "name": "Nearson", "orderCode": null, "reference": null, "status": null }, "material": "copper", "name": "Round 21.5 - Single Build", "numberConductors": 1, "outerDiameter": {"excludeMaximum": null, "excludeMinimum": null, "maximum": null, "minimum": null, "nominal": 0.000716 }, "outerHeight": null, "outerWidth": null, "standard": "NEMA MW 1000 C", "standardName": "21.5 AWG", "strand": null, "type": "round" } } ], "layersDescription": [{"additionalCoordinates": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0 ], "dimensions": [0.000716, 0.015528500000000004 ], "fillingFactor": 0.7250632911392404, "insulationMaterial": null, "name": "Primary section 0 layer 0", "orientation": "overlapping", "partialWindings": [{"connections": null, "parallelsProportion": [0.5 ], "winding": "Primary" } ], "section": "Primary section 0", "turnsAlignment": "spread", "type": "conduction", "windingStyle": "windByConsecutiveTurns" }, {"additionalCoordinates": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0 ], "dimensions": [0.000716, 0.015528500000000004 ], "fillingFactor": 0.7250632911392404, "insulationMaterial": null, "name": "Primary section 0 layer 1", "orientation": "overlapping", "partialWindings": [{"connections": null, "parallelsProportion": [0.5 ], "winding": "Primary" } ], "section": "Primary section 0", "turnsAlignment": "spread", "type": "conduction", "windingStyle": "windByConsecutiveTurns" } ], "sectionsDescription": [{"coordinateSystem": "cartesian", "coordinates": [0.005466000000000001, 0 ], "dimensions": [0.0014320000000000003, 0.015528500000000004 ], "fillingFactor": 0.24721205545509337, "layersAlignment": null, "layersOrientation": "overlapping", "margin": [0, 0 ], "name": "Primary section 0", "partialWindings": [{"connections": null, "parallelsProportion": [1 ], "winding": "Primary" } ], "type": "conduction", "windingStyle": "windByConsecutiveTurns" } ], "turnsDescription": [{"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.007406250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 0", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.006418750000000003 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 1", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.005431250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 2", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0044437500000000015 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 3", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0034562500000000014 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 4", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0024687500000000013 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 5", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0014812500000000012 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 6", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, 0.0004937500000000011 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 7", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.000493749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 8", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.001481249999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 9", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.002468749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 10", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.0034562499999999993 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 11", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.00444375 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 12", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.00543125 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 13", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.006418750000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 14", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.0051080000000000006, -0.007406250000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 0", "length": 0.04724938033997029, "name": "Primary parallel 0 turn 15", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.007406250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 16", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.006418750000000003 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 17", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.005431250000000002 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 18", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0044437500000000015 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 19", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0034562500000000014 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 20", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0024687500000000013 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 21", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0014812500000000012 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 22", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, 0.0004937500000000011 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 23", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.000493749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 24", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.001481249999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 25", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.002468749999999999 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 26", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.0034562499999999993 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 27", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.00444375 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 28", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.00543125 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 29", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.006418750000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 30", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" }, {"additionalCoordinates": null, "angle": null, "coordinateSystem": "cartesian", "coordinates": [0.005824000000000001, -0.007406250000000001 ], "dimensions": [0.000716, 0.000716 ], "layer": "Primary section 0 layer 1", "length": 0.051748141019910876, "name": "Primary parallel 0 turn 31", "orientation": "clockwise", "parallel": 0, "rotation": 0, "section": "Primary section 0", "winding": "Primary" } ] })"));
+    auto coil = OpenMagnetics::Coil(OpenMagneticsTesting::fixtures::get_json("coil-e25-13-11-32-turn-round"));
 
     json excitationJson = json();
     excitationJson["frequency"] = 1000000;
@@ -3529,6 +3304,77 @@ TEST_CASE("MagneticFluxDensity_From_Losses_Micrometals", "[physical-model][core-
     REQUIRE_THAT(magneticFluxDensity.get_processed().value().get_peak().value(), Catch::Matchers::WithinAbs(magneticFluxDensityFromCoreLossesPeak, magneticFluxDensityFromCoreLossesPeak * maxError));
 }
 
+// ABT #168: the fitter must recover a known synthetic law and must throw on
+// under-determined inputs instead of silently returning seed coefficients.
+TEST_CASE("Calculate_Steinmetz_Coefficients_Synthetic", "[physical-model][core-losses][steinmetz-fit]") {
+    auto makePoint = [](double frequency, double peak, double temperature) {
+        json pointJson;
+        pointJson["temperature"] = temperature;
+        pointJson["value"] = 2.0 * pow(frequency, 1.5) * pow(peak, 2.7);
+        pointJson["origin"] = "manufacturer";
+        pointJson["magneticFluxDensity"]["frequency"] = frequency;
+        pointJson["magneticFluxDensity"]["magneticFluxDensity"]["processed"]["label"] = "Sinusoidal";
+        pointJson["magneticFluxDensity"]["magneticFluxDensity"]["processed"]["offset"] = 0;
+        pointJson["magneticFluxDensity"]["magneticFluxDensity"]["processed"]["peak"] = peak;
+        pointJson["magneticFluxDensity"]["magneticFluxDensity"]["processed"]["peakToPeak"] = 2 * peak;
+        return VolumetricLossesPoint(pointJson);
+    };
+    std::vector<double> testFrequencies = {25000, 50000, 100000, 200000, 400000};
+    std::vector<double> testPeaks = {0.025, 0.05, 0.1, 0.2, 0.3};
+
+    SECTION("Single-temperature grid recovers k, alpha, beta (reduced model)") {
+        std::vector<VolumetricLossesPoint> data;
+        for (auto frequency : testFrequencies) {
+            for (auto peak : testPeaks) {
+                data.push_back(makePoint(frequency, peak, 25));
+            }
+        }
+        auto [coefficientsPerRange, errorPerRange] = OpenMagnetics::CoreLossesSteinmetzModel::calculate_steinmetz_coefficients(data, {{10000, 1000000}});
+        REQUIRE(coefficientsPerRange.size() == 1);
+        CHECK_THAT(coefficientsPerRange[0].get_k(), Catch::Matchers::WithinRel(2.0, 0.02));
+        CHECK_THAT(coefficientsPerRange[0].get_alpha(), Catch::Matchers::WithinRel(1.5, 0.02));
+        CHECK_THAT(coefficientsPerRange[0].get_beta(), Catch::Matchers::WithinRel(2.7, 0.02));
+        REQUIRE(errorPerRange[0] < 0.02);
+    }
+
+    SECTION("Two-temperature grid recovers k, alpha, beta") {
+        std::vector<VolumetricLossesPoint> data;
+        for (auto temperature : {25.0, 100.0}) {
+            for (auto frequency : testFrequencies) {
+                for (auto peak : testPeaks) {
+                    data.push_back(makePoint(frequency, peak, temperature));
+                }
+            }
+        }
+        auto [coefficientsPerRange, errorPerRange] = OpenMagnetics::CoreLossesSteinmetzModel::calculate_steinmetz_coefficients(data, {{10000, 1000000}});
+        REQUIRE(coefficientsPerRange.size() == 1);
+        CHECK_THAT(coefficientsPerRange[0].get_k(), Catch::Matchers::WithinRel(2.0, 0.02));
+        CHECK_THAT(coefficientsPerRange[0].get_alpha(), Catch::Matchers::WithinRel(1.5, 0.02));
+        CHECK_THAT(coefficientsPerRange[0].get_beta(), Catch::Matchers::WithinRel(2.7, 0.02));
+        REQUIRE(errorPerRange[0] < 0.02);
+    }
+
+    SECTION("Single frequency throws (alpha under-determined)") {
+        std::vector<VolumetricLossesPoint> data;
+        for (auto peak : testPeaks) {
+            data.push_back(makePoint(100000, peak, 25));
+        }
+        REQUIRE_THROWS_WITH(
+            OpenMagnetics::CoreLossesSteinmetzModel::calculate_steinmetz_coefficients(data, {{10000, 1000000}}),
+            Catch::Matchers::ContainsSubstring("same frequency"));
+    }
+
+    SECTION("Single flux density throws (beta under-determined)") {
+        std::vector<VolumetricLossesPoint> data;
+        for (auto frequency : testFrequencies) {
+            data.push_back(makePoint(frequency, 0.1, 25));
+        }
+        REQUIRE_THROWS_WITH(
+            OpenMagnetics::CoreLossesSteinmetzModel::calculate_steinmetz_coefficients(data, {{10000, 1000000}}),
+            Catch::Matchers::ContainsSubstring("same flux density"));
+    }
+}
+
 TEST_CASE("Calculate_Steinmetz_Coefficients", "[physical-model][core-losses]") {
     SKIP("Test needs investigation");
     load_core_materials();
@@ -3570,7 +3416,7 @@ TEST_CASE("Calculate_Steinmetz_Coefficients", "[physical-model][core-losses]") {
 // ============================================================================
 
 TEST_CASE("Test_Core_Losses_All_Models_Comparison_Table",
-          "[physical-model][core-losses][comparison]") {
+          "[physical-model][core-losses][comparison][heavy]") {
 
     // --- Model definitions ---
     struct ModelDef {
@@ -3696,9 +3542,24 @@ TEST_CASE("Test_Core_Losses_All_Models_Comparison_Table",
                     materialErrorSum += error;
                     testCount++;
                     if (error > maxErr) maxErr = error;
+
+                    // Every model/material/test-point combination must produce a finite positive loss.
+                    INFO(md.name << " / " << material << " @ " << tp.frequency << " Hz, "
+                                 << tp.magneticFluxDensityPeak << " T, " << tp.temperature << " C");
+                    CHECK(std::isfinite(volumetricLosses));
+                    CHECK(volumetricLosses > 0);
                 }
                 catch (const std::exception& e) {
-                    // Model not available for this material/config — skip silently
+                    std::string reason = e.what();
+                    if (reason.find("does not have method") != std::string::npos) {
+                        // Documented data gap: the material carries no data for this loss
+                        // method (e.g. ROSHEN needs data 3F4 does not publish). Recorded as
+                        // absent in the table, not a failure.
+                    } else {
+                        // Any other throw used to be skipped silently; it must fail.
+                        FAIL_CHECK(md.name << " / " << material << " @ " << tp.frequency << " Hz threw: "
+                                           << e.what());
+                    }
                 }
             }
 

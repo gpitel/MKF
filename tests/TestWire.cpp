@@ -3,6 +3,7 @@
 #include "support/Utils.h"
 #include "json.hpp"
 
+#include <numbers>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <filesystem>
@@ -503,9 +504,19 @@ namespace {
                                                                                               offset);
         
         auto wire = find_wire_by_name("Round 0.5 - Grade 1");
-        // double expectedNumberParallels = 69;
-
-        // REQUIRE_THAT(expectedConductingArea, Catch::Matchers::WithinAbs(conductingArea, max_error * expectedConductingArea));
+        // NOTE: the original conducting-area computation this test was written around was
+        // deleted at some point, leaving only commented-out expectations. Pin what is left:
+        // the wire lookup and its standard conducting area (pi * (0.25 mm)^2).
+        REQUIRE(wire.get_conducting_diameter());
+        double conductingDiameter = resolve_dimensional_values(wire.get_conducting_diameter().value());
+        REQUIRE_THAT(conductingDiameter, Catch::Matchers::WithinAbs(0.0005, 0.0005 * 0.01));
+        // Database wires carry the diameter, not a materialized conducting area; pin the
+        // area implied by the standard diameter instead (pi * (d/2)^2).
+        double conductingArea = std::numbers::pi * conductingDiameter * conductingDiameter / 4;
+        REQUIRE_THAT(conductingArea, Catch::Matchers::WithinAbs(1.9635e-7, 1.9635e-7 * 0.02));
+        auto& excitation = inputs.get_mutable_operating_points()[0].get_mutable_excitations_per_winding()[0];
+        REQUIRE(excitation.get_current()->get_processed());
+        CHECK(excitation.get_current()->get_processed()->get_rms().value() > 0);
     }
 
     TEST_CASE("Test_Number_Parallels_Low_Frequency_Round_1_Parallel", "[constructive-model][wire][smoke-test]") {
@@ -637,6 +648,11 @@ namespace {
         auto material = find_insulation_material_by_name("ETFE");
         json jsonDta;
         to_json(jsonDta, material);
+        // The ETFE insulation material must round-trip with its key dielectric data.
+        REQUIRE(!jsonDta.empty());
+        CHECK(jsonDta["name"] == "ETFE");
+        REQUIRE(jsonDta.contains("dielectricStrength"));
+        CHECK(jsonDta["dielectricStrength"].size() > 0);
     }
 
     TEST_CASE("Test_Find_Round_By_Dimension_European", "[constructive-model][wire][smoke-test]") {

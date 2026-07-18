@@ -42,7 +42,12 @@
 
 namespace OpenMagnetics {
 
-Coil get_dummy_coil(const Inputs& inputs) {
+// sizeParallelsToCurrent: POWER flows size the dummy strands to the winding RMS
+// current (ABT #70); suppression/CMC flows must NOT (ABT #126) — the "current"
+// there is the full line current, and current-sized parallels of a skin-depth
+// strand fit no toroid window, killing every suppression candidate at
+// post-processing (adviser returned ZERO results).
+Coil get_dummy_coil(const Inputs& inputs, bool sizeParallelsToCurrent) {
     double temperature = inputs.get_maximum_temperature();
     double frequency = 0;
     // Phase 6 (perf): cache operating-points by const-ref.
@@ -74,8 +79,9 @@ Coil get_dummy_coil(const Inputs& inputs) {
     // the same check MagnetizingInductance uses downstream, so the
     // two stay in sync by construction.
     size_t numberOfWindings = 1;
-    if (!operatingPoints.empty() &&
-        Inputs::can_be_common_mode_choke(operatingPoints[0])) {
+    bool isCommonModeChoke = !operatingPoints.empty() &&
+                             Inputs::can_be_common_mode_choke(operatingPoints[0]);
+    if (isCommonModeChoke) {
         numberOfWindings = operatingPoints[0].get_excitations_per_winding().size();
         if (numberOfWindings < 1) numberOfWindings = 1;
     }
@@ -101,6 +107,36 @@ Coil get_dummy_coil(const Inputs& inputs) {
         winding.set_number_parallels(1);
         winding.set_number_turns(1);
         winding.set_wire(wire);
+        // Size the number of PARALLEL strands to carry THIS winding's RMS current
+        // at <= maximumEffectiveCurrentDensity. The dummy wire is a skin-depth
+        // strand (good for AC loss) but a single strand ignores current-carrying
+        // capacity, so the fast path left high-current windings under-coppered —
+        // every winding at ~18 A/mm2 regardless of core (ABT #70). Use the same
+        // helper the WireAdviser uses on the full path so both paths agree.
+        // ABT #126: NOT for common-mode chokes — sizing every CMC winding's
+        // parallels to the full line current with a skin-depth strand produced
+        // N x ~dozens of parallel strands that fit no toroid window, so every
+        // suppression candidate died at post-processing (fast_wind: no turns)
+        // and the adviser returned ZERO results. The CMC dummy keeps 1 parallel
+        // (the historical suppression behaviour); real copper sizing for CMCs
+        // is the wire adviser's job downstream.
+        if (sizeParallelsToCurrent && !isCommonModeChoke && !operatingPoints.empty()) {
+            const auto& excitations = operatingPoints[0].get_excitations_per_winding();
+            if (w < excitations.size() && excitations[w].get_current()) {
+                auto windingCurrent = excitations[w].get_current().value();
+                // Satisfy BOTH MKF density limits — the AC/effective ceiling
+                // (maximumEffectiveCurrentDensity, ~12 A/mm2) AND the stricter DC
+                // ceiling (maximumCurrentDensity, ~7 A/mm2) — by taking the larger
+                // parallel count. Sizing to only the effective limit left the DC
+                // density above the DC filter's own threshold, so the design failed
+                // its own DcCurrentDensity check.
+                int parallelsEffective = Wire::calculate_number_parallels_needed(
+                    windingCurrent, temperature, wire, defaults.maximumEffectiveCurrentDensity);
+                double dcCurrentDensity = wire.calculate_dc_current_density(windingCurrent);
+                int parallelsDc = static_cast<int>(std::ceil(dcCurrentDensity / defaults.maximumCurrentDensity));
+                winding.set_number_parallels(std::max({1, parallelsEffective, parallelsDc}));
+            }
+        }
         windings.push_back(winding);
     }
 
@@ -169,7 +205,7 @@ std::vector<CoreShape> CoreAdviser::create_custom_core_shapes(Inputs inputs) {
 
 std::vector<std::pair<Magnetic, double>> CoreAdviser::create_magnetic_dataset(Inputs inputs, std::vector<Core>* cores, bool includeStacks) {
     std::vector<std::pair<Magnetic, double>> magnetics;
-    Coil coil = get_dummy_coil(inputs);
+    Coil coil = get_dummy_coil(inputs, get_application() != MAS::MagneticApplication::INTERFERENCE_SUPPRESSION);
     auto includeToroidalCores = settings.get_use_toroidal_cores();
     auto includeConcentricCores = settings.get_use_concentric_cores();
     auto globalIncludeStacks = settings.get_core_adviser_include_stacks();
@@ -286,7 +322,7 @@ std::vector<std::pair<Magnetic, double>> CoreAdviser::create_magnetic_dataset(In
 
 std::vector<std::pair<Magnetic, double>> CoreAdviser::create_magnetic_dataset(Inputs inputs, std::vector<CoreShape>* shapes, bool includeStacks) {
     std::vector<std::pair<Magnetic, double>> magnetics;
-    Coil coil = get_dummy_coil(inputs);
+    Coil coil = get_dummy_coil(inputs, get_application() != MAS::MagneticApplication::INTERFERENCE_SUPPRESSION);
     auto includeToroidalCores = settings.get_use_toroidal_cores();
     auto includeConcentricCores = settings.get_use_concentric_cores();
     auto globalIncludeStacks = settings.get_core_adviser_include_stacks();
@@ -406,7 +442,7 @@ std::vector<std::pair<Magnetic, double>> CoreAdviser::create_magnetic_dataset(In
 }
 
 void CoreAdviser::expand_magnetic_dataset_with_stacks(Inputs inputs, std::vector<Core>* cores, std::vector<std::pair<Magnetic, double>>* magnetics) {
-    Coil coil = get_dummy_coil(inputs);
+    Coil coil = get_dummy_coil(inputs, get_application() != MAS::MagneticApplication::INTERFERENCE_SUPPRESSION);
     auto includeToroidalCores = settings.get_use_toroidal_cores();
     double maximumHeight = std::numeric_limits<double>::infinity();
     if (inputs.get_design_requirements().get_maximum_dimensions()) {
@@ -525,7 +561,13 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
     auto reqAppOpt = inputs.get_design_requirements().get_application();
     // DesignRequirements.application is a plain JSON string in the new PEAS-backed schema.
     bool isSuppression = reqAppOpt.has_value() && reqAppOpt.value() == "interferenceSuppression";
+    // Candidates whose turn/gap sizing throws (e.g. an unreachable high-Lm transformer target whose
+    // gap solve leaves a degenerate gap -> GAP_INVALID_DIMENSIONS "Gap Area is not set", abt #53) are
+    // INFEASIBLE, not fatal: collect them and erase after the loop so the advise still returns the
+    // sizable cores instead of aborting the whole call.
+    std::vector<size_t> indexesToEraseForSizing;
     for (size_t i = 0; i < (*magneticsWithScoring).size(); ++i){
+      try {
 
         Core core = (*magneticsWithScoring)[i].first.get_core();
         if (!core.get_processed_description()) {
@@ -550,7 +592,18 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
                 double bMax = maximum_allowed_magnetic_flux_density(bSatRaw);
                 double nFromSaturation = magnetizingInductance
                     .calculate_turns_from_volt_seconds_and_max_flux_density(core, maxVoltSeconds, bMax);
-                initialNumberTurns = nFromSaturation > 0 ? nFromSaturation : 5;
+                // ABT #121.4: no fabricated turn seed. A non-positive result means the
+                // inputs are unusable (zero volt-seconds from missing excitation, or a
+                // non-positive allowed flux ceiling) — reject the candidate loudly (the
+                // per-candidate sizing catch below drops it) instead of designing a
+                // fictitious 5-turn transformer.
+                if (nFromSaturation <= 0) {
+                    throw InvalidInputException(ErrorCode::MISSING_DATA,
+                        "Transformer turn seeding: volt-seconds solver returned no turns (maxVoltSeconds=" +
+                        std::to_string(maxVoltSeconds) + ", bMax=" + std::to_string(bMax) +
+                        ") for core " + core.get_name().value_or("?"));
+                }
+                initialNumberTurns = nFromSaturation;
 
                 // For resonant transformers with a specific Lm target
                 // (e.g. CLLLC, CLLC) we must size BOTH N and the gap so
@@ -603,9 +656,29 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
                             .calculate_gapping_from_number_turns_and_inductance(
                                 core, tempCoil, &lmInputs, GappingType::GROUND);
                         if (!gaps.empty()) {
-                            core.set_gapping(gaps);
-                            core.process_gap();
-                            (*magneticsWithScoring)[i].first.set_core(core);
+                            Core gappedCore = core;
+                            gappedCore.set_gapping(gaps);
+                            // process_gap() returns false when the solved gap is
+                            // too long to fit the core's column: it then leaves the
+                            // gap AREA unset. Committing such a degenerate CoreGap
+                            // makes the downstream inductance/saturation filters (or
+                            // the reluctance model) throw GAP_INVALID_DIMENSIONS
+                            // ("Gap Area is not set"), which tunnels out of the fast
+                            // advise (ABT #41). Only adopt the gap when it physically
+                            // fits; otherwise leave the core ungapped so the
+                            // inductance filter culls this candidate cleanly.
+                            if (gappedCore.process_gap()) {
+                                core = gappedCore;
+                                (*magneticsWithScoring)[i].first.set_core(core);
+                            }
+                            else {
+                                logEntry(std::string("Transformer gap of ")
+                                         + std::to_string(gaps[0].get_length())
+                                         + " m does not fit core "
+                                         + core.get_name().value_or("?")
+                                         + " — leaving ungapped (inductance filter will cull)",
+                                         "CoreAdviser", 2);
+                            }
                         }
                     } catch (const std::exception& e) {
                         // Solver failed (e.g. target Lm unreachable with this
@@ -669,7 +742,14 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
                         Magnetic seeded = (*magneticsWithScoring)[i].first;
                         seeded.get_mutable_coil().get_mutable_functional_description()[0].set_number_turns(static_cast<int64_t>(std::llround(initialNumberTurns)));
                         try { seededIsat = seeded.calculate_saturation_current(temperature, /*proportion=*/false); }
-                        catch (const std::exception&) { seededIsat = std::nullopt; }
+                        catch (const std::exception& e) {
+                            // ABT #121.4: was silent — the saturation-aware re-gap is
+                            // skipped for this candidate, so say so.
+                            logEntry(std::string("Inductor seeding: saturation current failed for core ") +
+                                     core.get_name().value_or("?") + ": " + e.what() +
+                                     " — saturation-aware re-gap skipped", "CoreAdviser", 2);
+                            seededIsat = std::nullopt;
+                        }
                     }
 
                     if (seededIsat && seededIsat.value() > 0 && seededIsat.value() < requiredIsat) {
@@ -714,6 +794,15 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
                             core = acceptedCore;
                             (*magneticsWithScoring)[i].first.set_core(core);
                         }
+                        else {
+                            // ABT #121.4: was silent — the candidate proceeds with the
+                            // seeded N and an unmet Isat requirement; the saturation
+                            // filter downstream is the remaining gate.
+                            logEntry(std::string("Inductor seeding: saturation-aware re-gap search failed for core ") +
+                                     core.get_name().value_or("?") +
+                                     " (required Isat=" + std::to_string(requiredIsat) +
+                                     " A) — proceeding with seeded turns, saturation filter must gate", "CoreAdviser", 2);
+                        }
                     }
                 }
             }
@@ -725,57 +814,18 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
         }
 
         (*magneticsWithScoring)[i].first.get_mutable_coil().get_mutable_functional_description()[0].set_number_turns(initialNumberTurns);
+      }
+      catch (const OpenMagneticsException&) {
+        indexesToEraseForSizing.push_back(i);  // abt #53: drop a candidate whose sizing throws
+      }
+    }
+    for (auto it = indexesToEraseForSizing.rbegin(); it != indexesToEraseForSizing.rend(); ++it) {
+        (*magneticsWithScoring).erase((*magneticsWithScoring).begin() + *it);
     }
 }
 
-std::vector<std::pair<Magnetic, double>> add_initial_turns_by_impedance(std::vector<std::pair<Magnetic, double>> magneticsWithScoring, const Inputs& inputs) {
-    Impedance impedance;
-    std::vector<std::pair<Magnetic, double>> magneticsWithScoringAndTurns;
-    for (size_t i = 0; i < magneticsWithScoring.size(); ++i){
-        auto [magnetic, scoring] = magneticsWithScoring[i];
-        Core core = magnetic.get_core();
-        if (!core.get_processed_description()) {
-            core.process_data();
-            core.process_gap();
-        }
-        Bobbin bobbin;
-        if (inputs.get_wiring_technology() == WiringTechnology::PRINTED) {
-            bobbin = Bobbin::create_quick_bobbin(core, true);
-        }
-        else {
-            bobbin = Bobbin::create_quick_bobbin(core);
-        }
-        magnetic.get_mutable_coil().set_bobbin(bobbin);
-
-        double initialNumberTurns = magnetic.get_coil().get_functional_description()[0].get_number_turns();
-
-        try {
-            initialNumberTurns = impedance.calculate_minimum_number_turns(magnetic, inputs);
-            if (initialNumberTurns < 1) {
-                logEntry("add_initial_turns_by_impedance: core " + core.get_name().value_or("?") + " returned turns=" + std::to_string(initialNumberTurns) + ", skipping", "CoreAdviser", 2);
-                continue;
-            }
-        }
-        catch (const std::exception& e) {
-            logEntry(std::string("add_initial_turns_by_impedance: core ") + core.get_name().value_or("?") + " threw: " + e.what(), "CoreAdviser", 2);
-            continue;
-        }
-        catch (...) {
-            logEntry("add_initial_turns_by_impedance: core " + core.get_name().value_or("?") + " threw unknown exception", "CoreAdviser", 2);
-            continue;
-        }
-        if (inputs.get_design_requirements().get_turns_ratios().size() > 0) {
-            NumberTurns numberTurns(initialNumberTurns, inputs.get_design_requirements());
-            auto numberTurnsCombination = numberTurns.get_next_number_turns_combination();
-            initialNumberTurns = numberTurnsCombination[0];
-        }
-
-        magnetic.get_mutable_coil().get_mutable_functional_description()[0].set_number_turns(initialNumberTurns);
-        magneticsWithScoringAndTurns.push_back({magnetic, scoring});
-    }
-
-    return magneticsWithScoringAndTurns;
-}
+// NOTE (July 2026 health pass): the never-called add_initial_turns_by_impedance was
+// removed (impedance-driven turn seeding lives in the CMC pipeline now).
 
 void add_alternative_materials(std::vector<std::pair<Magnetic, double>> *magneticsWithScoring, Inputs inputs) {
     CoreMaterialCrossReferencer coreMaterialCrossReferencer(std::map<std::string, std::string>{{"coreLosses", "Steinmetz"}});

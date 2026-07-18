@@ -2,12 +2,30 @@
 #include "support/Settings.h"
 #include "processors/CircuitSimulatorInterface.h"
 #include <magic_enum.hpp>
+#include <cstdlib>
+#include <filesystem>
+#include <source_location>
 
 namespace OpenMagnetics {
 
     Settings& Settings::GetInstance()
     {
-        static Settings instance;
+        // ABT #113: one Settings instance PER THREAD. Every thread that calls
+        // into MKF sees its own configuration, so concurrent adviser runs can
+        // not observe each other's mid-computation Settings mutations (the
+        // SettingsGuard/RAII patterns all become thread-confined).
+        //
+        // WRINKLE: a freshly spawned worker thread starts with a
+        // DEFAULT-CONSTRUCTED Settings, NOT a copy of the spawning thread's.
+        // Workers that must inherit the parent configuration copy it
+        // explicitly at thread start:
+        //
+        //     const Settings parentSnapshot = Settings::GetInstance(); // parent
+        //     std::thread worker([parentSnapshot] {
+        //         Settings::GetInstance() = parentSnapshot;            // worker
+        //         ...
+        //     });
+        static thread_local Settings instance;
         return instance;
     }
 
@@ -21,6 +39,10 @@ namespace OpenMagnetics {
         // Initialize centralized model configuration from defaults
         _magneticFieldStrengthModel = defaults.magneticFieldStrengthModelDefault;
         _magneticFieldStrengthFringingEffectModel = defaults.magneticFieldStrengthFringingEffectModelDefault;
+        // Same ctor/reset asymmetry class as the stray-capacitance flag fixed in 0929c972:
+        // reset() sets this but the constructor didn't, leaving it indeterminate until the
+        // first reset() while LeakageInductance reads it on every calculation.
+        _leakageInductanceMagneticFieldStrengthModel = MagneticFieldStrengthModels::BINNS_LAWRENSON;  // BINNS works best for leakage (no fringing)
         _reluctanceModel = defaults.reluctanceModelDefault;
         _coreTemperatureModel = defaults.coreTemperatureModelDefault;
         _coreThermalResistanceModel = defaults.coreThermalResistanceModelDefault;
@@ -74,6 +96,8 @@ namespace OpenMagnetics {
 
         _useOnlyCoresInStock = true;
         _usePowderCores = true;
+        _corePerColumnWindingWindows = false;
+        _coilAdviserAllowLateralPlacement = false;
         _gappingStrategy = GappingOptimizationStrategy::SIMPLE;
         _nanocrystallineStackingFactor = 0.80;
     _effectiveParameterStandard = EffectiveParameterStandard::IEC_60205;
@@ -105,7 +129,7 @@ namespace OpenMagnetics {
         _painterColorLines = "0x010000";
         _painterColorText = "0x000000";
         _painterColorCurrentDensity = "0x0892D0";
-        _painterCciCoordinatesPath = std::string{selfFilePath}.substr(0, std::string{selfFilePath}.rfind("/")).append("/../../cci_coords/coordinates/");
+        _painterCciCoordinatesPath = std::nullopt;  // resolved at use time, see get_painter_cci_coordinates_path
         _painterColorMagneticFieldMinimum = "0x2b35f5";
         _painterColorMagneticFieldMaximum = "0xe84922";
         _painterMagneticFieldStrengthModel = std::nullopt;
@@ -174,6 +198,8 @@ namespace OpenMagnetics {
         _circuitSimulatorFracpoleOptions = std::nullopt;
         _circuitSimulatorIncludeSaturation = false;
         _circuitSimulatorIncludeMutualResistance = false;
+        _circuitSimulatorIncludeStrayCapacitance = true;
+        _circuitSimulatorIncludeSteinmetzCoreLoss = false;
         _circuitSimulatorCoreLossTopology = 1;
 
         if (previousToroidalCores != _useToroidalCores
@@ -326,6 +352,20 @@ namespace OpenMagnetics {
         _usePowderCores = value;
     }
 
+    bool Settings::get_core_per_column_winding_windows() const {
+        return _corePerColumnWindingWindows;
+    }
+    void Settings::set_core_per_column_winding_windows(bool value) {
+        _corePerColumnWindingWindows = value;
+    }
+
+    bool Settings::get_coil_adviser_allow_lateral_placement() const {
+        return _coilAdviserAllowLateralPlacement;
+    }
+    void Settings::set_coil_adviser_allow_lateral_placement(bool value) {
+        _coilAdviserAllowLateralPlacement = value;
+    }
+
     EffectiveParameterStandard Settings::get_effective_parameter_standard() const {
         return _effectiveParameterStandard;
     }
@@ -474,7 +514,55 @@ namespace OpenMagnetics {
     }
 
     std::string Settings::get_painter_cci_coordinates_path() const {
-        return _painterCciCoordinatesPath;
+        // Resolution order (first hit wins). Note the painter itself no longer
+        // reads coordinate FILES for N <= 1000 strands — those are embedded at
+        // build time (CciCoordinatesData) — so this path only matters to
+        // consumers that explicitly ask for the on-disk coordinate catalog.
+        //
+        // 1) Explicit set_painter_cci_coordinates_path() — caller's word is law.
+        if (_painterCciCoordinatesPath) {
+            return _painterCciCoordinatesPath.value();
+        }
+        auto withTrailingSeparator = [](std::string path) {
+            if (!path.empty() && path.back() != '/' && path.back() != '\\') {
+                path.push_back('/');
+            }
+            return path;
+        };
+        // 2) Environment override for relocated installs (wheels, prod hosts).
+        //    Pointing it at a missing directory is a hard error, not a fallthrough.
+        if (const char* environmentPath = std::getenv("MKF_CCI_COORDINATES_PATH")) {
+            if (!std::filesystem::is_directory(environmentPath)) {
+                throw std::runtime_error(
+                    "MKF_CCI_COORDINATES_PATH is set to '" + std::string(environmentPath) +
+                    "' but that is not an existing directory.");
+            }
+            return withTrailingSeparator(environmentPath);
+        }
+        // 3) Dev checkout: <this file's dir>/../../cci_coords/coordinates/ —
+        //    the historical default, but now only if it actually exists on THIS
+        //    machine (the old code baked the BUILD machine's absolute path into
+        //    the value, breaking relocated wheels/WASM).
+        const std::string selfFilePath = std::source_location::current().file_name();
+        auto lastSeparator = selfFilePath.find_last_of("/\\");
+        if (lastSeparator != std::string::npos) {
+            std::string sourceCandidate =
+                selfFilePath.substr(0, lastSeparator) + "/../../cci_coords/coordinates/";
+            if (std::filesystem::is_directory(sourceCandidate)) {
+                return sourceCandidate;
+            }
+        }
+        // 4) Current working directory.
+        std::string cwdCandidate = "cci_coords/coordinates/";
+        if (std::filesystem::is_directory(cwdCandidate)) {
+            return withTrailingSeparator(std::filesystem::absolute(cwdCandidate).string());
+        }
+        // 5) Loudly refuse to guess.
+        throw std::runtime_error(
+            "CCI coordinates directory not found. Set it explicitly with "
+            "set_painter_cci_coordinates_path(), export MKF_CCI_COORDINATES_PATH, or run "
+            "from a directory containing cci_coords/coordinates/. (Strand counts up to "
+            "1000 use build-time embedded coordinates and do not need this path.)");
     }
     void Settings::set_painter_cci_coordinates_path(std::string value) {
         _painterCciCoordinatesPath = value;
@@ -897,6 +985,20 @@ namespace OpenMagnetics {
     }
     void Settings::set_circuit_simulator_include_mutual_resistance(bool value) {
         _circuitSimulatorIncludeMutualResistance = value;
+    }
+
+    bool Settings::get_circuit_simulator_include_stray_capacitance() const {
+        return _circuitSimulatorIncludeStrayCapacitance;
+    }
+    void Settings::set_circuit_simulator_include_stray_capacitance(bool value) {
+        _circuitSimulatorIncludeStrayCapacitance = value;
+    }
+
+    bool Settings::get_circuit_simulator_include_steinmetz_core_loss() const {
+        return _circuitSimulatorIncludeSteinmetzCoreLoss;
+    }
+    void Settings::set_circuit_simulator_include_steinmetz_core_loss(bool value) {
+        _circuitSimulatorIncludeSteinmetzCoreLoss = value;
     }
 
     int Settings::get_circuit_simulator_core_loss_topology() const {

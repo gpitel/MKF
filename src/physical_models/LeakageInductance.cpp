@@ -1,6 +1,8 @@
 #include "support/CoilMesher.h"
 #include "physical_models/MagneticField.h"
 #include "physical_models/LeakageInductance.h"
+#include "physical_models/ReluctanceNetwork.h"
+#include "physical_models/Reluctance.h"
 #include "MAS.hpp"
 #include "support/Utils.h"
 #include "json.hpp"
@@ -55,17 +57,6 @@ std::pair<size_t, size_t> LeakageInductance::calculate_number_points_needed_for_
         numberPointsY = size_t(ceil(windingWindowsDimensions[1] / minimumDistanceVerticallyOrAngular));
     }
 
-    // Cap the grid resolution. The spacing above is the smallest turn dimension, so a thin
-    // conductor (e.g. a foil or planar turn) can drive it to a very fine grid (tens of
-    // thousands of points) — and this field solve runs once per winding, so on a large
-    // multi-winding coil it dominates the leakage cost (billions of field-pair evaluations).
-    // The leakage field is smooth on the mm scale of the winding sections, so the energy
-    // integral converges far below that density: capping to ~100/dimension changes the
-    // leakage energy by well under 1%.
-    constexpr size_t maximumNumberPointsPerDimension = 100;
-    numberPointsX = std::min(numberPointsX, maximumNumberPointsPerDimension);
-    numberPointsY = std::min(numberPointsY, maximumNumberPointsPerDimension);
-
     return {numberPointsX, numberPointsY};
 }
 
@@ -107,7 +98,11 @@ std::pair<ComplexField, double> LeakageInductance::calculate_magnetic_field(Oper
     }
     auto turns = magnetic.get_coil().get_turns_description().value();
 
-    if (turns[0].get_additional_coordinates()) {
+    // Toroid-only outer-half stitching: concentric multi-window turns now also carry
+    // additional coordinates (their second crossing), but this radius-gated overwrite
+    // is derived for the round bore geometry — rectangular windows must skip it.
+    if (turns[0].get_additional_coordinates() &&
+        magnetic.get_mutable_coil().resolve_bobbin().get_winding_window_shape() == WindingWindowShape::ROUND) {
         for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
             if (turns[turnIndex].get_additional_coordinates()) {
                 turns[turnIndex].set_coordinates(turns[turnIndex].get_additional_coordinates().value()[0]);
@@ -142,8 +137,36 @@ LeakageInductanceOutput LeakageInductance::calculate_leakage_inductance(Magnetic
             "(effective parameters/shape unresolved). Run magnetic autocomplete / process the core first.");
     }
 
-    auto originallyIncludeFringing = settings.get_magnetic_field_include_fringing();
-    settings.set_magnetic_field_include_fringing(false);
+    // Multi-column winding: the window-energy method below integrates the field of ONE
+    // window revolved around the main column — meaningless for a winding pair sitting
+    // on different columns, whose leakage flux closes through the other window and the
+    // air outside the core. Use the per-column reluctance network's short-circuit
+    // inductance (L_ss − L_sd²/L_dd, referred to the source): the magnetic-circuit
+    // leakage between leg-separated windings.
+    if (ReluctanceNetwork::has_non_main_placement(magnetic)) {
+        auto columnIndexPerWinding = ReluctanceNetwork::resolve_winding_column_indexes(magnetic);
+        if (columnIndexPerWinding[sourceIndex] != columnIndexPerWinding[destinationIndex]) {
+            auto reluctanceModel = ReluctanceModel::factory();
+            auto reluctanceOutput = reluctanceModel->get_core_reluctance(magnetic.get_mutable_core(), std::optional<OperatingPoint>(std::nullopt));
+            ReluctanceNetwork reluctanceNetwork(magnetic.get_core(), reluctanceOutput.get_ungapped_core_reluctance().value(),
+                                                reluctanceOutput.get_reluctance_per_gap().value_or(std::vector<AirGapReluctanceOutput>{}));
+            auto inductanceMatrix = reluctanceNetwork.calculate_magnetizing_inductance_matrix(magnetic);
+            double shortCircuitInductance = inductanceMatrix[sourceIndex][sourceIndex] -
+                                            inductanceMatrix[sourceIndex][destinationIndex] * inductanceMatrix[sourceIndex][destinationIndex] /
+                                                inductanceMatrix[destinationIndex][destinationIndex];
+            LeakageInductanceOutput leakageInductanceOutput;
+            leakageInductanceOutput.set_method_used("ReluctanceNetwork");
+            leakageInductanceOutput.set_origin(ResultOrigin::SIMULATION);
+            DimensionWithTolerance dimensionWithTolerance;
+            dimensionWithTolerance.set_nominal(shortCircuitInductance);
+            leakageInductanceOutput.set_leakage_inductance_per_winding({dimensionWithTolerance});
+            return leakageInductanceOutput;
+        }
+    }
+
+    // RAII: any throw between the manual set/restore pair (several are right below) used
+    // to leave fringing globally disabled for the rest of the process.
+    SettingsGuard<bool> fringingGuard(settings, &Settings::get_magnetic_field_include_fringing, &Settings::set_magnetic_field_include_fringing, false);
 
     auto bobbin = magnetic.get_mutable_coil().resolve_bobbin();
     if (!bobbin.get_processed_description()){
@@ -184,13 +207,13 @@ LeakageInductanceOutput LeakageInductance::calculate_leakage_inductance(Magnetic
     dimensionWithTolerance.set_nominal(leakageInductance);
     leakageInductanceOutput.set_leakage_inductance_per_winding({dimensionWithTolerance});
 
-    settings.set_magnetic_field_include_fringing(originallyIncludeFringing);
-
     return leakageInductanceOutput;
 }
 
 ComplexField LeakageInductance::calculate_leakage_magnetic_field(Magnetic magnetic, double frequency, size_t sourceIndex, size_t destinationIndex, size_t harmonicIndex) {
-    settings.set_magnetic_field_include_fringing(false);
+    // RAII: this function never restored the flag at all — one call permanently
+    // disabled fringing for every later field computation in the process.
+    SettingsGuard<bool> fringingGuard(settings, &Settings::get_magnetic_field_include_fringing, &Settings::set_magnetic_field_include_fringing, false);
 
     auto bobbin = magnetic.get_mutable_coil().resolve_bobbin();
     if (!bobbin.get_processed_description()){
@@ -290,8 +313,8 @@ double LeakageInductance::calculate_leakage_field_energy(Magnetic magnetic, cons
             ") does not match number of windings (" + std::to_string(numberWindings) + ")");
     }
 
-    auto originallyIncludeFringing = settings.get_magnetic_field_include_fringing();
-    settings.set_magnetic_field_include_fringing(false);
+    // RAII guard (see calculate_leakage_inductance above).
+    SettingsGuard<bool> fringingGuard(settings, &Settings::get_magnetic_field_include_fringing, &Settings::set_magnetic_field_include_fringing, false);
 
     auto bobbin = magnetic.get_mutable_coil().resolve_bobbin();
     if (!bobbin.get_processed_description()){
@@ -317,7 +340,6 @@ double LeakageInductance::calculate_leakage_field_energy(Magnetic magnetic, cons
 
     double energy = integrate_leakage_energy(magnetic, field, dA);
 
-    settings.set_magnetic_field_include_fringing(originallyIncludeFringing);
     return energy;
 }
 

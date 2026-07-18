@@ -1,6 +1,7 @@
 #include "physical_models/MagnetizingInductance.h"
 
 #include "processors/Inputs.h"
+#include "physical_models/ReluctanceNetwork.h"
 #include "physical_models/MagneticField.h"
 #include "physical_models/Reluctance.h"
 #include "support/Settings.h"
@@ -279,6 +280,37 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
             break;
         }
     } while (fabs(currentMagnetizingInductance - modifiedMagnetizingInductance) / modifiedMagnetizingInductance >= 0.1);
+
+    // Multi-column winding placement: the lumped N²/R model assumes the primary links
+    // the main-column flux. When any winding is placed on another column, rebuild the
+    // driving-point magnetizing inductance of the primary from the per-column
+    // reluctance network at the converged permeability.
+    {
+        Magnetic magneticForPlacement;
+        magneticForPlacement.set_core(core);
+        magneticForPlacement.set_coil(coil);
+        if (ReluctanceNetwork::has_non_main_placement(magneticForPlacement)) {
+            ReluctanceNetwork magneticCircuit(core, magnetizingInductanceOutput.get_ungapped_core_reluctance().value(),
+                                            magnetizingInductanceOutput.get_reluctance_per_gap().value_or(std::vector<AirGapReluctanceOutput>{}));
+            auto inductanceMatrix = magneticCircuit.calculate_magnetizing_inductance_matrix(magneticForPlacement);
+            modifiedMagnetizingInductance = inductanceMatrix[0][0];
+
+            // Per-column flux density: the driven column carries the full
+            // driving-point flux through ITS area. The lumped B = Φ/Ae both uses the
+            // wrong reluctance for a lateral-driven leg and averages over the
+            // effective area; saturation is checked in the actual column.
+            if (operatingPoint && operatingPoint->get_mutable_excitations_per_winding().size() > 0 &&
+                operatingPoint->get_mutable_excitations_per_winding()[0].get_magnetizing_current()) {
+                auto columnIndexPerWinding = ReluctanceNetwork::resolve_winding_column_indexes(magneticForPlacement);
+                double drivenColumnArea = core.get_columns()[columnIndexPerWinding[0]].get_area();
+                double drivingPointReluctance = pow(numberTurnsPrimary, 2) / modifiedMagnetizingInductance;
+                auto magneticFlux = OpenMagnetics::MagneticField::calculate_magnetic_flux(
+                    operatingPoint->get_mutable_excitations_per_winding()[0].get_magnetizing_current().value(),
+                    drivingPointReluctance, numberTurnsPrimary);
+                result.second = OpenMagnetics::MagneticField::calculate_magnetic_flux_density(magneticFlux, drivenColumnArea);
+            }
+        }
+    }
 
     if (operatingPoint) {
         if (operatingPoint->get_mutable_excitations_per_winding().size() > 0) {

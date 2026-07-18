@@ -86,36 +86,59 @@ void check_top_n(const std::string& label,
 // ----------------------------------------------------------------------------
 // SNAPSHOTS — captured 2026-05-19. Leave a vector empty to auto-harvest.
 // ----------------------------------------------------------------------------
+// Refreshed 2026-07-07 (ABT #118 loss-factor band clamp, user-approved re-pin):
+// the interpolation no longer extrapolates a material's loss factor beyond its
+// measured frequency band, so materials whose scores rode on extrapolated
+// (lower) loss values lose that unearned advantage. FerriteDefault: same
+// ranking, ~1e-6 drifts. FerriteOnlyTdk: slots 4-5 change (N27/N92 -> N51/N41),
+// scores ~2%. PowderDefault: Kool Mu Ultra 26 drops from slot 2 to slot 5.
+// PowderOnlyMicrometals: SM 40 and SM 60 swap slots 1-2. Regenerated with
+// kRegenerateBaselines on main 17e1f850.
+// Re-baselined 2026-07-14 (ABT #224 + advance MAS to latest main 489ddd9, user-approved re-pin).
+// The MAS bump is 232c2f0 (TDG import) -> latest main: it also adds Changsung (CSC) powder cores,
+// Ferroxcube 3E/3F37, TDK PC40/PC44/PC90, VAC nanocrystalline (ABT #213-216, #189). Effects:
+// FerriteDefault: TPW33 (new TDG DMR95-class MnZn) is slot 0 — at 25 °C its μr (3325) tracks 3C97
+//   (3341) even closer than DMR95 (3480) with identical saturation & losses. Slots 1-3 unchanged;
+//   slot 4 is now "T" (new Magnetics MnZn power ferrite), a marginally closer match than P492.
+// FerriteOnlyTdk: N95 overtakes PC47 at slot 0. The previous PC47 pin's justification compared
+//   permeabilities at MISMATCHED temperatures (each material's first datasheet point: 3C97 at
+//   -40 °C, PC47/N95 at -60 °C). At the actual 25 °C evaluation 3C97≈3341, N95≈3008 (closer),
+//   PC47≈2330, and N95 is also closer on volumetric losses (both weight-1 filters) — so N95 is
+//   the correct 25 °C match. Slots 1-3 unchanged; slot 4 is now PC44 (new TDK power ferrite).
+// PowderDefault: CSC Sendust 26 (Changsung Sendust, same FeSiAl alloy and μ=26 as the Kool Mµ MAX
+//   26 reference) takes slot 0 as a near-identical same-family match. NPH-L 26 (Poco High-Flux)
+//   also participates now that the curie-NaN crash is fixed (6 Poco NPN/NPU materials gained
+//   curieTemperature in MAS). Kool Mµ MAX 40 falls off the top-5.
 const std::vector<TopEntry> kTopFerriteDefault = {
-    {"DMR95", 2.7229156168842046},
-    {"P45",   2.7216465717490372},
-    {"3C95",  2.7144645242903547},
-    {"P492",  2.7032348169719453},
-    {"P452",  2.6934204788417202},
+    {"TPW33", 2.7280204415116578},
+    {"DMR95", 2.7229069637902059},
+    {"P45",   2.7216369780206886},
+    {"3C95",  2.7144498861636723},
+    {"T",     2.71339927430376},
 };
 
 const std::vector<TopEntry> kTopFerriteOnlyTdk = {
-    {"PC47", 2.6839499384443108},
-    {"N95",  2.651360761361282},
-    {"N97",  2.5578230120884067},
-    {"N27",  2.4991932937788723},
-    {"N92",  2.4814549828497379},
+    {"N95",  2.556455278905954},
+    {"PC47", 2.4863443793547764},
+    {"N97",  2.4851490946728743},
+    {"N51",  2.458893344562656},
+    {"PC44", 2.4578606280817934},
 };
 
 const std::vector<TopEntry> kTopPowderDefault = {
-    {"Kool Mµ Hƒ 26",    2.7299983338570506},
-    {"Kool Mµ Ultra 26", 2.7299790326971172},
-    {"Kool Mµ 26",       2.7211505563536287},
-    {"Kool Mµ MAX 19",   2.7171791666466776},
-    {"Kool Mµ MAX 40",   2.7166417605966702},
+    {"CSC Sendust 26", 2.7250690223085345},
+    {"Kool Mµ Hƒ 26",  2.7212624022782093},
+    {"Kool Mµ 26",     2.7211505563536287},
+    {"NPH-L 26",       2.7191529873382989},
+    {"Kool Mµ MAX 19", 2.7171791666466776},
 };
 
 const std::vector<TopEntry> kTopPowderOnlyMicrometals = {
-    {"SM 60", 2.6337004497830838},
-    {"SM 40", 2.6308271217456958},
-    {"SP 26", 2.6057980867714345},
-    {"SM 26", 2.5918014945962127},
-    {"OC 26", 2.5610286222647689},
+    {"SM 40", 2.6346308391155557},
+    {"SM 60", 2.6285960369736614},
+    {"SP 26", 2.6095998852559847},
+    {"SM 26", 2.5954523252716264},
+    {"OC 26", 2.5646142299287216},
 };
 
 } // namespace
@@ -125,7 +148,7 @@ const std::vector<TopEntry> kTopPowderOnlyMicrometals = {
 // =============================================================================
 
 TEST_CASE("CoreMaterialCrossReferencer 3C97 default top-5 snapshot",
-          "[adviser][core-material-cross-referencer][characterisation][ferrite-default]") {
+          "[adviser][core-material-cross-referencer][characterisation][heavy][ferrite-default]") {
     settings.reset();
     clear_databases();
 
@@ -137,7 +160,7 @@ TEST_CASE("CoreMaterialCrossReferencer 3C97 default top-5 snapshot",
 }
 
 TEST_CASE("CoreMaterialCrossReferencer 3C97 only-TDK top-5 snapshot",
-          "[adviser][core-material-cross-referencer][characterisation][only-tdk]") {
+          "[adviser][core-material-cross-referencer][characterisation][heavy][only-tdk]") {
     settings.reset();
     clear_databases();
 
@@ -149,7 +172,7 @@ TEST_CASE("CoreMaterialCrossReferencer 3C97 only-TDK top-5 snapshot",
 }
 
 TEST_CASE("CoreMaterialCrossReferencer Kool Mµ MAX 26 default top-5 snapshot",
-          "[adviser][core-material-cross-referencer][characterisation][powder-default]") {
+          "[adviser][core-material-cross-referencer][characterisation][heavy][powder-default]") {
     settings.reset();
     clear_databases();
 
@@ -160,7 +183,7 @@ TEST_CASE("CoreMaterialCrossReferencer Kool Mµ MAX 26 default top-5 snapshot",
 }
 
 TEST_CASE("CoreMaterialCrossReferencer Kool Mµ MAX 26 only-Micrometals top-5 snapshot",
-          "[adviser][core-material-cross-referencer][characterisation][only-micrometals]") {
+          "[adviser][core-material-cross-referencer][characterisation][heavy][only-micrometals]") {
     settings.reset();
     clear_databases();
 
