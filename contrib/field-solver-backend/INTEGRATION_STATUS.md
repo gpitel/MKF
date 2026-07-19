@@ -50,5 +50,11 @@ fixture ride the OpenMP CPU path). Wiring it needs Emscripten `-sASYNCIFY` and t
 - OpenMP pattern: **~5.5× at 20 threads, bit-exact** — standalone kernel bench
   (`fieldbench.cpp`, in the source deliverable). ✓
 - WebGPU: **~124×, matches f64 to 1.9e-8** (`webgpuFieldSolver.js` + Deno wgpu). ✓
-- **Pending:** native OpenMP bit-exact + speedup on the *integrated* loop with the
-  real field models (the standalone bench used the kernel in isolation).
+- Integrated loop, native OpenMP (2026-07-19): **bit-EXACT** (identical result hash
+  at 1 vs 20 threads) and **1.83×** (8849 ms → 4841 ms) on
+  `calculate_leakage_inductance` for the foil stress fixture. ✓ The 1.83× (vs the
+  kernel's ~6×) is Amdahl-limited: with the leakage grid cap in place the field solve
+  is ~half the cost, so the serial mesh-generation + energy-integral around it now
+  dominate. Threading is a **secondary** win on top of the grid cap, not a
+  replacement for it. Also confirmed by inspection: the field models set their state
+  once in setup (`MagneticField.cpp:345-357`) and only read it in the loop.
