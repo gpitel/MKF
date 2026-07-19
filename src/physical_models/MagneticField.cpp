@@ -657,7 +657,17 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
         }
         std::exception_ptr fieldSolveException;
 
-        #pragma omp parallel for schedule(dynamic)
+        // Only parallelise when the solve is large enough to amortise the OpenMP
+        // thread-pool spawn cost (~tens of ms). Below this, small designs regress
+        // (measured: a 29-turn transformer ran ~2.4x slower on 20 threads). The
+        // guard is the pair count of the O(N^2) sum below: induced grid points x
+        // inducing points. With the leakage grid cap in place most designs stay
+        // serial here; large multi-winding coils, where the field solve dominates,
+        // cross the threshold and parallelise.
+        const bool paralleliseFieldSolve =
+            static_cast<uint64_t>(inducedDataForHarmonic.size()) * inducingPointsForHarmonic.size() > 2000000ULL;
+
+        #pragma omp parallel for schedule(dynamic) if(paralleliseFieldSolve)
         for (size_t inducedPointIndex = 0; inducedPointIndex < inducedDataForHarmonic.size(); ++inducedPointIndex) {
           try {
             const auto& inducedFieldPoint = inducedDataForHarmonic[inducedPointIndex];
