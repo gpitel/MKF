@@ -616,7 +616,51 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
             }
         }
 
-        for (auto& inducedFieldPoint : inducedFields[harmonicIndex].get_data()) {
+        // --- parallelise the per-induced-point field solve -----------------------
+        // Each induced point's field is an independent sum over the inducing points,
+        // so the loop below is parallelised with OpenMP (a no-op when built without
+        // -fopenmp, e.g. the current WASM build). Three things make it thread-safe:
+        //   1. each iteration writes only its own fieldPoints[inducedPointIndex]
+        //      (pre-sized here, not push_back);
+        //   2. the ROSHEN/SULLIVAN fringing path lazily populates operatingPoint's
+        //      magnetizing current on first use (a shared mutation), so we force that
+        //      setup once here, before the parallel region;
+        //   3. exceptions must not escape an OpenMP region, so the body is wrapped in
+        //      try/catch and the first exception is rethrown after the loop.
+        const auto& inducedDataForHarmonic = inducedFields[harmonicIndex].get_data();
+        fieldPoints.resize(inducedDataForHarmonic.size());
+        {
+            bool albachRoutedGapsPending = _magneticFieldStrengthFringingEffectModel == MagneticFieldStrengthFringingEffectModels::ALBACH &&
+                                           !albachOutOfRangeGaps.empty();
+            if (!isAlbach && (_magneticFieldStrengthFringingEffectModel == MagneticFieldStrengthFringingEffectModels::ROSHEN ||
+                              _magneticFieldStrengthFringingEffectModel == MagneticFieldStrengthFringingEffectModels::SULLIVAN ||
+                              albachRoutedGapsPending)) {
+                if (includeFringing && std::abs(inducedFields[harmonicIndex].get_frequency() - operatingPoint.get_excitations_per_winding()[0].get_frequency()) <= 0.05 * operatingPoint.get_excitations_per_winding()[0].get_frequency()) {
+                    if (!operatingPoint.get_excitations_per_winding()[0].get_magnetizing_current()) {
+                        auto magnetizingInductance = MagneticSimulator().calculate_magnetizing_inductance(operatingPoint, magnetic);
+                        auto includeDcCurrent = Inputs::include_dc_offset_into_magnetizing_current(operatingPoint, magnetic.get_turns_ratios());
+                        auto magnetizingCurrent = Inputs::calculate_magnetizing_current(operatingPoint.get_mutable_excitations_per_winding()[0],
+                                                                                               resolve_dimensional_values(magnetizingInductance.get_magnetizing_inductance()),
+                                                                                               true, includeDcCurrent);
+                        operatingPoint.get_mutable_excitations_per_winding()[0].set_magnetizing_current(magnetizingCurrent);
+                    }
+                    if (!operatingPoint.get_excitations_per_winding()[0].get_magnetizing_current()->get_processed()) {
+                        auto excitations = operatingPoint.get_excitations_per_winding();
+                        auto magnetizingCurrent = excitations[0].get_magnetizing_current().value();
+                        auto processed = Inputs::calculate_basic_processed_data(magnetizingCurrent.get_waveform().value());
+                        magnetizingCurrent.set_processed(processed);
+                        excitations[0].set_magnetizing_current(magnetizingCurrent);
+                        operatingPoint.set_excitations_per_winding(excitations);
+                    }
+                }
+            }
+        }
+        std::exception_ptr fieldSolveException;
+
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t inducedPointIndex = 0; inducedPointIndex < inducedDataForHarmonic.size(); ++inducedPointIndex) {
+          try {
+            const auto& inducedFieldPoint = inducedDataForHarmonic[inducedPointIndex];
             double totalInducedFieldX = 0;
             double totalInducedFieldY = 0;
 
@@ -756,7 +800,14 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
             if (inducedFieldPoint.get_label()) {
                 complexFieldPoint.set_label(inducedFieldPoint.get_label().value());
             }
-            fieldPoints.push_back(complexFieldPoint);
+            fieldPoints[inducedPointIndex] = complexFieldPoint;
+          } catch (...) {
+            #pragma omp critical
+            { if (!fieldSolveException) fieldSolveException = std::current_exception(); }
+          }
+        }
+        if (fieldSolveException) {
+            std::rethrow_exception(fieldSolveException);
         }
         complexFieldPerHarmonic[harmonicIndex].set_data(fieldPoints);
     }
