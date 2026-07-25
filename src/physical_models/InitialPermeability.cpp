@@ -517,7 +517,7 @@ std::vector<size_t> InitialPermeability::get_only_frequency_dependent_indexes(Co
 
 std::vector<PermeabilityPoint> InitialPermeability::sample_initial_permeability_by_frequency_modifier(PermeabilityPoint permeabilityPoint) {
     std::vector<PermeabilityPoint> frequencyPoints;
-    InitialPermeabilitModifier modifiers = (*permeabilityPoint.get_modifiers())["default"];
+    InitialPermeabilitModifier modifiers = permeabilityPoint.get_modifiers() ? (*permeabilityPoint.get_modifiers())["default"] : InitialPermeabilitModifier();
     auto frequencies = logarithmic_spaced_array(defaults.measurementFrequency, defaults.maximumFrequency, 100);
     for (auto frequency : frequencies) {
         double initialPermeabilityValue = 1;
