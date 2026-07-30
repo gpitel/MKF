@@ -644,7 +644,7 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
         auto magneticFluxDensity = OpenMagnetics::MagneticField::calculate_magnetic_flux_density(magneticFlux, effectiveArea);
         auto magneticFieldStrength = OpenMagnetics::MagneticField::calculate_magnetic_field_strength(magneticFluxDensity, currentInitialPermeability);
 
-        modifiedInitialPermeability = initialPermeability.get_initial_permeability(core.resolve_material(), temperature, magneticFieldStrength.get_processed().value().get_mutable_offset(), frequency);
+        modifiedInitialPermeability = initialPermeability.get_initial_permeability(core.resolve_material(), temperature, magneticFieldStrength.get_processed().value().get_offset(), frequency);
 
         if (fabs(currentInitialPermeability - modifiedInitialPermeability) < 1 || timeout == 0) {
             break;

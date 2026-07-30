@@ -2526,7 +2526,7 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
 
     }
 
-    if (!bobbin.get_processed_description()->get_mutable_winding_windows()[0].get_sections_orientation()) {
+    if (!bobbin.get_processed_description()->get_winding_windows()[0].get_sections_orientation()) {
         auto processedDescription = bobbin.get_processed_description().value();
         if (configuration.contains("windingOrientation")) {
             WindingOrientation windingOrientation = WindingOrientation::CONTIGUOUS;
