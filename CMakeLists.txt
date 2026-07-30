@@ -411,9 +411,10 @@ echo 'WASM patches applied successfully'
     if(WIN32)
         target_link_libraries(ngspice INTERFACE ${NGSPICE_INSTALL_DIR}/lib/ngspice.lib)
     elseif(EMSCRIPTEN)
-        # Despite .so extension, this is a WASM static library when built with emscripten
-        # Use the symlink for version independence
-        target_link_libraries(ngspice INTERFACE ${NGSPICE_INSTALL_DIR}/lib/libngspice.so)
+        # --with-ngshared actually builds a shared wasm dylib (libngspice.so), which makes the
+        # final wasm loadDynamicLibrary('libngspice.so') at runtime (breaks the browser loader).
+        # Link the manually-assembled STATIC archive (libngspice.a) so ngspice is baked in.
+        target_link_libraries(ngspice INTERFACE ${NGSPICE_INSTALL_DIR}/lib/libngspice.a)
     else()
         target_link_libraries(ngspice INTERFACE ${NGSPICE_INSTALL_DIR}/lib/libngspice.so)
     endif()
@@ -630,8 +631,10 @@ ENDIF(HAVE_PLASMA)
 
 
 # On Windows, build as STATIC to avoid DLL boundary issues with inline globals
-# On other platforms, build as SHARED for better compatibility
-if(WIN32)
+# On other platforms, build as SHARED for better compatibility.
+# Under emscripten, STATIC too: a SHARED lib becomes a real wasm dylib, which forces -fPIC +
+# the MAIN_MODULE dynamic-linking runtime (loadDynamicLibrary) that the browser loader can't use.
+if(WIN32 OR EMSCRIPTEN)
     add_library(MKF STATIC ${SOURCES})
 else()
     add_library(MKF SHARED ${SOURCES})
