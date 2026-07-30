@@ -300,8 +300,18 @@ if(ENABLE_NGSPICE)
     if(EMSCRIPTEN)
         # Special configuration for WASM/Emscripten build
         # Based on ngspice patch #96: https://sourceforge.net/p/ngspice/patches/96/
-        # Using --with-ngshared produces a static lib (.so extension but actually WASM static lib)
-        # that provides the sharedspice.h API for WASM targets
+        # --with-ngshared gives us the sharedspice.h API, but note it really does
+        # build SHARED: libngspice.so is a genuine wasm dylib, not a static lib
+        # with a misleading extension. Adding --enable-static does not help --
+        # libtool hardcodes libngspice_la_LDFLAGS = -shared, so old_library
+        # stays empty and no archive is emitted.
+        #
+        # The emscripten link below therefore wants libngspice.a, which must be
+        # assembled by hand with an emar MRI script (expand libngspice_la_LIBADD
+        # via a make print rule to get the ~72 convenience .la archives, addlib
+        # each .libs/*.a, addmod the libngspice_la-*.o, then emranlib). Nothing
+        # in this file produces it yet, so a clean WASM build needs that step
+        # done out of band first.
         
         set(NGSPICE_CONFIGURE_FLAGS
             "--with-ngshared"
