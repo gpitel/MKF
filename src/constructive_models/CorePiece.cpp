@@ -1701,6 +1701,118 @@ class CorePieceUt : public CorePiece {
     }
 };
 
+class CorePieceUi : public CorePiece {
+  public:
+    // UI set = one U piece + one I plate. MAS dimensions: A total width,
+    // B U-piece height, B2 plate thickness, C depth, D window height,
+    // E window width, optional H leg width (defaults to (A - E) / 2).
+    // Unlike CorePieceU (one half of a mirrored UU set), this piece reports
+    // the ASSEMBLED core: full-circuit shape constants (no per-piece halving)
+    // and height B + B2, so Core's PIECE_AND_PLATE branch passes the values
+    // through without doubling (see Core.cpp).
+    double get_leg_width() {
+        auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
+        if (dimensions.find("H") == dimensions.end() || (roundFloat(dimensions["H"]) == 0)) {
+            return (dimensions["A"] - dimensions["E"]) / 2;
+        }
+        return dimensions["H"];
+    }
+
+    double get_plate_thickness() {
+        auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
+        if (dimensions.find("B2") == dimensions.end() || (roundFloat(dimensions["B2"]) == 0)) {
+            return dimensions["B"] - dimensions["D"];
+        }
+        return dimensions["B2"];
+    }
+
+    void process_winding_window() {
+        auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
+        WindingWindowElement windingWindow;
+        windingWindow.set_height(dimensions["D"]);
+        windingWindow.set_width(dimensions["E"]);
+        windingWindow.set_area(windingWindow.get_height().value() * windingWindow.get_width().value());
+        // Same centring convention as U/Ut/C pieces (ABT #107).
+        windingWindow.set_coordinates(std::vector<double>({(dimensions["A"] - dimensions["E"]) / 2 + dimensions["E"] / 2, 0}));
+        set_winding_window(windingWindow);
+    }
+
+    void process_extra_data() {
+        auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
+        set_width(dimensions["A"]);
+        set_height(dimensions["B"] + get_plate_thickness());
+        set_depth(dimensions["C"]);
+    }
+
+    void process_columns() {
+        auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
+        double legWidth = get_leg_width();
+        std::vector<ColumnElement> windingWindows;
+        ColumnElement mainColumn;
+        ColumnElement lateralColumn;
+        mainColumn.set_type(ColumnType::CENTRAL);
+        mainColumn.set_shape(ColumnShape::RECTANGULAR);
+        mainColumn.set_width(roundFloat(legWidth));
+        mainColumn.set_depth(roundFloat(dimensions["C"]));
+        mainColumn.set_height(roundFloat(dimensions["D"]));
+        mainColumn.set_area(roundFloat(mainColumn.get_width() * mainColumn.get_depth()));
+        mainColumn.set_coordinates({0, 0, 0});
+        windingWindows.push_back(mainColumn);
+        lateralColumn.set_type(ColumnType::LATERAL);
+        lateralColumn.set_shape(ColumnShape::RECTANGULAR);
+        lateralColumn.set_width(roundFloat(legWidth));
+        lateralColumn.set_depth(roundFloat(dimensions["C"]));
+        lateralColumn.set_height(roundFloat(dimensions["D"]));
+        lateralColumn.set_area(roundFloat(lateralColumn.get_width() * lateralColumn.get_depth()));
+        lateralColumn.set_coordinates({roundFloat((dimensions["A"] + dimensions["E"]) / 2), 0, 0});
+        windingWindows.push_back(lateralColumn);
+        set_columns(windingWindows);
+    }
+
+    std::tuple<double, double, double> get_shape_constants() {
+        auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
+        std::vector<double> lengths;
+        std::vector<double> areas;
+
+        double q = dimensions["C"];
+        double hTop = dimensions["B"] - dimensions["D"];  // U yoke thickness
+        double hPlate = get_plate_thickness();            // I plate thickness
+        double s = get_leg_width();
+
+        // Full closed circuit: two legs, U yoke, I plate, corner arcs
+        // (same corner-lumping convention as CorePieceUt).
+        lengths.push_back(dimensions["D"]);  // leg 1
+        lengths.push_back(dimensions["D"]);  // leg 2
+        lengths.push_back(dimensions["E"]);  // U yoke span
+        lengths.push_back(dimensions["E"]);  // plate span
+        lengths.push_back(std::numbers::pi / 4 * (s + hTop));    // corners into U yoke
+        lengths.push_back(std::numbers::pi / 4 * (s + hPlate));  // corners into plate
+
+        areas.push_back(s * q);       // leg 1
+        areas.push_back(s * q);       // leg 2
+        areas.push_back(hTop * q);    // U yoke
+        areas.push_back(hPlate * q);  // plate
+        areas.push_back((areas[0] + areas[2]) / 2);
+        areas.push_back((areas[0] + areas[3]) / 2);
+
+        double c1 = 0, c2 = 0;
+        for (size_t i = 0; i < lengths.size(); ++i) {
+            c1 += lengths[i] / areas[i];
+            c2 += lengths[i] / pow(areas[i], 2);
+        }
+        auto minimumArea = *min_element(areas.begin(), areas.end());
+
+        return {c1, c2, minimumArea};
+    }
+
+    std::tuple<double, double, double> get_shape_constants_iec63182() override {
+        auto [c1, c2, minimumArea] = get_shape_constants();
+        double le = pow(c1, 2) / c2;
+        double Ae = c1 / c2;
+        return {le, Ae, minimumArea};
+    }
+};
+
 class CorePieceT : public CorePiece {
   public:
     void process_extra_data() {
@@ -2022,6 +2134,13 @@ std::shared_ptr<CorePiece> CorePiece::factory(CoreShape shape, bool process) {
             piece->process();
         return piece;
     }
+    else if (family == CoreShapeFamily::UI) {
+        auto piece = std::make_shared<CorePieceUi>();
+        piece->set_shape(shape);
+        if (process)
+            piece->process();
+        return piece;
+    }
     else if (family == CoreShapeFamily::T) {
         auto piece = std::make_shared<CorePieceT>();
         piece->set_shape(shape);
@@ -2038,7 +2157,7 @@ std::shared_ptr<CorePiece> CorePiece::factory(CoreShape shape, bool process) {
     }
     else
         throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Unknown shape family: " + to_string(family) + ", available options are: {E, EC, EFD, EL, EP, EPX, LP, EQ, ER, "
-                                 "ETD, P, PLANAR_E, PLANAR_EL, PLANAR_ER, PM, PQ, RM, U, UR, UT, T, C}");
+                                 "ETD, P, PLANAR_E, PLANAR_EL, PLANAR_ER, PM, PQ, RM, U, UI, UR, UT, T, C}");
 }
 
 // ============================================================================

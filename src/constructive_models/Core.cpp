@@ -1407,8 +1407,25 @@ void Core::process_data() {
             processedDescription.set_height(corePiece->get_height() * 2);
             processedDescription.set_width(corePiece->get_width());
             break;
-        case CoreType::PIECE_AND_PLATE:
-            // FIX M-7: Placeholder for PIECE_AND_PLATE — approximating as TWO_PIECE_SET
+        case CoreType::PIECE_AND_PLATE: {
+            auto pieceFamily = std::get<CoreShape>(get_functional_description().get_shape()).get_family();
+            if (pieceFamily == CoreShapeFamily::UI) {
+                // CorePieceUi reports the ASSEMBLED core (full-circuit shape
+                // constants, height B + B2, winding window D x E), so pass the
+                // piece values through unchanged — the plate is flat and adds
+                // no winding window or column height.
+                processedDescription.set_columns(coreColumns);
+                processedDescription.set_effective_parameters(coreEffectiveParameters);
+                processedDescription.get_mutable_winding_windows().push_back(coreWindingWindow);
+                if (settings.get_core_per_column_winding_windows()) {
+                    appendPerColumnWindingWindows(processedDescription);
+                }
+                processedDescription.set_depth(corePiece->get_depth());
+                processedDescription.set_height(corePiece->get_height());
+                processedDescription.set_width(corePiece->get_width());
+                break;
+            }
+            // FIX M-7: Placeholder for other PIECE_AND_PLATE families — approximating as TWO_PIECE_SET
             for (auto& column : coreColumns) {
                 column.set_height(2 * column.get_height());
             }
@@ -1426,6 +1443,7 @@ void Core::process_data() {
             processedDescription.set_height(corePiece->get_height() * 2);
             processedDescription.set_width(corePiece->get_width());
             break;
+        }
         default:
             throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Unknown type of core, available options are {TOROIDAL, TWO_PIECE_SET}");
     }
