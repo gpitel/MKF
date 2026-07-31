@@ -18,6 +18,35 @@
 
 namespace OpenMagnetics {
 
+namespace {
+
+// Read the "default" permeability modifier without needing a mutable map.
+//
+// quicktype generates PermeabilityPoint's accessors differently across
+// versions: some emit get_modifiers() returning the optional BY VALUE plus a
+// get_mutable_modifiers(), others return a CONST REFERENCE and emit no mutable
+// getter at all. So map::operator[] compiles under one and not the other, and
+// get_mutable_modifiers() is not always available to fall back on. Copying the
+// optional and using find() works under every variant -- and copying matters,
+// because a by-value getter returns a temporary whose contents would dangle if
+// we bound a reference into it.
+//
+// operator[] would default-construct and insert on a missing key; callers pass
+// PermeabilityPoint by value, so that insertion was never observable and
+// returning a default-constructed modifier preserves the behaviour.
+InitialPermeabilitModifier default_permeability_modifier(const PermeabilityPoint& permeabilityPoint) {
+    auto modifiers = permeabilityPoint.get_modifiers();
+    if (modifiers) {
+        auto found = modifiers->find("default");
+        if (found != modifiers->end()) {
+            return found->second;
+        }
+    }
+    return InitialPermeabilitModifier();
+}
+
+} // namespace
+
 double InitialPermeability::get_initial_permeability(std::string coreMaterialName,
                                                      std::optional<double> temperature,
                                                      std::optional<double> magneticFieldDcBias,
@@ -60,7 +89,7 @@ double InitialPermeability::has_frequency_dependency(CoreMaterial coreMaterial) 
     if (std::holds_alternative<PermeabilityPoint>(initialPermeabilityData)) {
         auto permeabilityPoint = std::get<PermeabilityPoint>(initialPermeabilityData);
         if (permeabilityPoint.get_modifiers()) {
-            InitialPermeabilitModifier modifiers = (*permeabilityPoint.get_modifiers())["default"];
+            InitialPermeabilitModifier modifiers = default_permeability_modifier(permeabilityPoint);
             if (modifiers.get_frequency_factor()) {
                 return true;
             }
@@ -127,7 +156,7 @@ std::map<std::string, std::string> InitialPermeability::get_initial_permeability
     std::map<std::string, std::string> equations;
 
     if (permeabilityPoint.get_modifiers()) {
-        InitialPermeabilitModifier modifiers = (*permeabilityPoint.get_modifiers())["default"];
+        InitialPermeabilitModifier modifiers = default_permeability_modifier(permeabilityPoint);
         if ((*modifiers.get_method()) == InitialPermeabilitModifierMethod::MAGNETICS) {
             auto temperatureFactor = modifiers.get_temperature_factor();
             if (temperatureFactor) {
@@ -210,7 +239,7 @@ double InitialPermeability::get_initial_permeability_formula(CoreMaterial coreMa
     double initialPermeabilityValue = permeabilityPoint.get_value();
 
     if (permeabilityPoint.get_modifiers()) {
-        InitialPermeabilitModifier modifiers = (*permeabilityPoint.get_modifiers())["default"];
+        InitialPermeabilitModifier modifiers = default_permeability_modifier(permeabilityPoint);
         if ((*modifiers.get_method()) == InitialPermeabilitModifierMethod::MAGNETICS) {
             auto temperatureFactor = modifiers.get_temperature_factor();
             if (temperature && temperatureFactor) {
@@ -517,7 +546,7 @@ std::vector<size_t> InitialPermeability::get_only_frequency_dependent_indexes(Co
 
 std::vector<PermeabilityPoint> InitialPermeability::sample_initial_permeability_by_frequency_modifier(PermeabilityPoint permeabilityPoint) {
     std::vector<PermeabilityPoint> frequencyPoints;
-    InitialPermeabilitModifier modifiers = permeabilityPoint.get_modifiers() ? (*permeabilityPoint.get_modifiers())["default"] : InitialPermeabilitModifier();
+    InitialPermeabilitModifier modifiers = default_permeability_modifier(permeabilityPoint);
     auto frequencies = logarithmic_spaced_array(defaults.measurementFrequency, defaults.maximumFrequency, 100);
     for (auto frequency : frequencies) {
         double initialPermeabilityValue = 1;
@@ -563,7 +592,7 @@ std::vector<PermeabilityPoint> InitialPermeability::get_only_frequency_dependent
     if (std::holds_alternative<PermeabilityPoint>(initialPermeabilityData)) {
         auto permeabilityPoint = std::get<PermeabilityPoint>(initialPermeabilityData);
         if (permeabilityPoint.get_modifiers()) {
-            InitialPermeabilitModifier modifiers = (*permeabilityPoint.get_modifiers())["default"];
+            InitialPermeabilitModifier modifiers = default_permeability_modifier(permeabilityPoint);
             if (modifiers.get_frequency_factor()) {
                 frequencyPoints = sample_initial_permeability_by_frequency_modifier(permeabilityPoint);
             }
