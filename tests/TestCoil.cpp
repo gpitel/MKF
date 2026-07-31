@@ -10832,6 +10832,53 @@ static int real_geometry_collisions(OpenMagnetics::Coil& coil) {
     return collisions;
 }
 
+// ABT #229: number of pairs of drawn HORIZONTAL lead runs belonging to DIFFERENT conductors
+// (winding, parallel) that geometrically overlap — the ticket's exact defect was the K parallels'
+// terminal leads all drawn on the SAME edge line (coincident centrelines, which 3D consumers' gates
+// throw on). Scope matches the per-edge row allocator's domain: terminal leads (edge-routed runs and
+// own-level radial exits) and edge-routed U interleaved continuations (edgeDepth > 0). Vertical
+// stubs and U adjacent-layer turnaround links are excluded: those are short link segments at one
+// angular position, physically separated azimuthally (out of the 2D plane) in a real multifilar
+// winding. 0 means every conductor's horizontal run has its own line.
+static int coincident_connection_runs(OpenMagnetics::Coil& coil) {
+    auto spaces = coil.get_connection_reserved_spaces();
+    std::vector<const OpenMagnetics::ConnectionReservedSpace*> runs;
+    for (auto& s : spaces) {
+        if (!s.layer.empty()) {
+            continue;  // per-layer squeeze markers, not drawn runs
+        }
+        if (std::abs(s.rotation) > 1e-9) {
+            continue;  // diagonal (Z) or polar (toroidal) — not row-allocated
+        }
+        if (s.dimensions[1] > s.dimensions[0]) {
+            continue;  // vertical stub/link — azimuthally separated in 3D, not a row
+        }
+        if (!s.isTerminal && s.edgeDepth <= 0) {
+            continue;  // U adjacent-layer turnaround stretch at turn level — not edge-routed
+        }
+        runs.push_back(&s);
+    }
+    int overlaps = 0;
+    for (size_t i = 0; i < runs.size(); ++i) {
+        for (size_t j = i + 1; j < runs.size(); ++j) {
+            const auto* a = runs[i];
+            const auto* b = runs[j];
+            if (a->winding == b->winding && a->parallel == b->parallel) {
+                continue;  // segments of the SAME conductor may touch (stub-to-run corners)
+            }
+            double overlapX = (a->dimensions[0] + b->dimensions[0]) / 2 - std::abs(a->coordinates[0] - b->coordinates[0]);
+            double overlapY = (a->dimensions[1] + b->dimensions[1]) / 2 - std::abs(a->coordinates[1] - b->coordinates[1]);
+            if (overlapX > 1e-6 && overlapY > 1e-6) {
+                overlaps++;
+                std::cout << "[RUNCOLL] run(w=" << a->winding << " p=" << a->parallel << " c=" << a->coordinates[0]
+                          << "," << a->coordinates[1] << ") vs run(w=" << b->winding << " p=" << b->parallel
+                          << " c=" << b->coordinates[0] << "," << b->coordinates[1] << ")\n";
+            }
+        }
+    }
+    return overlaps;
+}
+
 static void paint_connection_demo(OpenMagnetics::Coil coil, const std::string& shapeName, const std::string& filename, bool withConnections) {
     auto outputFilePath = std::filesystem::path{ std::source_location::current().file_name() }.parent_path().append("..").append("output");
     auto outFile = outputFilePath;
@@ -11221,6 +11268,8 @@ TEST_CASE("Test_Real_Geometry_Multifilar_N_Filar", "[constructive-model][coil][r
         CHECK(distinct_parallels_with_terminal_leads(coil, "winding 0") == int(K));
         CHECK(layers_balanced_across_parallels(coil, "winding 0", K));
         CHECK(real_geometry_collisions(coil) == 0);
+        // ABT #229: the K parallels' leads must not be drawn on the same line.
+        CHECK(coincident_connection_runs(coil) == 0);
         paint_connection_demo(coil, "PQ 28/20", "Test_Real_Multifilar_K" + std::to_string(K) + "_Z.svg", true);
 
         // Same coil wound U.
@@ -11237,6 +11286,7 @@ TEST_CASE("Test_Real_Geometry_Multifilar_N_Filar", "[constructive-model][coil][r
         REQUIRE(coil.get_turns_description());
         CHECK(layers_balanced_across_parallels(coil, "winding 0", K));
         CHECK(real_geometry_collisions(coil) == 0);
+        CHECK(coincident_connection_runs(coil) == 0);
         paint_connection_demo(coil, "PQ 28/20", "Test_Real_Multifilar_K" + std::to_string(K) + "_U.svg", true);
 
         settings.reset();
@@ -11260,6 +11310,7 @@ TEST_CASE("Test_Real_Geometry_Bifilar_Interleaved", "[constructive-model][coil][
     CHECK(layers_balanced_across_parallels(coil, "winding 0", 2));
     CHECK(layers_balanced_across_parallels(coil, "winding 1", 1));
     CHECK(real_geometry_collisions(coil) == 0);
+    CHECK(coincident_connection_runs(coil) == 0);
     paint_connection_demo(coil, "PQ 40/40", "Test_Real_Bifilar_Interleaved_Z.svg", true);
 
     settings.reset();
@@ -11312,10 +11363,72 @@ static int toroidal_turn_overlaps(OpenMagnetics::Coil& coil) {
             double minSeparation = 0.9 * std::min(turns[i].get_dimensions().value()[0], turns[j].get_dimensions().value()[0]);
             if (std::hypot(a[0] - b[0], a[1] - b[1]) < minSeparation) {
                 overlaps++;
+                std::cout << "[TOVER] " << turns[i].get_name() << " (layer " << turns[i].get_layer().value_or("?")
+                          << " az=" << std::atan2(a[1], a[0]) * 180.0 / std::numbers::pi << " r=" << std::hypot(a[0], a[1])
+                          << ") vs " << turns[j].get_name() << " (layer " << turns[j].get_layer().value_or("?")
+                          << " az=" << std::atan2(b[1], b[0]) * 180.0 / std::numbers::pi << " r=" << std::hypot(b[0], b[1]) << ")\n";
             }
         }
     }
     return overlaps;
+}
+
+// ABT #187: number of turns sitting inside a connection lead's angular corridor on their own ring.
+// A radial terminal lead crossing a ring emits a marker (layer = ring name, rotation = azimuth);
+// the ring's turns must clear the corridor: angular distance >= marker half-angle + turn half-angle.
+static int toroidal_corridor_intrusions(OpenMagnetics::Coil& coil) {
+    if (!coil.get_turns_description()) {
+        return -1;
+    }
+    auto turns = coil.get_turns_description().value();
+    auto spaces = coil.get_connection_reserved_spaces();
+    auto wires = coil.get_wires();
+    std::map<std::string, std::pair<double, size_t>> radiusAccumulator;
+    for (auto& turn : turns) {
+        if (turn.get_layer()) {
+            auto& acc = radiusAccumulator[turn.get_layer().value()];
+            acc.first += std::hypot(turn.get_coordinates()[0], turn.get_coordinates()[1]);
+            acc.second++;
+        }
+    }
+    auto angularDistance = [](double a, double b) {
+        return std::abs(std::fmod(a - b + 540.0, 360.0) - 180.0);
+    };
+    int intrusions = 0;
+    for (auto& space : spaces) {
+        if (space.layer.empty() || !radiusAccumulator.count(space.layer)) {
+            continue;
+        }
+        double ringRadius = radiusAccumulator[space.layer].first / double(radiusAccumulator[space.layer].second);
+        double markerHalf = OpenMagnetics::wound_distance_to_angle(space.dimensions[1], ringRadius) / 2;
+        for (auto& turn : turns) {
+            if (!turn.get_layer() || turn.get_layer().value() != space.layer) {
+                continue;
+            }
+            size_t windingIndex = coil.get_winding_index_by_name(turn.get_winding());
+            double turnHalf = OpenMagnetics::wound_distance_to_angle(wires[windingIndex].get_maximum_outer_height(), ringRadius) / 2;
+            double turnAngle = std::atan2(turn.get_coordinates()[1], turn.get_coordinates()[0]) * 180.0 / std::numbers::pi;
+            if (angularDistance(turnAngle, space.rotation) < markerHalf + turnHalf - 0.01) {
+                intrusions++;
+                std::cout << "[TORCOLL] turn " << turn.get_name() << " angle=" << turnAngle
+                          << " inside corridor of lead(w=" << space.winding << " p=" << space.parallel
+                          << ") at " << space.rotation << " on " << space.layer << "\n";
+            }
+        }
+    }
+    return intrusions;
+}
+
+// ABT #187: number of crossing markers (spaces that name a ring) — proves the radial leads actually
+// declared their ring crossings for the corridor machinery.
+static int toroidal_crossing_markers(OpenMagnetics::Coil& coil) {
+    int markers = 0;
+    for (auto& space : coil.get_connection_reserved_spaces()) {
+        if (!space.layer.empty()) {
+            markers++;
+        }
+    }
+    return markers;
 }
 
 TEST_CASE("Test_Real_Geometry_Toroidal", "[constructive-model][coil][real-geometry]") {
@@ -11350,6 +11463,10 @@ TEST_CASE("Test_Real_Geometry_Toroidal", "[constructive-model][coil][real-geomet
         CHECK(toroidal_turn_overlaps(coil) == 0);
         CHECK(!coil.get_connection_reserved_spaces().empty());
         CHECK(distinct_parallels_with_terminal_leads(coil, "winding 0") == 2);
+        // ABT #187: the exit leads (innermost ring) cross the outer ring(s) radially — those
+        // crossings must be declared as markers, and no turn may sit inside a lead's corridor.
+        CHECK(toroidal_crossing_markers(coil) > 0);
+        CHECK(toroidal_corridor_intrusions(coil) == 0);
         paint_connection_demo(coil, shape, "Test_Real_Toroidal_Overlapping_" + tag + ".svg", true);
     }
 
@@ -11366,6 +11483,7 @@ TEST_CASE("Test_Real_Geometry_Toroidal", "[constructive-model][coil][real-geomet
         CHECK(!coil.get_connection_reserved_spaces().empty());
         CHECK(distinct_parallels_with_terminal_leads(coil, "winding 0") == 1);
         CHECK(distinct_parallels_with_terminal_leads(coil, "winding 1") == 1);
+        CHECK(toroidal_corridor_intrusions(coil) == 0);
         paint_connection_demo(coil, shape, "Test_Real_Toroidal_SectionContiguous_" + tag + ".svg", true);
     }
 
@@ -11633,5 +11751,28 @@ TEST_CASE("Test_Centered_Single_Turn_Toroidal_Emits_Outer_Crossing",
     REQUIRE_THAT(outer[1], Catch::Matchers::WithinAbs(0.0, 1e-9));
 }
 
+
+
+// ABT #278: the mid-loop measurement gap in the rectangular blocking loop (wind() skipping
+// wind_by_turns when the grown layout transiently stopped fitting) silently produced a turnless
+// coil for a fitting design. Guard the contract: a design that winds ideally must also wind with
+// real geometry when its blocking fixpoint fits, and real winding adds one crossing per conductor.
+TEST_CASE("Test_Real_Geometry_Wind_Survives_Transient_Unfit", "[constructive-model][coil][real-geometry]") {
+    namespace fs = std::filesystem;
+    auto file = fs::path{std::source_location::current().file_name()}.parent_path().append("..").append("MAS").append("examples").append("13_current_sense_er95_n87.json");
+    settings.reset();
+    std::ifstream f(file);
+    std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    json masJson = json::parse(data);
+    OpenMagnetics::compat::migrate_pre_1_0(masJson);
+    auto magneticIn = OpenMagnetics::Magnetic(masJson["magnetic"]);
+    settings.set_coil_use_real_winding_geometry(true);
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(magneticIn);
+    auto& coil = magnetic.get_mutable_coil();
+    REQUIRE(coil.get_turns_description());
+    // 1-turn primary + 100-turn secondary + one real-winding crossing per conductor.
+    CHECK(coil.get_turns_description().value().size() == size_t(1 + 100 + 2));
+    settings.reset();
+}
 
 }  // namespace

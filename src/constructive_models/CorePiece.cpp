@@ -1991,6 +1991,61 @@ class CorePieceC : public CorePiece {
     }
 };
 
+// ---- Additional families (2026-07, ABT #263-#272): geometry variants ----
+// Each is modelled as sharing the A-F dimension convention and magnetic-path model
+// of an existing piece. The mapping is validated per-family by comparing the
+// MKF-computed Ae/Le against the vendor datasheet's stated Ae/Le for a
+// representative size before any cores of that family are emitted (see the
+// validation notes in the accompanying commit / ABT tickets).
+// EER: E-type with a round centre leg -> identical model to ETD/ER.
+class CorePieceEer : public CorePieceEtd {};
+// EF: flat/economy E core -> E geometry.
+class CorePieceEf : public CorePieceE {};
+// EP derivatives (EPC low-profile, EPQ EP/PQ hybrid, EPW wide, EPT, LEP large-EP) -> EP geometry.
+class CorePieceEpc : public CorePieceEp {};
+class CorePieceEpq : public CorePieceEp {};
+class CorePieceEpw : public CorePieceEp {};
+class CorePieceEpt : public CorePieceEp {};
+class CorePieceLep : public CorePieceEp {};
+
+bool CorePiece::is_family_supported(CoreShapeFamily family) {
+    // Mirrors factory()'s dispatch below — add a family here when you add its branch.
+    switch (family) {
+        case CoreShapeFamily::E:
+        case CoreShapeFamily::EC:
+        case CoreShapeFamily::EFD:
+        case CoreShapeFamily::EL:
+        case CoreShapeFamily::EP:
+        case CoreShapeFamily::EPX:
+        case CoreShapeFamily::LP:
+        case CoreShapeFamily::EQ:
+        case CoreShapeFamily::ER:
+        case CoreShapeFamily::ETD:
+        case CoreShapeFamily::P:
+        case CoreShapeFamily::PLANAR_E:
+        case CoreShapeFamily::PLANAR_EL:
+        case CoreShapeFamily::PLANAR_ER:
+        case CoreShapeFamily::PM:
+        case CoreShapeFamily::PQ:
+        case CoreShapeFamily::RM:
+        case CoreShapeFamily::U:
+        case CoreShapeFamily::UR:
+        case CoreShapeFamily::UT:
+        case CoreShapeFamily::T:
+        case CoreShapeFamily::C:
+        case CoreShapeFamily::EER:
+        case CoreShapeFamily::EF:
+        case CoreShapeFamily::EPC:
+        case CoreShapeFamily::EPQ:
+        case CoreShapeFamily::EPW:
+        case CoreShapeFamily::EPT:
+        case CoreShapeFamily::LEP:
+            return true;
+        default:
+            return false;
+    }
+}
+
 std::shared_ptr<CorePiece> CorePiece::factory(CoreShape shape, bool process) {
     auto family = shape.get_family();
     if (family == CoreShapeFamily::E) {
@@ -2155,9 +2210,51 @@ std::shared_ptr<CorePiece> CorePiece::factory(CoreShape shape, bool process) {
             piece->process();
         return piece;
     }
+    else if (family == CoreShapeFamily::EER) {
+        auto piece = std::make_shared<CorePieceEer>();
+        piece->set_shape(shape);
+        if (process) piece->process();
+        return piece;
+    }
+    else if (family == CoreShapeFamily::EF) {
+        auto piece = std::make_shared<CorePieceEf>();
+        piece->set_shape(shape);
+        if (process) piece->process();
+        return piece;
+    }
+    else if (family == CoreShapeFamily::EPC) {
+        auto piece = std::make_shared<CorePieceEpc>();
+        piece->set_shape(shape);
+        if (process) piece->process();
+        return piece;
+    }
+    else if (family == CoreShapeFamily::EPQ) {
+        auto piece = std::make_shared<CorePieceEpq>();
+        piece->set_shape(shape);
+        if (process) piece->process();
+        return piece;
+    }
+    else if (family == CoreShapeFamily::EPW) {
+        auto piece = std::make_shared<CorePieceEpw>();
+        piece->set_shape(shape);
+        if (process) piece->process();
+        return piece;
+    }
+    else if (family == CoreShapeFamily::EPT) {
+        auto piece = std::make_shared<CorePieceEpt>();
+        piece->set_shape(shape);
+        if (process) piece->process();
+        return piece;
+    }
+    else if (family == CoreShapeFamily::LEP) {
+        auto piece = std::make_shared<CorePieceLep>();
+        piece->set_shape(shape);
+        if (process) piece->process();
+        return piece;
+    }
     else
         throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Unknown shape family: " + to_string(family) + ", available options are: {E, EC, EFD, EL, EP, EPX, LP, EQ, ER, "
-                                 "ETD, P, PLANAR_E, PLANAR_EL, PLANAR_ER, PM, PQ, RM, U, UI, UR, UT, T, C}");
+                                 "ETD, P, PLANAR_E, PLANAR_EL, PLANAR_ER, PM, PQ, RM, U, UI, UR, UT, T, C, EER, EF, EPC, EPQ, EPW, EPT, LEP}");
 }
 
 // ============================================================================
