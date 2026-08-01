@@ -2029,6 +2029,7 @@ bool CorePiece::is_family_supported(CoreShapeFamily family) {
         case CoreShapeFamily::PQ:
         case CoreShapeFamily::RM:
         case CoreShapeFamily::U:
+        case CoreShapeFamily::UI:
         case CoreShapeFamily::UR:
         case CoreShapeFamily::UT:
         case CoreShapeFamily::T:

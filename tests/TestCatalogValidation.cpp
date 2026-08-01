@@ -59,11 +59,17 @@ TEST_CASE("Test_Catalog_Unsupported_Families_Are_Not_Loaded", "[catalog][smoke-t
     // (ABT #274 / #275). They must not reach the database. When a family IS
     // implemented, its shapes load again and this expectation flips — update the
     // list rather than deleting the guard.
-    REQUIRE_FALSE(CorePiece::is_family_supported(CoreShapeFamily::UI));
+    //
+    // UI moved to the supported side: CorePieceUi exists now, so its records are
+    // expected to load. It is asserted positively below rather than dropped, so
+    // the guard keeps covering it.
     REQUIRE_FALSE(CorePiece::is_family_supported(CoreShapeFamily::PQI));
-    for (auto& name : {std::string("UI 93/76/20"), std::string("PQI 16/7.8")}) {
+    for (auto& name : {std::string("PQI 16/7.8")}) {
         CHECK_THROWS_AS(find_core_shape_by_name(name), CoreShapeNotFoundException);
     }
+
+    REQUIRE(CorePiece::is_family_supported(CoreShapeFamily::UI));
+    CHECK_NOTHROW(find_core_shape_by_name(std::string("UI 93/76/20")));
 }
 
 TEST_CASE("Test_Catalog_Impossible_Toroid_Is_Rejected", "[catalog][smoke-test]") {
