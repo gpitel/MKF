@@ -487,9 +487,38 @@ std::optional<std::vector<CoreGeometricalDescriptionElement>> Core::create_geome
                 }
             }
             break;
-        case CoreType::PIECE_AND_PLATE:
-            // TODO add for toroPIECE_AND_PLATE
+        case CoreType::PIECE_AND_PLATE: {
+            // A UI is one U piece closed by a flat I plate. There is no mirrored
+            // second half, so the whole assembly is a single CLOSED element -- the
+            // 3D builder (MVB++ ShapeUi) fuses the U and the plate into one solid,
+            // matching how CorePieceUi reports the assembled core.
+            //
+            // Emitting nothing here left the geometry list EMPTY, so a UI core was
+            // absent from any render: the builder ran zero iterations and reported
+            // it as "filtered out all geometry", which points nowhere near the
+            // cause. That is why this is not simply left as a TODO.
+            //
+            // No Y offset, unlike CLOSED_SHAPE above: ShapeUi already places the
+            // assembly in the frame CorePieceUi describes, with the winding window
+            // centred on the origin.
+            auto pieceFamily = std::get<CoreShape>(get_functional_description().get_shape()).get_family();
+            if (pieceFamily == CoreShapeFamily::UI) {
+                piece.set_type(CoreGeometricalDescriptionElementType::CLOSED);
+                for (auto i = 0; i < numberStacks; ++i) {
+                    piece.set_coordinates(std::vector<double>({0, 0, currentDepth}));
+                    piece.set_rotation(std::vector<double>({0, 0, 0}));
+                    // UI gapping is unimplemented end to end: a UI has one mating
+                    // plane rather than two, and a single fused solid cannot express
+                    // a lifted plate. process_gap has no UI branch either.
+                    piece.set_machining(std::nullopt);
+                    geometricalDescription.push_back(CoreGeometricalDescriptionElement(piece));
+                    currentDepth = roundFloat(currentDepth + corePieceDepth);
+                }
+                break;
+            }
+            // TODO other PIECE_AND_PLATE families (pqi) have no CorePiece yet.
             break;
+        }
         default:
             throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
                 "Unknown type of core, options are {TOROIDAL, TWO_PIECE_SET, PIECE_AND_PLATE, CLOSED_SHAPE}");
