@@ -9270,8 +9270,23 @@ Bobbin Coil::merge_per_column_bobbins(const std::vector<BobbinDataOrNameUnion> &
     if (!mergedBobbin.get_processed_description()) {
         throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA, "coil.bobbin[0] (centre column) has no processedDescription: cannot merge per-column bobbins");
     }
+    // Convention A (MAS coil.json): bobbins[i] is mounted on core.columns[i], index 0 being
+    // the centre/main column. That mapping lives ONLY in the array index, so stamp it onto
+    // every window the element contributes. Without this the merged windows carry no column,
+    // so every winding resolves to the main column and a genuinely per-leg magnetic silently
+    // gets ideal rank-1 coupling instead of the real flux divider. An explicit column on a
+    // window wins: the author stated it, and the array index is only the default.
+    auto stampColumn = [](std::vector<WindingWindowElement>& windows, size_t columnIndex) {
+        for (auto& window : windows) {
+            if (!window.get_column()) {
+                window.set_column(static_cast<int64_t>(columnIndex));
+            }
+        }
+    };
+
     auto mergedProcessedDescription = mergedBobbin.get_processed_description().value();
     auto mergedWindingWindows = mergedProcessedDescription.get_winding_windows();
+    stampColumn(mergedWindingWindows, 0);
     for (size_t columnIndex = 1; columnIndex < perColumnBobbins.size(); ++columnIndex) {
         auto columnBobbin = resolveElement(perColumnBobbins[columnIndex], columnIndex);
         if (!columnBobbin.get_processed_description()) {
@@ -9281,6 +9296,7 @@ Bobbin Coil::merge_per_column_bobbins(const std::vector<BobbinDataOrNameUnion> &
         if (columnWindingWindows.empty()) {
             throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA, "coil.bobbin[" + std::to_string(columnIndex) + "] has no winding windows");
         }
+        stampColumn(columnWindingWindows, columnIndex);
         mergedWindingWindows.insert(mergedWindingWindows.end(), columnWindingWindows.begin(), columnWindingWindows.end());
     }
     mergedProcessedDescription.set_winding_windows(mergedWindingWindows);
