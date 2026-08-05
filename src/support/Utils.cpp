@@ -2500,7 +2500,19 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
         magnetic.get_mutable_core().get_mutable_functional_description().get_mutable_gapping().clear();
     }
     else {
-        magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::TWO_PIECE_SET);
+        // Not every non-toroid is a mirrored pair. Forcing TWO_PIECE_SET here overwrote a
+        // correctly declared `pieceAndPlate`, so process_data ran its TWO_PIECE_SET branch
+        // and doubled a UI core's column height, winding-window height and area, le and
+        // effective volume (a 0.875 in window reported as 1.75 in), and
+        // create_geometrical_description emitted two HALF_SETs instead of the single fused
+        // CLOSED solid its PIECE_AND_PLATE branch exists to produce -- that branch was
+        // unreachable from here.
+        if (Core::is_piece_and_plate_family(magnetic.get_mutable_core().get_shape_family())) {
+            magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::PIECE_AND_PLATE);
+        }
+        else {
+            magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::TWO_PIECE_SET);
+        }
         shape.set_magnetic_circuit(MagneticCircuit::OPEN);
         for (size_t i = 0; i < magnetic.get_core().get_functional_description().get_gapping().size(); i++) {
             double gapLength = magnetic.get_core().get_functional_description().get_gapping()[i].get_length();
@@ -2608,7 +2620,11 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
     }
 
     if (!bobbin.get_functional_description() && !bobbin.get_processed_description()) {
-        if (magnetic.get_mutable_core().get_type() == CoreType::TWO_PIECE_SET && magnetic.get_wire(0).get_type() != WireType::RECTANGULAR && magnetic.get_wire(0).get_type() != WireType::PLANAR) {
+        // Concentric again, not just TWO_PIECE_SET: a UI core takes a walled bobbin for the
+        // same reason an E core does. Left as an equality test, a UI would have quietly
+        // dropped to the bare-core winding window (no wall thickness) once its type stopped
+        // being overwritten to TWO_PIECE_SET above.
+        if ((magnetic.get_mutable_core().get_type() == CoreType::TWO_PIECE_SET || magnetic.get_mutable_core().get_type() == CoreType::PIECE_AND_PLATE) && magnetic.get_wire(0).get_type() != WireType::RECTANGULAR && magnetic.get_wire(0).get_type() != WireType::PLANAR) {
             bobbin = Bobbin::create_quick_bobbin(magnetic.get_mutable_core(), false);
         }
         else {
@@ -2625,7 +2641,14 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
             processedDescription.get_mutable_winding_windows()[0].set_sections_orientation(windingOrientation);
         }
         else {
-            if (magnetic.get_mutable_core().get_type() == CoreType::TWO_PIECE_SET) {
+            // PIECE_AND_PLATE belongs with TWO_PIECE_SET in all three defaults below: the
+            // question is "is this concentric-wound rather than a toroid", and a UI is wound
+            // on its legs exactly like a two-piece set. (CoreAdviserDataset spells the same
+            // pair out under the name includeConcentricCores.) Testing TWO_PIECE_SET alone
+            // would have handed every UI core the toroid defaults the moment its type
+            // stopped being overwritten above, silently moving turn placement.
+            if (magnetic.get_mutable_core().get_type() == CoreType::TWO_PIECE_SET ||
+                magnetic.get_mutable_core().get_type() == CoreType::PIECE_AND_PLATE) {
                 if (magnetic.get_mutable_coil().is_edge_wound_coil()) {
                     processedDescription.get_mutable_winding_windows()[0].set_sections_orientation(WindingOrientation::CONTIGUOUS);
                 }
@@ -2644,7 +2667,8 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
             processedDescription.get_mutable_winding_windows()[0].set_sections_alignment(coilAlignment);
         }
         else {
-            if (magnetic.get_mutable_core().get_type() == CoreType::TWO_PIECE_SET) {
+            if (magnetic.get_mutable_core().get_type() == CoreType::TWO_PIECE_SET ||
+                magnetic.get_mutable_core().get_type() == CoreType::PIECE_AND_PLATE) {
                 if (magnetic.get_mutable_coil().is_edge_wound_coil()) {
                     processedDescription.get_mutable_winding_windows()[0].set_sections_alignment(CoilAlignment::SPREAD);
                 }
@@ -2682,7 +2706,8 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
             magnetic.get_mutable_coil().set_turns_alignment(turnsAlignment);
         }
         else {
-            if (magnetic.get_mutable_core().get_type() == CoreType::TWO_PIECE_SET) {
+            if (magnetic.get_mutable_core().get_type() == CoreType::TWO_PIECE_SET ||
+                magnetic.get_mutable_core().get_type() == CoreType::PIECE_AND_PLATE) {
                 magnetic.get_mutable_coil().set_turns_alignment(CoilAlignment::SPREAD);
             }
             else {

@@ -72,7 +72,13 @@ Core::Core(const CoreShape shape, std::optional<CoreMaterial> material) {
     else {
         get_mutable_functional_description().set_material("Dummy");
     }
-    if (shape.get_magnetic_circuit() == MagneticCircuit::OPEN) {
+    if (is_piece_and_plate_family(shape.get_family())) {
+        // Checked BEFORE the magneticCircuit flag: MAS marks UI/PQI records `closed`, so
+        // the flag alone made a UI core TOROIDAL here -- a shape with two rectangular
+        // columns described as a ring.
+        get_mutable_functional_description().set_type(CoreType::PIECE_AND_PLATE);
+    }
+    else if (shape.get_magnetic_circuit() == MagneticCircuit::OPEN) {
         get_mutable_functional_description().set_type(CoreType::TWO_PIECE_SET);
     }
     else {
@@ -1120,6 +1126,14 @@ void Core::set_type(CoreType coreType) {
     get_mutable_functional_description().set_type(coreType);
 }
 
+bool Core::is_piece_and_plate_family(CoreShapeFamily family) {
+    // Keep in step with the PIECE_AND_PLATE branches of process_data and
+    // create_geometrical_description. Only UI has a CorePiece so far; PQI still lands in
+    // process_data's approximate-as-two-piece fallback, which computes the same numbers it
+    // would have got as TWO_PIECE_SET, so naming it here is safe today and correct later.
+    return family == CoreShapeFamily::UI || family == CoreShapeFamily::PQI;
+}
+
 void Core::set_number_stacks(int64_t numberStacks) {
     get_mutable_functional_description().set_number_stacks(numberStacks);
 }
@@ -2056,6 +2070,12 @@ Core Core::create_quick_core(std::string coreShapeName, std::string coreMaterial
     core.set_name("Quick core with " + coreMaterialName + " " + coreShapeName);
     if (coreShape.get_family() == CoreShapeFamily::T) {
         core.set_type(CoreType::TOROIDAL);
+    }
+    else if (Core::is_piece_and_plate_family(coreShape.get_family())) {
+        // Without this a quick UI core doubled its column height, window height, le and
+        // volume in process_data's TWO_PIECE_SET branch, describing a mirrored pair of U
+        // pieces instead of a U closed by a plate.
+        core.set_type(CoreType::PIECE_AND_PLATE);
     }
     else if (coreShape.get_family() == CoreShapeFamily::UT) {
         core.set_type(CoreType::TWO_PIECE_SET); // FIX L-3: UT cores are U-type assembled, not toroidal

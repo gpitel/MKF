@@ -362,8 +362,12 @@ namespace OpenMagnetics {
         // wanted (integrated-leakage designs). Fully gated behind the setting; the
         // candidates run through the same wire/insulation/winding/scoring flow, and
         // their leakage/coupling comes from the per-column reluctance network.
+        // PIECE_AND_PLATE counts as multi-leg too: a UI core has the same two rectangular
+        // legs an E/U set has, and it is a natural home for a lateral secondary. Testing
+        // TWO_PIECE_SET alone silently dropped every UI core from these candidates once
+        // magnetic_autocomplete stopped overwriting its type (see Utils.cpp).
         if (settings.get_coil_adviser_allow_lateral_placement() && !isCmc && !isDmcMultiWinding &&
-            coreType == CoreType::TWO_PIECE_SET &&
+            (coreType == CoreType::TWO_PIECE_SET || coreType == CoreType::PIECE_AND_PLATE) &&
             mas.get_magnetic().get_coil().get_functional_description().size() == 2 &&
             mas.get_mutable_inputs().get_wiring_technology() == WiringTechnology::WOUND) {
             SettingsGuard<bool> perColumnWindowsGuard(settings, &Settings::get_core_per_column_winding_windows,

@@ -129,6 +129,11 @@ class Core : public MAS::MagneticCore {
     std::vector<VolumetricCoreLossesMethodType> get_available_core_losses_methods() const;
     static std::vector<VolumetricCoreLossesMethodType> get_available_core_losses_methods(CoreMaterial coreMaterial);
     CoreType get_type() const;
+    // The shape FAMILY, not the catalogue's magneticCircuit flag, says how a core is
+    // assembled: a `ui` shape is one U piece closed by a flat I plate and can never be a
+    // mirrored pair. MAS marks UI/PQI records `closed` (the set ships complete), so the
+    // OPEN/CLOSED flag cannot tell them apart from a toroid.
+    static bool is_piece_and_plate_family(CoreShapeFamily family);
     bool fits(MaximumDimensions maximumDimensions, bool allowRotation=false);
     std::vector<double> get_maximum_dimensions();
     void set_type(CoreType coreType);
