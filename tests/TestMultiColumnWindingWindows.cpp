@@ -490,6 +490,80 @@ TEST_CASE("MultiColumnWinding_PerColumnBobbinArray_MergesWindsAndRoundTrips", "[
     CHECK(section_x(reloaded, "Secondary") < 0);
 }
 
+// A catalog bobbin part describes its own window and knows nothing about which core column
+// it will be mounted on, so its windows carry no column edge. For a per-column array the
+// array index IS the mapping -- coil.json places bobbin[i] on core.columns[i] -- so the
+// merge has to stamp it. Without that the merged windows say nothing about which column
+// they wrap, every winding falls back to the main column, and a per-leg magnetic silently
+// gets ideal rank-1 coupling instead of the real flux divider.
+TEST_CASE("MultiColumnWinding_PerColumnBobbinArray_ColumnComesFromArrayIndex", "[constructive-model][coil][multi-column][smoke-test]") {
+    auto& settings = Settings::GetInstance();
+    settings.set_core_per_column_winding_windows(false);
+    auto core = OpenMagneticsTesting::get_quick_core("U 15/11/6", json::parse("[]"), 1, "Dummy");
+    auto columns = core.get_processed_description()->get_columns();
+    REQUIRE(columns.size() == 2);
+
+    auto quickBobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.001, 0.001);
+    auto quickWindows = quickBobbin.get_processed_description()->get_winding_windows();
+    REQUIRE(quickWindows.size() == 1);
+    // Nothing to inherit: the part carries no column edge of its own.
+    REQUIRE(!quickWindows[0].get_column());
+
+    // The same part on both legs -- the usual bill of materials for a two-coil build.
+    json elementJson;
+    to_json(elementJson, quickBobbin);
+    json coilJson;
+    coilJson["bobbin"] = json::array({elementJson, elementJson});
+    coilJson["functionalDescription"] = json::array();
+    coilJson["functionalDescription"].push_back(json{{"name", "Primary"}, {"numberTurns", 20}, {"numberParallels", 1},
+                                                     {"isolationSide", "primary"}, {"wire", "Round 0.475 - Grade 1"}});
+    coilJson["functionalDescription"].push_back(json{{"name", "Secondary"}, {"numberTurns", 10}, {"numberParallels", 1},
+                                                     {"isolationSide", "secondary"}, {"wire", "Round 0.475 - Grade 1"}});
+    OpenMagnetics::Coil coil(coilJson, false);
+
+    auto mergedWindows = coil.resolve_bobbin().get_processed_description()->get_winding_windows();
+    REQUIRE(mergedWindows.size() == 2);
+    REQUIRE(mergedWindows[0].get_column());
+    CHECK(mergedWindows[0].get_column().value() == 0);
+    REQUIRE(mergedWindows[1].get_column());
+    CHECK(mergedWindows[1].get_column().value() == 1);
+}
+
+// An explicit column on a part's window is the author's statement and outranks the array
+// index, which is only the default.
+TEST_CASE("MultiColumnWinding_PerColumnBobbinArray_ExplicitColumnWins", "[constructive-model][coil][multi-column][smoke-test]") {
+    auto& settings = Settings::GetInstance();
+    settings.set_core_per_column_winding_windows(false);
+    auto core = OpenMagneticsTesting::get_quick_core("U 15/11/6", json::parse("[]"), 1, "Dummy");
+    REQUIRE(core.get_processed_description()->get_columns().size() == 2);
+
+    auto quickBobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.001, 0.001);
+    auto statedProcessedDescription = quickBobbin.get_processed_description().value();
+    auto statedWindow = statedProcessedDescription.get_winding_windows()[0];
+    statedWindow.set_column(0);
+    statedProcessedDescription.set_winding_windows({statedWindow});
+    auto statedBobbin = quickBobbin;
+    statedBobbin.set_processed_description(statedProcessedDescription);
+
+    json firstJson;
+    json secondJson;
+    to_json(firstJson, quickBobbin);
+    to_json(secondJson, statedBobbin);
+    json coilJson;
+    coilJson["bobbin"] = json::array({firstJson, secondJson});
+    coilJson["functionalDescription"] = json::array();
+    coilJson["functionalDescription"].push_back(json{{"name", "Primary"}, {"numberTurns", 20}, {"numberParallels", 1},
+                                                     {"isolationSide", "primary"}, {"wire", "Round 0.475 - Grade 1"}});
+    OpenMagnetics::Coil coil(coilJson, false);
+
+    auto mergedWindows = coil.resolve_bobbin().get_processed_description()->get_winding_windows();
+    REQUIRE(mergedWindows.size() == 2);
+    CHECK(mergedWindows[0].get_column().value() == 0);
+    // Index 1 would have stamped column 1; the part said 0.
+    REQUIRE(mergedWindows[1].get_column());
+    CHECK(mergedWindows[1].get_column().value() == 0);
+}
+
 // Winding-style override (winding studio): the user can force multifilar
 // (consecutive parallels) or turn-by-turn (consecutive turns) per winding;
 // the heuristic keeps deciding for windings without an override.
