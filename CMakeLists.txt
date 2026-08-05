@@ -745,7 +745,26 @@ if(INCLUDE_MKF_TESTS)
     
     # TestingUtils.cpp holds shared fixtures; explicitly added below.
     list(FILTER ALL_TEST_SOURCES EXCLUDE REGEX "TestingUtils\\.cpp$")
-    
+
+    # Three test TUs cannot build without Kirchhoff, and the test target had no guard for
+    # any of them -- so INCLUDE_MKF_TESTS=ON with MKF_USE_KIRCHHOFF=OFF, which is the
+    # DEFAULT for both options, could not build MKF_tests at all. Two fail to compile
+    # ("fatal error: NgspiceRunner.cpp/.hpp: No such file or directory") because their
+    # includes resolve only through the Kirchhoff source include dir the MKF target
+    # propagates when Kirchhoff is on; the third fails to LINK against
+    # design_converter_tas / design_requirements_from_tas / simulate_tas, which live in
+    # src/converter_models/KirchhoffBridge.cpp -- already removed from SOURCES above under
+    # this same condition, and for the same stated reason.
+    #
+    # The ngspice link settings below were guarded; the sources never were. Filter them to
+    # match so the default configuration is testable. With Kirchhoff ON, all three build
+    # exactly as before.
+    if(NOT MKF_USE_KIRCHHOFF)
+        list(FILTER ALL_TEST_SOURCES EXCLUDE REGEX "KirchhoffNgspiceRunnerShim\\.cpp$")
+        list(FILTER ALL_TEST_SOURCES EXCLUDE REGEX "TestMutualResistanceExport\\.cpp$")
+        list(FILTER ALL_TEST_SOURCES EXCLUDE REGEX "TestKirchhoffBridge\\.cpp$")
+    endif()
+
     add_executable(MKF_tests ${ALL_TEST_SOURCES} "tests/TestingUtils.cpp")
     target_link_libraries(MKF_tests PRIVATE Catch2::Catch2WithMain)
     target_link_libraries(MKF_tests PUBLIC MKF)
