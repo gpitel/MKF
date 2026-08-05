@@ -133,8 +133,28 @@ std::vector<size_t> ReluctanceNetwork::resolve_winding_column_indexes(Magnetic m
     if (!core.get_processed_description()) {
         throw CoreNotProcessedException("Core is not processed, cannot resolve winding columns");
     }
+    // A winding's window index is BOBBIN-relative whenever the coil carries an inline
+    // processed bobbin: MAS defines it as an index into "the windingWindows list of the
+    // governing bobbin or core processed description", and both the winder
+    // (Coil::resolve_section_column_frame) and the Painter already read it that way.
+    // Resolving it against the CORE instead rejected every split-bobbin coil with more
+    // chambers than the core has windows -- a two-chamber bobbin on a U core is 2 vs 1,
+    // and it threw before any solving happened. A named bobbin needs no special case: its
+    // windows are either single or built by create_quick_bobbin, which copies the columns
+    // straight off the core, so both lists resolve to the same column either way.
     auto windingWindows = core.get_winding_windows();
+    auto bobbinDataOrName = magnetic.get_coil().get_bobbin();
+    if (std::holds_alternative<Bobbin>(bobbinDataOrName)) {
+        auto bobbin = std::get<Bobbin>(bobbinDataOrName);
+        if (bobbin.get_processed_description()) {
+            auto bobbinWindingWindows = bobbin.get_processed_description().value().get_winding_windows();
+            if (!bobbinWindingWindows.empty()) {
+                windingWindows = bobbinWindingWindows;
+            }
+        }
+    }
     size_t mainColumnIndex = core.get_main_column_index();
+    auto columns = core.get_processed_description().value().get_columns();
     std::vector<size_t> columnIndexPerWinding;
     for (auto& winding : magnetic.get_coil().get_functional_description()) {
         auto windowIndex = winding.get_winding_window();
@@ -153,10 +173,27 @@ std::vector<size_t> ReluctanceNetwork::resolve_winding_column_indexes(Magnetic m
         if (windowIndex.value() < 0 || static_cast<size_t>(windowIndex.value()) >= windingWindows.size()) {
             throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
                                         "Winding " + winding.get_name() + " references winding window " +
-                                            std::to_string(windowIndex.value()) + " but the core has " +
+                                            std::to_string(windowIndex.value()) + " but the governing bobbin/core has " +
                                             std::to_string(windingWindows.size()) + " winding windows");
         }
-        columnIndexPerWinding.push_back(core.get_winding_window_column_index(static_cast<size_t>(windowIndex.value())));
+        // Same rule as Core::get_winding_window_column_index, spelled out here rather than
+        // called: that method can only resolve an index into the CORE's own window list, and
+        // the list we just resolved may be the bobbin's.
+        auto column = windingWindows[static_cast<size_t>(windowIndex.value())].get_column();
+        if (!column) {
+            // Schema default: a window with no column edge wraps the main column. This is
+            // the stacked-chamber split bobbin, which the winder treats the same way.
+            columnIndexPerWinding.push_back(mainColumnIndex);
+            continue;
+        }
+        if (column.value() < 0 || static_cast<size_t>(column.value()) >= columns.size()) {
+            throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                                        "Winding " + winding.get_name() + " is placed in winding window " +
+                                            std::to_string(windowIndex.value()) + ", which wraps core column " +
+                                            std::to_string(column.value()) + ", but the core has " +
+                                            std::to_string(columns.size()) + " columns");
+        }
+        columnIndexPerWinding.push_back(static_cast<size_t>(column.value()));
     }
     return columnIndexPerWinding;
 }
