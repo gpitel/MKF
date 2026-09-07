@@ -55,6 +55,127 @@ namespace {
         REQUIRE(conductingDiameter == wireJson["conductingDiameter"]["nominal"]);
     }
 
+    // A litz bundle's own coating describes the SERVING; the insulation that separates one
+    // conductor from another is the STRAND enamel. Reading the bundle used to report exactly
+    // zero for every catalogue litz — no entry carries a serving thickness and none sets an
+    // outerDiameter, so the derived (outer - conducting)/2 collapsed to (strand - strand)/2.
+    // A user hit this as COIL_SHORTED_TURNS on a perfectly valid close-wound litz coil.
+    TEST_CASE("Litz reports the strand enamel as its turn-to-turn insulation", "[constructive-model][wire][litz]") {
+        for (const auto& name : {std::string("Litz 12x0.03 - Grade 1 - Double Served"),
+                                 std::string("Litz 12x0.03 - Grade 1 - Unserved")}) {
+            auto wire = OpenMagnetics::find_wire_by_name(name);
+            auto strandConductingDiameter =
+                resolve_dimensional_values(wire.resolve_strand().get_conducting_diameter());
+
+            INFO("wire: " << name);
+            // The whole point: not zero, and physically sane (a fraction of the strand).
+            REQUIRE(wire.get_coating_thickness() > 0);
+            REQUIRE(wire.get_coating_thickness() < strandConductingDiameter);
+        }
+    }
+
+    // ABT #857. The thermal model asks a litz wire what its coating is made of, in order to
+    // get the inter-strand matrix conductivity -- Temperature.cpp documents that value as
+    // "the strand enamel/insulation that heat must cross between conductors". It used to ask
+    // the wire's OWN coating, which for litz is the bundle SERVING: {type: served,
+    // material: null} in every catalogue and synthesized litz. resolve_coating_insulation_material
+    // then threw "Coating is missing material information" and the whole temperature field
+    // died. Measured on the production bug queue: 11 of 29 recent designs failed
+    // plot_temperature_field and every single one was litz, while every round, foil and
+    // planar design succeeded.
+    TEST_CASE("Litz resolves its coating material from the strand enamel rather than the bundle serving", "[constructive-model][wire][litz][coating]") {
+        for (const auto& name : {std::string("Litz 12x0.03 - Grade 1 - Double Served"),
+                                 std::string("Litz 12x0.03 - Grade 1 - Unserved")}) {
+            auto wire = OpenMagnetics::find_wire_by_name(name);
+            INFO("wire: " << name);
+
+            // Before the fix the SERVED bundle threw here rather than returning a number.
+            double thermalConductivity = wire.get_coating_thermal_conductivity();
+            REQUIRE(thermalConductivity > 0);
+            // Enamel, not copper: polyurethane/polyesterimide sits around 0.2-0.3 W/(m K).
+            // A value anywhere near copper's 400 would mean we had resolved the conductor.
+            REQUIRE(thermalConductivity < 1.0);
+
+            // The dielectric properties travel through the same resolution point, so they
+            // must answer too rather than throwing on the serving's absent material.
+            REQUIRE(wire.get_coating_relative_permittivity() > 1.0);
+        }
+    }
+
+    // The outer envelope must be the BUNDLE, not one strand. get_maximum_outer_width() used to
+    // fall back to get_maximum_conducting_width(), which for litz returns the strand diameter —
+    // so a 12-strand bundle claimed to be as wide as one of its own strands.
+    TEST_CASE("Litz outer width is the bundle envelope rather than a single strand", "[constructive-model][wire][litz]") {
+        auto wire = OpenMagnetics::find_wire_by_name("Litz 12x0.03 - Grade 1 - Double Served");
+        auto strandConductingDiameter =
+            resolve_dimensional_values(wire.resolve_strand().get_conducting_diameter());
+
+        REQUIRE(wire.get_maximum_outer_width() > strandConductingDiameter);
+        // 12 strands cannot fit inside less than ~sqrt(12) strand diameters.
+        REQUIRE(wire.get_maximum_outer_width() > 3 * strandConductingDiameter);
+        REQUIRE(wire.get_maximum_outer_width() == Catch::Approx(wire.get_maximum_outer_height()));
+    }
+
+    // The guard that catches a REAL fault must survive: strands with no insulation of their own
+    // genuinely leave copper exposed, and close-wound turns of that are shorted.
+    TEST_CASE("Litz with bare strands still reports no insulation", "[constructive-model][wire][litz]") {
+        auto wire = OpenMagnetics::find_wire_by_name("Litz 12x0.03 - Grade 1 - Double Served");
+        auto strand = wire.resolve_strand();
+        InsulationWireCoating bareCoating;
+        bareCoating.set_type(InsulationWireCoatingType::BARE);
+        strand.set_coating(bareCoating);
+        wire.set_strand(strand);
+
+        REQUIRE(wire.get_coating_thickness() == 0);
+    }
+
+    // ABT #853: a wire that DECLARES a coating but gives neither its thickness nor an outer
+    // dimension used to derive (outer - conducting) / 2 with the outer dimension defaulted to the
+    // conducting one -- "absent" read as "equal to the conductor", i.e. as bare metal -- and that
+    // zero then declared close-wound turns a short circuit. Enamelled wire with a grade resolves
+    // from the standard's table; anything else unresolvable is an incomplete wire and throws.
+    // A wire with NO coating at all stays bare (0): foil and planar conductors legitimately rely
+    // on separate insulation layers, and that declaration is explicit, not missing.
+    TEST_CASE("Declared coating without thickness or outer dimension resolves from the table or throws, never 0", "[constructive-model][wire][coating]") {
+        auto rectangular = OpenMagnetics::Wire(json::parse(R"({"type": "rectangular", "material": "copper", "numberConductors": 1,
+            "conductingWidth": {"nominal": 0.004}, "conductingHeight": {"nominal": 0.001},
+            "coating": {"type": "enamelled", "grade": 1}})"));
+        double rectangularCoating = rectangular.get_coating_thickness();
+        INFO("rectangular grade-1 coating: " << rectangularCoating);
+        REQUIRE(rectangularCoating > 0);
+        REQUIRE(rectangularCoating < 0.001);  // a fraction of the conductor, not the conductor
+        REQUIRE(rectangularCoating == Catch::Approx(std::min(
+            (OpenMagnetics::Wire::get_outer_width_rectangular(0.004, 1, WireStandard::IEC_60317) - 0.004) / 2,
+            (OpenMagnetics::Wire::get_outer_height_rectangular(0.001, 1, WireStandard::IEC_60317) - 0.001) / 2)));
+
+        auto round = OpenMagnetics::Wire(json::parse(R"({"type": "round", "material": "copper", "numberConductors": 1,
+            "conductingDiameter": {"nominal": 0.001}, "coating": {"type": "enamelled", "grade": 2}})"));
+        double roundCoating = round.get_coating_thickness();
+        INFO("round grade-2 coating: " << roundCoating);
+        REQUIRE(roundCoating > 0);
+        REQUIRE(roundCoating < 0.001);
+        REQUIRE(roundCoating == Catch::Approx(
+            (OpenMagnetics::Wire::get_outer_diameter_round(0.001, 2, WireStandard::IEC_60317) - 0.001) / 2));
+
+        // Declares an insulation but nothing that sizes it: cannot be derived, must not be 0.
+        auto foil = OpenMagnetics::Wire(json::parse(R"({"type": "foil", "material": "copper", "numberConductors": 1,
+            "conductingWidth": {"nominal": 0.0002}, "conductingHeight": {"nominal": 0.01},
+            "coating": {"type": "insulated"}})"));
+        REQUIRE_THROWS_AS(foil.get_coating_thickness(), OpenMagnetics::InvalidInputException);
+
+        // Explicitly bare: no coating key at all. Still 0 -- that is a declaration, not a gap.
+        auto bareFoil = OpenMagnetics::Wire(json::parse(R"({"type": "foil", "material": "copper", "numberConductors": 1,
+            "conductingWidth": {"nominal": 0.0002}, "conductingHeight": {"nominal": 0.01}})"));
+        REQUIRE(bareFoil.get_coating_thickness() == 0);
+
+        // Outer dimensions given: the derived route is still the answer.
+        auto foilWithOuter = OpenMagnetics::Wire(json::parse(R"({"type": "foil", "material": "copper", "numberConductors": 1,
+            "conductingWidth": {"nominal": 0.0002}, "conductingHeight": {"nominal": 0.01},
+            "outerWidth": {"nominal": 0.00025}, "outerHeight": {"nominal": 0.01005},
+            "coating": {"type": "insulated"}})"));
+        REQUIRE(foilWithOuter.get_coating_thickness() == Catch::Approx(0.000025));
+    }
+
     TEST_CASE("Test_Filling_Factors_Medium_Round_Enamelled_Wire_Grade_1", "[constructive-model][wire][smoke-test]") {
         auto fillingFactor = OpenMagnetics::Wire::get_filling_factor_round(5.4e-05);
         double expectedValue = 0.755;
@@ -878,6 +999,31 @@ namespace {
 
         auto newWire = OpenMagnetics::Wire::get_equivalent_wire(oldWire, newWireType, effectivefrequency);
         REQUIRE(newWire.get_type() == WireType::LITZ);
+    }
+
+
+    // ABT #898: the wire the ADVISERS synthesise must carry the coating whose table
+    // produced its outer diameter. get_wire_for_frequency/get_wire_for_conducting_area in
+    // `exact` mode size the outer diameter with get_outer_diameter_round(d, grade 1,
+    // IEC 60317) -- an ENAMELLED grade-1 wire -- but used to stamp no coating at all, so
+    // Wire::get_coating_thickness() read "no coating object" and answered 0. Every turn of
+    // the fast adviser's dummy coil was then bare copper, and StrayCapacitance rightly
+    // called close-wound bare turns a short circuit / an infinite capacitance.
+    TEST_CASE("Test_Synthesised_Adviser_Wire_Is_Insulated", "[constructive-model][wire][abt898]") {
+        for (auto wire : {OpenMagnetics::Wire::get_wire_for_frequency(100000, 25, true),
+                          OpenMagnetics::Wire::get_wire_for_conducting_area(1e-7, 25, true)}) {
+            auto conductingDiameter = resolve_dimensional_values(wire.get_conducting_diameter().value());
+            auto outerDiameter = resolve_dimensional_values(wire.get_outer_diameter().value());
+            REQUIRE(outerDiameter > conductingDiameter);
+            // The coating must exist, must not claim to be bare, and must measure the very
+            // gap the outer diameter already describes.
+            auto coating = wire.resolve_coating();
+            REQUIRE(coating);
+            REQUIRE(coating->get_type().value() != InsulationWireCoatingType::BARE);
+            REQUIRE(wire.get_coating_thickness() > 0);
+            REQUIRE_THAT(wire.get_coating_thickness(),
+                         Catch::Matchers::WithinRel((outerDiameter - conductingDiameter) / 2, 1e-9));
+        }
     }
 
 }  // namespace

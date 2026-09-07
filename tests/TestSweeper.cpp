@@ -1,4 +1,8 @@
 #include <source_location>
+#include <algorithm>
+#include "constructive_models/Magnetic.h"
+#include "constructive_models/Coil.h"
+#include "support/Utils.h"
 #include "processors/Sweeper.h"
 #include "support/Painter.h"
 #include "support/Settings.h"
@@ -1006,5 +1010,138 @@ namespace {
         settings.reset();
     }
 
+
+    // ABT #366/#362/#357: impedance sweeps over the new families. The impedance chain pulls
+    // magnetizing inductance, stray capacitance, winding and core losses together, so it is the
+    // broadest end-to-end path a magnetic goes through — and none of the drum-family or molded
+    // cores had ever been down it. Each family must sweep to a finite, positive, inductive-then
+    // -capacitive |Z| curve with a self-resonance inside the swept band. No pinned values: these
+    // are new geometries with no published impedance data to validate against.
+    TEST_CASE("Test_Sweeper_Impedance_New_Core_Families",
+              "[processor][sweeper][drum][drum-ring][drum-semishielded][molded]") {
+        settings.reset();
+        clear_databases();
+
+        auto buildMagnetic = [](const Core& core, int64_t numberTurns) {
+            json coilJson;
+            coilJson["bobbin"] = "Dummy";
+            coilJson["functionalDescription"] = json::array({{
+                {"name", "winding 0"}, {"numberTurns", numberTurns}, {"numberParallels", 1},
+                {"isolationSide", "primary"}, {"wire", "Round 0.1 - Grade 1"}}});
+            OpenMagnetics::Magnetic magnetic;
+            magnetic.set_core(core);
+            magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
+            return OpenMagnetics::magnetic_autocomplete(magnetic);
+        };
+        auto buildCustomCore = [](json shapeJson, const std::string& coreType, json coating = json()) {
+            json coreJson;
+            coreJson["functionalDescription"] = {
+                {"type", coreType}, {"material", "3C90"}, {"shape", shapeJson},
+                {"gapping", json::array()}, {"numberStacks", 1}};
+            if (!coating.is_null()) {
+                coreJson["functionalDescription"]["coating"] = coating;
+            }
+            Core core(coreJson);
+            core.process_data();
+            core.process_gap();
+            return core;
+        };
+
+        json drumDimensions = {
+            {"A", {{"nominal", 0.0038}}}, {"B", {{"nominal", 0.0018}}}, {"C", {{"nominal", 0.0015}}},
+            {"D", {{"nominal", 0.0004}}}, {"E", {{"nominal", 0.0010}}}, {"F", {{"nominal", 0.0004}}}};
+        json semishieldedDimensions = drumDimensions;
+        semishieldedDimensions["J"] = {{"nominal", 0.0040}};
+        semishieldedDimensions["K"] = {{"nominal", 0.0040}};
+        semishieldedDimensions["L"] = {{"nominal", 0.0018}};
+
+        std::vector<std::pair<std::string, OpenMagnetics::Magnetic>> magnetics;
+        magnetics.emplace_back("drum", buildMagnetic(
+            OpenMagneticsTesting::get_quick_core("DRH-14X20-4C", json::array(), 1, "3C90"), 20));
+        magnetics.emplace_back("drumRing", buildMagnetic(
+            OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "3C90"), 8));
+        magnetics.emplace_back("drumSemishielded", buildMagnetic(buildCustomCore(
+            {{"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "drumSemishielded"},
+             {"aliases", json::array()}, {"name", "LQS-like 4018"}, {"dimensions", semishieldedDimensions}},
+            "pieceAndPlate", {{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", "Kool Mµ 26"}}), 8));
+        magnetics.emplace_back("molded", buildMagnetic(buildCustomCore(
+            {{"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+             {"aliases", json::array()}, {"name", "MAPI-like 4020"},
+             {"dimensions", {
+                 {"A", {{"nominal", 0.0041}}}, {"B", {{"nominal", 0.0021}}}, {"C", {{"nominal", 0.0041}}},
+                 {"D", {{"nominal", 0.0014}}}, {"E", {{"nominal", 0.0030}}}, {"F", {{"nominal", 0.0012}}}}}},
+            "closedShape"), 8));
+
+        for (auto& [label, magnetic] : magnetics) {
+            // Band to 1 GHz, not 100 MHz: with the full energy-based capacitance model as the
+            // Impedance default (MKF d424c32e) these 8-turn bare-drum fixtures carry ~0.04 pF --
+            // a single air-spaced layer of 0.1 mm enamelled wire on a 2.3 mm drum, no resin, no
+            // second layer -- and with ~54 uH that puts the self-resonance at ~110 MHz, just past
+            // the old ceiling, where the "maximum interior to the band" check read it as no
+            // resonance at all. Real moulded parts sit in the pF class because of the resin and
+            // layering these synthetic fixtures do not have.
+            auto impedanceSweep = Sweeper().sweep_impedance_over_frequency(magnetic, 1000, 1000000000, 200);
+            auto impedanceMagnitudes = impedanceSweep.get_y_points();
+            REQUIRE(impedanceMagnitudes.size() > 100);
+            for (auto impedanceMagnitude : impedanceMagnitudes) {
+                REQUIRE(std::isfinite(impedanceMagnitude));
+                REQUIRE(impedanceMagnitude > 0);
+            }
+            // Inductive below resonance, capacitive above: the curve must rise then fall, so its
+            // maximum is interior to the band (a monotonic curve would mean no resonance found).
+            auto peak = std::max_element(impedanceMagnitudes.begin(), impedanceMagnitudes.end());
+            size_t peakIndex = size_t(std::distance(impedanceMagnitudes.begin(), peak));
+            UNSCOPED_INFO(label << ": |Z| peak " << *peak << " ohm at point " << peakIndex
+                          << "/" << impedanceMagnitudes.size() << ", |Z| at 1 kHz "
+                          << impedanceMagnitudes.front());
+            CHECK(peakIndex > 0);
+            CHECK(peakIndex < impedanceMagnitudes.size() - 1);
+            CHECK(impedanceMagnitudes.front() < *peak);
+        }
+        settings.reset();
+    }
+
+
+    // A coil the winder CANNOT place has no full-model stray capacitance: the full model sums
+    // per-turn energies and therefore winds the coil, and the winder returning no turns is a
+    // hard error (ABT #850), not a zero. That is correct -- but it also made the impedance of
+    // such a part uncomputable through the sweep, which hardcoded the full model. For a bead
+    // the impedance is set by the core and the capacitance only moves the self-resonance, so
+    // the one-layer model gives a usable curve; the caller has to ASK for it, which is what
+    // this pins. Both halves matter: without the throw the fallback would be silent, and
+    // without the opt-in the curve would be unreachable.
+    TEST_CASE("Test_Sweeper_Impedance_Unwindable_Coil_Needs_The_Fast_Capacitance_Model", "[processor][sweeper][unwindable]") {
+        settings.reset();
+        settings.set_coil_wind_even_if_not_fit(false);
+
+        // The bore's inner circumference is what limits a toroid, not its diameter: turns lie
+        // side by side around it. pi * 7.5 mm = 23.6 mm of room, and 12 turns of 3.15 mm wire
+        // need 37.8 mm, so this part cannot be built as specified.
+        std::vector<int64_t> numberTurns = {12};
+        std::vector<int64_t> numberParallels = {1};
+        std::string shapeName = "T 12.5/7.5/5";
+        std::vector<OpenMagnetics::Wire> wires = {find_wire_by_name("Round 3.15 - Grade 1")};
+        auto coil = OpenMagneticsTesting::get_quick_coil(
+            numberTurns, numberParallels, shapeName, 1,
+            WindingOrientation::OVERLAPPING, WindingOrientation::OVERLAPPING,
+            CoilAlignment::CENTERED, CoilAlignment::CENTERED, wires);
+        auto core = OpenMagneticsTesting::get_quick_core(shapeName, json::parse("[]"), 1, "3C97");
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(coil);
+
+        REQUIRE_THROWS(Sweeper().sweep_impedance_over_frequency(magnetic, 1e5, 1e8, 20));
+
+        auto curve = Sweeper().sweep_impedance_over_frequency(
+            magnetic, 1e5, 1e8, 20, "log", "Impedance over frequency",
+            /*fast=*/true, /*fastCapacitance=*/true);
+        auto impedances = curve.get_y_points();
+        REQUIRE(impedances.size() == 20);
+        for (auto impedance : impedances) {
+            REQUIRE(std::isfinite(impedance));
+            REQUIRE(impedance > 0);
+        }
+        settings.reset();
+    }
+
 }  // namespace
- 

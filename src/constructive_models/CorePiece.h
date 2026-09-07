@@ -4,11 +4,13 @@
 
 #include <MAS.hpp>
 
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <numbers>
+#include <optional>
 #include <streambuf>
 #include <vector>
 
@@ -55,6 +57,31 @@ class CorePiece {
     virtual void process_columns() = 0;
     virtual void process_winding_window() = 0;
     virtual void process_extra_data() = 0;
+
+    // ABT #362: pieces whose magnetic circuit crosses TWO materials (e.g. a ferrite drum
+    // closed by a magnetic-epoxy shell) expose their IEC shape constants split per material:
+    // {c1_core, c2_core, c1_shell, c2_shell}. c1 alone drives the per-section reluctance
+    // (mu applied section by section); c1 and c2 together give each material's own effective
+    // parameters — le = c1^2/c2, Ae = c1/c2, Ve = c1^3/c2^2 — which the core-loss split needs
+    // to price each material over ITS volume at ITS flux density. Single-material pieces
+    // return nullopt (default).
+    virtual std::optional<std::array<double, 4>> get_mixed_material_constants() { return std::nullopt; }
+
+    // ABT #1002: a compression-moulded body can be pressed from up to THREE powders -- the post
+    // the coil sits on, the cover moulded over the coil, and the base plate under it (the WE lists
+    // of parts name them COR / COV / SUB, or Inner / Outer when base and cover are one pressing).
+    // Pieces built that way expose their IEC 60205 sections grouped per REGION, in the order
+    // functionalDescription.material lists the grades, so the inductance model can apply each
+    // region's own permeability and the loss model can price each region's own volume. c1 and c2
+    // are the same sums get_shape_constants() makes: adding the regions reproduces the piece.
+    // Single-region pieces return nullopt (default).
+    struct RegionShapeConstants {
+        std::string name;
+        double c1;
+        double c2;
+        double minimumArea;
+    };
+    virtual std::optional<std::vector<RegionShapeConstants>> get_region_shape_constants() { return std::nullopt; }
 
     virtual ~CorePiece() = default;
 
@@ -233,6 +260,30 @@ class CorePiece {
      */
     CoreLossFractions calculate_core_loss_fractions();
 };
+
+/**
+ * The shape families CorePiece::factory can actually construct.
+ *
+ * This is the ENGINE's capability, and it is deliberately not the same question as
+ * get_core_shape_families() in Utils.h, which reports the families that happen to
+ * appear in the loaded shape database. A family with no catalogue shape is still
+ * fully buildable from a custom shape, so a UI that offers families must ask this
+ * one; asking the database instead silently hides every family nobody has published
+ * a part for yet.
+ *
+ * @return the supported families, in declaration order
+ */
+std::vector<CoreShapeFamily> get_supported_core_shape_families();
+
+/**
+ * The dimensions a family's geometry reads and REQUIRES, from the CorePiece subclass that
+ * reads them — not from whichever shapes are published, which answers nothing for a family
+ * with no catalogue record (ABT #1007). Optional, guarded dimensions are deliberately absent;
+ * get_shape_family_dimensions adds whatever the catalogue additionally carries.
+ *
+ * @throws std::runtime_error if the family has no declaration.
+ */
+std::vector<std::string> get_core_shape_family_required_dimensions(CoreShapeFamily family);
 
 void from_json(const json& j, OpenMagnetics::CorePiece& x);
 void to_json(json& j, const OpenMagnetics::CorePiece& x);

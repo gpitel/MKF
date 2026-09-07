@@ -12,7 +12,7 @@
 //
 // SHAPE OF EACH TEST
 //   - Build a fixed reference Magnetic (inductor-style: E 35 / 3C97, 40+20 turns,
-//     Round 2.00 - Grade 1 wire, ungapped).
+//     Round 1.00 - Grade 1 wire, ungapped — a design that FITS its window, ABT #785).
 //   - Build a fixed reference Inputs (100 kHz triangular, 100 µH, 25 °C, ±√3 A).
 //   - factory() the filter (where allowed).
 //   - evaluate_magnetic(...) once.
@@ -40,15 +40,18 @@
 
 #include <source_location>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <vector>
 #include <utility>
+#include "json.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/benchmark/catch_benchmark.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include "advisers/MagneticFilter.h"
+#include "advisers/MagneticAdviser.h"
 #include "constructive_models/Magnetic.h"
 #include "constructive_models/Core.h"
 #include "constructive_models/Coil.h"
@@ -74,18 +77,54 @@ constexpr double kRelTol = 1e-4;
 // A single deterministic Magnetic + Inputs pair used by all behaviour tests.
 // Keeping it tiny + ungapped keeps filter evaluation fast and avoids dragging
 // random external state into the snapshot.
+//
+// THE WIRE MUST KEEP THE DESIGN WINDABLE (ABT #785). The original fixture used
+// Round 2.00 - Grade 1 (outer 2.074 mm) in E 35's 7.5 x 25 mm window, which holds
+// floor(25/2.074) = 12 turns per layer and floor(7.5/2.074) = 3 layers — about 36
+// turns against the 60 this fixture asks for. are_sections_and_layers_fitting()
+// returned FALSE and wind() emitted a layout that cannot exist: winding 0 as a
+// SINGLE layer 2.074 x 82.96 mm, 3.3x taller than the window containing it
+// (section filling factor 1.84). Every layout-sensitive snapshot was therefore
+// pinned to whatever an over-stuffed winder happened to emit, which is why
+// DIMENSIONS / COST / AREA_NO_PARALLELS drifted with no code change anyone would
+// call a regression, and why nine more sat inert at {false, 0.0}.
+//
+// Round 1.00 - Grade 1 (outer 1.062 mm) gives 23 turns per layer x 7 layers = 161
+// turns of capacity for 60, so the coil genuinely fits and the filters measure a
+// real winding. If you change the wire or the turn counts again, CHECK
+// are_sections_and_layers_fitting() before re-harvesting anything.
 OpenMagnetics::Magnetic make_reference_magnetic() {
     OpenMagneticsTesting::QuickMagneticConfig cfg;
     cfg.numberTurns = {40, 20};
     cfg.numberParallels = {1, 1};
     cfg.coreShapeName = "E 35";
     cfg.coreMaterialName = "3C97";
-    cfg.wireNames = {"Round 2.00 - Grade 1", "Round 2.00 - Grade 1"};
+    cfg.wireNames = {"Round 1.00 - Grade 1", "Round 1.00 - Grade 1"};
     cfg.numberStacks = 1;
     auto m = OpenMagneticsTesting::create_quick_test_magnetic(cfg);
     // Wind the coil so filters that iterate turns/layers/sections (VOLUME, AREA,
     // HEIGHT, *_TIMES_VOLUME*, LOSSES family) don't trip COIL_NOT_PROCESSED.
     m.get_mutable_coil().wind();
+    return m;
+}
+
+// The same magnetic with its coil explicitly UNWOUND, for the tests that pin the
+// loud-failure contract: a filter needing turns/layers must THROW, never score
+// silently (the 2026-05-20 "eliminate silent fallbacks" pass).
+//
+// Those tests used to lean on make_reference_magnetic() failing to wind — wind()
+// above could not lay this design out when they were written, so the filters threw
+// by accident. The winder lays it out now, so the throw stopped happening: six
+// characterisation tests went red AND the contract they guard stopped being
+// exercised at all. Unwinding on purpose restores it and makes the tests
+// independent of whether any given design happens to fit.
+//
+// NOT for the tests whose contract is "wound but not delimited/compacted"
+// (AREA_WITH_PARALLELS) or "wound, but the inputs lack a spec"
+// (CORE_MINIMUM_IMPEDANCE) — those need the WOUND reference and still pass.
+OpenMagnetics::Magnetic make_unwound_reference_magnetic() {
+    auto m = make_reference_magnetic();
+    m.get_mutable_coil().unwind();
     return m;
 }
 
@@ -138,6 +177,34 @@ struct Snapshot {
 const std::map<std::string, Snapshot> kSnapshots = {
     // Baselines captured 2026-05-19 against E 35 / 3C97 / 40+20 turns /
     // Round 2.00 - Grade 1 wire, 100 kHz triangular, ±√3 A, 25 °C.
+    //
+    // RE-HARVESTED 2026-08-17 (ABT #785) after the fixture wire went
+    // Round 2.00 → Round 1.00 - Grade 1, because the old design did not fit its
+    // winding window and every layout-sensitive entry was characterising an
+    // impossible layout (see the note on make_reference_magnetic()). Only four
+    // entries moved, and the direction is reassuring: the coil now lays up as
+    // 3 conduction layers + 2 insulation layers, which is exactly the stack the
+    // 2026-05-19 harvest saw — COST comes back to its ORIGINAL 7.0 on its own.
+    //   DIMENSIONS         2.7616400000000005e-05 → 2.0178200000000003e-05
+    //   COST               6.0 (drifted) → 7.0 (original value restored)
+    //   AREA_NO_PARALLELS  valid true → false  (a real filter bug, see below)
+    //   TEMPERATURE        27.158311798960909 → 28.050433964481037
+    // TEMPERATURE rises because the thinner wire has more DC resistance; the
+    // core-only entries (AREA_PRODUCT, ENERGY_STORED, ESTIMATED_COST,
+    // MAGNETIZING_INDUCTANCE, SATURATION) are unmoved, as they should be.
+    //
+    // The two that moved to a NON-ZERO value are hand-derivable, so they are not
+    // merely "whatever the code emitted" (the June 2026 review's trap). The layup
+    // is 40 turns -> 2 layers, 20 turns -> 1 layer, plus 2 x 25 um insulation:
+    //   COST       = numberLayers + sum(wire relative cost) = 5 + (1 + 1)      = 7
+    //   DIMENSIONS = W x H x max(coreDepth, column0Depth + 2 x sum(layerWidths))
+    //              = 0.035 x 0.035 x (0.010 + 2 x (3 x 1.062 + 2 x 0.025) mm)
+    //              = 0.001225 x 0.016472                        = 2.017820e-05
+    //
+    // NOT fixed by the fixture change: the nine entries pinned at {false, 0.0}
+    // below are dead for their own reasons (no DcResistance on the wound coil,
+    // empty vectors, etc.), not because the reference could not be wound. Making
+    // the design windable did not revive any of them.
     // ---------------------------------------------------------------
     {"AREA_PRODUCT",                                    {true,  1.8374733304713626e-08}},
     // ENERGY_STORED / TEMPERATURE / SATURATION refreshed 2026-06-16 (ABT #10).
@@ -162,8 +229,16 @@ const std::map<std::string, Snapshot> kSnapshots = {
     // (MagneticFilter.cpp:1070–1071). Score is 0 here because earlier
     // model rejects → the double-call cannot be observed at this fixture.
     {"LOSSES_NO_PROXIMITY",                             {false, 0.0}},
-    {"DIMENSIONS",                                      {true,  2.7616400000000005e-05}},
-    {"AREA_NO_PARALLELS",                               {true,  0.0}},
+    {"DIMENSIONS",                                      {true,  2.0178200000000003e-05}},
+    // LOCKS BUG (ABT #787): MagneticFilterAreaNoParallels compares
+    // `wire.get_maximum_outer_width() < section.get_dimensions()[0]` — STRICTLY.
+    // A section holding exactly one layer is compacted to exactly one wire width,
+    // so the comparison is an exact float equality and the winding is rejected.
+    // Here winding 1 (20 turns, one 1.062 mm layer) trips it, so the filter says
+    // false for a coil that fits with room to spare. Not fixture-dependent: any
+    // single-layer section hits it. Locked as {false, 0.0}; when #787 lands this
+    // flips back to {true, 0.0} and that is the signal, not a regression.
+    {"AREA_NO_PARALLELS",                               {false, 0.0}},
     {"EFFECTIVE_RESISTANCE",                            {false, 0.0}},
     {"PROXIMITY_FACTOR",                                {false, 0.0}},
     {"TURNS_RATIOS",                                    {true,  0.0}},
@@ -182,7 +257,7 @@ const std::map<std::string, Snapshot> kSnapshots = {
     // LEAKAGE_INDUCTANCE no longer returns DBL_MAX sentinel — the error path
     // is now a throws-contract test below (see TEST_CASE "LEAKAGE_INDUCTANCE
     // throws on missing turns description"). No snapshot entry needed.
-    {"TEMPERATURE",                                     {true,  27.158311798960909}},  // 2026-06-16 ABT #10: -1.4 % from reclassified B recompute
+    {"TEMPERATURE",                                     {true,  28.050433964481037}},  // 2026-08-17 ABT #785: +3.3 % — Round 1.00 has more DC resistance than Round 2.00
     {"TURN_COUNT",                                      {true,  2.1000000000000001}},
     // FRINGING_FACTOR returns score=1.0 on every non-crashing path
     // (MagneticFilter.cpp:2079, 2082, 2089, 2092). After fix A the factory
@@ -251,6 +326,24 @@ std::vector<Core> load_test_cores(size_t limit = std::numeric_limits<size_t>::ma
 //   [characterisation][heavy]        always (heavy: excluded from smoke runs)
 //   [<filter-name-lowercased>]       so a specific filter can be re-run alone
 //
+
+// ABT #785: the snapshots below are only meaningful if the reference coil is a winding that can
+// physically exist. It was not for three years (Round 2.00 in E 35 needed ~60 turns of capacity
+// and had ~36), and the whole table silently characterised an over-stuffed layout. Guard it, so a
+// future fixture edit fails HERE with an obvious reason rather than as a drifting snapshot.
+TEST_CASE("MagneticFilter reference fixture is windable (ABT #785)",
+          "[magnetic-filter][characterisation][fixture]") {
+    settings.reset();
+    auto magnetic = make_reference_magnetic();
+    auto& coil = magnetic.get_mutable_coil();
+    REQUIRE(coil.get_sections_description());
+    REQUIRE(coil.get_layers_description());
+    REQUIRE(coil.get_turns_description());
+    REQUIRE(coil.get_turns_description().value().size() == 60);
+    INFO("the reference design must fit its winding window — see the wire note on "
+         "make_reference_magnetic()");
+    REQUIRE(coil.are_sections_and_layers_fitting());
+}
 
 TEST_CASE("MagneticFilter AREA_PRODUCT snapshot",
           "[magnetic-filter][characterisation][heavy][area-product]") {
@@ -402,7 +495,7 @@ TEST_CASE("MagneticFilter VOLUME snapshot",
     // bounding volume. Our reference magnetic doesn't have a fully processed
     // turns_description so it throws — Phase 1 should keep this loud.
     settings.reset();
-    auto magnetic = make_reference_magnetic();
+    auto magnetic = make_unwound_reference_magnetic();
     auto inputs = make_reference_inputs();
     auto filter = MagneticFilter::factory(MagneticFilters::VOLUME, inputs);
     REQUIRE_THROWS_AS(filter->evaluate_magnetic(&magnetic, &inputs),
@@ -412,7 +505,7 @@ TEST_CASE("MagneticFilter VOLUME snapshot",
 TEST_CASE("MagneticFilter AREA snapshot",
           "[magnetic-filter][characterisation][heavy][area]") {
     settings.reset();
-    auto magnetic = make_reference_magnetic();
+    auto magnetic = make_unwound_reference_magnetic();
     auto inputs = make_reference_inputs();
     auto filter = MagneticFilter::factory(MagneticFilters::AREA, inputs);
     REQUIRE_THROWS_AS(filter->evaluate_magnetic(&magnetic, &inputs),
@@ -422,7 +515,7 @@ TEST_CASE("MagneticFilter AREA snapshot",
 TEST_CASE("MagneticFilter HEIGHT snapshot",
           "[magnetic-filter][characterisation][heavy][height]") {
     settings.reset();
-    auto magnetic = make_reference_magnetic();
+    auto magnetic = make_unwound_reference_magnetic();
     auto inputs = make_reference_inputs();
     auto filter = MagneticFilter::factory(MagneticFilters::HEIGHT, inputs);
     REQUIRE_THROWS_AS(filter->evaluate_magnetic(&magnetic, &inputs),
@@ -438,7 +531,7 @@ TEST_CASE("MagneticFilter LOSSES_TIMES_VOLUME snapshot",
           "[magnetic-filter][characterisation][heavy][losses-times-volume]") {
     // Same precondition as VOLUME — wound + delimited coil required.
     settings.reset();
-    auto magnetic = make_reference_magnetic();
+    auto magnetic = make_unwound_reference_magnetic();
     auto inputs = make_reference_inputs();
     auto filter = MagneticFilter::factory(MagneticFilters::LOSSES_TIMES_VOLUME, inputs);
     REQUIRE_THROWS_AS(filter->evaluate_magnetic(&magnetic, &inputs),
@@ -448,7 +541,7 @@ TEST_CASE("MagneticFilter LOSSES_TIMES_VOLUME snapshot",
 TEST_CASE("MagneticFilter VOLUME_TIMES_TEMPERATURE_RISE snapshot",
           "[magnetic-filter][characterisation][heavy][volume-times-temperature-rise]") {
     settings.reset();
-    auto magnetic = make_reference_magnetic();
+    auto magnetic = make_unwound_reference_magnetic();
     auto inputs = make_reference_inputs();
     auto filter = MagneticFilter::factory(MagneticFilters::VOLUME_TIMES_TEMPERATURE_RISE, inputs);
     REQUIRE_THROWS_AS(filter->evaluate_magnetic(&magnetic, &inputs),
@@ -458,7 +551,7 @@ TEST_CASE("MagneticFilter VOLUME_TIMES_TEMPERATURE_RISE snapshot",
 TEST_CASE("MagneticFilter LOSSES_TIMES_VOLUME_TIMES_TEMPERATURE_RISE snapshot",
           "[magnetic-filter][characterisation][heavy][losses-times-volume-times-temperature-rise]") {
     settings.reset();
-    auto magnetic = make_reference_magnetic();
+    auto magnetic = make_unwound_reference_magnetic();
     auto inputs = make_reference_inputs();
     auto filter = MagneticFilter::factory(
         MagneticFilters::LOSSES_TIMES_VOLUME_TIMES_TEMPERATURE_RISE, inputs);
@@ -483,7 +576,7 @@ TEST_CASE("MagneticFilter LEAKAGE_INDUCTANCE throws on missing turns description
     // model throws CoilNotProcessedException — that exception must now
     // propagate instead of being swallowed and rewritten as DBL_MAX.
     settings.reset();
-    auto magnetic = make_reference_magnetic();
+    auto magnetic = make_unwound_reference_magnetic();
     auto inputs = make_reference_inputs();
     auto filter = MagneticFilter::factory(MagneticFilters::LEAKAGE_INDUCTANCE, inputs);
     REQUIRE_THROWS_AS(filter->evaluate_magnetic(&magnetic, &inputs),
@@ -701,6 +794,52 @@ TEST_CASE("MagneticFilter DATASHEET_LIMITS gates each winding against its own ra
 // =============================================================================
 // Filters that require Inputs at construction must throw if none is provided.
 
+// ABT #357 phase 1: the WE-MAPI catalogue corpus — 183 parts pulled from RedExpert's public
+// JSON API (scripts/pull_we_mapi.py, schema-validated at generation, provenance carried per
+// record). Pins: (a) the corpus stays complete and parseable; (b) DATASHEET_LIMITS gates on
+// REAL vendor records end-to-end — 20% over the part's own rated current rejects, 50% under
+// passes with headroom.
+TEST_CASE("MagneticFilter DATASHEET_LIMITS gates the WE-MAPI corpus (ABT #357 phase 1)",
+          "[magnetic-filter][datasheet-limits][we-mapi]") {
+    settings.reset();
+    auto path = std::filesystem::path{std::source_location::current().file_name()}
+                    .parent_path().append("testData").append("we_mapi_datasheet_stubs.ndjson");
+    std::ifstream in(path);
+    REQUIRE(in.good());
+    std::string line;
+    size_t partCount = 0;
+    std::optional<nlohmann::json> firstStub;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        nlohmann::json stub = nlohmann::json::parse(line);
+        auto& electricalJson = stub.at("manufacturerInfo").at("datasheetInfo").at("electrical").at(0);
+        REQUIRE(electricalJson.contains("inductance"));
+        REQUIRE(electricalJson.contains("saturationCurrents"));
+        REQUIRE(electricalJson.contains("ratedCurrents"));
+        if (!firstStub) firstStub = stub;
+        ++partCount;
+    }
+    CHECK(partCount == 183);
+
+    DatasheetInfo datasheetInfo;
+    from_json((*firstStub)["manufacturerInfo"]["datasheetInfo"], datasheetInfo);
+    REQUIRE(datasheetInfo.get_electrical());
+    auto electrical = datasheetInfo.get_electrical().value()[0];
+    REQUIRE(electrical.get_rated_currents());
+    double ratedCurrent = electrical.get_rated_currents().value()[0];
+    auto magnetic = make_datasheet_magnetic(electrical);
+    auto filter = MagneticFilter::factory(MagneticFilters::DATASHEET_LIMITS);
+
+    auto overInputs = make_datasheet_inputs({{ratedCurrent * 1.2, std::nullopt, std::nullopt, std::nullopt}});
+    auto [overValid, overScore] = filter->evaluate_magnetic(&magnetic, &overInputs);
+    CHECK(overValid == false);
+
+    auto underInputs = make_datasheet_inputs({{ratedCurrent * 0.5, std::nullopt, std::nullopt, std::nullopt}});
+    auto [underValid, underScore] = filter->evaluate_magnetic(&magnetic, &underInputs);
+    CHECK(underValid == true);
+    CHECK(underScore > 0);
+}
+
 TEST_CASE("MagneticFilter factory requires Inputs for AREA_PRODUCT",
           "[magnetic-filter][characterisation][factory-contract][smoke-test]") {
     REQUIRE_THROWS_AS(MagneticFilter::factory(MagneticFilters::AREA_PRODUCT, std::nullopt),
@@ -737,7 +876,7 @@ TEST_CASE("MagneticFilter factory requires Inputs for CORE_DC_AND_SKIN_LOSSES",
 // Tiered datasets: 10 / 100 / full (~4800 cores after parse-skips).
 
 TEST_CASE("Benchmark MagneticFilter SATURATION (10 cores)",
-          "[magnetic-filter][!benchmark][benchmark-saturation]") {
+          "[!benchmark][benchmark-saturation]") {
     settings.reset();
     auto inputs = make_reference_inputs();
     auto cores = load_test_cores(10);
@@ -765,7 +904,7 @@ TEST_CASE("Benchmark MagneticFilter SATURATION (10 cores)",
 }
 
 TEST_CASE("Benchmark MagneticFilter CORE_AND_DC_LOSSES (100 cores)",
-          "[magnetic-filter][!benchmark][benchmark-core-and-dc-losses]") {
+          "[!benchmark][benchmark-core-and-dc-losses]") {
     settings.reset();
     auto inputs = make_reference_inputs();
     auto cores = load_test_cores(100);
@@ -788,7 +927,7 @@ TEST_CASE("Benchmark MagneticFilter CORE_AND_DC_LOSSES (100 cores)",
 }
 
 TEST_CASE("Benchmark MagneticFilter AREA_PRODUCT (full DB)",
-          "[magnetic-filter][!benchmark][benchmark-area-product]") {
+          "[!benchmark][benchmark-area-product]") {
     settings.reset();
     auto inputs = make_reference_inputs();
     auto cores = load_test_cores();
@@ -825,3 +964,72 @@ TEST_CASE("Benchmark MagneticFilter AREA_PRODUCT (full DB)",
 // optimising the filter, also extract a cached-coil benchmark to isolate the
 // hot path. See "Performance" section of the Phase 6 plan.
 // =============================================================================
+
+// ABT #19 wiring: the DATASHEET_LIMITS filter existed and was factory-registered but was
+// never part of the DEFAULT catalogue flow — so catalogue parts were only gated by
+// MKF-simulated quantities and their own published limits were silently ignored. Pin the
+// flow membership so it cannot fall out again.
+TEST_CASE("Catalogue filter flow includes DATASHEET_LIMITS (ABT #19 wiring)",
+          "[adviser][magnetic-filter][datasheet]") {
+    OpenMagnetics::MagneticAdviser adviser;
+    bool datasheetLimitsPresent = false;
+    for (auto& operation : adviser._defaultCatalogueMagneticFilterFlow) {
+        if (operation.get_filter() == MagneticFilters::DATASHEET_LIMITS) {
+            datasheetLimitsPresent = true;
+        }
+    }
+    CHECK(datasheetLimitsPresent);
+}
+
+TEST_CASE("Processed-only excitation advises without a bad optional access (ABT #825)",
+          "[adviser][magnetic-filter]") {
+    // ABT #825: an excitation given as {label, dutyCycle, offset, peakToPeak} — the ordinary way
+    // to describe one without a waveform — short-circuits calculate_basic_processed_data, which is
+    // the only place processed.peak is derived. So the processed block arrives with an rms, a thd
+    // and harmonics but NO peak, and MagneticEnergy::calculate_required_magnetic_energy read it as
+    // get_peak().value(). Via MagneticFilterEnergyStored that sits on the core adviser's critical
+    // path, so advising ANY design described this way died with "bad optional access", naming
+    // neither the field nor the excitation. A plain inductor with no turns ratio reproduces it.
+    //
+    // Note what is NOT asserted here: that processed.peak gets populated. Filling it in at the
+    // source was the first fix and it was wrong — peak is read behind `if (get_peak())` in half a
+    // dozen filters, and giving it a value where they had learned to expect none changed which
+    // branch they take, emptying the candidate list for a flyback design
+    // (Test_CoreAdviser_Flyback_From_Frontend_Inputs, deterministic across two full-suite runs).
+    // The consumer that needs the number derives it instead, so this pins the BEHAVIOUR — the
+    // energy filter builds — not the representation.
+    json inputsJson = json();
+    inputsJson["designRequirements"]["magnetizingInductance"]["nominal"] = 100e-6;
+    inputsJson["designRequirements"]["turnsRatios"] = json::array();
+
+    json excitation = json();
+    excitation["frequency"] = 100000;
+    excitation["current"]["processed"]["dutyCycle"] = 0.5;
+    excitation["current"]["processed"]["label"] = "Triangular";
+    excitation["current"]["processed"]["offset"] = 0;
+    excitation["current"]["processed"]["peakToPeak"] = 10;
+
+    json operatingPoint = json();
+    operatingPoint["name"] = "Nominal";
+    operatingPoint["conditions"]["ambientTemperature"] = 25;
+    operatingPoint["excitationsPerWinding"] = json::array({excitation});
+    inputsJson["operatingPoints"] = json::array({operatingPoint});
+
+    OpenMagnetics::Inputs inputs(inputsJson);
+
+    // The processed block still has no peak — that is the input shape this ticket is about.
+    auto processedCurrent = inputs.get_operating_point(0).get_excitations_per_winding()[0]
+                                  .get_current().value().get_processed().value();
+    CHECK_FALSE(processedCurrent.get_peak());
+    CHECK_THAT(processedCurrent.get_peak_to_peak().value(), Catch::Matchers::WithinRel(10.0, 1e-9));
+
+    // ...and the energy filter builds anyway, deriving the peak it needs from the waveform.
+    REQUIRE_NOTHROW(OpenMagnetics::MagneticFilterEnergyStored(inputs, {}));
+
+    // The derived required energy is E = L*Ipk^2/2 with Ipk ~ 5 A for a 10 A pk-pk triangular
+    // at no offset: 100e-6 * 25 / 2 = 1.25 mJ.
+    OpenMagnetics::MagneticEnergy magneticEnergy;
+    double requiredEnergy = OpenMagnetics::resolve_dimensional_values(
+        magneticEnergy.calculate_required_magnetic_energy(inputs));
+    CHECK_THAT(requiredEnergy, Catch::Matchers::WithinRel(1.25e-3, 0.05));
+}

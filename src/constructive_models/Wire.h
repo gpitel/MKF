@@ -162,6 +162,11 @@ class Wire : public MAS::Wire {
         static WireRound convert_from_wire_to_strand(Wire wire);
         static std::optional<InsulationWireCoating> resolve_coating(const Wire& wire);
         std::optional<InsulationWireCoating> resolve_coating();
+        // ABT #857: the coating that insulates one CONDUCTOR from another -- the STRAND's
+        // enamel for litz (whose own coating is the bundle serving), the wire's own coating
+        // otherwise. Every consumer of "what insulates this conductor" must go through this
+        // one point so litz cannot answer differently to different callers.
+        static std::optional<InsulationWireCoating> resolve_insulating_coating(const Wire& wire);
         static WireRound resolve_strand(const Wire& wire);
         WireRound resolve_strand();
         static WireMaterial resolve_material(Wire wire);
@@ -276,6 +281,11 @@ class Wire : public MAS::Wire {
         static double get_coating_thermal_conductivity(Wire wire);  // NEW: Static version
         // NEW: Overloads that work directly with InsulationWireCoating (for thermal modeling)
         static double get_coating_thickness(const InsulationWireCoating& coating);
+        // The film a foil is wound with: one per turn interval, so a foil's layer pitch is the
+        // foil plus this. A declared coating gives its thickness; otherwise the standard
+        // polyester (Constants::foilInterlayerInsulationThickness). See Wire.cpp.
+        static double get_foil_interlayer_insulation(const Wire& wire);
+
         static double get_coating_thermal_conductivity(const InsulationWireCoating& coating);
         std::string encode_coating_label();
         static std::string encode_coating_label(Wire wire);
@@ -283,7 +293,9 @@ class Wire : public MAS::Wire {
         double get_coating_relative_permittivity();
         static double get_coating_relative_permittivity(Wire wire);
 
-        void cut_foil_wire_to_section(Section section);
+        // reservedPerEdge: the depth a connection lead crossing this section reserves at EACH
+        // edge of the turn axis. A foil sheet may not span a corridor a lead crosses (ABT #1001).
+        void cut_foil_wire_to_section(Section section, double reservedPerEdge = 0.0);
         void cut_planar_wire_to_section(Section section);
         double get_relative_cost();
         std::string get_reference();

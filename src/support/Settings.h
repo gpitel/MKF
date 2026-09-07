@@ -49,6 +49,19 @@ class Settings
         // ignored. When true, the winder accounts for the space reserved by connection/lead wires
         // (affecting filling factors) and their length is included in the winding losses.
         bool _coilUseRealWindingGeometry = false;
+        // ABT #685 (Alf, 2026-08-16): COATING SQUISH. When true, the sections/layers fit check
+        // tolerates a filling factor up to 1 + 1e-3: the helical stacking pitch (turns tangent
+        // in 3D, ABT #780) is a second-order correction ((K*od/L)^2/2, always well under 0.1%),
+        // so a layer that was EXACTLY full under flat-stack arithmetic now overflows by a few
+        // tens of um — physically absorbed by the wire coating squishing, which every real
+        // winder relies on. Default OFF: fit stays exact unless the caller opts in.
+        bool _coilAllowCoatingSquish = false;
+        // ABT #685 (Alf, 2026-08-16): HORIZONTAL OVERFLOW. When true, the fit check ignores
+        // overflow on the LAYER axis (x for overlapping windings): the winding may bulge
+        // radially past the window edge (real windings do, past the bobbin flange), while the
+        // turn axis (y) stays strict. Lets over-full example designs wind with real-winding
+        // blocking applied instead of silently skipping it. Default OFF.
+        bool _coilAllowHorizontalOverflow = false;
         size_t _coilMaximumLayersPlanar = 32;  // Keep in sync with reset()
 
         bool _useOnlyCoresInStock = true;
@@ -152,6 +165,11 @@ class Settings
         bool _wireAdviserIncludeLitz = true;
         bool _wireAdviserIncludeRound = true;
         bool _wireAdviserAllowRectangularInToroidalCores = false;
+        // Wire standard the advisers restrict themselves to (ABT #1110: the web follows the
+        // profile unit system, IEC 60317 under SI and NEMA MW 1000 C under imperial). Empty
+        // means no preference: the wire adviser takes any standard and the coil adviser
+        // keeps its built-in preference (Defaults::commonWireStandard).
+        std::optional<WireStandard> _preferredWireStandard = std::nullopt;
 
         bool _harmonicAmplitudeThresholdQuickMode = true;
         double _harmonicAmplitudeThreshold;
@@ -276,6 +294,12 @@ class Settings
         bool get_coil_use_real_winding_geometry() const;
         void set_coil_use_real_winding_geometry(bool value);
 
+        bool get_coil_allow_coating_squish() const;
+        void set_coil_allow_coating_squish(bool value);
+
+        bool get_coil_allow_horizontal_overflow() const;
+        void set_coil_allow_horizontal_overflow(bool value);
+
         size_t get_coil_maximum_layers_planar() const;
         void set_coil_maximum_layers_planar(size_t value);
 
@@ -354,6 +378,15 @@ class Settings
         std::string get_painter_color_text() const;
         void set_painter_color_text(std::string value);
 
+        // ABT #647: the non-throwing half of get_painter_cci_coordinates_path().
+        // The CCI coordinate directory is OPTIONAL — strand counts up to 1000 use
+        // the build-time embedded coordinates and never need it — so a caller that
+        // merely REPORTS the settings (a get_settings() dump, a UI, a serializer)
+        // must be able to ask "is one resolvable?" without an exception. Returns
+        // nullopt when nothing resolves. Same rule as try_find_core_shape_by_name
+        // (ABT #631): ask, don't throw-and-catch. Consumers that genuinely require
+        // the catalog keep calling get_painter_cci_coordinates_path(), which throws.
+        std::optional<std::string> try_get_painter_cci_coordinates_path() const;
         std::string get_painter_cci_coordinates_path() const;
         void set_painter_cci_coordinates_path(std::string value);
 
@@ -460,6 +493,8 @@ class Settings
         void set_wire_adviser_include_round(bool value);
 
         bool get_wire_adviser_allow_rectangular_in_toroidal_cores() const;
+        std::optional<WireStandard> get_preferred_wire_standard() const;
+        void set_preferred_wire_standard(std::optional<WireStandard> value);
         void set_wire_adviser_allow_rectangular_in_toroidal_cores(bool value);
 
         bool get_harmonic_amplitude_threshold_quick_mode() const;

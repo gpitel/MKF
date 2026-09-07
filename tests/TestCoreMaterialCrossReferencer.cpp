@@ -25,6 +25,27 @@ namespace {
     // cross-referencing can actually guarantee: that the right materials are IN the
     // shortlist. A material dropping OUT of the top N is a real regression; the order
     // among near-identical scores is not.
+    //
+    // ABT #398 (2026-07-31): re-pinned. The band above widened rather than moved — the
+    // scores of the ORIGINAL pins are unchanged to every digit (DMR95 2.70371, P45
+    // 2.70033, 3C95 2.68183, TPW33 2.67987), so nothing about the model shifted. What
+    // changed is the catalogue: the JFE (MAS 0d65a56, ABT #220) and TDG (MAS 56d8c84,
+    // ABT #217) material batches dropped six more MnZn power ferrites straight into the
+    // tie band, and they displaced the old pins by fractions of a percent. Measured
+    // ranking for 3C97 at 25 °C, STEINMETZ:
+    //
+    //     1. ML33D  2.70557  (best)      7. P47     2.68850  0.631%
+    //     2. DMR95  2.70371  0.069%      8. PL-13   2.68627  0.713%
+    //     3. MBT2   2.70242  0.117%      9. TPG33B  2.68552  0.741%
+    //     4. TPW30  2.70200  0.132%     10. TPG30   2.68371  0.808%
+    //     5. P45    2.70033  0.194%     11. 3C95    2.68183  0.877%
+    //     6. TP4C   2.69934  0.230%     12. TPW33   2.67987  0.950%
+    //
+    // Twelve grades from seven manufacturers inside 0.95%. Membership in the top FIVE is
+    // therefore no more stable than the ordering this test stopped asserting in #190c —
+    // it will churn again on the next batch. #398 tracks the underlying fix (make the
+    // score discriminate, or report an explicit tie band); until then this pin records
+    // WHERE the band sits so the next flip is a one-line update, not an investigation.
     std::vector<std::string> shortlist_names(const std::vector<std::pair<CoreMaterial, double>>& results) {
         std::vector<std::string> names;
         for (auto& [material, scoring] : results) {
@@ -60,10 +81,12 @@ namespace {
 
         REQUIRE(crossReferencedCoreMaterials.size() > 0);
 
-        // The DMR95-class MnZn power ferrites must all make 3C97's shortlist: TPW33 (ABT
-        // #224, MAS TDG import — initial permeability 3325 vs 3C97's 3341, identical
-        // saturation), DMR95 (3480) and 3C95. Their relative order is data-churn noise.
-        require_shortlisted(crossReferencedCoreMaterials, {"TPW33", "DMR95", "3C95"});
+        // The DMR95-class MnZn power ferrites must make 3C97's shortlist; their relative
+        // order is data-churn noise. Re-pinned for ABT #398 to the grades that occupy the
+        // top five today — TPW33 (2.67987) and 3C95 (2.68183) are still sound matches but
+        // now sit 12th and 11th, edged out by six newer grades within 0.95% (see the band
+        // above). DMR95 is the one survivor of the original pin.
+        require_shortlisted(crossReferencedCoreMaterials, {"ML33D", "DMR95", "MBT2", "TPW30", "P45"});
 
         auto scorings = coreMaterialCrossReferencer.get_scorings();
         auto scoredValues = coreMaterialCrossReferencer.get_scored_values();
@@ -138,7 +161,19 @@ namespace {
         // to Kool Mu MAX 26 — both are FeSiAl (Sendust) powder at μ=26, i.e. the same alloy family
         // and permeability, so it tracks the reference more tightly than any Kool Mu grade. Was
         // Kool Mu Hf 26 before the Changsung powder cores entered the database (ABT #214).
-        REQUIRE(crossReferencedCoreMaterials[0].first.get_name() == "CSC Sendust 26");
+        //
+        // ABT #834 (2026-08-20): the head of this ranking is a TIE BAND, not a preference — the
+        // 2026-08 catalogue growth moved the min-max normalization pool and Kool Mµ MAX 40 now
+        // edges CSC Sendust 26 by 0.06% (2.71664 vs 2.71503). A µ=40 grade nosing past the
+        // same-alloy same-µ match on a 0.06% margin is normalization noise (ABT #398 tracks
+        // making the score discriminate), so per the smoke-level house rule this asserts
+        // MEMBERSHIP in the head tie band rather than pinning a coin flip: the semantically
+        // right answer (same alloy family AND same permeability) must stay in the top 2.
+        REQUIRE(crossReferencedCoreMaterials.size() >= 2);
+        const bool sendustInTopTwo =
+            crossReferencedCoreMaterials[0].first.get_name() == "CSC Sendust 26" ||
+            crossReferencedCoreMaterials[1].first.get_name() == "CSC Sendust 26";
+        REQUIRE(sendustInTopTwo);
     }
 
     TEST_CASE("Test_CoreMaterialCrossReferencer_All_Core_Materials_Powder_Only_Micrometals", "[adviser][core-material-cross-referencer][smoke-test]") {

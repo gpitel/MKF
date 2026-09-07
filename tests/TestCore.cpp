@@ -1,13 +1,23 @@
 #include <source_location>
 #include "constructive_models/Core.h"
+#include "constructive_models/CorePiece.h"
+#include <limits>
+#include "constructive_models/Coil.h"
+#include "constructive_models/Magnetic.h"
 #include "TestingUtils.h"
 #include "support/Utils.h"
+#include "support/Painter.h"
 #include "support/Settings.h"
 #include "physical_models/MagnetizingInductance.h"
+#include "processors/MagneticSimulator.h"
+#include "physical_models/ReluctanceNetwork.h"
+#include "physical_models/Inductance.h"
+#include "processors/Inputs.h"
 #include "json.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -810,10 +820,19 @@ TEST_CASE("RM_7LP", "[constructive-model][core][processed-description][smoke-tes
     REQUIRE(std::get<CoreMaterial>(core.get_mutable_functional_description().get_mutable_material())
               .get_mutable_volumetric_losses()["default"]
               .size() > 0);
-    REQUIRE_THAT(core.get_processed_description()->get_effective_parameters().get_effective_area(), Catch::Matchers::WithinAbs(0.000040 * numberStacks, 0.000040 * numberStacks * 0.2));
+    // ABT #783: these four were harvested in 2022, when "RM 7LP" was only an ALIAS pointing at
+    // RM 7/10 — the WITH-centre-hole part. They were therefore RM 7's figures (Ae 40 mm2,
+    // Ve 1190 mm3, Amin 32.3 mm2), and Amin went red the moment MAS 92a2af8 dropped the wrong LP
+    // aliases and gave RM 7LP its own record. TDK rm_7.pdf, ordering code B65819P, header
+    // "Without center hole", publishes for the LP set:
+    //     le = 23.5 mm, Ae = 45.3 mm2, Amin = 39.6 mm2, Ve = 1060 mm3
+    // MKF computes le 24.40 (+3.8 %), Ae 43.70 (-3.5 %), Amin 39.592 (-0.02 %), Ve 1066 (+0.6 %).
+    // H is absent from the record BY DESIGN (no centre hole), so d4 = 0 is correct, not a
+    // fallback; the subtype-2 branch of CorePieceRm never reads C, so its absence is inert.
+    REQUIRE_THAT(core.get_processed_description()->get_effective_parameters().get_effective_area(), Catch::Matchers::WithinAbs(0.0000453 * numberStacks, 0.0000453 * numberStacks * 0.2));
     REQUIRE_THAT(core.get_processed_description()->get_effective_parameters().get_effective_length(), Catch::Matchers::WithinAbs(0.0235, 0.0235 * 0.2));
-    REQUIRE_THAT(core.get_processed_description()->get_effective_parameters().get_effective_volume(), Catch::Matchers::WithinAbs(0.000001190 * numberStacks, 0.000001190 * numberStacks * 0.2));
-    REQUIRE_THAT(core.get_processed_description()->get_effective_parameters().get_minimum_area(), Catch::Matchers::WithinAbs(0.0000323 * numberStacks, 0.0000323 * numberStacks * 0.2));
+    REQUIRE_THAT(core.get_processed_description()->get_effective_parameters().get_effective_volume(), Catch::Matchers::WithinAbs(0.000001060 * numberStacks, 0.000001060 * numberStacks * 0.2));
+    REQUIRE_THAT(core.get_processed_description()->get_effective_parameters().get_minimum_area(), Catch::Matchers::WithinAbs(0.0000396 * numberStacks, 0.0000396 * numberStacks * 0.2));
     REQUIRE_THAT(*(core.get_processed_description()->get_winding_windows()[0].get_height()), Catch::Matchers::WithinAbs(0.0047, 0.0047 * 0.2));
     REQUIRE_THAT(*(core.get_processed_description()->get_winding_windows()[0].get_width()), Catch::Matchers::WithinAbs(0.00375, 0.00375 * 0.2));
     REQUIRE_THAT(core.get_processed_description()->get_columns()[0].get_width(), Catch::Matchers::WithinAbs(0.00725, 0.00725 * 0.2));
@@ -1671,7 +1690,13 @@ TEST_CASE("Test_Core_Functional_Description_Web_1", "[constructive-model][core][
 
     REQUIRE(functionalDescription.get_gapping().size() == 2u);
     REQUIRE((*functionalDescription.get_gapping()[0].get_coordinates())[0] == 0);
-    REQUIRE((*functionalDescription.get_gapping()[0].get_coordinates())[1] == 0);
+    // ABT #644: this used to require [1] == 0. A single ground gap is machined into ONE half --
+    // grinding one piece by the whole gap is cheaper than grinding two by half each -- so it spans
+    // 0..length and its centre sits at +length/2, here 0.0001/2. The old expectation came from the
+    // distributed branch, which a bare one-gap list used to fall through to; it contradicted
+    // TestCore.cpp's own E_55_21_central_gap (which requires [1] != 0) and
+    // E_19_8_5_Geometrical_Description (which requires exactly one machined half-set).
+    REQUIRE((*functionalDescription.get_gapping()[0].get_coordinates())[1] == 0.0001 / 2);
     REQUIRE((*functionalDescription.get_gapping()[0].get_coordinates())[2] == 0);
 
     REQUIRE((*functionalDescription.get_gapping()[1].get_coordinates())[0] == 0);
@@ -1860,6 +1885,48 @@ TEST_CASE("Missing_Core_Hermes", "[constructive-model][core][functional-descript
     CHECK(effectiveParameters.get_effective_volume() > 0);
 }
 
+TEST_CASE("Test_Core_Standard_Shape_Reference_By_Object", "[constructive-model][core][functional-description][bug][smoke-test]") {
+    // ABT #626: a core whose shape is a *reference* to the standard catalog given as a full
+    // object ({"type": "standard", "family": <fam>, "name": <catalog name>}, no "dimensions" --
+    // legal per core/shape.json, which does not require "dimensions") used to throw "bad
+    // optional access" for EVERY family/name, 100% reproduction. Root cause: Core::process_data()
+    // only resolved the database lookup when get_shape() held a bare std::string; when it held a
+    // CoreShape object instead (this form), the lookup was skipped entirely and
+    // CorePiece::factory() received a CoreShape with no "dimensions" map at all, so every
+    // per-family builder's `get_shape().get_dimensions().value()` dereferenced a disengaged
+    // optional. This mirrors the exact repro reported against PyOM's
+    // calculate_core_processed_description (Core(json, false, false, false) +
+    // core.process_data()).
+    std::vector<std::pair<std::string, std::string>> familyAndName = {
+        {"pq", "PQ 26/25"},
+        {"etd", "ETD 29"},
+        {"rm", "RM 8"},
+        {"e", "E 25/13/7"},
+        {"ec", "EC 35"},
+        {"pq", "PQ27.3/18"},
+    };
+
+    for (auto& [family, name] : familyAndName) {
+        DYNAMIC_SECTION("Standard shape reference: " << family << " / " << name) {
+            json shapeJson = {{"type", "standard"}, {"family", family}, {"name", name}};
+            json coreJson;
+            coreJson["name"] = "t";
+            coreJson["functionalDescription"] = {
+                {"type", "pieceAndPlate"}, {"material", "3C95"}, {"shape", shapeJson},
+                {"gapping", json::array()}, {"numberStacks", 1}};
+
+            Core core(coreJson, false, false, false);
+            REQUIRE_NOTHROW(core.process_data());
+
+            REQUIRE(core.get_processed_description());
+            auto effectiveParameters = core.get_processed_description()->get_effective_parameters();
+            CHECK(effectiveParameters.get_effective_area() > 0);
+            CHECK(effectiveParameters.get_effective_length() > 0);
+            CHECK(effectiveParameters.get_effective_volume() > 0);
+        }
+    }
+}
+
 TEST_CASE("Test_Core_Initial_Permeability", "[constructive-model][core][functional-description][smoke-test]") {
     auto coreFilePath = masPath + "samples/magnetic/core/core_E_55_21_N97_additive.json";
     std::ifstream json_file(coreFilePath);
@@ -2012,8 +2079,17 @@ TEST_CASE("Toroid_Coating_Winding_Window_Offset", "[constructive-model][core][co
 
     // A toroid with no coating field is jacketed in practice, so it falls back to the
     // default (epoxy) coating; a name-only coating resolves to its datasheet default.
-    REQUIRE_THAT(defaulted.get_coating_thickness(), Catch::Matchers::WithinAbs(0.1e-3, 1e-12));
-    REQUIRE_THAT(epoxy.get_coating_thickness(), Catch::Matchers::WithinAbs(0.1e-3, 1e-12));
+    //
+    // ABT #964: this is a FERRITE ring core, and epoxy on ferrite is not the film a powder
+    // toroid carries. Fair-Rite's thermo-set plastic adds at most 0.5 mm across a diameter
+    // (0.25 mm per surface), Ferroxcube DIMENSIONS its TN jacket at ~0.3 mm, and TDK's coated
+    // limits on R 50.0x30.0x20.0 work out to exactly 0.400 mm per surface against the UNCOATED
+    // limits, matching the "< 0.4 mm" it states. The old 0.10 mm here was the POWDER-core value,
+    // which is still what a powder toroid resolves to.
+    REQUIRE_THAT(defaulted.get_coating_thickness(),
+                 Catch::Matchers::WithinAbs(Defaults().defaultFerriteEpoxyCoreCoatingThickness, 1e-12));
+    REQUIRE_THAT(epoxy.get_coating_thickness(),
+                 Catch::Matchers::WithinAbs(Defaults().defaultFerriteEpoxyCoreCoatingThickness, 1e-12));
     REQUIRE_THAT(parylene.get_coating_thickness(), Catch::Matchers::WithinAbs(12.7e-6, 1e-12));
 
     // True-uncoated baseline: an explicit zero-thickness coating gives the full bore.
@@ -2035,7 +2111,8 @@ TEST_CASE("Toroid_Coating_Winding_Window_Offset", "[constructive-model][core][co
 
     // The usable winding bore shrinks by exactly the coating thickness vs the bare bore.
     REQUIRE(epoxyRh < uncoatedRh);
-    REQUIRE_THAT(uncoatedRh - epoxyRh, Catch::Matchers::WithinAbs(0.1e-3, 1e-9));
+    REQUIRE_THAT(uncoatedRh - epoxyRh,
+                 Catch::Matchers::WithinAbs(Defaults().defaultFerriteEpoxyCoreCoatingThickness, 1e-9));
     REQUIRE_THAT(uncoatedRh - paryleneRh, Catch::Matchers::WithinAbs(12.7e-6, 1e-9));
     // Window area follows the reduced radius.
     double epoxyArea = epoxy.get_processed_description()->get_winding_windows()[0].get_area().value();
@@ -2135,3 +2212,1192 @@ TEST_CASE("Toroid_Coating_Relative_Permittivity", "[constructive-model][core][co
 }
 
 }  // namespace
+
+namespace TestDrumCore {
+    // ABT #331: drum (open-shape) core geometry. The winding window is the groove between the
+    // flanges, the single column is the post with the bore subtracted, and nothing is doubled.
+    TEST_CASE("Test_Drum_Core_Geometry", "[core][drum][open-core]") {
+        settings.reset();
+        clear_databases();
+        auto core = OpenMagneticsTesting::get_quick_core("DRH-14X20-4C", json::array(), 1, "Dummy");
+        REQUIRE(core.get_functional_description().get_type() == CoreType::OPEN_SHAPE);
+        auto processed = core.get_processed_description().value();
+
+        auto windingWindow = processed.get_winding_windows()[0];
+        // groove: width (A-C)/2 = (14-9)/2 = 2.5 mm, height E = 12.5 mm
+        CHECK_THAT(windingWindow.get_width().value(), Catch::Matchers::WithinRel(0.0025, 1e-6));
+        CHECK_THAT(windingWindow.get_height().value(), Catch::Matchers::WithinRel(0.0125, 1e-6));
+
+        auto columns = processed.get_columns();
+        REQUIRE(columns.size() == 1);
+        // post area pi/4 (C^2 - H^2) = pi/4 (9^2 - 3.2^2) mm^2
+        double expectedArea = std::numbers::pi / 4 * (pow(0.009, 2) - pow(0.0032, 2));
+        CHECK_THAT(columns[0].get_area(), Catch::Matchers::WithinRel(expectedArea, 0.01));
+        // height NOT doubled: single piece
+        CHECK_THAT(processed.get_height(), Catch::Matchers::WithinRel(0.020, 1e-6));
+        settings.reset();
+    }
+
+    // ABT #366: shielded drum (drumRing) — a drum closed by a concentric shield ring,
+    // CoreType::PIECE_AND_PLATE. The winding window stays the drum groove, the envelope
+    // includes the ring, and process_gap synthesizes the two STRUCTURAL annular clearance
+    // gaps ((K - A)/2 each, unrolled-annulus section) instead of the column-based machinery.
+    TEST_CASE("Test_Drum_Ring_Core_Geometry", "[core][drum-ring]") {
+        settings.reset();
+        clear_databases();
+        auto core = OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "Dummy");
+        REQUIRE(core.get_functional_description().get_type() == CoreType::PIECE_AND_PLATE);
+        auto processed = core.get_processed_description().value();
+
+        // Winding window = drum groove: width (A - C)/2 = (2.3 - 1.1)/2 mm, height E = 0.58 mm.
+        auto windingWindow = processed.get_winding_windows()[0];
+        CHECK_THAT(windingWindow.get_width().value(), Catch::Matchers::WithinRel((0.0023 - 0.0011) / 2, 1e-6));
+        CHECK_THAT(windingWindow.get_height().value(), Catch::Matchers::WithinRel(0.00058, 1e-6));
+
+        // Envelope includes the ring: width/depth = ring OD J, height = max(B, L).
+        CHECK_THAT(processed.get_width(), Catch::Matchers::WithinRel(0.003, 1e-6));
+        CHECK_THAT(processed.get_height(), Catch::Matchers::WithinRel(0.00105, 1e-6));
+
+        // Two structural annular gaps: residual, length (K - A)/2 = 50 um, area = mean
+        // cylindrical surface over each flange thickness, mirrored about the equator.
+        auto gapping = core.get_functional_description().get_gapping();
+        REQUIRE(gapping.size() == 2);
+        double meanRadius = (0.0023 + 0.0024) / 4;
+        for (auto& gap : gapping) {
+            CHECK(gap.get_type() == GapType::RESIDUAL);
+            CHECK_THAT(gap.get_length(), Catch::Matchers::WithinRel((0.0024 - 0.0023) / 2, 1e-4));
+            CHECK_THAT(gap.get_area().value(),
+                       Catch::Matchers::WithinRel(2 * std::numbers::pi * meanRadius * 0.00021, 0.01));
+        }
+        CHECK_THAT(gapping[0].get_coordinates().value()[1],
+                   Catch::Matchers::WithinAbs((0.001 - 0.00021) / 2, 1e-6));
+        CHECK_THAT(gapping[1].get_coordinates().value()[1],
+                   Catch::Matchers::WithinAbs(-(0.001 - 0.00021) / 2, 1e-6));
+
+        // The geometrical description is drum solid (CLOSED) + ring closer (PLATE).
+        auto geometricalDescription = core.create_geometrical_description().value();
+        REQUIRE(geometricalDescription.size() == 2);
+        CHECK(geometricalDescription[0].get_type() == CoreGeometricalDescriptionElementType::CLOSED);
+        CHECK(geometricalDescription[1].get_type() == CoreGeometricalDescriptionElementType::PLATE);
+
+        // User gapping on a drumRing is rejected: nothing can be ground on the assembly.
+        auto userGapping = json::array();
+        userGapping.push_back(json{{"type", "subtractive"}, {"length", 0.0001}});
+        CHECK_THROWS(OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", userGapping, 1, "Dummy"));
+        settings.reset();
+    }
+
+    // ABT #357: molded composite body (WE-MAPI class) — a single pressed CLOSED solid whose
+    // distributed gap lives in the material. Magnetically a pot core with a rectangular outer
+    // boundary: post + two plates + return shell. MAPI-4020-like custom dimensions (vendors
+    // publish no internals; the cavity here is a plausible reconstruction for geometry tests).
+    // Letters per the pot-core convention: D cavity height, E cavity OD, F post diameter.
+    TEST_CASE("Test_Molded_Core_Geometry", "[core][molded]") {
+        settings.reset();
+        clear_databases();
+        json shapeJson = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+            {"aliases", json::array()}, {"name", "MAPI-like 4020"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0041}}}, {"B", {{"nominal", 0.0021}}}, {"C", {{"nominal", 0.0041}}},
+                {"D", {{"nominal", 0.0014}}}, {"E", {{"nominal", 0.0030}}}, {"F", {{"nominal", 0.0012}}}}}
+        };
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", "closedShape"}, {"material", "Kool Mµ 26"}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1}};
+        Core core(coreJson);
+        core.process_data();
+        core.process_gap();
+        REQUIRE(core.get_functional_description().get_type() == CoreType::CLOSED_SHAPE);
+        auto processed = core.get_processed_description().value();
+
+        // Winding window = the coil cavity annulus (pot-core letter convention):
+        // width (E - F)/2, height D.
+        auto windingWindow = processed.get_winding_windows()[0];
+        CHECK_THAT(windingWindow.get_width().value(), Catch::Matchers::WithinRel((0.0030 - 0.0012) / 2, 1e-6));
+        CHECK_THAT(windingWindow.get_height().value(), Catch::Matchers::WithinRel(0.0014, 1e-6));
+
+        // Central post + return-shell columns.
+        auto columns = processed.get_columns();
+        REQUIRE(columns.size() == 2);
+        CHECK_THAT(columns[0].get_area(),
+                   Catch::Matchers::WithinRel(std::numbers::pi / 4 * pow(0.0012, 2), 0.01));
+        double expectedShellArea = 0.0041 * 0.0041 - std::numbers::pi / 4 * pow(0.0030, 2);
+        CHECK_THAT(columns[1].get_area(), Catch::Matchers::WithinRel(expectedShellArea, 0.01));
+
+        // Body envelope, nothing doubled.
+        CHECK_THAT(processed.get_width(), Catch::Matchers::WithinRel(0.0041, 1e-6));
+        CHECK_THAT(processed.get_height(), Catch::Matchers::WithinRel(0.0021, 1e-6));
+
+        // No gaps, ever: neither synthesized residual gaps nor user gapping.
+        CHECK(core.get_functional_description().get_gapping().empty());
+        auto effectiveParameters = processed.get_effective_parameters();
+        double bodyVolume = 0.0041 * 0.0041 * 0.0021;
+        CHECK(effectiveParameters.get_effective_volume() > 0);
+        CHECK(effectiveParameters.get_effective_volume() < bodyVolume);
+        // The path length must exceed one cavity-height-plus-radial loop and stay below a few
+        // body perimeters — a gross sectioning error would leave this band.
+        CHECK(effectiveParameters.get_effective_length() > 0.0021);
+        CHECK(effectiveParameters.get_effective_length() < 4 * (0.0041 + 0.0021));
+
+        // Single CLOSED solid in the geometrical description.
+        auto geometricalDescription = core.create_geometrical_description().value();
+        REQUIRE(geometricalDescription.size() == 1);
+        CHECK(geometricalDescription[0].get_type() == CoreGeometricalDescriptionElementType::CLOSED);
+
+        // Discrete gapping is physically meaningless on a molded body. The Core(json)
+        // constructor already processes, so the throw fires during construction.
+        json gappedCoreJson = coreJson;
+        gappedCoreJson["functionalDescription"]["gapping"].push_back(
+            json{{"type", "subtractive"}, {"length", 0.0001}});
+        CHECK_THROWS(Core(gappedCoreJson).process_gap());
+        settings.reset();
+    }
+
+    // ABT #362: semi-shielded drum — a wound drum overcoated with magnetic epoxy acting as a
+    // low-mu return shell (WE-LQS class). Letters: drum A..H + shell envelope J/K/L. The shell
+    // is cast in contact (no gaps); its material rides the magneticEpoxy coating.
+    TEST_CASE("Test_Drum_Semishielded_Core_Geometry", "[core][drum-semishielded]") {
+        settings.reset();
+        clear_databases();
+        json shapeJson = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "drumSemishielded"},
+            {"aliases", json::array()}, {"name", "LQS-like 4018"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0038}}}, {"B", {{"nominal", 0.0018}}}, {"C", {{"nominal", 0.0015}}},
+                {"D", {{"nominal", 0.0004}}}, {"E", {{"nominal", 0.0010}}}, {"F", {{"nominal", 0.0004}}},
+                {"J", {{"nominal", 0.0040}}}, {"K", {{"nominal", 0.0040}}}, {"L", {{"nominal", 0.0018}}}}}
+        };
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", "pieceAndPlate"}, {"material", "3C90"}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1},
+            {"coating", {{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", "Kool Mµ 26"}}}};
+        Core core(coreJson);
+        core.process_data();
+        core.process_gap();
+        REQUIRE(core.get_functional_description().get_type() == CoreType::PIECE_AND_PLATE);
+        auto processed = core.get_processed_description().value();
+
+        // Winding window stays the drum groove: width (A - C)/2, height E.
+        auto windingWindow = processed.get_winding_windows()[0];
+        CHECK_THAT(windingWindow.get_width().value(), Catch::Matchers::WithinRel((0.0038 - 0.0015) / 2, 1e-6));
+        CHECK_THAT(windingWindow.get_height().value(), Catch::Matchers::WithinRel(0.0010, 1e-6));
+
+        // Envelope = the finished body J x K x L.
+        CHECK_THAT(processed.get_width(), Catch::Matchers::WithinRel(0.0040, 1e-6));
+        CHECK_THAT(processed.get_height(), Catch::Matchers::WithinRel(0.0018, 1e-6));
+
+        // No gaps ever: the glue is cast in contact.
+        CHECK(core.get_functional_description().get_gapping().empty());
+        auto effectiveParameters = processed.get_effective_parameters();
+        CHECK(effectiveParameters.get_effective_length() > 0.0018);
+        CHECK(effectiveParameters.get_effective_length() < 4 * (0.0040 + 0.0018));
+
+        // Drum solid (CLOSED) + glue shell closer (PLATE).
+        auto geometricalDescription = core.create_geometrical_description().value();
+        REQUIRE(geometricalDescription.size() == 2);
+        CHECK(geometricalDescription[0].get_type() == CoreGeometricalDescriptionElementType::CLOSED);
+        CHECK(geometricalDescription[1].get_type() == CoreGeometricalDescriptionElementType::PLATE);
+
+        // User gapping rejected.
+        json gappedCoreJson = coreJson;
+        gappedCoreJson["functionalDescription"]["gapping"].push_back(
+            json{{"type", "subtractive"}, {"length", 0.0001}});
+        CHECK_THROWS(Core(gappedCoreJson).process_gap());
+
+        // A shell envelope smaller than the drum is impossible (letters describe the FINISHED body).
+        json badShapeCoreJson = coreJson;
+        badShapeCoreJson["functionalDescription"]["shape"]["dimensions"]["J"] = {{"nominal", 0.0030}};
+        CHECK_THROWS(Core(badShapeCoreJson).process_data());
+        settings.reset();
+    }
+
+    // ABT #366/#362/#357: the 2D painter used to reconstruct a mirrored half-set for EVERY
+    // non-toroidal family, drawing drums/drumRings/semi-shielded/molded as nonsense; they now
+    // route to paint_drum_family_core. Smoke: each family paints a valid, non-empty SVG.
+    TEST_CASE("Test_Drum_Family_Core_Painter_Smoke", "[core][drum][drum-ring][drum-semishielded][molded][painter]") {
+        settings.reset();
+        clear_databases();
+        auto outputFilePath = std::filesystem::path{std::source_location::current().file_name()}
+                                  .parent_path().append("..").append("output");
+        std::filesystem::create_directories(outputFilePath);
+
+        json semishieldedShape = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "drumSemishielded"},
+            {"aliases", json::array()}, {"name", "LQS-like 4018"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0038}}}, {"B", {{"nominal", 0.0018}}}, {"C", {{"nominal", 0.0015}}},
+                {"D", {{"nominal", 0.0004}}}, {"E", {{"nominal", 0.0010}}}, {"F", {{"nominal", 0.0004}}},
+                {"J", {{"nominal", 0.0040}}}, {"K", {{"nominal", 0.0040}}}, {"L", {{"nominal", 0.0018}}}}}
+        };
+        json moldedShape = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+            {"aliases", json::array()}, {"name", "MAPI-like 4020"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0041}}}, {"B", {{"nominal", 0.0021}}}, {"C", {{"nominal", 0.0041}}},
+                {"D", {{"nominal", 0.0014}}}, {"E", {{"nominal", 0.0030}}}, {"F", {{"nominal", 0.0012}}}}}
+        };
+
+        std::vector<std::pair<std::string, Core>> cores;
+        cores.emplace_back("drum", OpenMagneticsTesting::get_quick_core("DRH-14X20-4C", json::array(), 1, "Dummy"));
+        cores.emplace_back("drum_ring", OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "Dummy"));
+        for (auto& [label, shapeJson] : std::vector<std::pair<std::string, json>>{
+                 {"drum_semishielded", semishieldedShape}, {"molded", moldedShape}}) {
+            json coreJson;
+            coreJson["functionalDescription"] = {
+                {"type", label == "molded" ? "closedShape" : "pieceAndPlate"}, {"material", "Dummy"},
+                {"shape", shapeJson}, {"gapping", json::array()}, {"numberStacks", 1}};
+            Core core(coreJson);
+            core.process_data();
+            cores.emplace_back(label, core);
+        }
+
+        json coilJson;
+        coilJson["bobbin"] = "Dummy";
+        coilJson["functionalDescription"] = json::array();
+        coilJson["functionalDescription"].push_back(json{
+            {"name", "winding 0"}, {"numberTurns", 1}, {"numberParallels", 1},
+            {"isolationSide", "primary"}, {"wire", "Dummy"}});
+
+        for (auto& [label, core] : cores) {
+            OpenMagnetics::Magnetic magnetic;
+            magnetic.set_core(core);
+            magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
+            auto outFile = outputFilePath;
+            outFile.append("Test_Painter_" + label + ".svg");
+            std::filesystem::remove(outFile);
+            OpenMagnetics::Painter painter(outFile);
+            painter.paint_core(magnetic);
+            painter.export_svg();
+            OpenMagneticsTesting::check_svg(outFile);
+        }
+        settings.reset();
+    }
+}
+
+// ABT #366/#362/#357: SATURATION CURRENT for the new families. Isat is a headline datasheet
+// spec for every one of them (drum, shielded drum, semi-shielded, molded), and it runs through
+// a different chain than inductance — Bsat(T) x N x Ae / L — where L itself comes from the
+// family's own model (open-core demagnetising for a bare drum, mixed-material sectioning for a
+// semi-shielded, closed-circuit for drumRing/molded). None of that was exercised, so this pins
+// that the chain runs and orders physically: for one turn count, MORE inductance means LESS
+// saturation current, so the shielded assembly must saturate EARLIER than the bare drum it is
+// built from.
+namespace TestNewFamilySaturation {
+    TEST_CASE("Test_Drum_Family_Saturation_Current", "[core][drum][drum-ring][molded][saturation]") {
+        settings.reset();
+        clear_databases();
+        int64_t numberTurns = 20;
+
+        json coilJson;
+        coilJson["bobbin"] = "Dummy";
+        coilJson["functionalDescription"] = json::array({{
+            {"name", "winding 0"}, {"numberTurns", numberTurns}, {"numberParallels", 1},
+            {"isolationSide", "primary"}, {"wire", "Dummy"}}});
+
+        auto magneticFromCore = [&](const Core& core) {
+            OpenMagnetics::Magnetic magnetic;
+            magnetic.set_core(core);
+            magnetic.set_coil(OpenMagnetics::Coil(coilJson));
+            return magnetic;
+        };
+
+        // Bare drum with the same drum dimensions as the shielded pair below.
+        json bareShape = {
+            {"magneticCircuit", "open"}, {"type", "custom"}, {"family", "drum"},
+            {"aliases", json::array()}, {"name", "DR 2.3 bare"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0023}}}, {"B", {{"nominal", 0.001}}}, {"C", {{"nominal", 0.0011}}},
+                {"D", {{"nominal", 0.00021}}}, {"E", {{"nominal", 0.00058}}}, {"F", {{"nominal", 0.00021}}}}}
+        };
+        json bareCoreJson;
+        bareCoreJson["functionalDescription"] = {
+            {"type", "openShape"}, {"material", "3C90"}, {"shape", bareShape},
+            {"gapping", json::array()}, {"numberStacks", 1}};
+        Core bareDrum(bareCoreJson);
+        bareDrum.process_data();
+        auto bareMagnetic = magneticFromCore(bareDrum);
+        double bareSaturationCurrent = bareMagnetic.calculate_saturation_current(25);
+
+        // Shielded drum: same drum, closed by its ring.
+        auto shieldedCore = OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "3C90");
+        auto shieldedMagnetic = magneticFromCore(shieldedCore);
+        double shieldedSaturationCurrent = shieldedMagnetic.calculate_saturation_current(25);
+
+        // Molded composite body.
+        json moldedShape = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+            {"aliases", json::array()}, {"name", "MAPI-like 4020"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0041}}}, {"B", {{"nominal", 0.0021}}}, {"C", {{"nominal", 0.0041}}},
+                {"D", {{"nominal", 0.0014}}}, {"E", {{"nominal", 0.0030}}}, {"F", {{"nominal", 0.0012}}}}}
+        };
+        json moldedCoreJson;
+        moldedCoreJson["functionalDescription"] = {
+            {"type", "closedShape"}, {"material", "Kool Mµ 26"}, {"shape", moldedShape},
+            {"gapping", json::array()}, {"numberStacks", 1}};
+        Core moldedCore(moldedCoreJson);
+        moldedCore.process_data();
+        moldedCore.process_gap();
+        auto moldedMagnetic = magneticFromCore(moldedCore);
+        double moldedSaturationCurrent = moldedMagnetic.calculate_saturation_current(25);
+
+        // Semi-shielded: same drum, closed by a magnetic-epoxy shell (its permeability comes
+        // from the magneticEpoxy coating, so this also proves the mixed-material inductance path
+        // feeds the saturation chain).
+        json semishieldedShape = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "drumSemishielded"},
+            {"aliases", json::array()}, {"name", "LQS-like 4018"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0038}}}, {"B", {{"nominal", 0.0018}}}, {"C", {{"nominal", 0.0015}}},
+                {"D", {{"nominal", 0.0004}}}, {"E", {{"nominal", 0.0010}}}, {"F", {{"nominal", 0.0004}}},
+                {"J", {{"nominal", 0.0040}}}, {"K", {{"nominal", 0.0040}}}, {"L", {{"nominal", 0.0018}}}}}
+        };
+        json semishieldedCoreJson;
+        semishieldedCoreJson["functionalDescription"] = {
+            {"type", "pieceAndPlate"}, {"material", "3C90"}, {"shape", semishieldedShape},
+            {"gapping", json::array()}, {"numberStacks", 1},
+            {"coating", {{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", "Kool Mµ 26"}}}};
+        Core semishieldedCore(semishieldedCoreJson);
+        semishieldedCore.process_data();
+        semishieldedCore.process_gap();
+        auto semishieldedMagnetic = magneticFromCore(semishieldedCore);
+        double semishieldedSaturationCurrent = semishieldedMagnetic.calculate_saturation_current(25);
+
+        UNSCOPED_INFO("Isat @20T: bare drum " << bareSaturationCurrent << " A, shielded "
+                      << shieldedSaturationCurrent << " A, semi-shielded "
+                      << semishieldedSaturationCurrent << " A, molded " << moldedSaturationCurrent << " A");
+        for (double saturationCurrent : {bareSaturationCurrent, shieldedSaturationCurrent,
+                                         semishieldedSaturationCurrent, moldedSaturationCurrent}) {
+            CHECK(std::isfinite(saturationCurrent));
+            CHECK(saturationCurrent > 0);
+        }
+        // The ferrite ring multiplies inductance (~2.9x on this pair), so with the same turns the
+        // shielded assembly reaches Bsat at a proportionally lower current than the bare drum.
+        CHECK(shieldedSaturationCurrent < bareSaturationCurrent);
+        settings.reset();
+    }
+}
+
+// ABT #379: a caller that DECLARES a multicolumn core (one winding window per column) must keep
+// that topology through processing. It used to be silently reduced to the single window the E
+// family rebuilds from its functionalDescription, and the failure then surfaced far away and
+// blamed the wrong object: the coil's section-derived placement resolved "window 2",
+// ReluctanceNetwork found one window, and the error named the WINDING
+// ("Winding Secondary references winding window 2 but the core has 1 winding windows") for
+// something the CORE processing had dropped. Fixture mirrors OMFEM's multicolumn E42.
+namespace TestMulticolumnWindows {
+    TEST_CASE("Test_Core_Declared_Multicolumn_Windows_Survive_Processing", "[core][multicolumn]") {
+        settings.reset();
+        clear_databases();
+
+        auto declaredCore = OpenMagneticsTesting::get_quick_core("E 42/21/20", json::array(), 1, "3C97");
+        settings.set_core_per_column_winding_windows(true);
+        auto multicolumnCore = OpenMagneticsTesting::get_quick_core("E 42/21/20", json::array(), 1, "3C97");
+        auto declaredWindows = multicolumnCore.get_processed_description().value().get_winding_windows();
+        settings.reset();
+        REQUIRE(declaredWindows.size() > 1);  // the per-column machinery produced the topology
+
+        // Hand that multi-window description to a core built the ordinary (single-window) way,
+        // exactly as a caller supplying a multicolumn MAS file does, then re-process.
+        auto processedDescription = declaredCore.get_processed_description().value();
+        processedDescription.set_winding_windows(declaredWindows);
+        declaredCore.set_processed_description(processedDescription);
+        REQUIRE(declaredCore.get_processed_description().value().get_winding_windows().size() == declaredWindows.size());
+
+        declaredCore.process_data();
+
+        auto survivingWindows = declaredCore.get_processed_description().value().get_winding_windows();
+        UNSCOPED_INFO("declared " << declaredWindows.size() << " winding windows, kept "
+                      << survivingWindows.size() << " after processing");
+        CHECK(survivingWindows.size() == declaredWindows.size());
+        // Each window still names the column it wraps, which is what winding placement resolves.
+        for (auto& windingWindow : survivingWindows) {
+            CHECK(windingWindow.get_column().has_value());
+        }
+        settings.reset();
+    }
+
+    // The end-to-end shape of ABT #379, with the MAS file that reported it: a hand-authored
+    // 3-column E 42 transformer whose windings carry no explicit windingWindow (placement lives
+    // on the sections). Before the fix, re-processing collapsed 3 windows to 1, the coil's
+    // section-derived window 2 then fell outside the core, and the thrown message blamed the
+    // winding. Now the declared topology survives and the magnetic simulates.
+    TEST_CASE("Test_Core_Multicolumn_Mas_File_Simulates", "[core][multicolumn]") {
+        settings.reset();
+        auto path = std::filesystem::path{std::source_location::current().file_name()}
+                        .parent_path().append("testData").append("multicolumn_e42_transformer.json");
+        std::ifstream masFile(path);
+        REQUIRE(masFile.good());
+        json masJson = json::parse(masFile);
+
+        OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+        auto processedWindows = magnetic.get_core().get_processed_description().value().get_winding_windows();
+        UNSCOPED_INFO("core kept " << processedWindows.size() << " winding windows after construction");
+        CHECK(processedWindows.size() == 3);
+
+        // The path that used to throw with the misleading message.
+        OpenMagnetics::Inputs inputs(masJson["inputs"]);
+        OpenMagnetics::MagneticSimulator simulator;
+        OpenMagnetics::Mas simulated;
+        REQUIRE_NOTHROW(simulated = simulator.simulate(inputs, magnetic));
+        REQUIRE(simulated.get_outputs().size() > 0);
+
+        // ABT #925: this fixture shipped with designRequirements.turnsRatios = 1e9 for a 24:12
+        // coil, so its generated secondary excitation carried 1e9 A. Nothing noticed until
+        // simulate() grew a thermal step (ABT #906): 1.26e16 W of ohmic loss in the secondary
+        // drove the thermal network to 5.7e6 K and it refused to converge, and the throw read as
+        // a thermal-solver bug rather than as impossible input. Pin the ampere-turn balance so a
+        // regenerated fixture cannot go unphysical again without saying so here.
+        auto primaryExcitation = inputs.get_winding_excitation(0, 0);
+        auto secondaryExcitation = inputs.get_winding_excitation(0, 1);
+        double primaryAmpereTurns = primaryExcitation.get_current()->get_processed()->get_rms().value()
+                                    * magnetic.get_coil().get_functional_description()[0].get_number_turns();
+        double secondaryAmpereTurns = secondaryExcitation.get_current()->get_processed()->get_rms().value()
+                                      * magnetic.get_coil().get_functional_description()[1].get_number_turns();
+        UNSCOPED_INFO("primary " << primaryAmpereTurns << " At, secondary " << secondaryAmpereTurns << " At");
+        CHECK_THAT(secondaryAmpereTurns, Catch::Matchers::WithinRel(primaryAmpereTurns, 0.01));
+        auto& output = simulated.get_outputs()[0];
+        REQUIRE(output.get_inductance());
+        double inductance = OpenMagnetics::resolve_dimensional_values(
+            output.get_inductance()->get_magnetizing_inductance().get_magnetizing_inductance());
+        UNSCOPED_INFO("magnetizing inductance " << inductance * 1e6 << " uH");
+        CHECK(std::isfinite(inductance));
+        CHECK(inductance > 0);
+
+        // Preserving the windows is only half the point: the network must actually USE them.
+        // The primary sits on a LATERAL column, so its driving-point reluctance is
+        // R_lateral + (R_central || R_other_lateral) -- strictly worse than the central-column
+        // path the lumped N^2/R model assumes. Pin that the placed answer is the lower one, so a
+        // future regression that silently reverts to the ideal single-window circuit is caught
+        // even though nothing throws.
+        // Preserving the windows is only half the point: the placement must actually REACH the
+        // physics. The two windings sit on DIFFERENT legs of the E core, so they must resolve to
+        // different columns -- with the collapsed single window this resolution is exactly what
+        // threw. Their coupling is then the real flux divider (secondary flux splits between the
+        // centre leg and the far leg), not the ideal rank-1 coupling a one-window core implies.
+        REQUIRE(OpenMagnetics::ReluctanceNetwork::has_non_main_placement(magnetic));
+        auto columnIndexPerWinding = OpenMagnetics::ReluctanceNetwork::resolve_winding_column_indexes(magnetic);
+        REQUIRE(columnIndexPerWinding.size() == 2);
+        UNSCOPED_INFO("Primary on column " << columnIndexPerWinding[0] << ", Secondary on column "
+                      << columnIndexPerWinding[1]);
+        CHECK(columnIndexPerWinding[0] != columnIndexPerWinding[1]);
+
+        OpenMagnetics::Inductance inductanceModel;
+        auto inductanceMatrix = inductanceModel.calculate_inductance_matrix(magnetic, 100000).get_magnitude();
+        double selfPrimary = inductanceMatrix["Primary"]["Primary"].get_nominal().value();
+        double selfSecondary = inductanceMatrix["Secondary"]["Secondary"].get_nominal().value();
+        double mutual = inductanceMatrix["Primary"]["Secondary"].get_nominal().value();
+        double couplingCoefficient = std::abs(mutual) / std::sqrt(selfPrimary * selfSecondary);
+        UNSCOPED_INFO("coupling coefficient " << couplingCoefficient);
+        CHECK(couplingCoefficient > 0.1);
+        CHECK(couplingCoefficient < 0.999);
+        settings.reset();
+    }
+}
+
+// A CATALOGUE record whose gapping cannot fit its columns must be refused at load, naming itself.
+// process_gap() reports that by returning false, which is a NORMAL answer during core advising —
+// the CoreAdviser sweeps candidate gap lengths and necessarily generates some that do not fit,
+// then skips them — but never legitimate for a shipped part. Left unchecked such a record carried
+// gaps with no area and killed the first consumer that swept the whole catalogue, with a bare
+// "[GAP_INVALID_DIMENSIONS] Gap Area is not set" naming neither the core nor the reason. Finding
+// the culprits took a full-catalogue scan: seven Magnetics parts whose gap lengths were exact mil
+// values stored 1000x too large, e.g. a 127 mm gap on a 19.3 mm core (5 mil, i.e. 0.127 mm). Data
+// fixed in MAS; this keeps the next such record from getting in quietly.
+TEST_CASE("Test_Catalogue_Core_With_Impossible_Gapping_Is_Refused_By_Name", "[core][gapping]") {
+    settings.reset();
+    clear_databases();
+
+    // One record, shaped exactly like the catalogue bug: 127 mm of gap in a 19.3 mm core.
+    json impossibleRecord;
+    impossibleRecord["name"] = "E 19.3/4.8 - 3C97 - Gapped 127.000 mm";
+    impossibleRecord["functionalDescription"] = json();
+    impossibleRecord["functionalDescription"]["type"] = "twoPieceSet";
+    impossibleRecord["functionalDescription"]["material"] = "3C97";
+    impossibleRecord["functionalDescription"]["shape"] = "E 19.3/4.8";
+    impossibleRecord["functionalDescription"]["numberStacks"] = 1;
+    impossibleRecord["functionalDescription"]["gapping"] = json::array({
+        {{"type", "subtractive"}, {"length", 0.127}},
+        {{"type", "residual"}, {"length", 0.000005}},
+        {{"type", "residual"}, {"length", 0.000005}},
+    });
+
+    std::string message;
+    try {
+        load_cores(impossibleRecord.dump());
+        message = "no exception";
+    }
+    catch (const std::exception& exception) {
+        message = exception.what();
+    }
+    UNSCOPED_INFO(message);
+    CHECK(message.find("E 19.3/4.8 - 3C97 - Gapped 127.000 mm") != std::string::npos);  // names itself
+    CHECK(message.find("does not fit its columns") != std::string::npos);
+
+    // The same record with the gap it was meant to have loads, and its gaps carry an area.
+    clear_databases();
+    impossibleRecord["name"] = "E 19.3/4.8 - 3C97 - Gapped 0.127 mm";
+    impossibleRecord["functionalDescription"]["gapping"][0]["length"] = 0.000127;
+    REQUIRE_NOTHROW(load_cores(impossibleRecord.dump()));
+    REQUIRE(OpenMagnetics::coreDatabase.size() == 1);
+    for (auto& gap : OpenMagnetics::coreDatabase[0].get_functional_description().get_gapping()) {
+        CHECK(gap.get_area().has_value());
+    }
+    clear_databases();
+    settings.reset();
+}
+
+// ABT #680: calculate_core_gapping() and every other caller that hands process_gap() one
+// specific core it expects to already be valid must not get back a schema-invalid gap (every
+// derived field null) when the gap is too long for its column -- it must throw right where the
+// mismatch is known. process_gap() itself must keep returning bare false: CoreAdviser sweeps
+// candidate gap lengths and depends on that bool to silently skip the ones that don't fit
+// (see the comment on the Core(json) constructor). process_gap_or_throw() is the loud variant.
+TEST_CASE("ABT680_Gap_Longer_Than_Column_Opening_Throws_Instead_Of_Returning_Null_Fields", "[core][gapping]") {
+    // Same custom E+I geometry and threshold as the bug report: the column opening is exactly
+    // 2*D, confirmed there by bisection at several window heights.
+    auto coreJson = [](double gapLength) {
+        json j;
+        j["name"] = "t";
+        j["functionalDescription"]["type"] = "twoPieceSet";
+        j["functionalDescription"]["material"] = "3C95";
+        j["functionalDescription"]["shape"]["type"] = "custom";
+        j["functionalDescription"]["shape"]["family"] = "ei";
+        j["functionalDescription"]["shape"]["name"] = "t";
+        j["functionalDescription"]["shape"]["dimensions"]["A"] = 0.0182;
+        j["functionalDescription"]["shape"]["dimensions"]["B"] = 0.00745;
+        j["functionalDescription"]["shape"]["dimensions"]["C"] = 0.0182;
+        j["functionalDescription"]["shape"]["dimensions"]["D"] = 0.00047;
+        j["functionalDescription"]["shape"]["dimensions"]["E"] = 0.01018;
+        j["functionalDescription"]["shape"]["dimensions"]["F"] = 0.0014;
+        j["functionalDescription"]["shape"]["dimensions"]["B2"] = 0.0014;
+        j["functionalDescription"]["gapping"] = json::array({{{"type", "subtractive"}, {"length", gapLength}}});
+        j["functionalDescription"]["numberStacks"] = 1;
+        return j;
+    };
+
+    SECTION("just inside the threshold: process_gap() succeeds and every field is populated") {
+        Core core(coreJson(0.00094), false, false, false);
+        core.process_data();
+        REQUIRE(core.process_gap());
+        auto gapping = core.get_functional_description().get_gapping();
+        REQUIRE(gapping.size() == 3u);
+        CHECK(gapping[0].get_coordinates().has_value());
+        CHECK(gapping[0].get_area().has_value());
+    }
+
+    SECTION("just past the threshold: process_gap() still just returns false") {
+        Core core(coreJson(0.00095), false, false, false);
+        core.process_data();
+        CHECK_FALSE(core.process_gap());
+    }
+
+    SECTION("just past the threshold: process_gap_or_throw() throws, naming the gap and column") {
+        Core core(coreJson(0.00095), false, false, false);
+        core.process_data();
+        std::string message = "no exception";
+        try {
+            core.process_gap_or_throw();
+        }
+        catch (const std::exception& exception) {
+            message = exception.what();
+        }
+        UNSCOPED_INFO(message);
+        CHECK(message != "no exception");
+        CHECK(message.find("0.00095") != std::string::npos);
+        CHECK(message.find("does not fit") != std::string::npos);
+        // And it must not have left a schema-invalid gap (every derived field null) behind for
+        // an inattentive caller to trip over downstream.
+        auto gapping = core.get_functional_description().get_gapping();
+        REQUIRE(gapping.size() == 1u);
+        CHECK_FALSE(gapping[0].get_area().has_value());
+    }
+}
+
+// Every core in the shipped catalogue must be constructible. This is what would have caught the
+// seven bad records at the source instead of leaving them to break whichever consumer swept the
+// full catalogue first (the core cross-referencer, which sets use_only_cores_in_stock(false)).
+TEST_CASE("Test_All_Catalogue_Cores_Have_Feasible_Gapping", "[core][gapping][catalog]") {
+    settings.reset();
+    settings.set_use_only_cores_in_stock(false);
+    clear_databases();
+    load_cores();
+    auto& cores = OpenMagnetics::coreDatabase;
+    REQUIRE(cores.size() > 1000);
+    std::vector<std::string> coresWithoutGapArea;
+    for (auto& core : cores) {
+        for (auto& gap : core.get_functional_description().get_gapping()) {
+            if (!gap.get_area()) {
+                coresWithoutGapArea.push_back(core.get_name().value_or("<unnamed>"));
+                break;
+            }
+        }
+    }
+    if (!coresWithoutGapArea.empty()) {
+        std::string joined;
+        for (size_t i = 0; i < coresWithoutGapArea.size() && i < 10; ++i) {
+            joined += "\n    " + coresWithoutGapArea[i];
+        }
+        UNSCOPED_INFO(coresWithoutGapArea.size() << " catalogue cores have a gap with no area:" << joined);
+    }
+    CHECK(coresWithoutGapArea.empty());
+    settings.reset();
+}
+
+// ABT #267/#407: a json -> Core conversion (json::parse(s).get<std::vector<Core>>(), or any
+// nlohmann conversion) used to resolve through the base class to MAS's GENERATED
+// from_json(json, MagneticCore&), skipping the legacy-form migration that the Core(json)
+// constructor applies. The same document therefore produced different objects depending on which
+// entry point you happened to use.
+//
+// It bit on a shape whose family was written "planar e", the pre-1.0 spelling of "planarE".
+// Unmigrated, that string matches no enum value, and the generated converter leaves the enum
+// DEFAULT-CONSTRUCTED — which is CoreShapeFamily::BLOCK, because block sorts first. So a planar E
+// core silently became a "block" core, and the failure surfaced far away as "Unknown shape family:
+// block" out of a factory that had never been asked for a block. (block is a declared-but-unused
+// future family; nothing in the catalogue has one.)
+TEST_CASE("Test_Core_Json_Conversion_Migrates_Legacy_Shape_Family", "[core][migration]") {
+    settings.reset();
+    clear_databases();
+
+    json coreJson;
+    coreJson["name"] = "legacy spelling core";
+    coreJson["functionalDescription"] = json();
+    coreJson["functionalDescription"]["type"] = "twoPieceSet";
+    coreJson["functionalDescription"]["material"] = "3C97";
+    coreJson["functionalDescription"]["numberStacks"] = 1;
+    coreJson["functionalDescription"]["gapping"] = json::array();
+    // The pre-1.0 spelling, exactly as it appears in older inventories.
+    coreJson["functionalDescription"]["shape"] = json{
+        {"name", "E 18/4/10"},
+        {"family", "planar e"},
+        {"type", "standard"},
+        {"magneticCircuit", "open"},
+        {"dimensions", json{
+            {"A", {{"minimum", 0.01765}, {"maximum", 0.01835}}},
+            {"B", {{"minimum", 0.0039},  {"maximum", 0.0041}}},
+            {"C", {{"minimum", 0.0098},  {"maximum", 0.0102}}},
+            {"D", {{"minimum", 0.0019},  {"maximum", 0.0021}}},
+            {"E", {{"minimum", 0.0137},  {"maximum", 0.0143}}},
+            {"F", {{"minimum", 0.0039},  {"maximum", 0.0041}}},
+        }},
+    };
+
+    // Both entry points must agree, and both must say planar E rather than block.
+    OpenMagnetics::Core constructedCore(coreJson);
+    CHECK(constructedCore.get_shape_family() == CoreShapeFamily::PLANAR_E);
+
+    auto convertedCore = coreJson.get<OpenMagnetics::Core>();
+    CHECK(convertedCore.get_shape_family() == CoreShapeFamily::PLANAR_E);
+
+    // And a family string that is not in the enum at all must be refused by name, rather than
+    // quietly becoming value 0 the way "planar e" used to.
+    json unknownFamilyJson = coreJson;
+    unknownFamilyJson["functionalDescription"]["shape"]["family"] = "not a real family";
+    std::string message;
+    try {
+        auto rejected = unknownFamilyJson.get<OpenMagnetics::Core>();
+        message = "no exception";
+    }
+    catch (const std::exception& exception) {
+        message = exception.what();
+    }
+    UNSCOPED_INFO(message);
+    CHECK(message.find("not a real family") != std::string::npos);
+    CHECK(message.find("E 18/4/10") != std::string::npos);
+    settings.reset();
+}
+
+TEST_CASE("ABT644_Short_Gapping_List_Pads_With_Residual_Not_By_Repeating_Last",
+          "[constructive-model][core][gapping]") {
+    // A gapping list SHORTER than the column count used to be padded by repeating its LAST entry,
+    // type included. One {subtractive, L} on a three-column core therefore became a subtractive gap
+    // of length L in EVERY column -- a core ground on all three legs. The lateral gaps then sat in
+    // parallel with the central one, so the reluctance was far too high and the core came back
+    // 1.7-1.8x less inductive than the caller asked for, silently.
+    //
+    // The contract is that the gaps given map onto the columns in order (central column first) and
+    // every remaining column gets a RESIDUAL gap. That is also exactly how all 2139 gapped cores in
+    // the catalogue are written: [subtractive, residual, residual].
+    auto constants = Constants();
+
+    for (auto shapeName : {std::string("PQ 26/25"), std::string("E 42/21/20"),
+                           std::string("ETD 29/16/10"), std::string("RM 10")}) {
+        json coreJson;
+        coreJson["name"] = "gapping test " + shapeName;
+        coreJson["functionalDescription"] = json();
+        coreJson["functionalDescription"]["type"] = "two-piece set";
+        coreJson["functionalDescription"]["material"] = "3C95";
+        coreJson["functionalDescription"]["shape"] = shapeName;
+        coreJson["functionalDescription"]["numberStacks"] = 1;
+        coreJson["functionalDescription"]["gapping"] = json::array({
+            json{{"type", "subtractive"}, {"length", 0.0005}}});
+
+        OpenMagnetics::Core core(coreJson);
+        auto gapping = core.get_functional_description().get_gapping();
+        auto columns = core.get_processed_description().value().get_columns();
+
+        UNSCOPED_INFO("shape: " << shapeName);
+        // one gap per column, however many columns the shape has
+        REQUIRE(gapping.size() == columns.size());
+        REQUIRE(columns.size() > 1);
+
+        // the stated gap lands on the central column...
+        CHECK(columns[0].get_type() == ColumnType::CENTRAL);
+        CHECK(gapping[0].get_type() == GapType::SUBTRACTIVE);
+        CHECK_THAT(gapping[0].get_length(),
+                   Catch::Matchers::WithinRel(0.0005, 1e-9));
+
+        // ...and every other column gets a residual gap, NOT a copy of the subtractive one
+        for (size_t i = 1; i < gapping.size(); ++i) {
+            UNSCOPED_INFO("column index: " << i);
+            CHECK(gapping[i].get_type() == GapType::RESIDUAL);
+            CHECK_THAT(gapping[i].get_length(),
+                       Catch::Matchers::WithinRel(constants.residualGap, 1e-9));
+        }
+    }
+}
+
+TEST_CASE("ABT644_Short_Gapping_List_Matches_The_Explicit_Spelling",
+          "[constructive-model][core][gapping]") {
+    // The one-entry form must be equivalent to spelling the residual gaps out by hand -- that
+    // equivalence is the whole point, and it is what the bug broke. Checked on the derived gap
+    // geometry, not just the lengths, and against the resulting magnetising inductance.
+    auto build = [](json gapping) {
+        json coreJson;
+        coreJson["name"] = "gapping equivalence";
+        coreJson["functionalDescription"] = json();
+        coreJson["functionalDescription"]["type"] = "two-piece set";
+        coreJson["functionalDescription"]["material"] = "3C95";
+        coreJson["functionalDescription"]["shape"] = "PQ 26/25";
+        coreJson["functionalDescription"]["numberStacks"] = 1;
+        coreJson["functionalDescription"]["gapping"] = gapping;
+        return OpenMagnetics::Core(coreJson);
+    };
+
+    auto implicitCore = build(json::array({json{{"type", "subtractive"}, {"length", 0.0005}}}));
+    auto explicitCore = build(json::array({
+        json{{"type", "subtractive"}, {"length", 0.0005}},
+        json{{"type", "residual"}, {"length", Constants().residualGap}},
+        json{{"type", "residual"}, {"length", Constants().residualGap}}}));
+
+    auto a = implicitCore.get_functional_description().get_gapping();
+    auto b = explicitCore.get_functional_description().get_gapping();
+    REQUIRE(a.size() == b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+        UNSCOPED_INFO("gap index: " << i);
+        CHECK(a[i].get_type() == b[i].get_type());
+        CHECK_THAT(a[i].get_length(), Catch::Matchers::WithinRel(b[i].get_length(), 1e-9));
+        CHECK_THAT(a[i].get_area().value(),
+                   Catch::Matchers::WithinRel(b[i].get_area().value(), 1e-9));
+        // Exact now. These two spellings land in different branches of
+        // distribute_and_process_gap, and the branches used to disagree here: one subtracted half
+        // the residual gap's length, the other ignored it (0.0080475 vs 0.0080500 on PQ 26/25).
+        // Both now use (columnHeight - gapLength)/2, which is what the quantity means. ABT #644.
+        CHECK_THAT(a[i].get_distance_closest_normal_surface().value(),
+                   Catch::Matchers::WithinRel(b[i].get_distance_closest_normal_surface().value(),
+                                              1e-9));
+        // Including the AXIAL position. These two spellings used to reach different placement
+        // paths and disagree by half a gap in y -- one centred the lone gap on the mating plane,
+        // the other put it in one half. A ground gap is always machined into a single half, so
+        // both now place it there and the whole coordinate triple must match. ABT #644.
+        for (size_t axis : {0, 1, 2}) {
+            UNSCOPED_INFO("axis: " << axis);
+            CHECK_THAT(a[i].get_coordinates().value()[axis],
+                       Catch::Matchers::WithinAbs(b[i].get_coordinates().value()[axis], 1e-12));
+        }
+    }
+
+    // And the inductance must agree. Before the fix the implicit form read ~0.59x the explicit one
+    // on this shape, which is the error that made this visible in the first place.
+    auto coil = OpenMagneticsTesting::get_quick_coil(
+        std::vector<int64_t>({10}), std::vector<int64_t>({1}), "PQ 26/25");
+    MagnetizingInductance magnetizingInductance;
+    auto implicitInductance = magnetizingInductance
+        .calculate_inductance_from_number_turns_and_gapping(implicitCore, coil)
+        .get_magnetizing_inductance().get_nominal().value();
+    auto explicitInductance = magnetizingInductance
+        .calculate_inductance_from_number_turns_and_gapping(explicitCore, coil)
+        .get_magnetizing_inductance().get_nominal().value();
+    UNSCOPED_INFO("implicit: " << implicitInductance << "  explicit: " << explicitInductance);
+    CHECK_THAT(implicitInductance, Catch::Matchers::WithinRel(explicitInductance, 1e-9));
+}
+
+TEST_CASE("ABT644_Gap_Type_Decides_Where_The_Gap_Goes", "[constructive-model][core][gapping]") {
+    // The gapping array is a vocabulary, and TYPE -- not position, not count -- decides which
+    // column a gap lands on. The factory helpers define it:
+    //     create_ground_gapping(L, n)         1 SUBTRACTIVE + (n-1) RESIDUAL
+    //     create_distributed_gapping(L, N, n) N SUBTRACTIVE + (n-1) RESIDUAL
+    //     create_spacer_gapping(L, n)         n ADDITIVE
+    // So SUBTRACTIVE is always ground out of the CENTRAL column -- several of them are one
+    // distributed gap spaced down that column, never one gap per leg -- while ADDITIVE is a shim
+    // between the halves and therefore separates EVERY column.
+    auto constants = Constants();
+    const double L = 0.0005;
+
+    auto build = [](json gapping) {
+        json coreJson;
+        coreJson["name"] = "gap vocabulary";
+        coreJson["functionalDescription"] = json();
+        coreJson["functionalDescription"]["type"] = "two-piece set";
+        coreJson["functionalDescription"]["material"] = "3C95";
+        coreJson["functionalDescription"]["shape"] = "PQ 26/25";
+        coreJson["functionalDescription"]["numberStacks"] = 1;
+        coreJson["functionalDescription"]["gapping"] = gapping;
+        return OpenMagnetics::Core(coreJson);
+    };
+    auto sub = [&](double l) { return json{{"type", "subtractive"}, {"length", l}}; };
+    auto add = [&](double l) { return json{{"type", "additive"}, {"length", l}}; };
+    auto res = [&]() { return json{{"type", "residual"}, {"length", constants.residualGap}}; };
+
+    auto countOfType = [](std::vector<CoreGap> const& g, GapType t) {
+        size_t n = 0;
+        for (auto const& x : g) if (x.get_type() == t) ++n;
+        return n;
+    };
+
+    SECTION("three subtractive gaps are a DISTRIBUTED gap in the central column, not one per leg") {
+        auto gapping = build(json::array({sub(L), sub(L), sub(L)}))
+                           .get_functional_description().get_gapping();
+        // three in the centre plus a residual on each of the two return columns
+        REQUIRE(gapping.size() == 5);
+        CHECK(countOfType(gapping, GapType::SUBTRACTIVE) == 3);
+        CHECK(countOfType(gapping, GapType::RESIDUAL) == 2);
+        // all three subtractive gaps share the central column's x, and are spread in y
+        std::vector<double> heights;
+        for (auto const& g : gapping) {
+            if (g.get_type() != GapType::SUBTRACTIVE) continue;
+            CHECK_THAT(g.get_coordinates().value()[0], Catch::Matchers::WithinAbs(0.0, 1e-12));
+            heights.push_back(g.get_coordinates().value()[1]);
+        }
+        REQUIRE(heights.size() == 3);
+        std::sort(heights.begin(), heights.end());
+        CHECK(heights[0] < heights[1]);
+        CHECK(heights[1] < heights[2]);
+        CHECK_THAT(heights[1], Catch::Matchers::WithinAbs(0.0, 1e-12));
+
+        // and it must agree with the hand-built form, which is what callers use today
+        auto explicitForm = build(json::array({sub(L), sub(L), sub(L), res(), res()}))
+                                .get_functional_description().get_gapping();
+        REQUIRE(explicitForm.size() == gapping.size());
+        for (size_t i = 0; i < gapping.size(); ++i) {
+            UNSCOPED_INFO("gap index: " << i);
+            CHECK(gapping[i].get_type() == explicitForm[i].get_type());
+            CHECK_THAT(gapping[i].get_length(),
+                       Catch::Matchers::WithinRel(explicitForm[i].get_length(), 1e-9));
+            for (size_t axis = 0; axis < 3; ++axis) {
+                CHECK_THAT(gapping[i].get_coordinates().value()[axis],
+                           Catch::Matchers::WithinAbs(
+                               explicitForm[i].get_coordinates().value()[axis], 1e-12));
+            }
+        }
+    }
+
+    SECTION("a spacer separates EVERY column, however few additive gaps are given") {
+        // one additive gap is still a shim between the halves: all three columns are pushed apart
+        auto shortForm = build(json::array({add(L)}))
+                             .get_functional_description().get_gapping();
+        auto fullForm = build(json::array({add(L), add(L), add(L)}))
+                            .get_functional_description().get_gapping();
+        REQUIRE(shortForm.size() == 3);
+        REQUIRE(fullForm.size() == 3);
+        CHECK(countOfType(shortForm, GapType::ADDITIVE) == 3);
+        CHECK(countOfType(fullForm, GapType::ADDITIVE) == 3);
+        CHECK(countOfType(shortForm, GapType::RESIDUAL) == 0);
+        for (size_t i = 0; i < shortForm.size(); ++i) {
+            UNSCOPED_INFO("gap index: " << i);
+            CHECK(shortForm[i].get_type() == fullForm[i].get_type());
+            CHECK_THAT(shortForm[i].get_length(),
+                       Catch::Matchers::WithinRel(fullForm[i].get_length(), 1e-9));
+        }
+    }
+
+    SECTION("one subtractive gap is a ground gap: centre only, residual on the laterals") {
+        auto gapping = build(json::array({sub(L)})).get_functional_description().get_gapping();
+        REQUIRE(gapping.size() == 3);
+        CHECK(countOfType(gapping, GapType::SUBTRACTIVE) == 1);
+        CHECK(countOfType(gapping, GapType::RESIDUAL) == 2);
+        CHECK(gapping[0].get_type() == GapType::SUBTRACTIVE);
+        CHECK_THAT(gapping[0].get_coordinates().value()[0], Catch::Matchers::WithinAbs(0.0, 1e-12));
+        // ground into ONE half -- cheaper than machining both by half the gap each -- so the gap
+        // spans 0..L and sits half a gap off the mating plane, never straddling it
+        CHECK_THAT(gapping[0].get_coordinates().value()[1],
+                   Catch::Matchers::WithinRel(L / 2, 1e-9));
+        auto columnHeight = build(json::array({sub(L)}))
+                                .get_processed_description().value().get_columns()[0].get_height();
+        CHECK_THAT(gapping[0].get_distance_closest_normal_surface().value(),
+                   Catch::Matchers::WithinRel(columnHeight / 2 - L / 2, 1e-6));
+    }
+
+    SECTION("an all-residual list stays one residual gap per column") {
+        auto gapping = build(json::array({res(), res(), res()}))
+                           .get_functional_description().get_gapping();
+        REQUIRE(gapping.size() == 3);
+        CHECK(countOfType(gapping, GapType::RESIDUAL) == 3);
+    }
+}
+
+TEST_CASE("Toroid_Coating_Is_Resolved_Per_Material_Family", "[core][coating][abt964]") {
+    // Which jacket a toroid carries, and how thick, is a property of the ceramic it is pressed
+    // from. Epoxy on a FERRITE ring core is ~3x the film on a powder toroid, and the two families
+    // cross over from parylene to epoxy at DIFFERENT sizes -- TDK puts a ferrite ring core's at
+    // R 9.53 and Magnetics' ferrite catalogue agrees (coating code Y up to 7.62 mm OD, code Z
+    // from 9.53 mm), while Micrometals/Fair-Rite put a powder toroid's at 0.20". Both thickness
+    // numbers are tolerance-free: they compare a coated limit against the UNCOATED limit in the
+    // same direction, so the bare core's dimensional tolerance cancels instead of being counted
+    // as coating. TDK R 50.0x30.0x20.0 yields 0.400 mm on all three axes that way, matching the
+    // "< 0.4 mm" it states; Ferroxcube draws its TN jacket at ~0.3 mm.
+    auto toroid = [](const std::string& shape, const std::string& material) {
+        json coreJson;
+        coreJson["functionalDescription"]["type"] = "toroidal";
+        coreJson["functionalDescription"]["material"] = material;
+        coreJson["functionalDescription"]["shape"] = shape;
+        coreJson["functionalDescription"]["gapping"] = json::array();
+        coreJson["functionalDescription"]["numberStacks"] = 1;
+        return Core(coreJson, true);
+    };
+    auto defaults = Defaults();
+
+    // Ferrite past TDK's R 9.53 crossover: epoxy, at the drawn ring-core thickness.
+    auto ferriteLarge = toroid("T 25/15/10", "N97");
+    REQUIRE(ferriteLarge.is_ferrite_core());
+    REQUIRE_FALSE(ferriteLarge.get_default_toroid_coating_is_parylene());
+    REQUIRE_THAT(ferriteLarge.get_coating_thickness(),
+                 Catch::Matchers::WithinAbs(defaults.defaultFerriteEpoxyCoreCoatingThickness, 1e-12));
+
+    // THE CASE A SINGLE SHARED THRESHOLD GOT WRONG. One shape, 6,3 mm across, sits between the
+    // two crossovers: past 0.20" so a POWDER toroid of that size is epoxy, but short of R 9.53 so
+    // a FERRITE one is still parylene. Same geometry, opposite jackets, ~24x apart in thickness.
+    auto ferriteMid = toroid("T 6.3/3.8/2.5", "N97");
+    REQUIRE(ferriteMid.is_ferrite_core());
+    REQUIRE(ferriteMid.get_default_toroid_coating_is_parylene());
+    REQUIRE_THAT(ferriteMid.get_coating_thickness(),
+                 Catch::Matchers::WithinAbs(defaults.defaultParyleneCoreCoatingThickness, 1e-12));
+
+    auto powderMid = toroid("T 6.3/3.8/2.5", "Kool M\u00b5 26");
+    REQUIRE_FALSE(powderMid.is_ferrite_core());
+    REQUIRE_FALSE(powderMid.get_default_toroid_coating_is_parylene());
+    REQUIRE_THAT(powderMid.get_coating_thickness(),
+                 Catch::Matchers::WithinAbs(defaults.defaultEpoxyCoreCoatingThickness, 1e-12));
+
+    REQUIRE(ferriteMid.get_coating_thickness() < powderMid.get_coating_thickness());
+    REQUIRE(powderMid.get_coating_thickness() < ferriteLarge.get_coating_thickness());
+}
+
+TEST_CASE("Unprocessed toroid still resolves its ring edge", "[core][coating][abt964][regression]") {
+    // REGRESSION. get_toroid_edge_radius() read the processed columns through
+    //     const auto& columns = get_processed_description()->get_columns();
+    // and get_processed_description() hands the optional back BY VALUE, so that reference pointed
+    // into a temporary that was already gone. Undefined behaviour does not fail loudly: this build
+    // read it fine, while asgard's WASM read it back EMPTY and threw "Toroid has no processed
+    // column" for every catalogue toroid -- all 236 CMCs and El Choker's graph panel with them.
+    //
+    // The path that exposed it is the one autocomplete takes: a MAS record from the catalogue
+    // carries no processedDescription, so the core arrives unprocessed and create_quick_bobbin
+    // processes it on the way through. Build it that way here rather than pre-processing.
+    json coreJson;
+    coreJson["functionalDescription"]["type"] = "toroidal";
+    coreJson["functionalDescription"]["material"] = "N97";
+    coreJson["functionalDescription"]["shape"] = "T 25/15/10";
+    coreJson["functionalDescription"]["gapping"] = json::array();
+    coreJson["functionalDescription"]["numberStacks"] = 1;
+    Core unprocessed(coreJson, true);
+    unprocessed.set_processed_description(std::nullopt);
+    REQUIRE_FALSE(unprocessed.get_processed_description());
+
+    auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(unprocessed, false);
+    REQUIRE(bobbin.get_processed_description());
+    REQUIRE(bobbin.get_column_corner_radius() > 0);
+
+    // And the same core, processed up front, must agree: the datum is a property of the part,
+    // not of the order the caller happened to build it in.
+    Core processed(coreJson, true);
+    auto processedBobbin = OpenMagnetics::Bobbin::create_quick_bobbin(processed, false);
+    REQUIRE_THAT(bobbin.get_column_corner_radius(),
+                 Catch::Matchers::WithinRel(processedBobbin.get_column_corner_radius(), 1e-12));
+}
+
+// ABT #995: a UT core is a U closed by a flat bar — the T — which is the same construction as
+// the UI beside it in the family cascade. With no entry it fell to the TWO_PIECE_SET default
+// and was mirrored, doubling the effective magnetic path.
+//
+// The failure is SILENT, which is why it survived: a toroid wrongly typed twoPieceSet throws
+// bad_optional_access, while a UT returns entirely plausible numbers. It was found by
+// measuring a datasheet against the engine, not by anything failing.
+TEST_CASE("Test_Core_Type_UT_Is_Piece_And_Plate", "[core][core-type][smoke-test]") {
+    settings.reset();
+
+    // The family cascade lives in Core(CoreShape, material) — the constructor that BUILDS a
+    // core from a shape. (Core(MagneticCore) requires the type in the json and does not derive
+    // one, which is why a producer must state it.)
+    auto coreShape = OpenMagnetics::find_core_shape_by_name("UT 20");
+    Core core(coreShape, OpenMagnetics::find_core_material_by_name("3C95"));
+
+    // A U piece closed by a flat bar — the same as UI, not a mirrored two-piece set and not a
+    // single solid. US 11,749,439 describes the construction as "a U-shaped core and I-shaped
+    // core ... the I-shaped core connecting both leg portions of the U-shaped core to form a
+    // closed magnetic path", and UT parts are wound on a bobbin, which a one-piece core could
+    // not accept.
+    //
+    // "Closed rectangular ferrite core" on a UT choke datasheet, and magneticCircuit: closed on
+    // the MAS shape record, describe the assembled CIRCUIT — not the piece count. That is the
+    // exact confusion Core.cpp's cascade comment warns about for UI/PQI.
+    CHECK(core.get_functional_description().get_type() == CoreType::PIECE_AND_PLATE);
+
+    // And it must show in the physics: mirrored, a UT reports ~106 mm of effective length for
+    // a core whose real path is ~53 mm (the WE-FC datasheets state 53).
+    core.process_data();
+    REQUIRE(core.get_processed_description());
+    auto effective = core.get_processed_description()->get_effective_parameters();
+    CHECK_THAT(effective.get_effective_length() * 1000, Catch::Matchers::WithinRel(53.20, 0.02));
+}
+
+
+// Same class as the UT case above (ABT #995): an EI core is an E piece closed by an I bar —
+// the family the records themselves name "E+I" — and it had no entry in the cascade either,
+// so it fell to TWO_PIECE_SET and was mirrored. ET 20 reported le 99.51 mm against the
+// 49.76 mm a piece-and-plate gives, the same exact factor of two.
+//
+// Found by the heimdall CMC pipeline while adding ET 20 to MAS, immediately after the UT
+// fix — the same gap, one family over, which is why this test exists beside that one rather
+// than as an afterthought in it.
+TEST_CASE("Test_Core_Type_EI_Is_Piece_And_Plate", "[core][core-type][smoke-test]") {
+    settings.reset();
+
+    // An EI core is an E piece closed by an I bar — the same construction as the UI already
+    // in the cascade, and the family our own records name "E+I". It had no entry either, so
+    // it fell to TWO_PIECE_SET and was mirrored: on ET 20, le 99.51 mm against the 49.76 mm a
+    // piece-and-plate gives — the same exact factor of two as the UT case above.
+    //
+    // The shape is built INLINE rather than looked up, because MAS ships no `ei` record yet
+    // (ET 20 is being added). So this asserts the family->type derivation only; the effective
+    // length is deliberately NOT asserted, since pinning it would mean embedding dimensions
+    // here that belong in MAS. Add the le assertion, as the UT test has, once an ei shape is
+    // published — a type-only test would pass through a regression that keeps the enum and
+    // changes the mirroring.
+    CoreShape shape;
+    shape.set_family(CoreShapeFamily::EI);
+    shape.set_name("EI test shape");
+    shape.set_type(FunctionalDescriptionType::CUSTOM);
+    shape.set_dimensions(std::map<std::string, Dimension>{
+        {"A", 0.0404}, {"B", 0.0202}, {"C", 0.0128},
+        {"D", 0.0101}, {"E", 0.0202}, {"F", 0.0128},
+    });
+
+    Core core(shape, OpenMagnetics::find_core_material_by_name("3C95"));
+    CHECK(core.get_functional_description().get_type() == CoreType::PIECE_AND_PLATE);
+}
+
+// ABT #1002: a moulded body pressed from more than one powder. The piece exposes its IEC sections
+// grouped by the pressing that carries them -- post, cover, base -- and the single-material
+// constants are the SUM of those regions, so the two views can never disagree.
+TEST_CASE("Test_Molded_Region_Constants_Sum_To_Piece", "[core][molded][abt-1002]") {
+    settings.reset();
+    clear_databases();
+    json shapeJson = {
+        {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+        {"aliases", json::array()}, {"name", "MAPI-like 4020"},
+        {"dimensions", {
+            {"A", {{"nominal", 0.0041}}}, {"B", {{"nominal", 0.0021}}}, {"C", {{"nominal", 0.0041}}},
+            {"D", {{"nominal", 0.0014}}}, {"E", {{"nominal", 0.0030}}}, {"F", {{"nominal", 0.0012}}}}}
+    };
+    json coreJson;
+    coreJson["functionalDescription"] = {
+        {"type", "closedShape"}, {"material", "Kool Mµ 26"}, {"shape", shapeJson},
+        {"gapping", json::array()}, {"numberStacks", 1}};
+    Core core(coreJson);
+    auto corePiece = CorePiece::factory(core.resolve_shape());
+    auto regions = corePiece->get_region_shape_constants();
+    REQUIRE(regions.has_value());
+    REQUIRE(regions->size() == 3);
+    CHECK((*regions)[0].name == "post");
+    CHECK((*regions)[1].name == "cover");
+    CHECK((*regions)[2].name == "base");
+
+    auto [c1, c2, minimumArea] = corePiece->get_shape_constants();
+    double c1Sum = 0;
+    double c2Sum = 0;
+    double minimumAreaOfRegions = std::numeric_limits<double>::max();
+    for (auto& region : *regions) {
+        CHECK(region.c1 > 0);
+        CHECK(region.c2 > 0);
+        CHECK(region.minimumArea > 0);
+        c1Sum += region.c1;
+        c2Sum += region.c2;
+        minimumAreaOfRegions = std::min(minimumAreaOfRegions, region.minimumArea);
+    }
+    CHECK_THAT(c1Sum, Catch::Matchers::WithinRel(c1, 1e-12));
+    CHECK_THAT(c2Sum, Catch::Matchers::WithinRel(c2, 1e-12));
+    CHECK_THAT(minimumAreaOfRegions, Catch::Matchers::WithinRel(minimumArea, 1e-12));
+
+    // The post region is the axial run through the cavity: D over pi/4 F^2, nothing else.
+    double postArea = std::numbers::pi / 4 * pow(0.0012, 2);
+    CHECK_THAT((*regions)[0].c1, Catch::Matchers::WithinRel(0.0014 / postArea, 1e-9));
+    CHECK_THAT((*regions)[0].minimumArea, Catch::Matchers::WithinRel(postArea, 1e-9));
+    // The cover carries the side wall, so it is the longer return path of the two plates.
+    CHECK((*regions)[1].c1 > (*regions)[2].c1);
+    settings.reset();
+}
+
+// ABT #1002: how the material list of a moulded body resolves to its regions, and what the
+// reserved non-magnetic name "air" is allowed to mean.
+TEST_CASE("Test_Molded_Region_Materials_Resolution", "[core][molded][abt-1002]") {
+    settings.reset();
+    clear_databases();
+    json shapeJson = {
+        {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+        {"aliases", json::array()}, {"name", "MAPI-like 4020"},
+        {"dimensions", {
+            {"A", {{"nominal", 0.0041}}}, {"B", {{"nominal", 0.0021}}}, {"C", {{"nominal", 0.0041}}},
+            {"D", {{"nominal", 0.0014}}}, {"E", {{"nominal", 0.0030}}}, {"F", {{"nominal", 0.0012}}}}}
+    };
+    auto coreWithMaterial = [&](json material) {
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", "closedShape"}, {"material", material}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1}};
+        return Core(coreJson);
+    };
+
+    // A bare grade and a one-entry list are one grade everywhere: ONE region entry, so the
+    // per-region models stay out of the way of every single-grade moulded core.
+    CHECK(coreWithMaterial("Kool Mµ 26").resolve_region_materials().size() == 1);
+    CHECK(coreWithMaterial(json::array({"Kool Mµ 26"})).resolve_region_materials().size() == 1);
+
+    // [inner, outer]: the outer powder fills cover AND base.
+    auto twoGrades = coreWithMaterial(json::array({"Kool Mµ 60", "Kool Mµ 26"}));
+    auto regions = twoGrades.resolve_region_materials();
+    REQUIRE(regions.size() == 3);
+    CHECK(regions[0].value().get_name() == "Kool Mµ 60");
+    CHECK(regions[1].value().get_name() == "Kool Mµ 26");
+    CHECK(regions[2].value().get_name() == "Kool Mµ 26");
+    // The primary grade is the post's.
+    CHECK(twoGrades.resolve_material().get_name() == "Kool Mµ 60");
+
+    // [post, cover, base]
+    auto threeGrades = coreWithMaterial(json::array({"Kool Mµ 60", "Kool Mµ 26", "Kool Mµ 40"}));
+    regions = threeGrades.resolve_region_materials();
+    REQUIRE(regions.size() == 3);
+    CHECK(regions[2].value().get_name() == "Kool Mµ 40");
+
+    // A coil on a plastic bobbin: the post is air, and the primary GRADE is then the cover's.
+    auto bobbinPost = coreWithMaterial(json::array({"air", "Kool Mµ 26", "Kool Mµ 26"}));
+    regions = bobbinPost.resolve_region_materials();
+    REQUIRE(regions.size() == 3);
+    CHECK_FALSE(regions[0].has_value());
+    CHECK(regions[1].value().get_name() == "Kool Mµ 26");
+    CHECK(bobbinPost.resolve_material().get_name() == "Kool Mµ 26");
+    CHECK(bobbinPost.get_material_name() == "Kool Mµ 26");
+    // The drum families have no non-magnetic piece, so the piece list refuses the placeholder.
+    CHECK_THROWS(bobbinPost.resolve_materials());
+
+    // What the body cannot be.
+    CHECK_THROWS(coreWithMaterial(json::array({"Kool Mµ 26", "Kool Mµ 26", "Kool Mµ 26", "Kool Mµ 26"})).resolve_region_materials());
+    CHECK_THROWS(coreWithMaterial(json::array({"Kool Mµ 26", "air"})).resolve_region_materials());
+    CHECK_THROWS(coreWithMaterial(json::array({"air"})).resolve_region_materials());
+    CHECK_THROWS(coreWithMaterial(json::array({"air", "air", "air"})).resolve_material());
+    settings.reset();
+}

@@ -138,8 +138,11 @@ std::shared_ptr<MagneticFieldStrengthModel> MagneticField::factory(MagneticField
     else if (modelName == MagneticFieldStrengthModels::ALBACH) {
         return std::make_shared<MagneticFieldStrengthAlbach2DModel>();
     }
+    else if (modelName == MagneticFieldStrengthModels::DOWELL) {
+        return std::make_shared<MagneticFieldStrengthDowellModel>();
+    }
     else
-        throw ModelNotAvailableException("Unknown Magnetic Field Strength model, available options are: {BINNS_LAWRENSON, LAMMERANER, WANG, ALBACH}");
+        throw ModelNotAvailableException("Unknown Magnetic Field Strength model, available options are: {BINNS_LAWRENSON, LAMMERANER, WANG, ALBACH, DOWELL}");
 }
 
 std::shared_ptr<MagneticFieldStrengthFringingEffectModel> MagneticField::factory(MagneticFieldStrengthFringingEffectModels modelName) {
@@ -227,7 +230,8 @@ double get_magnetic_field_strength_gap(OperatingPoint& operatingPoint, Magnetic 
         auto includeDcCurrent = Inputs::include_dc_offset_into_magnetizing_current(operatingPoint, magnetic.get_turns_ratios());
         auto magnetizingCurrent = Inputs::calculate_magnetizing_current(operatingPoint.get_mutable_excitations_per_winding()[0],
                                                                                resolve_dimensional_values(magnetizingInductance.get_magnetizing_inductance()),
-                                                                               true, includeDcCurrent);
+                                                                               true, includeDcCurrent,
+                                                                               operatingPoint.get_excitations_per_winding().size() > 1);
         operatingPoint.get_mutable_excitations_per_winding()[0].set_magnetizing_current(magnetizingCurrent);
     }
 
@@ -269,6 +273,31 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
     auto& settings = OpenMagnetics::Settings::GetInstance();
     auto includeFringing = settings.get_magnetic_field_include_fringing();
 
+    // ABT #835: DOWELL is a 1-D MMF STAIRCASE, not a 2-D kernel. Its step contribution
+    // (fieldStep = I / windingBreadth, applied whole/half/not-at-all by comparing the
+    // inducing and induced x) carries NO distance dependence at all — so every filament it
+    // is handed counts as a whole extra conductor in the staircase, wherever it sits.
+    //
+    // The inducing mesh, however, expands each turn into a (2M+1)x(2N+1) lattice of
+    // method-of-images filaments, because the 2-D kernels (Lammeraner, Binns-Lawrenson,
+    // Albach) NEED those images to satisfy the high-permeability wall boundary condition.
+    // Feeding them to Dowell is doubly wrong: the axial images sit at the SAME x as their
+    // parent and simply triple every real step, while the inner radial images sit to the
+    // left of every real turn and each add a full step — a constant pedestal that dominated
+    // the result. On the 12-turn P 3.3/2.6 fixture that read H ~16x high at the first layer
+    // and proximity loss 2.27 W against ALBACH/LAMMERANER/BINNS's 0.038 W (~60x, since loss
+    // goes as H^2).
+    //
+    // Dowell's 1-D formulation already embodies the wall boundary condition, so it must see
+    // the REAL conductors only. Suppressing mirroring for this model alone brings it to
+    // 0.0362 W — within 6% of the 2-D models — while leaving them their images (they drop to
+    // 0.0297 W without them, so this cannot be a global change).
+    std::optional<SettingsGuard<int>> dowellMirroringGuard;
+    if (_magneticFieldStrengthModel == MagneticFieldStrengthModels::DOWELL) {
+        dowellMirroringGuard.emplace(settings, &Settings::get_magnetic_field_mirroring_dimension,
+                                     &Settings::set_magnetic_field_mirroring_dimension, 0);
+    }
+
     CoilMesher coilMesher; 
     std::vector<Field> inducingFields;
     auto core = magnetic.get_core();
@@ -283,7 +312,7 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
         core.process_data();
     }
     if (!core.is_gap_processed()) {
-        core.process_gap();
+        core.process_gap_or_throw();
     }
     magnetic.set_core(core);
     auto gapping = core.get_functional_description().get_gapping();
@@ -355,6 +384,19 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
     }
     _model->_wireMaxOuterWidth = _wireMaxOuterWidth;
     _model->_wireMaxOuterHeight = _wireMaxOuterHeight;
+
+    // ABT #376: Dowell needs the winding breadth b — the window dimension the layers run along,
+    // which for MKF's concentric windows is the window HEIGHT (layers stack radially, the field
+    // runs axially). Supplied to every model; only Dowell reads it.
+    {
+        auto bobbin = magnetic.get_mutable_coil().resolve_bobbin();
+        if (bobbin.get_processed_description()) {
+            auto bobbinWindingWindows = bobbin.get_processed_description()->get_winding_windows();
+            if (!bobbinWindingWindows.empty() && bobbinWindingWindows[0].get_height()) {
+                _model->_windingWindowBreadth = bobbinWindingWindows[0].get_height().value();
+            }
+        }
+    }
     
     auto turns = magnetic.get_coil().get_turns_description().value();
 
@@ -425,7 +467,8 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
                 auto includeDcCurrent = Inputs::include_dc_offset_into_magnetizing_current(operatingPoint, magnetic.get_turns_ratios());
                 auto magnetizingCurrent = Inputs::calculate_magnetizing_current(operatingPoint.get_mutable_excitations_per_winding()[0],
                                                                                        resolve_dimensional_values(magnetizingInductance.get_magnetizing_inductance()),
-                                                                                       true, includeDcCurrent);
+                                                                                       true, includeDcCurrent,
+                                                                               operatingPoint.get_excitations_per_winding().size() > 1);
 
                 operatingPoint.get_mutable_excitations_per_winding()[0].set_magnetizing_current(magnetizingCurrent);
                 // throw std::runtime_error("Operating point is missing magnetizing current");
@@ -451,19 +494,39 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
                         if (gap.get_coordinates().value()[0] < 0) {
                             continue;
                         }
-                        // Albach's equivalent-current fit is only valid for small
-                        // gapLength / columnDiameter ratios; larger gaps are routed
-                        // through the Roshen conformal model per induced point below
-                        // (deterministic model routing by geometry, not a fallback).
-                        // Only one harmonic can pass the frequency-tolerance gate
-                        // (harmonics are integer multiples), so no dedup is needed.
-                        if (!MagneticFieldStrengthAlbachModel::is_gap_within_validity_range(gap)) {
-                            albachOutOfRangeGaps.push_back(gap);
+                        // ABT #832: only functional (SUBTRACTIVE/ADDITIVE) gaps fringe.
+                        // A RESIDUAL gap is a ground mating surface a few um long; its
+                        // conformal near-field sampled at a surface point mm away is a
+                        // modelling artifact, not physics (same doctrine as the
+                        // width-sample gate below). With residual-gap fringing included
+                        // a 12-turn P-core read R_ac/R_dc 2.63 at 1 MHz where OMFEM
+                        // gives 1.263 -- excluding it lands at 1.25.
+                        if (gap.get_type() != GapType::SUBTRACTIVE && gap.get_type() != GapType::ADDITIVE) {
                             continue;
                         }
-                        auto fieldPoint = fringingModel->get_equivalent_inducing_point_for_gap(gap, magneticFieldStrengthGap);
-
-                        inducingFields[harmonicIndex].get_mutable_data().push_back(fieldPoint);
+                        // ABT #832 (FEM-arbitrated 2026-08-20): the equivalent-current
+                        // construction is NOT used, for two independent reasons.
+                        //  1. Albach's fitted current polynomial (Abb. 9.5) is stated
+                        //     accurate only for xi = lg/(2rc) < 0.2 and its denominator
+                        //     has a pole at xi ~ 0.2755; the old validity gate
+                        //     (denominator > 0) admitted xi up to the pole, where the
+                        //     equivalent current diverges (ETD24, 2 mm gap, xi = 0.253:
+                        //     I_eq = 60x the gap MMF -> R_ac/R_dc 53 vs FEM 1.44 at
+                        //     100 kHz).
+                        //  2. Even inside the fit's validity the construction needs the
+                        //     book's full boundary-value treatment (Sect. 9.1.3: the
+                        //     loop's images in the core) to mean anything; feeding the
+                        //     equivalent point as a bare wire carrying I = H_g*lg/0.25
+                        //     (= 4x the gap MMF at small xi) over-predicts fringing
+                        //     proximity loss 6-9x on an IN-validity gap (ETD24,
+                        //     0.5 mm gap, xi = 0.063, vs OMFEM).
+                        // Until the faithful axisymmetric treatment exists, every gap is
+                        // routed through the Roshen conformal per-point model below --
+                        // the same path the out-of-validity gaps already took -- which
+                        // matches OMFEM within 16-35% on the same geometry.
+                        // Only one harmonic can pass the frequency-tolerance gate
+                        // (harmonics are integer multiples), so no dedup is needed.
+                        albachOutOfRangeGaps.push_back(gap);
                     }
                 }
             }
@@ -583,6 +646,11 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
                                 if (gap.get_coordinates().value()[0] < 0) {
                                     continue;
                                 }
+                                // ABT #832: residual (mating-surface) gaps do not contribute
+                                // fringing loss -- see the matching gate in the ALBACH branch.
+                                if (gap.get_type() != GapType::SUBTRACTIVE && gap.get_type() != GapType::ADDITIVE) {
+                                    continue;
+                                }
                                 auto fringingContrib = _fringingEffectModel->get_magnetic_field_strength_between_gap_and_point(gap, magneticFieldStrengthGap, inducedFieldPoint);
                                 complexFieldPoint.set_real(complexFieldPoint.get_real() + fringingContrib.get_real());
                                 complexFieldPoint.set_imaginary(complexFieldPoint.get_imaginary() + fringingContrib.get_imaginary());
@@ -690,7 +758,8 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
                         auto includeDcCurrent = Inputs::include_dc_offset_into_magnetizing_current(operatingPoint, magnetic.get_turns_ratios());
                         auto magnetizingCurrent = Inputs::calculate_magnetizing_current(operatingPoint.get_mutable_excitations_per_winding()[0],
                                                                                                resolve_dimensional_values(magnetizingInductance.get_magnetizing_inductance()),
-                                                                                               true, includeDcCurrent);
+                                                                                               true, includeDcCurrent,
+                                                                               operatingPoint.get_excitations_per_winding().size() > 1);
 
                         operatingPoint.get_mutable_excitations_per_winding()[0].set_magnetizing_current(magnetizingCurrent);
                         // throw std::runtime_error("Operating point is missing magnetizing current");
@@ -728,6 +797,11 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
                     auto& gapsToProcess = albachRoutedGapsPending ? albachOutOfRangeGaps : gapping;
                     for (auto& gap : gapsToProcess) {
                         if (gap.get_coordinates().value()[0] < 0) {
+                            continue;
+                        }
+                        // ABT #832: residual (mating-surface) gaps do not contribute
+                        // fringing loss -- see the matching gate in the ALBACH branch.
+                        if (gap.get_type() != GapType::SUBTRACTIVE && gap.get_type() != GapType::ADDITIVE) {
                             continue;
                         }
                         auto complexFieldPoint = albachRoutedGapsPending ?
@@ -1165,6 +1239,53 @@ ComplexFieldPoint MagneticFieldStrengthBinnsLawrensonModel::get_magnetic_field_s
         complexFieldPoint.set_turn_length(inducedFieldPoint.get_turn_length().value());
     }
     return complexFieldPoint;   
+}
+
+// ABT #376: Dowell's one-dimensional field (see the class comment in the header). The layers are
+// assumed to span the winding breadth b, so the field is PARALLEL to them and depends only on the
+// ampere-turns enclosed between the induced point and the zero-field boundary. Per inducing
+// conductor that is a step: the conductor's own I/b is felt on one side of it and nothing on the
+// other, so summing over the conductors of a layered winding rebuilds Dowell's MMF staircase.
+//
+// Orientation: MKF's concentric windows stack layers along x (radial) with the field running
+// along y (axial), which is Dowell's own arrangement, so the step is taken on the x coordinate
+// and the field is returned on y. Toroidal/other layouts are not Dowell's geometry and the
+// caller should choose a two-dimensional model there.
+ComplexFieldPoint MagneticFieldStrengthDowellModel::get_magnetic_field_strength_between_two_points(FieldPoint inducingFieldPoint, FieldPoint inducedFieldPoint, std::optional<size_t> inducingWireIndex) {
+    ComplexFieldPoint magneticFieldStrengthPoint;
+    magneticFieldStrengthPoint.set_point(inducedFieldPoint.get_point());
+    if (inducedFieldPoint.get_label()) {
+        magneticFieldStrengthPoint.set_label(inducedFieldPoint.get_label().value());
+    }
+
+    // Without a breadth there is no Dowell field to speak of; refusing beats inventing one.
+    if (_windingWindowBreadth <= 0) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "Dowell's field model needs the winding breadth (the window dimension parallel to the "
+            "layers); none was supplied, so H = MMF / b is undefined");
+    }
+
+    double inducingRadialPosition = inducingFieldPoint.get_point()[0];
+    double inducedRadialPosition = inducedFieldPoint.get_point()[0];
+    double fieldStep = inducingFieldPoint.get_value() / _windingWindowBreadth;
+
+    // The conductor contributes to points OUTSIDE it (further from the zero-field boundary) and
+    // not to points inside. On the conductor itself the enclosed fraction is taken as half, which
+    // is Dowell's own treatment of the layer carrying the current.
+    double contribution;
+    if (inducedRadialPosition > inducingRadialPosition) {
+        contribution = fieldStep;
+    }
+    else if (inducedRadialPosition < inducingRadialPosition) {
+        contribution = 0;
+    }
+    else {
+        contribution = fieldStep / 2;
+    }
+
+    magneticFieldStrengthPoint.set_real(0);
+    magneticFieldStrengthPoint.set_imaginary(contribution);
+    return magneticFieldStrengthPoint;
 }
 
 ComplexFieldPoint MagneticFieldStrengthLammeranerModel::get_magnetic_field_strength_between_two_points(FieldPoint inducingFieldPoint, FieldPoint inducedFieldPoint, std::optional<size_t> inducingWireIndex) {

@@ -8,6 +8,7 @@
 #include "Definitions.h"
 #include "Defaults.h"
 #include <MAS.hpp>
+#include <set>
 
 using namespace MAS;
 
@@ -132,6 +133,17 @@ class MagneticAdviser{
 
         std::map<MagneticFilters, std::shared_ptr<MagneticFilter>> _filters;
         std::vector<MagneticFilterOperation> _loadedFilterFlow;
+        /// @brief Candidates that FAILED a non-strictly-required filter, per filter.
+        ///
+        /// A filter that rejects a candidate returns {false, 0.0} — a raw score of
+        /// zero, not a distance. Non-strict scoring keeps that raw value, and with
+        /// `invert` (lower raw = better, the usual setting) zero is the BEST possible
+        /// score, so rejected candidates outranked fitting ones; when every candidate
+        /// was rejected, normalize_scoring's max==min branch handed them all the full
+        /// weight and the filter stopped discriminating entirely. Recording the
+        /// rejections here lets get_scorings() force them to the worst normalized
+        /// value instead, which works for any invert/log configuration (ABT #801).
+        std::map<MagneticFilters, std::set<std::string>> _failedScorings;
         /// @brief Default filter flow for custom magnetic design.
         /// COST and LOSSES use log normalization (spans orders of magnitude).
         /// DIMENSIONS uses linear normalization (intuitive volume comparison).
@@ -143,7 +155,13 @@ class MagneticAdviser{
 
         /// @brief Default filter flow for catalogue magnetic selection.
         /// These filters are strictly required to ensure compatibility with design requirements.
+        /// DATASHEET_LIMITS goes first: it gates a catalogue part against its OWN published
+        /// electrical limits (rated/saturation currents, etc.) from manufacturerInfo.datasheetInfo
+        /// — the cheapest reject available, and a pure pass-through for parts without a datasheet
+        /// block (every designed/custom magnetic). It existed since ABT #19 but was never wired
+        /// into this flow, so catalogue parts were only ever gated by MKF-simulated quantities.
         std::vector<MagneticFilterOperation> _defaultCatalogueMagneticFilterFlow{
+            MagneticFilterOperation(MagneticFilters::DATASHEET_LIMITS, true, false, 1.0),
             MagneticFilterOperation(MagneticFilters::TURNS_RATIOS, true, false, true, 1.0),
             MagneticFilterOperation(MagneticFilters::MAXIMUM_DIMENSIONS, true, false, 1.0),
             MagneticFilterOperation(MagneticFilters::SATURATION, true, false, 1.0),

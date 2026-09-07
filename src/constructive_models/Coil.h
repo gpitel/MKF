@@ -10,6 +10,8 @@
 
 #include <MAS.hpp>
 #include <vector>
+#include <set>
+#include <optional>
 #include "support/Exceptions.h"
 
 using namespace MAS;
@@ -28,7 +30,20 @@ class Winding : public MAS::CoilFunctionalDescription {
     public:
         const WireDataOrNameUnion & get_wire() const { return wire; }
         WireDataOrNameUnion & get_mutable_wire() { return wire; }
-        void set_wire(const WireDataOrNameUnion & value) { this->wire = value; }
+        // ABT #611: this member SHADOWS MAS::CoilFunctionalDescription::wire (it holds the
+        // richer OpenMagnetics::Wire), and serializing through the base is the natural way to
+        // emit schema-clean MAS json — so the base member is kept in sync on every write, or
+        // base to_json silently emits the 'Dummy' placeholder and the file re-winds with a
+        // 12.5 um dummy wire (the 25/26 PSPS delivery's hair-thin 298-turn winding).
+        void set_wire(const WireDataOrNameUnion & value) {
+            this->wire = value;
+            if (std::holds_alternative<std::string>(value)) {
+                MAS::CoilFunctionalDescription::set_wire(std::get<std::string>(value));
+            }
+            else {
+                MAS::CoilFunctionalDescription::set_wire(static_cast<MAS::Wire>(std::get<Wire>(value)));
+            }
+        }
 
         void set_isolation_side_from_index(size_t windingIndex);
         Winding(const MAS::CoilFunctionalDescription& winding) {
@@ -89,6 +104,52 @@ class Winding : public MAS::CoilFunctionalDescription {
         Wire resolve_wire();
 };
 
+// ABT #492: which plane a connection marker's rectangle routes in.
+enum class RoutePlane {
+    // The winding-window XY cross-section every other rectangle in the coil lives in (default —
+    // every marker that existed before ABT #492 is WINDOW_XY and completely unchanged).
+    WINDOW_XY,
+    // The core's front/back (YZ) face — where there are no lateral legs — used by the DRAGBACK of a
+    // Z interleaved inter-section return: manufacturing routes that return as vertically as
+    // possible on this face, riding as a local radial bump over the intervening sections' build, so
+    // it consumes NO winding-window space. Coordinates/dimensions keep the coil's usual meaning
+    // (index 0 = radial, index 1 = axial for overlapping layers), the rectangle just lives at an
+    // azimuth outside the XY cut. Consequences for consumers:
+    //   - The XY Painter must SKIP these markers (out of plane; a dedicated YZ view is a future
+    //     feature).
+    //   - They never block window turn slots and never charge a layer/section filling factor
+    //     (they always carry an empty `layer`).
+    //   - Their copper length is carried EXPLICITLY in `routedLength`, like every marker's: no
+    //     consumer may infer it from the rectangle (a radial climb of a tall RECTANGULAR/FOIL wire
+    //     can be SHORTER than the wire's own height, so even "the longer dimension" misreads it).
+    FRONT_YZ,
+};
+
+// ABT #685 (Alf, 2026-08-16): WHAT a connection between two electrically-consecutive turns of one
+// conductor physically IS. wind() already decides this — from the winding order (U or Z), from
+// whether the two turns share a layer/section, and from whether the run crosses intervening
+// layers — and then throws the decision away, publishing only rectangles. Every downstream
+// consumer therefore had to GUESS it back from turn coordinates: MVB++'s 3D ConductorBuilder ran
+// an isZReturn() heuristic (median pitch, filar-count thresholds, sign-of-advance rules, each
+// tuned against a design where it had been wrong), and the YZ Painter kept a third copy of the
+// same guess. Publishing the kind here makes MKF the single owner, exactly as the winding
+// geometry itself is (Alf: "MVB++ ALWAYS follows MKF").
+enum class ConnectionKind {
+    TERMINAL_ENTRANCE,   // the conductor's start, routed out to its terminal
+    TERMINAL_EXIT,       // the conductor's end, routed out to its terminal
+    U_ADJACENT,          // serpentine turnaround: both connected turns sit at the SAME axial edge
+    U_TANGENTIAL,        // same-section U: one constant-height tangential run, no vertical stub
+    Z_DRAGBACK,          // return to the FAR end of the next layer — the classic dragback
+    // ABT #685: the conductor FINISHING, not returning. The last layer holds exactly one turn of
+    // this parallel and it is the conductor's last, so the wire simply crosses the window in one
+    // revolution to land on it — the Turn chunk with a full-height pitch, not a connection. It
+    // lays NO ride: nothing outside it has to bulge over a return that was never laid. True of
+    // both winding orders (Alf: "which is also true for the U winding case").
+    FINAL_LANDING,
+    EDGE_CONTINUATION,   // run along the window edge, across the layers it passes over
+    LAYER_SQUEEZE        // book-keeping only: the slot a CROSSED layer loses. No copper of its own
+};
+
 // One rectangle of radial space reserved by a terminal/connection lead crossing a layer boundary,
 // used when real winding geometry is enabled (Settings::get_coil_use_real_winding_geometry). It
 // both feeds the section filling factor and is drawn by the Painter for debugging.
@@ -98,8 +159,34 @@ struct ConnectionReservedSpace {
     std::string winding;              // the winding whose lead reserves the space
     int64_t parallel = -1;            // the parallel whose lead reserves the space (each parallel of a
                                       // bifilar/N-filar group is its own conductor with its own leads)
-    std::vector<double> coordinates;  // centre of the reserved rectangle (same system as turns)
-    std::vector<double> dimensions;   // {width, height}
+    std::vector<double> coordinates;  // centre of the reserved rectangle, cartesian as turns are
+    // Which system `dimensions` (and `rotation`) are expressed in — the same declaration layers,
+    // sections and turns carry, so a consumer reads it instead of inferring the window shape:
+    //   CARTESIAN: {X extent, Y extent}, the convention every rectangle in a rectangular winding
+    //       window uses. It does NOT depend on the layer orientation — a consumer wanting the extent
+    //       along a layer's TURN axis indexes [1] for OVERLAPPING layers (turns stack axially) and [0]
+    //       for CONTIGUOUS ones (turns run laterally), and the reverse for the layer axis.
+    //   POLAR: {radial extent, azimuthal extent} with `rotation` the azimuth of the radial axis, as
+    //       built by toroidal_connection_reserved_spaces. A toroidal lead runs RADIALLY, so its length
+    //       is [0] whatever the layers orientation says. The centre stays cartesian either way,
+    //       matching toroidal turns.
+    CoordinateSystem coordinateSystem = CoordinateSystem::CARTESIAN;
+    // ABT #492: the plane this rectangle routes in. WINDOW_XY (default) for everything in the
+    // winding-window cross-section; FRONT_YZ for the out-of-plane dragback segments of a Z
+    // interleaved inter-section return (see RoutePlane above for the consumer contract).
+    RoutePlane plane = RoutePlane::WINDOW_XY;
+    std::vector<double> dimensions;
+    // ABT #492 loss-reader audit: the centerline COPPER LENGTH this marker charges to the
+    // connection resistance, set by EVERY emitter from its own geometry. Authoritative for
+    // resistance ONLY — `coordinates`/`dimensions` stay the geometric truth for painters and
+    // blocking. It exists because inferring the run from the rectangle was structurally wrong in
+    // two ways: an orientation-derived index misread every segment running along the OTHER axis (a
+    // U stub counted as one wire width), and "the longer dimension" misread a radial climb of a
+    // tall RECTANGULAR/FOIL wire (wire height > climb run). Space-only book-keeping markers (the
+    // per-layer squeezes; the copper they represent is carried by the DRAWN segments of the same
+    // route) set it to 0. A marker with it UNSET is an emitter bug: markers are always freshly
+    // emitted at runtime, and WindingOhmicLosses throws on it (no-fallback rule).
+    std::optional<double> routedLength;
     double rotation = 0;              // degrees, for diagonal links (Z continuations); 0 = axis-aligned
     // A terminal lead routes a winding end out to the bobbin window border (entrance/exit). It is
     // drawn and its length feeds the connection loss, but it does not squeeze a conduction layer.
@@ -112,6 +199,54 @@ struct ConnectionReservedSpace {
     // (compute_connection_blocked_slots_per_layer) derives each crossed layer's freed slots from the
     // DEEPEST run crossing it. 0 = not an edge-routed run (radial exits, stubs, Z diagonals).
     double edgeDepth = 0;
+    // ABT #685: the CLASSIFICATION this rectangle belongs to (see ConnectionKind), and the two
+    // turns it connects. Several rectangles make up one route (a stub, an edge run, a second
+    // stub), and they are grouped back into that route by (winding, parallel, fromTurn, toTurn).
+    // A terminal lead names only the turn it attaches to; its other end is the terminal itself.
+    ConnectionKind kind = ConnectionKind::LAYER_SQUEEZE;
+    std::string fromTurn;
+    std::string toTurn;
+};
+
+// ABT #685: one BUMP. A return laid at `radius` makes every turn at or outside that radius on the
+// same face ride `height` further out — the local radial displacement the RoutePlane comment above
+// describes, made explicit so consumers stop re-deriving it. Levels within half a wire merge.
+struct ConnectionRideLevel {
+    int side = 0;        // 0 = the PRIMARY isolation side's face, 1 = every other side's face
+    double radius = 0;   // the lane's destination radius, in the layer-axis coordinate
+    double height = 0;   // how much a wire riding over it is displaced (one wire OD)
+};
+
+// ABT #685: one connection of one conductor, as MKF drew it — the record MVB++ realises in 3D and
+// the painters draw. `waypoints` is the route in the winding-window half-plane, (layer axis, turn
+// axis), in path order from `fromTurn` to `toTurn`; a consumer follows it, it never invents one.
+struct ConnectionRoute {
+    std::string winding;
+    int64_t parallel = -1;
+    std::string fromTurn;
+    std::string toTurn;
+    ConnectionKind kind = ConnectionKind::U_ADJACENT;
+    int side = 0;                                  // which face the out-of-plane part routes on
+    std::vector<std::vector<double>> waypoints;    // {layerAxis, turnAxis} centres, in path order
+    double routedLength = 0;                       // summed copper of the route's segments
+};
+
+// ABT #685: the whole connection layout of a wound coil — every conductor's routes, plus the ride
+// levels those routes impose. ONE computation, shared by the painters and by MVB++'s 3D builder,
+// so the three can no longer disagree about what the winder does.
+struct ConnectionLayout {
+    std::vector<ConnectionRoute> routes;
+    std::vector<ConnectionRideLevel> rideLevels;
+    // Total displacement a turn at `radius` on `side` rides over.
+    double ride_at(double radius, int side) const {
+        double ride = 0;
+        for (const auto& level : rideLevels) {
+            if (level.side == side && level.radius <= radius + 0.5 * level.height) {
+                ride += level.height;
+            }
+        }
+        return ride;
+    }
 };
 
 // The column a section's turns are wound around, in the winding frame (+x side of
@@ -123,6 +258,11 @@ struct WoundColumnFrame {
     double columnWidth;
     double columnDepth;
     double axisX;
+    // Radius of the former's corners, which is what a turn actually bends around (see
+    // WireBend). Only read under the real-winding flag: the classic model treats the
+    // column as a mathematically sharp rectangle, so the turn's corner radius there is
+    // just its standoff, and every existing result depends on that.
+    double cornerRadius = 0;
 };
 
 class Coil : public MAS::Coil {
@@ -131,13 +271,27 @@ class Coil : public MAS::Coil {
         std::map<std::pair<size_t, size_t>, std::vector<Layer>> _insulationInterSectionsLayers;
         std::map<size_t, Layer> _insulationInterLayers;
         std::map<std::pair<size_t, size_t>, CoilSectionInterface> _coilSectionInterfaces;
-        std::map<std::pair<size_t, size_t>, std::string> _insulationSectionsLog;
-        std::map<std::pair<size_t, size_t>, std::string> _insulationInterSectionsLayersLog;
         std::map<std::string, size_t> _windingIndexByName;
         std::map<std::string, size_t> _turnIndexByName;
         std::map<std::string, Turn> _turnByName;
-        std::vector<std::pair<ElectricalType, std::pair<size_t, double>>> _sectionInfoWithInsulation;
+        // ABT #720: keyed by CONDUCTION-section ordinal — one {topOrLeft, bottomOrRight}
+        // entry per conduction section, in wound order flat across all groups. Insulation
+        // sections carry no margin entry. Section::margin on the wound sections is the
+        // persisted truth; this vector is the transient winding-time input.
         std::vector<std::vector<double>> _marginsPerSection;
+        // ABT #724 (owner ruling): margins recovered from a previous wind FOLLOW THE WINDING.
+        // Which winding each recovered ordinal belonged to, and each winding's merged
+        // {topOrLeft, bottomOrRight}; plan_section_group re-maps mismatched ordinals when the
+        // re-wind changes the layout. Cleared whenever explicit margins arrive
+        // (preload_margins / add_margin_to_section_by_index / reset_margins_per_section).
+        std::vector<std::string> _recoveredMarginWindings;
+        std::map<std::string, std::vector<double>> _recoveredMarginPerWinding;
+        // ABT #724: reset_margins_per_section() means "the next wind is margin-free"; the
+        // empty vector alone cannot express that, because wind()'s ABT #676 recovery treats
+        // empty as "recover the persisted margins from the sections". Re-armed to false when
+        // margins are explicitly handed in again (preload_margins /
+        // add_margin_to_section_by_index).
+        bool _marginsExplicitlyCleared = false;
         size_t _interleavingLevel = 1;
         WindingOrientation _windingOrientation = WindingOrientation::OVERLAPPING;
         WindingOrientation _layersOrientation = WindingOrientation::OVERLAPPING;
@@ -152,6 +306,62 @@ class Coil : public MAS::Coil {
         // blocked at its {top, bottom}. Consumed by wind_by_rectangular_layers when
         // _applyConnectionBlocking is set. Both stay empty/false unless real winding geometry is on.
         std::map<std::string, std::pair<uint64_t, uint64_t>> _connectionBlockedSlotsPerLayer;
+        // The CONTINUOUS depths those slot counts were quantized from: per crossed layer, the deepest
+        // crossing run's edgeDepth (insulation included) at its {high, low} edge, in metres along its
+        // turn axis, accumulated monotonically like the slots. Slots stay the CAPACITY currency
+        // (integer turns freed, ceil-conservative); these depths are the PLACEMENT currency —
+        // align_blocked_layer_turns lets turns reach exactly to the crossing runs instead of stopping
+        // at the whole-slot grid, which parked up to one pitch of dead band against every run row.
+        std::map<std::string, std::pair<double, double>> _connectionBlockedDepthPerLayer;
+        // ABT #608 (final form): the U landing placement depths, kept SEPARATE from the marker
+        // depths above because they are RECOMPUTED (replaced) each blocking iteration, never
+        // max-merged: the depth is capped by the layer's own turn count (a full layer cannot
+        // descend without overflowing), and that count moves while the fixpoint redistributes —
+        // an early uncapped value locked in by a monotone merge squeezed the span below the
+        // layer's copper and pushed turns into the terminal-lead rows. Converges because the
+        // slot counts (monotone) pin the per-layer copper, after which this map is a pure
+        // function of settled state. align_blocked_layer_turns spreads against the element-wise
+        // max of both maps.
+        std::map<std::string, std::pair<double, double>> _uLandingDepthPerLayer;
+        // ABT #685: the EDGE a U layer's wire arrives at, recorded separately from the depth above.
+        // The depth alone cannot carry it: a landing level with a turn that already sits at the
+        // window edge needs a depth of exactly ZERO, and "no depth on either side" is
+        // indistinguishable from "not a landing at all" — which dropped that layer back to the
+        // fence-post spread, opened bundle gaps the arriving wire then had to dive through, and
+        // put a parallel's descent 0.81 mm from its sibling's link.
+        std::map<std::string, bool> _uLandingAtHighSidePerLayer;
+        // ABT #685 (Alf, 2026-08-16): whether the LAST wind actually applied real-winding
+        // connection blocking. False when the flag was off OR when the ideal wind did not fit
+        // (the ABT #650 gate declined). Consumers that require blocked geometry — the 3D
+        // ConductorBuilder above all — must ASK instead of discovering it as a collision.
+        bool _realWindingBlockingApplied = false;
+        // ABT #978: set by wind_planar when real winding geometry places planar turns left-justified from the
+        // column (pcb.designRules), consumed by wind_by_planar_turns.
+        bool _planarLeftJustifyTurns = false;
+        // ABT #685 (Alf, 2026-08-15): conductors whose LAST turn is a STEEP EXIT LANDING — "when a
+        // turn is the last one of the section and must go out [at the far side], they must reach
+        // the other side in one full pitch". The last turn's station is placed at the FAR edge of
+        // its layer's band, so the 3D revolution spirals the whole height in one turn and the exit
+        // leaves right there — no full-height vertical, no level ring blocking every azimuth.
+        // Set by align_blocked_layer_turns, read by the terminal-lead emission (the exit edge is
+        // then simply the station's own, nearest edge). Cleared with the other blocking state.
+        std::set<std::pair<std::string, int64_t>> _steepExitLandingByConductor;
+        // ABT #685: the same landing depth BEFORE the pigeonhole cap. The capped value cannot size
+        // the layer's capacity — the cap is computed from the turn count that the capacity decides,
+        // so charging it is circular and converges on the over-filled layer it was meant to
+        // prevent. The ideal is what the geometry actually requires.
+        std::map<std::string, std::pair<double, double>> _uLandingIdealDepthPerLayer;
+        // ABT #616 (Alf, 2026-08-09): the edge (top/bottom) each winding's ENTRANCE terminal
+        // row was allocated on in the previous blocking iteration. The winding's first
+        // section/layer starts winding FROM that edge, so the entrance connects to the turn
+        // adjacent to its own row (stage-2's arrival-edge rule extended to terminals).
+        std::map<std::string, bool> _terminalEntranceAtTop;
+        // ABT #430: the room each layer ACTUALLY surrendered to those leads, in metres along its turn
+        // axis, as applied by wind_by_rectangular_layers (blocked slots * the layer's own wire, after
+        // the one-slot-minimum cap). The layer's extent — and so its filling factor — already excludes
+        // this, so apply_connection_reserved_space charges only what is left over. Recorded by the
+        // producer rather than recomputed by the consumer, so the two can never drift.
+        std::map<std::string, double> _connectionBlockedRoomPerLayer;
         bool _applyConnectionBlocking = false;
         std::string coilLog;
         InsulationCoordinator _standardCoordinator = InsulationCoordinator();
@@ -186,6 +396,25 @@ class Coil : public MAS::Coil {
         std::optional<std::vector<BobbinDataOrNameUnion>> perColumnBobbins;
         std::vector<Winding> functional_description;
 
+        // ABT #720: shared per-group orchestration for wind_by_rectangular_sections /
+        // wind_by_round_sections — pattern subsetting, proportion renormalization, ordered
+        // sections + insulation, wound_with/virtualization slot inheritance, winding styles,
+        // and margin application (keyed by conduction ordinal). The winders keep only the
+        // shape-specific geometry emission; this is the one copy of the orchestration to
+        // keep right (it had drifted between the two ~80% copy-paste siblings repeatedly).
+        struct SectionGroupPlan {
+            Group group;                              // +x window-local frame for rectangular multi-column
+            std::optional<size_t> groupWindowIndex;   // rectangular multi-column only
+            std::set<size_t> groupWindingIndexes;
+            std::vector<std::pair<ElectricalType, std::pair<size_t, double>>> orderedSectionsWithInsulation;
+            std::vector<size_t> numberSectionsPerWinding;
+            std::vector<WindingStyle> windByConsecutiveTurns;
+            bool skip = false;                        // multi-group group without windings
+        };
+        SectionGroupPlan plan_section_group(Group group, const std::vector<double>& proportionPerWinding,
+                                            const std::vector<size_t>& pattern, size_t repetitions,
+                                            bool multiGroup, WindingWindowShape windowShape,
+                                            size_t conductionSectionOffset);
         bool wind_by_rectangular_sections(std::vector<double> proportionPerWinding, std::vector<size_t> pattern, size_t repetitions);
         bool wind_by_round_sections(std::vector<double> proportionPerWinding, std::vector<size_t> pattern, size_t repetitions);
         bool wind_by_rectangular_layers();
@@ -216,9 +445,6 @@ class Coil : public MAS::Coil {
         // group cannot be resolved (a silent 0 would wind into the wrong
         // window).
         size_t find_window_index_for_group(const std::string& groupName) const;
-        // Winding window a section is placed in: the section's explicit
-        // windingWindow reference when present, else its group's, else 0.
-        size_t resolve_section_winding_window_index(const Section& section) const;
         // Region sharing: when main-column and lateral-column windings coexist, the
         // main winding's annulus occupies the inner side of every window region and
         // each lateral winding the outer side of its own — halve and anchor each
@@ -232,7 +458,12 @@ class Coil : public MAS::Coil {
         // Length of one turn at radial position turnX wrapped around the given
         // column frame; nullopt when the geometry is invalid (negative length),
         // matching the winder's historical soft-failure.
-        std::optional<double> get_turn_length_in_frame(const WoundColumnFrame& frame, double turnX);
+        // turnBendRadius: the centreline radius the turn's corners actually achieve, when the
+        // caller has solved it (WireBend). Only consulted under the real-winding flag, and only
+        // needed for a turn that LIFTS OFF the former -- a conforming turn's bend is simply the
+        // former's corner plus its standoff, which the frame already carries.
+        std::optional<double> get_turn_length_in_frame(const WoundColumnFrame& frame, double turnX,
+                                                       std::optional<double> turnBendRadius = std::nullopt);
         // Multi-column winding support: every group is wound in a window-local
         // frame on the +x side of the main column, so the whole section/layer/
         // turn machinery keeps a single geometry. This final winding step
@@ -244,6 +475,12 @@ class Coil : public MAS::Coil {
         void apply_group_window_sides(bool inverse = false);
 
     public:
+        // Winding window a section is placed in: the section's explicit
+        // windingWindow reference when present, else its group's, else 0. Public:
+        // non-member consumers that place per-window geometry against a section
+        // (e.g. the painter framing a margin rectangle, ABT #227.7) need this same
+        // resolution, not just Coil's own internal winding/placement machinery.
+        size_t resolve_section_winding_window_index(const Section& section) const;
         // Distribute windings across the bobbin's winding windows. Creates one
         // Group per winding window in the bobbin and assigns windings to
         // groups per the provided indices. The outer vector size MUST equal
@@ -272,6 +509,9 @@ class Coil : public MAS::Coil {
         // Transient, like preload_margins: not part of the MAS coil.
         void preload_custom_section_rects(std::map<std::string, std::pair<std::vector<double>, std::vector<double>>> rects) { _customSectionRects = rects; }
         bool apply_custom_section_rects();
+        // ABT #978/#982: stack-up for a planar PCB from the printed group's pcb rules — one copper layer per
+        // (winding, parallel) group, windings interleaved (port of the auto_planar/MPB layerer).
+        std::vector<size_t> plan_planar_stackup();
         bool wind_by_planar_sections(std::vector<size_t> stackUp, std::map<std::pair<size_t, size_t>, double> insulationThickness = {}, double coreToLayerDistance = 0);
         bool wind_by_planar_layers();
         bool wind_by_planar_turns(double borderToWireDistance, std::map<size_t, double> wireToWireDistance);
@@ -289,16 +529,38 @@ class Coil : public MAS::Coil {
         bool unwind();
         bool wind();
         bool wind(std::vector<double> proportionPerWinding, std::vector<size_t> pattern, size_t repetitions=1);
+        // ABT #850: the winding body, wrapped by wind() so that a wind which FAILS and
+        // produces no turns restores every piece of state it mutated (margin-recovery
+        // members, section/layer/turn/group descriptions). Before this, one failed
+        // sectioned wind poisoned the object: the ABT #676 recovery had loaded the
+        // infeasible margins into _marginsPerSection, which survived clearing the
+        // descriptions, so every later wind re-applied them and failed too.
+        bool wind_inner(std::vector<double> proportionPerWinding, std::vector<size_t> pattern, size_t repetitions);
         bool wind(std::vector<size_t> pattern, size_t repetitions=1);
         bool wind(size_t repetitions);
         bool wind_planar(std::vector<size_t> stackUp, std::optional<double> borderToWireDistance = std::nullopt, std::map<size_t, double> wireToWireDistance = {}, std::map<std::pair<size_t, size_t>, double> insulationThickness = {}, double coreToLayerDistance = 0);
         void try_rewind();
         void clear();
         bool are_sections_and_layers_fitting();
+        // ABT #685: did the last wind apply real-winding connection blocking? (see the member)
+        bool is_real_winding_blocking_applied() const { return _realWindingBlockingApplied; }
+        // ABT #624: every turn's copper inside the winding window (final wind verdict only).
+        bool are_turns_inside_winding_window();
 
         const BobbinDataOrNameUnion & get_bobbin() const { return bobbin; }
         BobbinDataOrNameUnion & get_mutable_bobbin() { return bobbin; }
-        void set_bobbin(const BobbinDataOrNameUnion & value) { this->bobbin = value; }
+        // ABT #611 (same shadow class as Winding::wire): keep the MAS::Coil base's bobbin in
+        // sync, or base-class to_json emits the default in place of the resolved bobbin.
+        void set_bobbin(const BobbinDataOrNameUnion & value) {
+            this->bobbin = value;
+            _bobbin_resolved = false;
+            if (std::holds_alternative<std::string>(value)) {
+                MAS::Coil::set_bobbin(std::get<std::string>(value));
+            }
+            else {
+                MAS::Coil::set_bobbin(static_cast<MAS::Bobbin>(std::get<Bobbin>(value)));
+            }
+        }
 
         const std::optional<std::vector<BobbinDataOrNameUnion>> & get_per_column_bobbins() const { return perColumnBobbins; }
         void set_per_column_bobbins(const std::optional<std::vector<BobbinDataOrNameUnion>> & value) { this->perColumnBobbins = value; }
@@ -329,14 +591,15 @@ class Coil : public MAS::Coil {
         std::optional<WindingStyle> get_winding_style_override(size_t windingIndex) const;
         std::vector<std::pair<size_t, double>> get_ordered_sections(double spaceForSections, std::vector<double> proportionPerWinding, std::vector<size_t> pattern, size_t repetitions=1);
         std::vector<std::pair<ElectricalType, std::pair<size_t, double>>> add_insulation_to_sections(std::vector<std::pair<size_t, double>> orderedSections);
-        void remove_insulation_if_margin_is_enough(std::vector<std::pair<size_t, double>> orderedSections);
-        void equalize_margins(std::vector<std::pair<ElectricalType, std::pair<size_t, double>>> orderedSectionsWithInsulation);
+        void remove_insulation_if_margin_is_enough(const std::vector<std::pair<size_t, double>>& orderedSections, size_t conductionSectionOffset);
+        // conductionSectionOffset: same conduction-ordinal margin keying as apply_margin_tape.
+        void equalize_margins(const std::vector<std::pair<ElectricalType, std::pair<size_t, double>>>& orderedSectionsWithInsulation, size_t conductionSectionOffset = 0);
 
         std::vector<double> get_proportion_per_winding_based_on_wires();
-        // sectionIndexOffset: flat offset of this group's first ordered section in
-        // _marginsPerSection (margins are indexed flat across all groups in winding
-        // order; single-group coils pass 0).
-        void apply_margin_tape(std::vector<std::pair<ElectricalType, std::pair<size_t, double>>> orderedSectionsWithInsulation, size_t sectionIndexOffset = 0);
+        // conductionSectionOffset: number of conduction sections wound by previous groups
+        // (_marginsPerSection is keyed by conduction ordinal flat across all groups;
+        // single-group coils pass 0).
+        void apply_margin_tape(const std::vector<std::pair<ElectricalType, std::pair<size_t, double>>>& orderedSectionsWithInsulation, size_t conductionSectionOffset = 0);
         std::vector<double> get_aligned_section_dimensions_rectangular_window(size_t sectionIndex);
         std::vector<double> get_aligned_section_dimensions_round_window(size_t sectionIndex);
         size_t convert_conduction_section_index_to_global(size_t conductionSectionIndex);
@@ -346,7 +609,7 @@ class Coil : public MAS::Coil {
         static std::vector<double> polar_to_cartesian(std::vector<double> value, double radialHeight);
         void convert_turns_to_cartesian_coordinates();
         void convert_turns_to_polar_coordinates();
-        std::vector<std::pair<double, std::vector<double>>> get_collision_distances(std::vector<double> turnCoordinates, std::vector<std::vector<double>> placedTurnsCoordinates, double wireHeight);
+        std::vector<std::pair<double, std::vector<double>>> get_collision_distances(const std::vector<double>& turnCoordinates, const std::vector<std::vector<double>>& placedTurnsCoordinates, double wireHeight);
 
         // Custom-rectangle re-flow (winding studio): re-run layers+turns INSIDE the
         // current section rectangles, without recomputing the sections and without
@@ -380,13 +643,16 @@ class Coil : public MAS::Coil {
         void reset_margins_per_section();
         void reset_insulation();
         size_t get_interleaving_level() const;
+        // Repetitions actually used by the LAST wind (was returned by get_interleaving_level
+        // until 2026-08: that getter now reflects set_interleaving_level as its name promises).
+        size_t get_current_repetitions() const;
         void set_winding_orientation(WindingOrientation windingOrientation);
         void set_layers_orientation(WindingOrientation layersOrientation, std::optional<std::string> sectionName = std::nullopt);
         void set_turns_alignment(CoilAlignment turnsAlignment, std::optional<std::string> sectionName = std::nullopt);
         void set_section_alignment(CoilAlignment sectionAlignment);
 
         WindingOrientation get_winding_orientation();
-        WindingOrientation get_layers_orientation() const;
+        WindingOrientation get_layers_orientation(std::optional<std::string> sectionName = std::nullopt) const;
         CoilAlignment get_turns_alignment(std::optional<std::string> sectionName = std::nullopt) const;
         CoilAlignment get_section_alignment();
 
@@ -398,21 +664,53 @@ class Coil : public MAS::Coil {
         // section). Returns the rectangles of space reserved by terminal/connection leads crossing
         // layer boundaries. Computed from the wound layers; independent of the real-geometry
         // setting so the Painter can also overlay it for debugging.
-        std::vector<ConnectionReservedSpace> get_connection_reserved_spaces();
+        // ABT #685: `routesOut`, when given, also receives the ROUTES — one per (conductor,
+        // transition), with the waypoints recorded AT THE POINT OF DRAWING. Recording them here
+        // rather than reconstructing them from the rectangles is deliberate: a rectangle does not
+        // say which of its axes is the run (a stub of a tall RECTANGULAR wire is shorter than the
+        // wire's own width), which is the same trap routedLength exists to avoid.
+        std::vector<ConnectionReservedSpace> get_connection_reserved_spaces(
+            std::vector<ConnectionRoute>* routesOut = nullptr);
+        // ABT #685: the same connections, GROUPED into one route per (conductor, transition) and
+        // classified (see ConnectionKind), together with the ride levels — the bumps — those
+        // routes impose on the turns outside them. This is the contract MVB++'s 3D builder and
+        // the YZ/XZ painters read; none of them may re-derive a connection's kind, its route or
+        // its bump from turn coordinates. Derived from get_connection_reserved_spaces(), so it
+        // carries MKF's own decision rather than a reconstruction of it.
+        ConnectionLayout get_connection_layout();
+        // ABT #685: name every station for the turn that BEGINS there, and the station closing a
+        // layer "<last turn>_ending". Real winding only; ideal winding has no closing stations.
+        void name_turns_by_beginning();
         // Adds the reserved-connection area into the affected section filling factors. Called at the
         // end of wind() when Settings::get_coil_use_real_winding_geometry() is true.
         void apply_connection_reserved_space();
         // Counts, per conduction layer, how many connection leads cross its {top, bottom} — derived
         // from get_connection_reserved_spaces() and the wound layer centres. This is the global
         // (window-wide) turn-blocking incidence wind() iterates on; a lead blocks any layer it
-        // crosses regardless of section/winding.
-        std::map<std::string, std::pair<uint64_t, uint64_t>> compute_connection_blocked_slots_per_layer();
+        // crosses regardless of section/winding. When freshDepths is given, it also receives the
+        // continuous per-edge run depths the slot counts were quantized from (same keys), for the
+        // caller to accumulate into _connectionBlockedDepthPerLayer.
+        std::map<std::string, std::pair<uint64_t, uint64_t>> compute_connection_blocked_slots_per_layer(
+            std::map<std::string, std::pair<double, double>>* freshDepths = nullptr);
         // Real-winding blocking makes a section's interior layers lose top/bottom slots, so an even
         // interleaving turn split leaves orphan turns in a near-empty spillover layer. Re-split each
         // winding's turns across its conduction sections (radial order) so interior sections fill
         // complete blocked layers and the remainder is pushed to the outermost section. Single
         // parallel only (bifilar needs per-parallel connections). Called in the wind() blocking pass.
         void redistribute_section_turns_for_blocking();
+        // ABT #608 (final form, Alf 2026-08-08): in a U (serpentine) section, every layer after the
+        // first receives its wire over the TANGENTIAL link from the previous layer's last turn, and
+        // that landing turn "must already include the decrease of the pitch": it starts at the
+        // arrival height and its own revolution descends, so its STATION sits one wire OD into the
+        // layer from the arrival — NOT level with it (level is legal only when the landing turn is
+        // the section's last, where nothing follows it). This returns, per landing layer, the extra
+        // {top, bottom} span depth (from the window edge on the layer's turn axis) that places its
+        // first station exactly one OD past the arrival. It is PLACEMENT ONLY — merged into
+        // _connectionBlockedDepthPerLayer (which align_blocked_layer_turns spreads against), never
+        // into the slot counts: no capacity is charged, no reserved-space marker is emitted, no
+        // filling factor moves (the N_layer+1 reservation model was retracted — the arrival IS the
+        // landing turn's own copper, already accounted).
+        std::map<std::string, std::pair<double, double>> compute_u_landing_extra_depths();
         // After delimit (which re-centres every layer), shift each blocked conduction layer's turns to
         // the UNblocked edge, so the slots freed by turn-blocking sit exactly where the connection
         // leads run (top edge for top-crossing leads, bottom for bottom) and no window space is wasted
@@ -427,7 +725,7 @@ class Coil : public MAS::Coil {
         // displacement, the CAPACITY deficit in that ring's own turn slots; wind()'s toroidal
         // blocking loop reserves those slots (turns spill inward) and re-winds, after which
         // displacement succeeds. Round windows only; no-op (empty map) otherwise.
-        std::map<std::string, uint64_t> align_blocked_ring_turns();
+        std::map<std::string, uint64_t> align_blocked_ring_turns(bool forceSpreadBaseline = false);
 
         std::vector<Section> get_sections_description_conduction() const;
         std::vector<Layer> get_layers_description_conduction() const;
@@ -496,15 +794,15 @@ class Coil : public MAS::Coil {
         Wire resolve_wire(size_t windingIndex);
         static Wire resolve_wire(Winding winding);
         std::vector<double> resolve_margin(size_t sectionIndex);
-        static std::vector<double> resolve_margin(Section section);
-        static std::vector<double> resolve_margin(Margin marginVariant);
+        static std::vector<double> resolve_margin(const Section& section);
+        static std::vector<double> resolve_margin(const Margin& marginVariant);
         MarginInfo resolve_margin_info(size_t sectionIndex);
-        static MarginInfo resolve_margin_info(Section section);
-        static MarginInfo resolve_margin_info(Margin marginVariant);
+        static MarginInfo resolve_margin_info(const Section& section);
+        static MarginInfo resolve_margin_info(const Margin& marginVariant);
 
-        double overlapping_filling_factor(Section section);
+        double overlapping_filling_factor(const Section& section);
 
-        double contiguous_filling_factor(Section section);
+        double contiguous_filling_factor(const Section& section);
 
         /**
          * @brief Fill factors of a wound coil, plus whether it actually fits.
@@ -527,7 +825,6 @@ class Coil : public MAS::Coil {
 
         FillingFactorsOutput calculate_filling_factor(size_t groupIndex = 0);
 
-        static Bobbin resolve_bobbin(Coil coil);
         Bobbin resolve_bobbin();
 
         void preload_margins(std::vector<std::vector<double>> marginPairs);
@@ -602,13 +899,24 @@ class Coil : public MAS::Coil {
 
         std::vector<size_t> extract_stack_up(std::vector<Section> sections);
         bool is_planar();
+        // ABT #650: what last failed are_sections_and_layers_fitting(), so a coil that silently
+        // loses real-winding blocking can say WHY instead of just not doing it. Diagnostic text
+        // only — never a control input.
+        std::string _lastFitFailure;
+        // ABT #930: fills _lastFitFailure when a wind produced no turns at all.
+        void diagnose_empty_wind();
         std::vector<Turn> get_turns_touching_bobbin_column();
         std::vector<Turn> get_turns_touching_bobbin_walls();
         std::vector<Turn> get_turns_touching_bobbin_column(std::vector<Turn> turns);
         std::vector<Turn> get_turns_touching_bobbin_walls(std::vector<Turn> turns);
         std::vector<Turn> get_turns_touching_bobbin_column(std::vector<size_t> turnIndexes);
         std::vector<Turn> get_turns_touching_bobbin_walls(std::vector<size_t> turnIndexes);
-                                               
+
+        // ABT #930: why the last wind failed to fit, in words, for callers that discard wind()'s
+        // bool (magnetic_autocomplete, the Impedance / StrayCapacitance scoring paths). Empty when
+        // the last wind succeeded or the reason could not be determined. Diagnostic only.
+        const std::string& get_last_fit_failure() const { return _lastFitFailure; }
+
 };
 }
 namespace OpenMagnetics {
@@ -659,9 +967,22 @@ inline void Coil::set_bobbin_from_json(const json & bobbinJson) {
     }
 }
 
+// ABT #829: a missing required field used to escape as nlohmann's own
+// "[json.exception.out_of_range.403] key 'bobbin' not found". That names the key but not the
+// object, and a key like "name" is ambiguous across the magnetic, the core, the shape, the
+// bobbin, manufacturerInfo and every winding — so a caller loading a catalogue could not tell
+// which record, or even which kind of object, had failed. Say which object is missing what.
+inline const json& required_field(const json& j, const char* key, const char* owner) {
+    auto field = j.find(key);
+    if (field == j.end()) {
+        throw std::invalid_argument(std::string(owner) + " is missing required field '" + key + "'");
+    }
+    return *field;
+}
+
 inline void from_json(const json & j, Coil& x) {
-    x.set_bobbin_from_json(j.at("bobbin"));
-    x.set_functional_description(j.at("functionalDescription").get<std::vector<Winding>>());
+    x.set_bobbin_from_json(required_field(j, "bobbin", "coil"));
+    x.set_functional_description(required_field(j, "functionalDescription", "coil").get<std::vector<Winding>>());
     x.set_layers_description(get_stack_optional<std::vector<Layer>>(j, "layersDescription"));
     x.set_sections_description(get_stack_optional<std::vector<Section>>(j, "sectionsDescription"));
     x.set_turns_description(get_stack_optional<std::vector<Turn>>(j, "turnsDescription"));
@@ -674,11 +995,11 @@ inline void from_json(const json & j, Coil& x) {
 
 inline void from_json(const json & j, Winding& x) {
     x.set_connections(get_stack_optional<std::vector<ConnectionElement>>(j, "connections"));
-    x.set_isolation_side(j.at("isolationSide").get<IsolationSide>());
-    x.set_name(j.at("name").get<std::string>());
-    x.set_number_parallels(j.at("numberParallels").get<int64_t>());
-    x.set_number_turns(j.at("numberTurns").get<int64_t>());
-    x.set_wire(j.at("wire").get<OpenMagnetics::WireDataOrNameUnion>());
+    x.set_isolation_side(required_field(j, "isolationSide", "coil winding").get<IsolationSide>());
+    x.set_name(required_field(j, "name", "coil winding").get<std::string>());
+    x.set_number_parallels(required_field(j, "numberParallels", "coil winding").get<int64_t>());
+    x.set_number_turns(required_field(j, "numberTurns", "coil winding").get<int64_t>());
+    x.set_wire(required_field(j, "wire", "coil winding").get<OpenMagnetics::WireDataOrNameUnion>());
     // Multi-column placement: without this, a winding-level windingWindow set
     // through any JSON boundary (WASM, file load) was silently discarded and
     // the winder placed everything in window 0.

@@ -1,5 +1,6 @@
 #include "support/Painter.h"
 #include "support/CciCoordinatesData.h"
+#include "support/Utils.h"
 #include "json.hpp"
 #include "TestingUtils.h"
 #include "Fixtures.h"
@@ -1756,7 +1757,13 @@ namespace {
             int64_t numberStacks = 1;
             std::string coreShape = shapeName;
             std::string coreMaterial = "3C97";
-            auto gapping = OpenMagneticsTesting::get_ground_gap(0.0001);
+            // drumRing (shielded drum, ABT #366) rejects user gapping: its two annular clearance
+            // gaps are structural, derived from the geometry. Paint it with no user gaps and let
+            // process_gap derive them; every other family keeps the ground gap.
+            std::vector<CoreGap> gapping;
+            if (OpenMagnetics::find_core_shape_by_name(coreShape).get_family() != CoreShapeFamily::DRUM_RING) {
+                gapping = OpenMagneticsTesting::get_ground_gap(0.0001);
+            }
 
             auto coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, coreShape, interleavingLevel);
             auto core = OpenMagneticsTesting::get_quick_core(coreShape, gapping, numberStacks, coreMaterial);
@@ -4549,4 +4556,474 @@ namespace {
         settings.reset();
     }
 
+    // ABT #646 — paint the design whose real winding cannot be routed, in BOTH projections,
+    // so the conflict can be seen rather than only read in an exception. paint_magnetic is
+    // the only entry point that draws the CONNECTIONS (inter-layer links, dragbacks and the
+    // terminal leads): XY adds paint_coil_connections on top of core+bobbin+turns, YZ is the
+    // connection-face projection where the leads are seen end-on.
+    //
+    // Painted with real-winding blocking ON, because that is the layout that collides: MKF
+    // reserves the lead and dragback corridors only when the flag is set, so painting without
+    // it would draw a different coil from the one MVB++ refuses to route.
+    TEST_CASE("Test_Painter_ABT646_Lead_Dragback_Collision_XY_YZ",
+              "[support][painter][abt646]") {
+        std::ifstream json_file(std::filesystem::path{std::source_location::current().file_name()}
+                                    .parent_path()
+                                    .append("testData")
+                                    .append("abt646_e16_litz_2layer_leadcollision.json")
+                                    .string());
+        REQUIRE(json_file.good());
+        auto masJson = json::parse(json_file);
+
+        settings.set_coil_use_real_winding_geometry(true);
+        auto magnetic = OpenMagnetics::magnetic_autocomplete(
+            OpenMagnetics::Magnetic(masJson["magnetic"]), json{});
+
+        for (auto [projection, suffix] : {std::pair{PainterProjection::XY, std::string("XY")},
+                                          std::pair{PainterProjection::YZ, std::string("YZ")}}) {
+            auto outFile = outputFilePath;
+            outFile.append("Test_Painter_ABT646_leadcollision_" + suffix + ".svg");
+            std::filesystem::remove(outFile);
+            Painter painter(outFile);
+            painter.paint_magnetic(magnetic, projection);
+            painter.export_svg();
+            REQUIRE(std::filesystem::exists(outFile));
+            REQUIRE(std::filesystem::file_size(outFile) > 1000);
+        }
+        settings.reset();
+    }
+
+    // ABT #685: the TOP-DOWN view, on a design that actually has returns and bumps. This is the
+    // projection Alf asked for to debug the 3D — rings around the column, the lanes through them,
+    // and the ring displacement each lane causes — and it is drawn entirely from
+    // Coil::get_connection_layout(), so it also pins that the layout classifies and rides.
+    TEST_CASE("Test_Painter_XZ_Top_View_Dragbacks_And_Bumps", "[support][painter][abt685]") {
+        // XZ_MAS=<path> points the view at any MAS file, so a design being debugged in 3D can be
+        // looked at from above without a fixture round-trip (same affordance as ABT646_UNWOUND
+        // below). Unset, it draws the pinned two-layer design that has a return and a bump.
+        const char* masOverride = std::getenv("XZ_MAS");
+        std::ifstream json_file(
+            masOverride ? std::filesystem::path(masOverride)
+                        : std::filesystem::path{std::source_location::current().file_name()}
+                              .parent_path()
+                              .append("testData")
+                              .append("abt646_e16_litz_2layer_leadcollision.json"));
+        REQUIRE(json_file.good());
+        auto masJson = json::parse(json_file);
+        // Re-wind from scratch. A MAS that already carries a turnsDescription is painted AS
+        // STORED otherwise, so the view would show whatever wound it last -- not this build.
+        if (masJson.contains("magnetic") && masJson["magnetic"].contains("coil")) {
+            for (const char* derived : {"turnsDescription", "layersDescription",
+                                        "sectionsDescription", "groupsDescription"}) {
+                masJson["magnetic"]["coil"].erase(derived);
+            }
+        }
+
+        settings.set_coil_use_real_winding_geometry(true);
+        // The over-full example designs only wind WITH blocking applied when the fit is allowed
+        // to absorb the coating squish -- without it the wind declines, the whole real-winding
+        // path is skipped, and the view would show an ideal layout while claiming to show a real
+        // one. Same opt-in MVB++ takes for these fixtures.
+        settings.set_coil_allow_coating_squish(true);
+        settings.set_coil_allow_horizontal_overflow(true);
+        auto magnetic = OpenMagnetics::magnetic_autocomplete(
+            OpenMagnetics::Magnetic(masJson["magnetic"]), json{});
+
+        auto coil = magnetic.get_mutable_coil();
+        REQUIRE(coil.is_real_winding_blocking_applied());
+        {
+            // ABT #685 (Alf, 2026-08-17). Two rules, pinned on the pushpull, whose Secondary 1
+            // winds 4 turns over 3 layers as 2 + 1 + 1.
+            //
+            // 1. Every station is named for the turn BEGINNING there, and the station closing a
+            //    layer is "<last turn>_ending". Layer 0 therefore reads turn 0, turn 1,
+            //    turn 1_ending -- two turns, three circles.
+            // 2. A layer holding a SINGLE turn connects to both neighbours as U whatever the
+            //    section's order: there is nothing to drag back along, so the wire steps radially
+            //    to the next layer and spends the whole pitch in one revolution.
+            const auto wound = coil.get_turns_description().value();
+            std::vector<std::string> secondaryOne;
+            for (const auto& turn : wound) {
+                if (turn.get_winding() == "Secondary 1" && turn.get_parallel() == 0) {
+                    secondaryOne.push_back(turn.get_name());
+                }
+            }
+            const std::string prefix = "Secondary 1 parallel 0 ";
+            // The named expectation is the pushpull's; other fixtures only get the general rules.
+            if (!secondaryOne.empty())
+            CHECK(secondaryOne == std::vector<std::string>{
+                prefix + "turn 0", prefix + "turn 1", prefix + "turn 1_ending",
+                prefix + "turn 2", prefix + "turn 2_ending",
+                prefix + "turn 3", prefix + "turn 3_ending"});
+            // No station may be named for a turn the winding does not have.
+            for (const auto& winding : coil.get_functional_description()) {
+                for (const auto& turn : wound) {
+                    if (turn.get_winding() != winding.get_name()) continue;
+                    const auto at = turn.get_name().rfind(" turn ");
+                    REQUIRE(at != std::string::npos);
+                    std::string index = turn.get_name().substr(at + 6);
+                    const auto suffix = index.find("_ending");
+                    if (suffix != std::string::npos) index = index.substr(0, suffix);
+                    INFO(turn.get_name());
+                    CHECK(std::stoll(index) < winding.get_number_turns());
+                }
+            }
+            for (const auto& route : coil.get_connection_layout().routes) {
+                if (secondaryOne.empty()) break;
+                if (route.winding != "Secondary 1" || route.parallel != 0) continue;
+                if (route.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE ||
+                    route.kind == OpenMagnetics::ConnectionKind::TERMINAL_EXIT) continue;
+                INFO(route.fromTurn << " -> " << route.toTurn << " kind " << int(route.kind));
+                CHECK((route.kind == OpenMagnetics::ConnectionKind::U_ADJACENT ||
+                       route.kind == OpenMagnetics::ConnectionKind::U_TANGENTIAL));
+            }
+        }
+        auto layout = coil.get_connection_layout();
+        // Every route carries a kind and a drawn polyline: nothing downstream may have to guess.
+        REQUIRE_FALSE(layout.routes.empty());
+        for (const auto& route : layout.routes) {
+            INFO("route " << route.winding << " parallel " << route.parallel << " kind "
+                          << int(route.kind));
+            CHECK(route.waypoints.size() >= 2);
+            CHECK(route.routedLength > 0);
+        }
+        // ride_at is monotone outward: a lane displaces everything at or outside it, never less
+        // further out.
+        double previous = 0;
+        for (double r = 0; r < 0.05; r += 0.0005) {
+            const double ride = layout.ride_at(r, 0);
+            CHECK(ride >= previous - 1e-12);
+            previous = ride;
+        }
+
+        // Paint every projection: the cross-section is what a reviewer reads first, the top view
+        // is where the lanes and bumps live.
+        const std::string tag = std::getenv("XZ_NAME") ? std::string("_") + std::getenv("XZ_NAME") : "";
+        for (auto [projection, suffix] : {std::pair{PainterProjection::XY, std::string("_XY")},
+                                          std::pair{PainterProjection::YZ, std::string("_YZ")},
+                                          std::pair{PainterProjection::XZ, std::string("_XZ")}}) {
+            auto outFile = outputFilePath;
+            outFile.append("Test_Painter" + tag + suffix + ".svg");
+            std::filesystem::remove(outFile);
+            Painter painter(outFile);
+            painter.paint_magnetic(magnetic, projection);
+            painter.export_svg();
+            REQUIRE(std::filesystem::exists(outFile));
+            REQUIRE(std::filesystem::file_size(outFile) > 1000);
+        }
+        settings.reset();
+    }
+
+    // ABT #646 diagnosis: the reserved rectangles the input/terminal connections claim, next to
+    // where the turns actually landed. If a turn overlaps a rectangle its own winding reserved,
+    // the layer did not respect the blocked corridor — which is exactly what makes the entrance
+    // lead and a dragback share a line downstream in MVB++.
+    TEST_CASE("Test_Painter_ABT646_Reserved_Space_Audit", "[support][painter][abt646][audit]") {
+        std::ifstream json_file(std::filesystem::path{std::source_location::current().file_name()}
+                                    .parent_path()
+                                    .append("testData")
+                                    .append(std::getenv("ABT646_UNWOUND")
+                                                ? "abt646_e16_litz_2layer_leadcollision_unwound.json"
+                                                : "abt646_e16_litz_2layer_leadcollision.json")
+                                    .string());
+        REQUIRE(json_file.good());
+        auto masJson = json::parse(json_file);
+
+        settings.set_coil_use_real_winding_geometry(true);
+        auto magnetic = OpenMagnetics::magnetic_autocomplete(
+            OpenMagnetics::Magnetic(masJson["magnetic"]), json{});
+        auto coil = magnetic.get_mutable_coil();
+
+        auto reserved = coil.get_connection_reserved_spaces();
+        std::cout << "\n=== reserved spaces (" << reserved.size() << ") ===\n";
+        for (const auto& r : reserved) {
+            std::cout << "  section='" << r.section << "' layer='" << r.layer << "' winding='"
+                      << r.winding << "' parallel=" << r.parallel
+                      << "  centre=(" << r.coordinates[0] << ", " << r.coordinates[1] << ")"
+                      << "  dims=(" << r.dimensions[0] << " x " << r.dimensions[1] << ")"
+                      << "  x:[" << (r.coordinates[0] - r.dimensions[0] / 2) << ", "
+                      << (r.coordinates[0] + r.dimensions[0] / 2) << "]"
+                      << "  y:[" << (r.coordinates[1] - r.dimensions[1] / 2) << ", "
+                      << (r.coordinates[1] + r.dimensions[1] / 2) << "]\n";
+        }
+
+        auto layers = coil.get_layers_description().value();
+        std::cout << "\n=== conduction layers ===\n";
+        for (const auto& l : layers) {
+            if (l.get_type() != MAS::ElectricalType::CONDUCTION) continue;
+            auto c = l.get_coordinates();
+            auto d = l.get_dimensions();
+            std::cout << "  '" << l.get_name() << "'  centre=(" << c[0] << ", " << c[1] << ")"
+                      << "  dims=(" << d[0] << " x " << d[1] << ")"
+                      << "  y:[" << (c[1] - d[1] / 2) << ", " << (c[1] + d[1] / 2) << "]\n";
+        }
+
+        auto turns = coil.get_turns_description().value();
+        std::cout << "\n=== turns vs reserved ===\n";
+        size_t violations = 0;
+        for (const auto& t : turns) {
+            auto c = t.get_coordinates();
+            auto d = t.get_dimensions().value();
+            for (const auto& r : reserved) {
+                const double dx = std::abs(c[0] - r.coordinates[0]) - (d[0] + r.dimensions[0]) / 2;
+                const double dy = std::abs(c[1] - r.coordinates[1]) - (d[1] + r.dimensions[1]) / 2;
+                if (dx < 0 && dy < 0) {
+                    ++violations;
+                    std::cout << "  OVERLAP: turn '" << t.get_name() << "' layer='"
+                              << t.get_layer().value_or("?") << "' centre=(" << c[0] << ", " << c[1]
+                              << ") dims=(" << d[0] << " x " << d[1] << ")  vs reserved layer='"
+                              << r.layer << "' parallel=" << r.parallel << " centre=("
+                              << r.coordinates[0] << ", " << r.coordinates[1] << ") dims=("
+                              << r.dimensions[0] << " x " << r.dimensions[1] << ")"
+                              << "  penetration=(" << -dx << ", " << -dy << ") m\n";
+                }
+            }
+        }
+        std::cout << "=== " << violations << " turn/reserved overlaps ===\n" << std::endl;
+        settings.reset();
+    }
+
+    // mas_autocomplete is what the web calls, so real winding has to survive THAT entry point,
+    // not just magnetic_autocomplete (what the audit above calls). ABT #650: the window-envelope
+    // check read the winding window through a dangling reference, so it failed on the first turn
+    // and wind() dropped connection blocking — the layers came back at full window height and,
+    // before the warning below existed, said nothing about it.
+    TEST_CASE("Test_ABT646_Rewind_Through_Mas_Autocomplete", "[support][abt646][abt650][masautocomplete]") {
+        std::ifstream json_file(std::filesystem::path{std::source_location::current().file_name()}
+                                    .parent_path()
+                                    .append("testData")
+                                    .append("abt646_e16_litz_2layer_leadcollision.json")
+                                    .string());
+        REQUIRE(json_file.good());
+        auto masJson = json::parse(json_file);
+
+        std::vector<double> shortestLayerHeight;
+        for (bool realWinding : {false, true}) {
+            settings.reset();
+            settings.set_coil_use_real_winding_geometry(realWinding);
+            OpenMagnetics::read_log();   // register the capture sink + raise to WARNING
+            OpenMagnetics::Mas mas(masJson);
+            auto out = OpenMagnetics::mas_autocomplete(mas, false, json{});
+            auto log = OpenMagnetics::read_log();
+
+            auto outMagnetic = out.get_mutable_magnetic();
+            auto coil = outMagnetic.get_mutable_coil();
+            auto bobbinOut = coil.resolve_bobbin();
+            auto processedDescription = bobbinOut.get_processed_description().value();
+            auto ww = processedDescription.get_winding_windows()[0];
+            // The window the coil comes back with is the one the fit check must have used.
+            REQUIRE(ww.get_coordinates());
+            CHECK_THAT(ww.get_coordinates().value()[0], Catch::Matchers::WithinAbs(0.0045, 1e-9));
+            double windowHeight = ww.get_height().value();
+
+            REQUIRE(coil.get_layers_description());
+            double shortest = windowHeight;
+            auto layersOut = coil.get_layers_description().value();
+            for (const auto& layer : layersOut) {
+                if (layer.get_type() != MAS::ElectricalType::CONDUCTION) continue;
+                shortest = std::min(shortest, layer.get_dimensions()[1]);
+            }
+            shortestLayerHeight.push_back(shortest);
+
+            // Requested real winding must either be APPLIED or refused out loud — never dropped
+            // in silence, which is how ABT #650 stayed invisible for a day.
+            if (realWinding) {
+                INFO(log);
+                CHECK(log.find("connection blocking was NOT applied") == std::string::npos);
+                // A corridor is reserved: at least one conduction layer is shorter than the window.
+                CHECK(shortest < windowHeight - 1e-6);
+            }
+            else {
+                // Nothing is blocked with the flag off: every layer spans the full window height.
+                CHECK_THAT(shortest, Catch::Matchers::WithinAbs(windowHeight, 1e-5));
+            }
+        }
+        // And the two settings must actually differ — otherwise the flag is doing nothing.
+        CHECK(shortestLayerHeight[1] < shortestLayerHeight[0]);
+        settings.reset();
+    }
+
+}  // namespace
+namespace {
+    TEST_CASE("Test_Abt685_Shared_Terminal_Row_Svg", "[support][painter][abt685]") {
+        // ABT #685: the 8t x 2p E16 with the winding's parallels sharing ONE terminal row. The
+        // connection overlay is what to look at — one row for the bundle, plus the vertical stub
+        // that lifts the second parallel to its own first turn.
+        settings.reset();
+        settings.set_coil_use_real_winding_geometry(true);
+        auto dataDir = std::filesystem::path{__FILE__}.parent_path().append("testData");
+        auto mas = OpenMagneticsTesting::mas_loader(
+            (dataDir / "abt646_e16_litz_2layer_leadcollision.json").string());
+        auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+        auto sourceCoil = magnetic.get_mutable_coil();
+        OpenMagnetics::Coil coil;
+        coil.set_bobbin(sourceCoil.resolve_bobbin());
+        auto windings = sourceCoil.get_functional_description();
+        windings[0].set_number_turns(8);
+        windings[0].set_number_parallels(2);
+        coil.set_functional_description(windings);
+        REQUIRE(coil.wind());
+        magnetic.set_coil(coil);
+        if (std::getenv("MKF_BLOCKING_DIAG"))
+        for (const auto& space : coil.get_connection_reserved_spaces()) {
+            std::cerr << "[space] " << (space.isTerminal ? "TERM " : "trans")
+                      << " w=" << space.winding << " p=" << space.parallel
+                      << " layer='" << space.layer << "'"
+                      << " at (" << space.coordinates[0] * 1e3 << "," << space.coordinates[1] * 1e3
+                      << ") dims=(" << space.dimensions[0] * 1e3 << "x" << space.dimensions[1] * 1e3
+                      << ") rot=" << space.rotation << "\n";
+        }
+
+        auto outFile = outputFilePath;
+        outFile.append("Test_Abt685_Shared_Terminal_Row.svg");
+        std::filesystem::remove(outFile);
+        Painter painter(outFile);
+        painter.paint_core(magnetic);
+        painter.paint_bobbin(magnetic);
+        painter.paint_coil_turns(magnetic);
+        painter.paint_coil_connections(magnetic);
+        painter.export_svg();
+        REQUIRE(std::filesystem::exists(outFile));
+        settings.reset();
+    }
+}
+
+// TEMPORARY (ABT #685 review): env-driven Painter export for arbitrary MAS examples, with the
+// terminal/connection overlay. MKF_SVG_FIXTURES is a comma-separated list of paths relative to
+// MAS/examples (subdirs allowed, e.g. "complete/pushpull_transformer_complete.json"). Real
+// winding ON — the connections exist only under the blocking layout. Remove before commit.
+namespace {
+    TEST_CASE("Tmp_Abt685_Fixture_Svg", "[tmpsvg]") {
+        const char* list = std::getenv("MKF_SVG_FIXTURES");
+        // ABT #833: this is a MANUAL export tool, not an assertion about the product — it renders
+        // whatever designs MKF_SVG_FIXTURES names so a human can look at them. With no list there
+        // is nothing to render, and REQUIRE()ing the variable made an unset environment (i.e. every
+        // ordinary suite run) a hard FAILURE, which is why it shows up red in the #833 sweep next
+        // to genuine geometry defects. Skip instead: absent input is "not asked for", not "broken".
+        if (list == nullptr) {
+            SKIP("set MKF_SVG_FIXTURES=<comma-separated MAS/examples paths> to export review SVGs");
+        }
+        settings.reset();
+        settings.set_coil_use_real_winding_geometry(true);
+        // ABT #685 (Alf, 2026-08-16): both fit relaxations ON for this review test — coating
+        // squish (heals the helical-pitch epsilon, e.g. pushpull's ff=1.00068) and horizontal
+        // overflow (the over-full complete examples wind with blocking applied, bulging
+        // radially, instead of silently skipping the blocking).
+        settings.set_coil_allow_coating_squish(true);
+        settings.set_coil_allow_horizontal_overflow(true);
+        const auto outDir = std::filesystem::path{std::source_location::current().file_name()}
+                                .parent_path().append("..").append("output");
+        const auto examplesDir = std::filesystem::path{std::source_location::current().file_name()}
+                                     .parent_path().append("..").append("MAS").append("examples");
+        std::stringstream ss(list);
+        std::string name;
+        while (std::getline(ss, name, ',')) {
+            std::cerr << "[design] " << name << "\n";
+            try {
+                std::ifstream f((examplesDir / name).string());
+                if (!f.good()) {
+                    std::cerr << "[svg-fail] " << name << ": example file not found\n";
+                    continue;
+                }
+                // The MVB++ recipe (magnetic_autocomplete_safe): Coil(json, false) skips the
+                // ctor-time wind that trips "bad optional access" on the complete examples'
+                // raw Basic bobbins; autocomplete then does the full enrichment itself.
+                auto j = json::parse(f);
+                auto magneticJson = j.contains("magnetic") ? j.at("magnetic") : j;
+                OpenMagnetics::Magnetic om;
+                om.set_core(OpenMagnetics::Core(magneticJson.at("core")));
+                om.set_coil(OpenMagnetics::Coil(magneticJson.at("coil"), false));
+                OpenMagnetics::Magnetic magnetic;
+                try {
+                    magnetic = OpenMagnetics::magnetic_autocomplete(om, json{});
+                } catch (const std::exception& e) {
+                    std::cerr << "[svg-fail] " << name << ": AUTOCOMPLETE: " << e.what() << "\n";
+                    continue;
+                }
+                auto base = std::filesystem::path(name).stem().string();
+                auto outFile = outDir;
+                outFile.append("Tmp_Abt685_" + base + ".svg");
+                std::filesystem::remove(outFile);
+                Painter painter(outFile);
+                // Staged, each individually caught: export whatever paints, and name the
+                // stage that fails instead of one opaque "bad optional access".
+                auto stage = [&](const char* what, auto&& fn) {
+                    try {
+                        fn();
+                    } catch (const std::exception& e) {
+                        std::cerr << "[svg-stage-fail] " << name << ": " << what << ": "
+                                  << e.what() << "\n";
+                    }
+                };
+                stage("core", [&] { painter.paint_core(magnetic); });
+                stage("bobbin", [&] { painter.paint_bobbin(magnetic); });
+                stage("turns", [&] { painter.paint_coil_turns(magnetic); });
+                stage("connections", [&] { painter.paint_coil_connections(magnetic); });
+                if (std::getenv("MKF_DUMP")) {
+                    if (magnetic.get_coil().get_turns_description()) {
+                        const auto dumpTurns = magnetic.get_coil().get_turns_description().value();
+                        for (const auto& t : dumpTurns) {
+                            std::cerr << "[turn] " << t.get_name() << " ("
+                                      << t.get_coordinates()[0] * 1e3 << ","
+                                      << t.get_coordinates()[1] * 1e3 << ")\n";
+                        }
+                    }
+                    auto dumpCoil = magnetic.get_coil();
+                    for (const auto& sp : dumpCoil.get_connection_reserved_spaces()) {
+                        if (!sp.layer.empty()) continue;
+                        std::cerr << "[space] " << (sp.isTerminal ? "TERM " : "trans") << " w="
+                                  << sp.winding << " p" << sp.parallel << " at ("
+                                  << sp.coordinates[0] * 1e3 << "," << sp.coordinates[1] * 1e3
+                                  << ") dims=(" << sp.dimensions[0] * 1e3 << "x"
+                                  << sp.dimensions[1] * 1e3 << ")\n";
+                    }
+                }
+                painter.export_svg();
+                std::cerr << "[svg] " << outFile.string() << "\n";
+            } catch (const std::exception& e) {
+                std::cerr << "[svg-fail] " << name << ": " << e.what() << "\n";
+            }
+        }
+        settings.reset();
+    }
+    // TEMPORARY (ABT #685): repaint Alf's buck-inductor toroid with the new outer-crossing
+    // placement so the anchored crossings can be looked at. Writes straight to the path he asked
+    // for. Remove once reviewed.
+    TEST_CASE("Test_Tmp_Buck_Toroid_Repaint", "[tmp-buck]") {
+        clear_databases();
+        std::ifstream json_file("/home/alf/OpenMagnetics/MVB++/tests/mas_complete_fixtures/"
+                                "buck_inductor_complete.json");
+        REQUIRE(json_file.good());
+        auto masJson = json::parse(json_file);
+        // ABT #685 (Alf, 2026-08-18): "I want to test the 2 layers, make it 10 turns". The
+        // fixture's 8 turns x 3 parallels fit one bore ring now that the phantom stations are
+        // gone; 10 x 3 forces a second ring, which is what exercises the ring transition.
+        masJson["magnetic"]["coil"]["functionalDescription"][0]["numberTurns"] = 10;
+        settings.set_coil_use_real_winding_geometry(true);
+        auto magnetic = OpenMagnetics::magnetic_autocomplete(
+            OpenMagnetics::Magnetic(masJson["magnetic"]), json{});
+        {
+            const auto turnsDesc = magnetic.get_mutable_coil().get_turns_description().value();
+            std::map<std::pair<std::string, int64_t>, size_t> stations;
+            size_t withCrossing = 0;
+            for (const auto& t : turnsDesc) {
+                ++stations[{t.get_winding(), t.get_parallel()}];
+                if (t.get_additional_coordinates()) ++withCrossing;
+            }
+            for (const auto& [key, n] : stations) {
+                std::cerr << "[count] " << key.first << " p" << key.second << ": " << n
+                          << " inner crossings" << std::endl;
+            }
+            std::cerr << "[count] outer crossings total: " << withCrossing << std::endl;
+        }
+        std::filesystem::path outFile("/home/alf/OpenMagnetics/MVB++/output/mas_sweep/"
+                                      "complete_buck_inductor_complete/"
+                                      "complete_buck_inductor_complete.DIAGNOSTIC.svg");
+        std::filesystem::remove(outFile);
+        Painter painter(outFile);
+        painter.paint_magnetic(magnetic, PainterProjection::XY);
+        painter.export_svg();
+        REQUIRE(std::filesystem::exists(outFile));
+        settings.reset();
+    }
 }  // namespace

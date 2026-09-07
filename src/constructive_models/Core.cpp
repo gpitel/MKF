@@ -10,6 +10,7 @@
 #include "support/Utils.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -32,6 +33,13 @@ Core::Core(json j, bool includeMaterialData, bool includeProcessedDescription, b
     
     if (includeProcessedDescription) {
         process_data();
+        // process_gap() reports "this gapping does not fit its columns" by returning false.
+        // That is a NORMAL answer here: the CoreAdviser synthesises candidate cores by sweeping
+        // gap lengths and necessarily generates some that do not fit (a 4.4 mm gap on an E 5),
+        // then skips them — CoreAdviserDataset checks the bool. So construction stays permissive.
+        // The place a non-fitting gapping is a genuine defect is the CATALOGUE, and that is
+        // checked in load_cores(), which is where the seven Magnetics records with mil-as-metre
+        // gap lengths (ABT #407) would have been caught.
         process_gap();
     }
 
@@ -72,17 +80,53 @@ Core::Core(const CoreShape shape, std::optional<CoreMaterial> material) {
     else {
         get_mutable_functional_description().set_material("Dummy");
     }
-    if (is_piece_and_plate_family(shape.get_family())) {
-        // Checked BEFORE the magneticCircuit flag: MAS marks UI/PQI records `closed`, so
-        // the flag alone made a UI core TOROIDAL here -- a shape with two rectangular
-        // columns described as a ring.
+    // Core type follows the FAMILY, not the open/closed flag. That flag says whether a shape
+    // "can be combined with others" or "has to be used by itself" (MAS shape schema), which is a
+    // different question: a UI or PQI record describes a whole piece-and-plate assembly, so it is
+    // closed by that definition, yet it is obviously not a toroid. Keying the type off the flag
+    // made every closed shape TOROIDAL and would have turned UI/PQI into toroids.
+    auto shapeFamily = shape.get_family();
+    if (shapeFamily == CoreShapeFamily::T) {
+        get_mutable_functional_description().set_type(CoreType::TOROIDAL);
+    }
+    else if (shapeFamily == CoreShapeFamily::UI || shapeFamily == CoreShapeFamily::PQI ||
+             shapeFamily == CoreShapeFamily::UT || shapeFamily == CoreShapeFamily::EI ||
+             shapeFamily == CoreShapeFamily::DRUM_RING || shapeFamily == CoreShapeFamily::DRUM_SEMISHIELDED) {
+        // DRUM_RING (ABT #366) / DRUM_SEMISHIELDED (ABT #362): a drum closed by its shield
+        // ring / magnetic-epoxy shell — same piece-plus-closer semantics as UI/PQI (nothing
+        // doubled, the piece class reports the whole assembly).
+        //
+        // EI: an E piece closed by an I bar — the same construction as UI, and the family the
+        // records themselves name "E+I". It had no entry either, so it was mirrored too:
+        // ET 20 reports le 99.51 mm as a twoPieceSet against 49.76 mm as a piece and plate,
+        // the same exact factor of two.
+        //
+        // UT (ABT #995): a U piece closed by a flat bar — the T — exactly the UI case. It had
+        // NO entry here at all and fell to the TWO_PIECE_SET default, which MIRRORED it and
+        // doubled the magnetic path: 106.41 mm against 53.20 mm on MAS's own UT 20, where the
+        // supplier catalogues quote 53.
+        //
+        // Do not be misled by "closed rectangular ferrite core" in UT choke datasheets, or by
+        // magneticCircuit: closed on the shape record — both describe the ASSEMBLED CIRCUIT,
+        // which is precisely the trap the comment above this cascade warns about. The pieces
+        // are two: US 11,749,439 describes the construction as "a U-shaped core and I-shaped
+        // core formed of ferrite, with the I-shaped core connecting both leg portions of the
+        // U-shaped core to form a closed magnetic path", and UT parts are wound on a bobbin,
+        // which a one-piece closed core could not accept.
         get_mutable_functional_description().set_type(CoreType::PIECE_AND_PLATE);
     }
-    else if (shape.get_magnetic_circuit() == MagneticCircuit::OPEN) {
-        get_mutable_functional_description().set_type(CoreType::TWO_PIECE_SET);
+    else if (shapeFamily == CoreShapeFamily::DRUM || shapeFamily == CoreShapeFamily::ROD) {
+        // Single piece whose magnetic circuit closes through the surrounding air (drum ABT #331,
+        // rod ABT #933). Without this the default below would make a rod a TWO_PIECE_SET and
+        // silently double its effective length.
+        get_mutable_functional_description().set_type(CoreType::OPEN_SHAPE);
+    }
+    else if (shapeFamily == CoreShapeFamily::MOLDED) {
+        // Single pressed solid, circuit closed IN-MATERIAL (distributed gap, ABT #357).
+        get_mutable_functional_description().set_type(CoreType::CLOSED_SHAPE);
     }
     else {
-        get_mutable_functional_description().set_type(CoreType::TOROIDAL);
+        get_mutable_functional_description().set_type(CoreType::TWO_PIECE_SET);
     }
 
     if (material) {
@@ -282,8 +326,16 @@ std::optional<std::vector<CoreGeometricalDescriptionElement>> Core::create_geome
         case CoreType::CLOSED_SHAPE:
             piece.set_type(CoreGeometricalDescriptionElementType::CLOSED);
             for (auto i = 0; i < numberStacks; ++i) {
-                double currentHeight = roundFloat(corePieceHeight);
-                std::vector<double> coordinates = {0, currentHeight, currentDepth};
+                // y = 0, like TOROIDAL and OPEN_SHAPE above: a single closed piece is centred
+                // on the winding window, which is also at y = 0. This branch used to place it
+                // at y = corePieceHeight — a full body-height above the coil — so a moulded
+                // inductor rendered as a block floating over its own winding, with the coil
+                // outside the moulding it is embedded in.
+                //
+                // Only the two-piece types offset a piece vertically, because there the halves
+                // must sit either side of the parting plane. One piece has no other half to
+                // make room for.
+                std::vector<double> coordinates = {0, 0, currentDepth};
                 piece.set_coordinates(coordinates);
                 piece.set_rotation(std::vector<double>({0, 0, 0}));
                 piece.set_machining(std::nullopt);
@@ -493,36 +545,75 @@ std::optional<std::vector<CoreGeometricalDescriptionElement>> Core::create_geome
                 }
             }
             break;
+        case CoreType::OPEN_SHAPE:
+            // Single solid piece (drum): same emission as CLOSED_SHAPE — openness is a property
+            // of the magnetic circuit, not of the solid.
+            piece.set_type(CoreGeometricalDescriptionElementType::CLOSED);
+            for (auto i = 0; i < numberStacks; ++i) {
+                std::vector<double> coordinates = {0, 0, currentDepth};
+                piece.set_coordinates(coordinates);
+                piece.set_rotation(std::vector<double>({0, 0, 0}));
+                piece.set_machining(std::nullopt);
+                geometricalDescription.push_back(CoreGeometricalDescriptionElement(piece));
+                currentDepth = roundFloat(currentDepth + corePieceDepth);
+            }
+            break;
+
         case CoreType::PIECE_AND_PLATE: {
-            // A UI is one U piece closed by a flat I plate. There is no mirrored
-            // second half, so the whole assembly is a single CLOSED element -- the
-            // 3D builder (MVB++ ShapeUi) fuses the U and the plate into one solid,
-            // matching how CorePieceUi reports the assembled core.
+            // A shaped piece (U, PQ...) closed by a flat plate. MAS has a PLATE element type for
+            // exactly this, so the shaped half stays a HALF_SET and the closing plate is emitted as
+            // PLATE rather than as a second mirrored half.
             //
-            // Emitting nothing here left the geometry list EMPTY, so a UI core was
-            // absent from any render: the builder ran zero iterations and reported
-            // it as "filtered out all geometry", which points nowhere near the
-            // cause. That is why this is not simply left as a TODO.
+            // Unlike TWO_PIECE_SET there is nothing to SPLIT: a ground gap is machined into the
+            // shaped piece's columns, and the plate is flat and unmachined. So all machining goes
+            // to the piece, and the plate carries none.
             //
-            // No Y offset, unlike CLOSED_SHAPE above: ShapeUi already places the
-            // assembly in the frame CorePieceUi describes, with the winding window
-            // centred on the origin.
-            auto pieceFamily = std::get<CoreShape>(get_functional_description().get_shape()).get_family();
-            if (pieceFamily == CoreShapeFamily::UI) {
+            // This replaces an empty `break` that emitted NO geometrical description at all, which
+            // left CAD/3D consumers with nothing to draw for a piece-and-plate core (ABT #264).
+            if (resolve_shape().get_family() == CoreShapeFamily::DRUM_RING ||
+                resolve_shape().get_family() == CoreShapeFamily::DRUM_SEMISHIELDED) {
+                // Shielded drum (ABT #366) / semi-shielded drum (ABT #362): the drum body is a
+                // complete single solid (CLOSED, same emission as the bare drum) and the
+                // closer — shield ring or cast glue shell — is the PLATE, both concentric at
+                // the origin: no spacer, no machining. The 3D consumer derives the drum from
+                // letters A..H and the closer from J/K/L on the shared shape record.
+                auto ringPiece = piece;
                 piece.set_type(CoreGeometricalDescriptionElementType::CLOSED);
+                ringPiece.set_type(CoreGeometricalDescriptionElementType::PLATE);
                 for (auto i = 0; i < numberStacks; ++i) {
-                    piece.set_coordinates(std::vector<double>({0, 0, currentDepth}));
+                    std::vector<double> coordinates = {0, 0, currentDepth};
+                    piece.set_coordinates(coordinates);
                     piece.set_rotation(std::vector<double>({0, 0, 0}));
-                    // UI gapping is unimplemented end to end: a UI has one mating
-                    // plane rather than two, and a single fused solid cannot express
-                    // a lifted plate. process_gap has no UI branch either.
                     piece.set_machining(std::nullopt);
                     geometricalDescription.push_back(CoreGeometricalDescriptionElement(piece));
+
+                    ringPiece.set_coordinates(coordinates);
+                    ringPiece.set_rotation(std::vector<double>({0, 0, 0}));
+                    ringPiece.set_machining(std::nullopt);
+                    geometricalDescription.push_back(CoreGeometricalDescriptionElement(ringPiece));
+
                     currentDepth = roundFloat(currentDepth + corePieceDepth);
                 }
                 break;
             }
-            // TODO other PIECE_AND_PLATE families (pqi) have no CorePiece yet.
+            auto platePiece = piece;
+            bottomPiece.set_type(CoreGeometricalDescriptionElementType::HALF_SET);
+            platePiece.set_type(CoreGeometricalDescriptionElementType::PLATE);
+            for (auto i = 0; i < numberStacks; ++i) {
+                bottomPiece.set_coordinates(std::vector<double>({0, roundFloat(-spacerThickness / 2), currentDepth}));
+                bottomPiece.set_rotation(std::vector<double>({0, 0, 0}));
+                if (machining.size() > 0) {
+                    bottomPiece.set_machining(machining);
+                }
+                geometricalDescription.push_back(bottomPiece);
+
+                platePiece.set_coordinates(std::vector<double>({0, roundFloat(spacerThickness / 2), currentDepth}));
+                platePiece.set_rotation(std::vector<double>({0, 0, 0}));
+                platePiece.set_machining(std::nullopt);
+                geometricalDescription.push_back(platePiece);
+
+                currentDepth = roundFloat(currentDepth + corePieceDepth);
+            }
             break;
         }
         default:
@@ -691,6 +782,11 @@ void Core::set_gap_length(double gapLength) {
     distribute_and_process_gap();
 }
 
+bool Core::fail_gap_processing(const std::string& message) {
+    _lastGapProcessingFailure = message;
+    return false;
+}
+
 bool Core::distribute_and_process_gap() {
     auto constants = Constants();
     std::vector<CoreGap> newGapping;
@@ -700,6 +796,15 @@ bool Core::distribute_and_process_gap() {
     double coreChunkSizePlusGap = 0;
     auto nonResidualGaps = find_gaps_by_type(GapType::SUBTRACTIVE);
     auto additiveGaps = find_gaps_by_type(GapType::ADDITIVE);
+    // SUBTRACTIVE and ADDITIVE are both "non residual" but they mean opposite things about WHERE
+    // the gap lives, so the two counts are kept apart as well as summed. SUBTRACTIVE is material
+    // ground off the CENTRAL column -- several of them are one distributed gap down that column,
+    // never one gap per leg -- while ADDITIVE is a spacer shimmed between the halves, which by
+    // construction separates EVERY column equally. The factory helpers below spell out the same
+    // vocabulary: create_ground_gapping is 1 subtractive + residuals, create_distributed_gapping
+    // is N subtractive + residuals, create_spacer_gapping is one additive PER COLUMN.
+    int numberSubtractiveGaps = nonResidualGaps.size();
+    int numberAdditiveGaps = additiveGaps.size();
     nonResidualGaps.insert(nonResidualGaps.end(), additiveGaps.begin(), additiveGaps.end());
     auto residualGaps = find_gaps_by_type(GapType::RESIDUAL);
     int numberNonResidualGaps = nonResidualGaps.size();
@@ -736,7 +841,10 @@ bool Core::distribute_and_process_gap() {
             gap.set_coordinates(columns[i].get_coordinates());
             gap.set_shape(columns[i].get_shape());
             if (columns[i].get_height() / 2 - constants.residualGap / 2 < 0) {
-                return false;
+                return fail_gap_processing(
+                    "the default residual gap (" + std::to_string(constants.residualGap) +
+                    " m) does not fit column of index " + std::to_string(i) +
+                    " (column height " + std::to_string(columns[i].get_height()) + " m)");
                 // throw std::runtime_error("distance_closest_normal_surface cannot be negative in shape: " + std::get<CoreShape>(get_functional_description().get_shape()).get_name().value() + ", column of index: " + std::to_string(i));
 
             }
@@ -747,7 +855,20 @@ bool Core::distribute_and_process_gap() {
             newGapping.push_back(gap);
         }
     }
-    else if (numberNonResidualGaps + numberResidualGaps < numberColumns) {
+    else if (numberNonResidualGaps + numberResidualGaps < numberColumns && numberSubtractiveGaps == 0) {
+        // FEWER GAPS THAN COLUMNS, AND NONE OF THEM SUBTRACTIVE. Only spacers and residual gaps
+        // reach here, and for those replicating the last entry across the remaining columns is the
+        // right thing: an ADDITIVE gap is a shim between the core halves, so it separates every
+        // column by the same amount, and a short residual list just means "the rest mate too".
+        //
+        // ABT #644: the `numberSubtractiveGaps == 0` guard is the fix. Without it a single
+        // {subtractive, L} on a three-column core was replicated into all three legs, so the
+        // lateral gaps sat in parallel with the central one and the core came back 1.7-1.8x less
+        // inductive than the caller asked for (PQ 26/25, E 42/21/20, ETD 29/16/10, RM 10) --
+        // silently, since the gapping produced is a well-formed MAS object. Subtractive gaps now
+        // fall through to the distributed branch below, which puts them where they belong: down
+        // the central column, with residual gaps generated for the return columns. That is exactly
+        // what create_ground_gapping() and create_distributed_gapping() build by hand.
         for (size_t i = 0; i < columns.size(); ++i) {
             size_t gapIndex = i;
             if (i >= gapping.size()) {
@@ -759,7 +880,10 @@ bool Core::distribute_and_process_gap() {
             gap.set_coordinates(columns[i].get_coordinates());
             gap.set_shape(columns[i].get_shape());
             if (columns[i].get_height() / 2 - gapping[gapIndex].get_length() / 2 < 0) {
-                return false;
+                return fail_gap_processing(
+                    "gap of length " + std::to_string(gapping[gapIndex].get_length()) +
+                    " m does not fit column of index " + std::to_string(i) +
+                    " (column height " + std::to_string(columns[i].get_height()) + " m)");
                 // throw std::runtime_error("distance_closest_normal_surface cannot be negative in shape: " + std::get<CoreShape>(get_functional_description().get_shape()).get_name().value() + ", column of index: " + std::to_string(i));
 
             }
@@ -770,7 +894,16 @@ bool Core::distribute_and_process_gap() {
             newGapping.push_back(gap);
         }
     }
-    else if ((numberResidualGaps == numberColumns || numberNonResidualGaps == numberColumns) &&
+    // ONE GAP PER COLUMN, laid out positionally. Legitimate for an all-residual core (an ungapped
+    // two-piece set) and for a SPACER, where one additive gap per column is precisely what
+    // create_spacer_gapping() emits.
+    //
+    // ABT #644: this used to test numberNonResidualGaps, which lumps SUBTRACTIVE in with ADDITIVE,
+    // so [subtractive, subtractive, subtractive] was laid out as one ground gap per leg. Three
+    // subtractive gaps mean a DISTRIBUTED gap -- three gaps spaced down the central column, with
+    // residual gaps on the laterals, i.e. what create_distributed_gapping() builds. Testing the
+    // additive count instead sends the subtractive case to the distributed branch below.
+    else if ((numberResidualGaps == numberColumns || numberAdditiveGaps == numberColumns) &&
              (numberGaps == numberColumns)) {
         for (size_t i = 0; i < columns.size(); ++i) {
             CoreGap gap;
@@ -779,7 +912,10 @@ bool Core::distribute_and_process_gap() {
             gap.set_coordinates(columns[i].get_coordinates());
             gap.set_shape(columns[i].get_shape());
             if (columns[i].get_height() / 2 - gapping[i].get_length() / 2 < 0) {
-                return false;
+                return fail_gap_processing(
+                    "gap of length " + std::to_string(gapping[i].get_length()) +
+                    " m does not fit column of index " + std::to_string(i) +
+                    " (column height " + std::to_string(columns[i].get_height()) + " m)");
                 // throw std::runtime_error("distance_closest_normal_surface cannot be negative in shape: " + std::get<CoreShape>(get_functional_description().get_shape()).get_name().value() + ", column of index: " + std::to_string(i));
 
             }
@@ -805,13 +941,41 @@ bool Core::distribute_and_process_gap() {
             returnColumns = lateralColumns;
         }
 
-        if (numberGaps == numberColumns) {
+        // ONE non-residual gap is a ground gap: the centre leg of one half is machined back, so the
+        // gap opens off the mating plane and its centre sits half a gap above it. MORE than one is
+        // a distributed gap and the gaps are spread evenly down the column instead.
+        //
+        // ABT #644: `numberGaps == numberColumns` alone is only a proxy for "one gap", and it
+        // stopped being one once three subtractive gaps started arriving here. On a three-column
+        // core [subtractive x3] took the single-ground-gap placement and came out at
+        // y = 0.25/4.275/8.3 mm instead of the distributed -4.025/0/+4.025 mm. Requiring exactly
+        // one non-residual gap as well keeps every previously-correct case on its existing path
+        // and sends only the genuinely distributed one to the branch below.
+        if (nonResidualGaps.size() == 1) {
+            // A SINGLE GROUND GAP LIVES ENTIRELY IN ONE HALF, never straddling the mating plane:
+            // it is cheaper to grind one piece by the whole gap than two pieces by half of it
+            // each. So the gap spans 0..length and its centre sits at +length/2.
+            //
+            // ABT #644: the condition used to be `numberGaps == numberColumns`, which meant this
+            // placement only applied when the caller had spelled out one residual gap per
+            // remaining column. A bare [subtractive] fell through to the distributed branch below
+            // and came out CENTRED on the mating plane instead -- the same core placed two
+            // different ways depending only on how its gapping was written. The rule is about the
+            // gap, not about how many entries came with it, so it keys off the non-residual count.
             if (windingColumn.get_height() > nonResidualGaps[0].get_length()) {
                 centralColumnGapsHeightOffset = roundFloat(nonResidualGaps[0].get_length() / 2);
             }
             else {
                 centralColumnGapsHeightOffset = 0;
             }
+            // Left as height/2 - length/2, MEASURED AGAINST REFERENCE DATA rather than derived.
+            // Reluctance.cpp documents this quantity as "the core left between this gap and the
+            // nearest normal surface", which for a gap ground into one half (spanning 0..length)
+            // reads as height/2 - length. That was tried and the validation data rejects it:
+            // Test_Reluctance_PQ_28_20_Grinded goes from its expected 6.98e6 to 8.93e6 (28% high)
+            // and Test_Gapping_U_Shape_Ferrite_Ground's solved gap moves from 6.6mm to 5.8mm. The
+            // half-length form is what reproduces measured reluctance on ground cores, so it
+            // stands; the prose in Reluctance.cpp is the thing that does not quite describe it.
             distanceClosestNormalSurface = roundFloat(windingColumn.get_height() / 2 - nonResidualGaps[0].get_length() / 2);
         }
         else {
@@ -829,7 +993,10 @@ bool Core::distribute_and_process_gap() {
                                       windingColumn.get_coordinates()[2]}));
             gap.set_shape(windingColumn.get_shape());
             if (distanceClosestNormalSurface < 0) {
-                return false;
+                return fail_gap_processing(
+                    "gap of length " + std::to_string(nonResidualGaps[i].get_length()) +
+                    " m does not fit the winding column (column height " +
+                    std::to_string(windingColumn.get_height()) + " m)");
                 // throw std::runtime_error("distance_closest_normal_surface cannot be negative in shape: " + std::get<CoreShape>(get_functional_description().get_shape()).get_name().value() + ", non residual gap of index: " + std::to_string(i));
 
             }
@@ -856,7 +1023,10 @@ bool Core::distribute_and_process_gap() {
                 gap.set_coordinates(returnColumns[i].get_coordinates());
                 gap.set_shape(returnColumns[i].get_shape());
                 if (returnColumns[i].get_height() / 2 - constants.residualGap / 2 < 0) {
-                    return false;
+                    return fail_gap_processing(
+                        "the default residual gap (" + std::to_string(constants.residualGap) +
+                        " m) does not fit return column of index " + std::to_string(i) +
+                        " (column height " + std::to_string(returnColumns[i].get_height()) + " m)");
                     // throw std::runtime_error("distance_closest_normal_surface cannot be negative in shape: " + std::get<CoreShape>(get_functional_description().get_shape()).get_name().value() + ", return column of index: " + std::to_string(i));
 
                 }
@@ -874,12 +1044,23 @@ bool Core::distribute_and_process_gap() {
                 gap.set_length(residualGaps[i].get_length());
                 gap.set_coordinates(returnColumns[i].get_coordinates());
                 gap.set_shape(returnColumns[i].get_shape());
-                if (returnColumns[i].get_height() / 2 < 0) {
-                    return false;
+                // ABT #644: this used to be height/2, ignoring the residual gap's OWN length, while
+                // the sibling branch just above (which generates the residual gaps rather than
+                // taking them from the caller) correctly used height/2 - length/2. The same core
+                // therefore reported two different distance_closest_normal_surface values depending
+                // on whether its residual gaps were spelled out or inferred -- 0.0080500 vs
+                // 0.0080475 on PQ 26/25, half a residual gap apart. The distance from the gap to
+                // the closest normal surface is (columnHeight - gapLength)/2 by definition, so the
+                // subtracting form is the correct one and both branches now use it.
+                if (returnColumns[i].get_height() / 2 - residualGaps[i].get_length() / 2 < 0) {
+                    return fail_gap_processing(
+                        "residual gap of length " + std::to_string(residualGaps[i].get_length()) +
+                        " m does not fit return column of index " + std::to_string(i) +
+                        " (column height " + std::to_string(returnColumns[i].get_height()) + " m)");
                     // throw std::runtime_error("distance_closest_normal_surface cannot be negative in shape: " + std::get<CoreShape>(get_functional_description().get_shape()).get_name().value() + ", return column of index: " + std::to_string(i));
 
                 }
-                gap.set_distance_closest_normal_surface(returnColumns[i].get_height() / 2);
+                gap.set_distance_closest_normal_surface(returnColumns[i].get_height() / 2 - residualGaps[i].get_length() / 2);
                 gap.set_distance_closest_parallel_surface(processedDescription.get_winding_windows()[0].get_width());
                 gap.set_area(returnColumns[i].get_area());
                 gap.set_section_dimensions(std::vector<double>({returnColumns[i].get_width(), returnColumns[i].get_depth()}));
@@ -1038,6 +1219,78 @@ bool Core::process_gap() {
         throw GapException("Toroids cannot be gapped: " + std::to_string(gapping[0].get_length()));
     }
 
+    if (family == CoreShapeFamily::MOLDED) {
+        // Molded composite body (ABT #357): the gap is DISTRIBUTED in the material — a single
+        // pressed solid has no mating surfaces, so neither user gaps nor synthesized residual
+        // gaps exist. (Falling through would let distribute_and_process_gap add a fake
+        // residual column gap.)
+        if (gapping.size() > 0) {
+            throw GapException("Molded cores cannot be gapped: the distributed gap lives in "
+                               "the composite material, not in the geometry");
+        }
+        get_mutable_functional_description().set_gapping(std::vector<CoreGap>{});
+        return true;
+    }
+
+    if (family == CoreShapeFamily::DRUM_SEMISHIELDED) {
+        // Semi-shielded drum (ABT #362): the magnetic-epoxy shell is CAST in contact with the
+        // flange rims — no mating surfaces, no clearance. The low-permeability return is a
+        // MATERIAL section handled by the mixed-material reluctance path, not a gap.
+        if (gapping.size() > 0) {
+            throw GapException("Semi-shielded drums cannot be gapped: the glue shell is cast "
+                               "in contact; its low permeability is a material section, not a gap");
+        }
+        get_mutable_functional_description().set_gapping(std::vector<CoreGap>{});
+        return true;
+    }
+
+    if (family == CoreShapeFamily::DRUM_RING) {
+        // Shielded drum (ABT #366): the only gaps are the two STRUCTURAL annular radial
+        // clearances between flange rim and ring bore. They are derived from the geometry —
+        // nothing can be ground on an assembled drum+ring — so user gapping is rejected, and
+        // RESIDUAL entries (ours, from a previous pass) are simply re-derived, which keeps
+        // process_gap idempotent.
+        for (auto& gap : gapping) {
+            if (gap.get_type() != GapType::RESIDUAL) {
+                throw GapException("drumRing cores cannot carry user gapping: their two annular "
+                                   "clearance gaps are structural, derived from A/K/D/F");
+            }
+        }
+        auto dimensions = flatten_dimensions(resolve_shape().get_dimensions().value());
+        if (dimensions.find("A2") != dimensions.end() && dimensions["A2"] > 0 &&
+            roundFloat(dimensions["A2"]) != roundFloat(dimensions["A"])) {
+            throw NotImplementedException("drumRing with asymmetric flanges (A2 != A) is not "
+                                          "supported yet: the per-side clearance would differ");
+        }
+        double flangeOuterDiameter = dimensions["A"];
+        double ringInnerDiameter = dimensions["K"];
+        double gapLength = (ringInnerDiameter - flangeOuterDiameter) / 2;
+        double meanRadius = (flangeOuterDiameter + ringInnerDiameter) / 4;
+        double windingWindowWidth = processedDescription.get_winding_windows()[0].get_width().value();
+        std::vector<CoreGap> annularGaps;
+        // {flange thickness, gap centre height}: top flange (D) and bottom flange (F). The
+        // flux crosses the clearance radially over each flange's axial extent, so the gap is
+        // the annulus UNROLLED to a rectangular section {mean circumference, flange thickness}
+        // — the long thin gap the reluctance/fringing models expect.
+        for (auto& [flangeThickness, gapCenterHeight] :
+             std::vector<std::pair<double, double>>{
+                 {dimensions["D"], (dimensions["B"] - dimensions["D"]) / 2},
+                 {dimensions["F"], -(dimensions["B"] - dimensions["F"]) / 2}}) {
+            CoreGap gap;
+            gap.set_type(GapType::RESIDUAL);
+            gap.set_length(roundFloat(gapLength));
+            gap.set_coordinates(std::vector<double>({roundFloat(meanRadius), roundFloat(gapCenterHeight), 0}));
+            gap.set_shape(ColumnShape::RECTANGULAR);
+            gap.set_distance_closest_normal_surface(roundFloat(flangeThickness / 2));
+            gap.set_distance_closest_parallel_surface(windingWindowWidth);
+            gap.set_area(roundFloat(2 * std::numbers::pi * meanRadius * flangeThickness));
+            gap.set_section_dimensions(std::vector<double>({roundFloat(2 * std::numbers::pi * meanRadius), roundFloat(flangeThickness)}));
+            annularGaps.push_back(gap);
+        }
+        get_mutable_functional_description().set_gapping(annularGaps);
+        return true;
+    }
+
     if (family != CoreShapeFamily::T) {
         if (gapping.size() == 0 || !gapping[0].get_coordinates() || is_gapping_misaligned()) {
             return distribute_and_process_gap();
@@ -1052,7 +1305,11 @@ bool Core::process_gap() {
             gap.set_coordinates(gapping[i].get_coordinates());
             gap.set_shape(columns[columnIndex].get_shape());
             if (roundFloat(columns[columnIndex].get_height() / 2 - fabs((*gapping[i].get_coordinates())[1]) - gapping[i].get_length() / 2) < 0) {
-                return false;
+                return fail_gap_processing(
+                    "gap of length " + std::to_string(gapping[i].get_length()) +
+                    " m at its supplied coordinates does not fit column of index " +
+                    std::to_string(columnIndex) + " (column height " +
+                    std::to_string(columns[columnIndex].get_height()) + " m)");
                 // throw std::runtime_error("distance_closest_normal_surface cannot be negative in shape: " + std::get<CoreShape>(get_functional_description().get_shape()).get_name().value() + ", gap of index: " + std::to_string(i));
 
             }
@@ -1068,9 +1325,23 @@ bool Core::process_gap() {
     return true;
 }
 
+void Core::process_gap_or_throw() {
+    _lastGapProcessingFailure.reset();
+    if (!process_gap()) {
+        throw GapException(_lastGapProcessingFailure.value_or(
+            "core gapping does not fit its columns"));
+    }
+}
+
+// The write-back below memoizes the resolved record into the functional description. For a
+// MULTI-GRADE assembly that would overwrite the whole list with just the primary piece and
+// silently destroy every closing material (ABT #576) — so a list is cached but never written
+// back. The list form is already fully resolvable on demand through resolve_materials().
 CoreMaterial Core::resolve_material() {
     auto material = resolve_material(get_functional_description().get_material());
-    get_mutable_functional_description().set_material(material);
+    if (!std::holds_alternative<std::vector<MaterialElement>>(get_functional_description().get_material())) {
+        get_mutable_functional_description().set_material(material);
+    }
     _cachedResolvedMaterial = material;
     return material;
 }
@@ -1089,7 +1360,10 @@ CoreMaterial Core::resolve_material() const {
     if (_cachedResolvedMaterial) return *_cachedResolvedMaterial;
     auto material = resolve_material(get_functional_description().get_material());
     _cachedResolvedMaterial = material;
-    const_cast<Core*>(this)->get_mutable_functional_description().set_material(material);
+    // Same guard as the non-const overload: never collapse a multi-grade list to its primary.
+    if (!std::holds_alternative<std::vector<MaterialElement>>(get_functional_description().get_material())) {
+        const_cast<Core*>(this)->get_mutable_functional_description().set_material(material);
+    }
     return material;
 }
 
@@ -1117,21 +1391,125 @@ CoreMaterial Core::resolve_material(CoreMaterialDataOrNameUnion coreMaterial) {
         coreMaterial = coreMaterialData;
         return coreMaterialData;
     }
+    // ABT #576: a multi-grade assembly lists its pieces, primary first. Everything that asks for
+    // "the" material of the core means the primary (wound) piece — the drum of a drum+ring, the
+    // piece the turns sit on — so resolve that and hand it back. Callers that need the closing
+    // pieces ask resolve_materials() instead.
+    else if (std::holds_alternative<std::vector<MaterialElement>>(coreMaterial)) {
+        auto materials = std::get<std::vector<MaterialElement>>(coreMaterial);
+        if (materials.empty()) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "core material list is empty — it must name at least the primary piece");
+        }
+        // ABT #1002: a moulded body whose post is a plastic bobbin lists "air" first. The
+        // primary GRADE is then the first entry that is a material -- the cover the flux
+        // returns through -- never the placeholder.
+        for (auto& materialElement : materials) {
+            if (!is_non_magnetic_region(materialElement)) {
+                return resolve_material(material_element_to_union(materialElement));
+            }
+        }
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "core material list names no magnetic grade: every entry is the reserved non-magnetic "
+            "region \"air\"");
+    }
     else {
         return std::get<CoreMaterial>(coreMaterial);
     }
 }
 
-void Core::set_type(CoreType coreType) {
-    get_mutable_functional_description().set_type(coreType);
+// The array items are their own two-way union; widen one to the outer union so the single
+// resolution path above handles names and inline records identically.
+CoreMaterialDataOrNameUnion Core::material_element_to_union(const MaterialElement& materialElement) {
+    if (std::holds_alternative<std::string>(materialElement)) {
+        return std::get<std::string>(materialElement);
+    }
+    return std::get<CoreMaterial>(materialElement);
 }
 
-bool Core::is_piece_and_plate_family(CoreShapeFamily family) {
-    // Keep in step with the PIECE_AND_PLATE branches of process_data and
-    // create_geometrical_description. Only UI has a CorePiece so far; PQI still lands in
-    // process_data's approximate-as-two-piece fallback, which computes the same numbers it
-    // would have got as TWO_PIECE_SET, so naming it here is safe today and correct later.
-    return family == CoreShapeFamily::UI || family == CoreShapeFamily::PQI;
+// Every piece of the assembly, in the order the magnetic circuit crosses them: primary (wound)
+// piece first, then the closing pieces. A single-material core yields a one-element vector, so
+// callers never need to branch on how the core was written.
+std::vector<CoreMaterial> Core::resolve_materials() {
+    auto materialField = get_functional_description().get_material();
+    if (!std::holds_alternative<std::vector<MaterialElement>>(materialField)) {
+        return {resolve_material()};
+    }
+    auto materials = std::get<std::vector<MaterialElement>>(materialField);
+    if (materials.empty()) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "core material list is empty — it must name at least the primary piece");
+    }
+    std::vector<CoreMaterial> resolved;
+    resolved.reserve(materials.size());
+    for (const auto& materialElement : materials) {
+        if (is_non_magnetic_region(materialElement)) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "the reserved non-magnetic region name \"air\" belongs to a moulded body's material "
+                "list (resolve_region_materials); every piece of this assembly is magnetic");
+        }
+        resolved.push_back(resolve_material(material_element_to_union(materialElement)));
+    }
+    return resolved;
+}
+
+bool Core::is_non_magnetic_region(const MaterialElement& materialElement) {
+    if (!std::holds_alternative<std::string>(materialElement)) {
+        return false;
+    }
+    auto name = std::get<std::string>(materialElement);
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+    return name == "air";
+}
+
+std::vector<std::optional<CoreMaterial>> Core::resolve_region_materials() {
+    auto materialField = get_functional_description().get_material();
+    if (!std::holds_alternative<std::vector<MaterialElement>>(materialField)) {
+        return {resolve_material()};
+    }
+    auto materials = std::get<std::vector<MaterialElement>>(materialField);
+    if (materials.empty()) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "core material list is empty — it must name at least the primary piece");
+    }
+    auto resolveRegion = [](const MaterialElement& materialElement) -> std::optional<CoreMaterial> {
+        if (is_non_magnetic_region(materialElement)) {
+            return std::nullopt;
+        }
+        return resolve_material(material_element_to_union(materialElement));
+    };
+    if (get_shape_family() != CoreShapeFamily::MOLDED) {
+        std::vector<std::optional<CoreMaterial>> resolved;
+        for (const auto& materialElement : materials) {
+            resolved.push_back(resolveRegion(materialElement));
+        }
+        return resolved;
+    }
+    if (materials.size() > 3) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "molded names " + std::to_string(materials.size()) + " grades; the body has three regions "
+            "(post, cover, base), so the list must hold one, two ([inner, outer]) or three entries");
+    }
+    if (materials.size() == 1) {
+        if (is_non_magnetic_region(materials[0])) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "a moulded body pressed from nothing but \"air\" is not a core");
+        }
+        return {resolveRegion(materials[0])};
+    }
+    auto post = resolveRegion(materials[0]);
+    auto cover = resolveRegion(materials[1]);
+    auto base = materials.size() == 3 ? resolveRegion(materials[2]) : cover;
+    if (!cover || !base) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "a moulded body's cover and base are pressed from powder; only the post may be the "
+            "non-magnetic region \"air\" (a coil on a plastic bobbin)");
+    }
+    return {post, cover, base};
+}
+
+void Core::set_type(CoreType coreType) {
+    get_mutable_functional_description().set_type(coreType);
 }
 
 void Core::set_number_stacks(int64_t numberStacks) {
@@ -1191,12 +1569,93 @@ CoreShape Core::resolve_shape(CoreShapeDataOrNameUnion coreShape) {
     }
 }
 
+bool Core::is_ferrite_core() const {
+    // Which jacket a toroid carries, and how thick, is a property of the ceramic it is pressed
+    // from: a ferrite ring core and a powder toroid are coated by different vendors to different
+    // specifications. Anything we cannot read a material for is treated as not-ferrite, which
+    // keeps the powder/legacy values these cores already used.
+    try {
+        return resolve_material().get_material() == MaterialType::FERRITE;
+    }
+    catch (const std::exception&) {
+        return false;
+    }
+}
+
 bool Core::get_default_toroid_coating_is_parylene() const {
     // Pick the default coating type for an uncoated toroid by its outer diameter (the "A"
-    // dimension): small toroids are parylene-coated, larger ones epoxy (Micrometals/Fair-
-    // Rite). Only meaningful for toroidal shapes; callers guard on the shape family.
+    // dimension): small toroids are parylene-coated, larger ones epoxy. The crossover size is
+    // family-specific -- TDK puts a ferrite ring core's at R 9.53 and Magnetics' ferrite
+    // catalogue agrees, while Micrometals/Fair-Rite put a powder toroid's at 0.20" -- and
+    // picking the wrong one hands a 6 mm ferrite toroid an epoxy thickness ~24x the parylene
+    // film it really carries. Only meaningful for toroidal shapes; callers guard on the family.
     double outerDiameter = flatten_dimensions(resolve_shape().get_dimensions().value())["A"];
-    return outerDiameter <= Defaults().defaultToroidParyleneMaximumOuterDiameter;
+    auto defaults = Defaults();
+    return outerDiameter <= (is_ferrite_core()
+                                 ? defaults.defaultFerriteToroidParyleneMaximumOuterDiameter
+                                 : defaults.defaultToroidParyleneMaximumOuterDiameter);
+}
+
+double Core::get_default_epoxy_coating_thickness() const {
+    // Epoxy on a ferrite ring core is ~3x the film on a powder toroid; see Defaults for the
+    // tolerance-free derivations (TDK's coated-vs-uncoated LIMITS, Ferroxcube's drawn jacket).
+    auto defaults = Defaults();
+    return is_ferrite_core() ? defaults.defaultFerriteEpoxyCoreCoatingThickness
+                             : defaults.defaultEpoxyCoreCoatingThickness;
+}
+
+double Core::get_toroid_edge_radius() const {
+    if (get_shape_family() != CoreShapeFamily::T) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Only a toroid has a ring cross-section edge for a turn to be pulled over; a "
+            "bobbin-wound core's turns bend around the bobbin's column corner instead");
+    }
+    if (!get_processed_description()) {
+        throw CoreNotProcessedException("Core has not been processed yet");
+    }
+    // get_processed_description() hands the optional back BY VALUE and get_columns() returns a
+    // reference INTO it, so the description has to be a named local: binding the column vector
+    // straight off the call leaves a reference into a temporary that is already gone. Reading it
+    // is undefined behaviour, and it does not fail loudly -- under a different build it read back
+    // EMPTY and threw "no processed column" for every catalogue toroid, which is how this reached
+    // asgard's WASM and broke the whole CMC catalogue and El Choker's graph panel.
+    const auto processedDescription = get_processed_description().value();
+    const auto& columns = processedDescription.get_columns();
+    if (columns.empty()) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Toroid has no processed column, so its ring cross-section is not known");
+    }
+    // CorePieceT::process_columns sets the ring section: width is the radial wall (A - B) / 2,
+    // depth is the height C.
+    const double ringWall = columns[0].get_width();
+    const double ringHeight = columns[0].get_depth();
+    if (!(ringWall > 0) || !(ringHeight > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Toroid ring cross-section must have a positive wall and height, got wall " +
+            std::to_string(ringWall) + " m and height " + std::to_string(ringHeight) + " m");
+    }
+
+    // Which edge this core actually has depends on its size tier, because the two are made
+    // differently: TDK chamfers medium and large ring cores but only tumbles the small ones, and
+    // a tumbled edge is far tighter than a drawn chamfer. The tier boundary is the same size the
+    // coating crosses over at (parylene below, epoxy above), which is not a coincidence -- both
+    // are "is this a small core?" -- so it is read from the same place.
+    auto defaults = Defaults();
+    const double tierRadius = get_default_toroid_coating_is_parylene()
+                                  ? defaults.defaultTumbledToroidEdgeRadius
+                                  : defaults.defaultToroidRingEdgeRadius;
+
+    // The jacket is always there, so the edge is at least as round as the jacket is thick; the
+    // tier value is the number to use when it is larger than that (see Defaults for the sourcing
+    // of both, and for the caveat on the tumbled one).
+    const double sourced = std::max(tierRadius, get_coating_thickness());
+
+    // A corner radius cannot exceed half the smaller dimension of the section it is a corner of:
+    // past that the two edges on the same face have eaten the face between them and the section
+    // is no longer that shape. This is a geometric limit, not a tuned cap, and it is what keeps a
+    // 0,3 mm edge off a T 2.5/1.5/1 whose radial wall is only 0,5 mm.
+    const double geometricLimit = 0.5 * std::min(ringWall, ringHeight);
+    return std::min(sourced, geometricLimit);
 }
 
 double Core::get_coating_thickness() const {
@@ -1211,7 +1670,7 @@ double Core::get_coating_thickness() const {
             auto defaults = Defaults();
             return get_default_toroid_coating_is_parylene()
                 ? defaults.defaultParyleneCoreCoatingThickness
-                : defaults.defaultEpoxyCoreCoatingThickness;
+                : get_default_epoxy_coating_thickness();
         }
         return 0;
     }
@@ -1229,7 +1688,7 @@ double Core::get_coating_thickness() const {
         return defaults.defaultParyleneCoreCoatingThickness;
     }
     if (name == "epoxy") {
-        return defaults.defaultEpoxyCoreCoatingThickness;
+        return get_default_epoxy_coating_thickness();
     }
     throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
         "Core coating type '" + name + "' has no known default thickness; provide an explicit coating thickness");
@@ -1367,6 +1826,28 @@ void Core::process_data() {
         shape_data.set_name(std::get<std::string>(get_functional_description().get_shape()));
         get_mutable_functional_description().set_shape(shape_data);
     }
+    else {
+        // The shape can also arrive as a full CoreShape object that merely REFERENCES the
+        // standard catalog by name (type: "standard", family, name) instead of carrying its
+        // own dimensions -- MAS's core/shape.json does not require "dimensions", so this is
+        // just the object-shaped equivalent of the bare-string case above. ABT #626: this
+        // branch used to be skipped for that case (get_shape() already holds a CoreShape, not
+        // a std::string), so CorePiece::factory() below received a CoreShape with no
+        // "dimensions" at all, and every per-family builder's
+        // `get_shape().get_dimensions().value()` threw "bad optional access" for every
+        // standard-by-name shape reference, 100% of the time. Resolve it from the database
+        // the same way, keyed by name.
+        auto& shape = std::get<CoreShape>(get_functional_description().get_shape());
+        if (shape.get_type() == FunctionalDescriptionType::STANDARD && !shape.get_dimensions()) {
+            if (!shape.get_name()) {
+                throw std::runtime_error("Standard core shape is missing its dimensions and has no name to look it up by in the database");
+            }
+            auto shapeName = shape.get_name().value();
+            auto shape_data = find_core_shape_by_name(shapeName);
+            shape_data.set_name(shapeName);
+            get_mutable_functional_description().set_shape(shape_data);
+        }
+    }
 
     // If the material is a string, we have to load its data from the database, unless it is dummy (in order to avoid
     // long loading operatings)
@@ -1394,6 +1875,21 @@ void Core::process_data() {
     auto coreColumns = corePiece->get_columns();
     auto coreWindingWindow = corePiece->get_winding_window();
     auto coreEffectiveParameters = corePiece->get_partial_effective_parameters();
+
+    // A windingOrder on an incoming winding window is user intent (how the coil is wound in
+    // that window: U serpentine vs Z dragback), not geometry. The switch below rebuilds the
+    // windows from the core piece and would silently drop it (ABT #352) — capture per window
+    // index and re-apply after regeneration.
+    size_t incomingNumberWindingWindows = 0;
+    std::vector<std::optional<WindingOrder>> incomingWindingOrders;
+    auto incomingProcessedDescription = get_processed_description();
+    if (incomingProcessedDescription) {
+        auto incomingWindingWindows = incomingProcessedDescription->get_winding_windows();
+        for (const auto& windingWindow : incomingWindingWindows) {
+            incomingWindingOrders.push_back(windingWindow.get_winding_order());
+            incomingNumberWindingWindows++;
+        }
+    }
 
     // Apply stacking factor for tape-wound cores (nanocrystalline and amorphous)
     // Stacking factor accounts for the space between ribbon layers in tape-wound cores
@@ -1441,6 +1937,19 @@ void Core::process_data() {
             break;
         }
 
+        case CoreType::OPEN_SHAPE:
+            // One piece, nothing doubled. The winding window is the drum's groove (a rectangular
+            // window around the post), already set by the piece. The partial effective parameters
+            // describe the FERRITE INTERNAL PATH only — magnetizing inductance for open shapes
+            // routes through the open-core model in MagnetizingInductance.cpp (ABT #331).
+            processedDescription.set_columns(coreColumns);
+            processedDescription.set_effective_parameters(coreEffectiveParameters);
+            processedDescription.get_mutable_winding_windows().push_back(corePiece->get_winding_window());
+            processedDescription.set_depth(corePiece->get_depth());
+            processedDescription.set_height(corePiece->get_height());
+            processedDescription.set_width(corePiece->get_width());
+            break;
+
         case CoreType::TWO_PIECE_SET:
             for (auto& column : coreColumns) {
                 column.set_height(2 * column.get_height());
@@ -1463,45 +1972,70 @@ void Core::process_data() {
             processedDescription.set_height(corePiece->get_height() * 2);
             processedDescription.set_width(corePiece->get_width());
             break;
-        case CoreType::PIECE_AND_PLATE: {
-            auto pieceFamily = std::get<CoreShape>(get_functional_description().get_shape()).get_family();
-            if (pieceFamily == CoreShapeFamily::UI) {
-                // CorePieceUi reports the ASSEMBLED core (full-circuit shape
-                // constants, height B + B2, winding window D x E), so pass the
-                // piece values through unchanged — the plate is flat and adds
-                // no winding window or column height.
-                processedDescription.set_columns(coreColumns);
-                processedDescription.set_effective_parameters(coreEffectiveParameters);
-                processedDescription.get_mutable_winding_windows().push_back(coreWindingWindow);
-                if (settings.get_core_per_column_winding_windows()) {
-                    appendPerColumnWindingWindows(processedDescription);
-                }
-                processedDescription.set_depth(corePiece->get_depth());
-                processedDescription.set_height(corePiece->get_height());
-                processedDescription.set_width(corePiece->get_width());
-                break;
-            }
-            // FIX M-7: Placeholder for other PIECE_AND_PLATE families — approximating as TWO_PIECE_SET
-            for (auto& column : coreColumns) {
-                column.set_height(2 * column.get_height());
-            }
+        case CoreType::PIECE_AND_PLATE:
+            // A shaped piece closed by a FLAT PLATE, not by a mirrored second half. None of the
+            // TWO_PIECE_SET doublings apply: the plate contributes no column, so the column height
+            // and the winding window stay those of the single piece, and the piece class already
+            // returns the effective parameters of the WHOLE assembly (see
+            // piece_and_plate_shape_constants in CorePiece.cpp, which walks both legs, the piece's
+            // own yoke AND the plate). Doubling here would count the circuit twice.
+            //
+            // This replaces a placeholder that copied TWO_PIECE_SET verbatim and so reported twice
+            // the column height, effective length, effective volume and window height. Nothing in
+            // MAS used the path at the time (0 pieceAndPlate cores against 6407 twoPieceSet and
+            // 12371 toroidal), so no stored result changes; UI and PQI are its first users.
             processedDescription.set_columns(coreColumns);
-            coreEffectiveParameters.set_effective_length(2 * coreEffectiveParameters.get_effective_length());
-            coreEffectiveParameters.set_effective_volume(2 * coreEffectiveParameters.get_effective_volume());
             processedDescription.set_effective_parameters(coreEffectiveParameters);
-            coreWindingWindow.set_area(2 * coreWindingWindow.get_area().value());
-            coreWindingWindow.set_height(2 * coreWindingWindow.get_height().value());
             processedDescription.get_mutable_winding_windows().push_back(coreWindingWindow);
             if (settings.get_core_per_column_winding_windows()) {
                 appendPerColumnWindingWindows(processedDescription);
             }
             processedDescription.set_depth(corePiece->get_depth());
-            processedDescription.set_height(corePiece->get_height() * 2);
+            // NOT doubled: process_extra_data on a piece-and-plate class already reports the
+            // assembled height (the piece plus the plate laid on it), unlike a mirrored half.
+            processedDescription.set_height(corePiece->get_height());
             processedDescription.set_width(corePiece->get_width());
             break;
-        }
         default:
             throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Unknown type of core, available options are {TOROIDAL, TWO_PIECE_SET}");
+    }
+    {
+        // ABT #379: a caller that DECLARED a multicolumn core (several winding windows, one per
+        // column) must not have that silently reduced to the single window this switch rebuilds
+        // from the family geometry. The symptom was remote from the cause: the coil's own
+        // section-derived placement then resolved "window 2", ReluctanceNetwork found one window
+        // and blamed the WINDING ("Winding Secondary references winding window 2 but the core has
+        // 1"), naming the coil for something the core processing dropped. MKF already knows how
+        // to build per-column windows (the machinery below, normally behind a setting), so honour
+        // the declaration instead of discarding it.
+        {
+            auto& regeneratedWindingWindows = processedDescription.get_mutable_winding_windows();
+            if (incomingNumberWindingWindows > regeneratedWindingWindows.size() &&
+                processedDescription.get_columns().size() > 1) {
+                appendPerColumnWindingWindows(processedDescription);
+            }
+            if (incomingNumberWindingWindows > processedDescription.get_winding_windows().size()) {
+                // Still short: say so plainly rather than letting a downstream index error blame
+                // the coil for a core that lost its windows here.
+                throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                    "Core processing produced " +
+                    std::to_string(processedDescription.get_winding_windows().size()) +
+                    " winding window(s) but the supplied core described " +
+                    std::to_string(incomingNumberWindingWindows) +
+                    "; this shape family cannot be represented with that many windows");
+            }
+        }
+
+        // Re-apply the captured winding orders (ABT #352). By index: window 0 is always the
+        // main window on both sides; per-column windows appended behind it keep their slot.
+        auto& regeneratedWindingWindows = processedDescription.get_mutable_winding_windows();
+        for (size_t windowIndex = 0;
+             windowIndex < regeneratedWindingWindows.size() && windowIndex < incomingWindingOrders.size();
+             ++windowIndex) {
+            if (incomingWindingOrders[windowIndex]) {
+                regeneratedWindingWindows[windowIndex].set_winding_order(incomingWindingOrders[windowIndex]);
+            }
+        }
     }
     set_processed_description(processedDescription);
     // Default a missing numberStacks to 1 (single core); dereferencing the optional
@@ -2071,14 +2605,22 @@ Core Core::create_quick_core(std::string coreShapeName, std::string coreMaterial
     if (coreShape.get_family() == CoreShapeFamily::T) {
         core.set_type(CoreType::TOROIDAL);
     }
-    else if (Core::is_piece_and_plate_family(coreShape.get_family())) {
-        // Without this a quick UI core doubled its column height, window height, le and
-        // volume in process_data's TWO_PIECE_SET branch, describing a mirrored pair of U
-        // pieces instead of a U closed by a plate.
+    else if (coreShape.get_family() == CoreShapeFamily::UI || coreShape.get_family() == CoreShapeFamily::PQI ||
+             coreShape.get_family() == CoreShapeFamily::UT || coreShape.get_family() == CoreShapeFamily::EI ||
+             coreShape.get_family() == CoreShapeFamily::DRUM_RING ||
+             coreShape.get_family() == CoreShapeFamily::DRUM_SEMISHIELDED) {
+        // UT joins UI here (ABT #995), replacing a TWO_PIECE_SET branch labelled "UT cores are
+        // U-type assembled, not toroidal" — which corrected a wrong TOROIDAL classification and
+        // then stopped one step short. U-type assembled is right; two-piece-SET is not, because
+        // the second piece is a flat bar, not a mirrored half.
+        // A shaped piece closed by a plate/ring/shell, not by a mirrored half (ABT #274/#275, #366, #362).
         core.set_type(CoreType::PIECE_AND_PLATE);
     }
-    else if (coreShape.get_family() == CoreShapeFamily::UT) {
-        core.set_type(CoreType::TWO_PIECE_SET); // FIX L-3: UT cores are U-type assembled, not toroidal
+    else if (coreShape.get_family() == CoreShapeFamily::DRUM || coreShape.get_family() == CoreShapeFamily::ROD) {
+        core.set_type(CoreType::OPEN_SHAPE);
+    }
+    else if (coreShape.get_family() == CoreShapeFamily::MOLDED) {
+        core.set_type(CoreType::CLOSED_SHAPE);
     }
     else {
         core.set_type(CoreType::TWO_PIECE_SET);
@@ -2089,5 +2631,43 @@ Core Core::create_quick_core(std::string coreShapeName, std::string coreMaterial
     return core;
 }
 
+
+// See the note on the declaration in Core.h (ABT #267/#407). Two jobs: run the legacy-form
+// migration that the Core(json) constructor runs, so a json -> Core conversion cannot disagree
+// with construction; and refuse a shape family string the enum does not know, instead of letting
+// the generated converter leave it default-constructed at CoreShapeFamily::BLOCK.
+void from_json(const json& j, Core& x) {
+    json migrated = j;
+    OpenMagnetics::compat::migrate_pre_1_0(migrated);
+
+    // An inline shape carries its family as a string. The generated enum converter has no way to
+    // report "I did not recognise this", so check it here by round-tripping: serialise the value
+    // the converter produced and compare it with what we were given. A mismatch means the string
+    // was not in the enum and we are holding value 0 by accident.
+    if (migrated.contains("functionalDescription") &&
+        migrated["functionalDescription"].contains("shape") &&
+        migrated["functionalDescription"]["shape"].is_object() &&
+        migrated["functionalDescription"]["shape"].contains("family") &&
+        migrated["functionalDescription"]["shape"]["family"].is_string()) {
+        auto declaredFamily = migrated["functionalDescription"]["shape"]["family"].get<std::string>();
+        MAS::CoreShapeFamily parsedFamily;
+        MAS::from_json(migrated["functionalDescription"]["shape"]["family"], parsedFamily);
+        json roundTripped;
+        MAS::to_json(roundTripped, parsedFamily);
+        if (roundTripped.get<std::string>() != declaredFamily) {
+            std::string shapeName = "<unnamed>";
+            if (migrated["functionalDescription"]["shape"].contains("name") &&
+                migrated["functionalDescription"]["shape"]["name"].is_string()) {
+                shapeName = migrated["functionalDescription"]["shape"]["name"].get<std::string>();
+            }
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "Unrecognised core shape family '" + declaredFamily + "' on shape '" + shapeName +
+                "'; it is not a value of the MAS CoreShapeFamily enum and would otherwise be read as '" +
+                roundTripped.get<std::string>() + "'");
+        }
+    }
+
+    MAS::from_json(migrated, static_cast<MAS::MagneticCore&>(x));
+}
 
 } // namespace OpenMagnetics

@@ -15,6 +15,7 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <magic_enum.hpp>
 #include <cmath>
+#include <random>
 #include <vector>
 
 using json = nlohmann::json;
@@ -535,4 +536,286 @@ TEST_CASE("Test_Complete_Excitation_Smoke", "[processor][waveform-processor][smo
     REQUIRE(excitation.get_voltage()->get_harmonics());
     REQUIRE(excitation.get_voltage()->get_processed());
     REQUIRE(WaveformProcessor::is_waveform_sampled(excitation.get_voltage()->get_waveform().value()));
+}
+
+// --- ABT #602 -------------------------------------------------------------
+// An imported (SPICE-simulated) waveform used to be classified SINUSOIDAL no
+// matter its shape, because the sine-fit error was divided by N twice: `area`
+// accumulated a SUM while `error` was averaged. At N = 512 the 5% acceptance
+// threshold became an effective 2560% relative error, so CUSTOM was
+// unreachable. try_guess_duty_cycle then returned the canonical 0.5 for the
+// SINUSOIDAL label without ever looking at the samples — a user importing a
+// FlyBuck switch-node voltage with a ~21% duty was shown 50%.
+//
+// The rectangle below mimics the reported waveform: +15.086 V for 20.7% of the
+// period and -3.92 V for the rest, with finite (2-sample) edges so it looks
+// like real simulator output rather than an ideal step.
+namespace {
+// `ripple` reproduces what makes real simulator output different from an ideal
+// rectangle: the plateaus are not flat, so compress_waveform cannot collapse the
+// signal to the 5 vertices the RECTANGULAR branch needs (the reported file
+// compressed to 61 points). With ripple = 0 this builds the ideal rectangle,
+// which SHOULD still be recognised as RECTANGULAR.
+Waveform build_imported_rectangle(size_t numberPoints, double dutyCycle, double high, double low,
+                                  double period, double ripple) {
+    std::vector<double> data;
+    std::vector<double> time;
+    size_t pointsHigh = static_cast<size_t>(numberPoints * dutyCycle);
+    for (size_t i = 0; i < numberPoints; ++i) {
+        double value = (i < pointsHigh) ? high : low;
+        // Two-sample linear edges, as a finite-slew simulator export would have.
+        if (i == pointsHigh || i == pointsHigh + 1) {
+            value = high + (low - high) * (i - pointsHigh + 1) / 3.0;
+        }
+        // Deterministic plateau ripple — no rand(), so the test cannot flake.
+        value += ripple * sin(2 * 3.14159265358979323846 * i * 7 / numberPoints);
+        data.push_back(value);
+        time.push_back(period * i / numberPoints);
+    }
+    Waveform waveform;
+    waveform.set_data(data);
+    waveform.set_time(time);
+    return waveform;
+}
+}  // namespace
+
+TEST_CASE("Test_Ideal_Rectangle_Still_Recognised_As_Rectangular", "[processor][waveform-processor][smoke-test]") {
+    // The clean case must keep using the analytical vertex path, duty and all.
+    auto waveform = build_imported_rectangle(512, 0.207, 15.086, -3.92, 1.0 / 300000, 0.0);
+
+    auto processed = WaveformProcessor::calculate_basic_processed_data(waveform);
+    REQUIRE(magic_enum::enum_name(processed.get_label()) == magic_enum::enum_name(WaveformLabel::RECTANGULAR));
+    REQUIRE_THAT(processed.get_duty_cycle().value(), Catch::Matchers::WithinAbs(0.207, 0.01));
+}
+
+TEST_CASE("Test_Imported_Rectangle_Is_Custom_Not_Sinusoidal", "[processor][waveform-processor][smoke-test]") {
+    // 0.25 V of plateau ripple on a 19 V swing (~1.3%), matching the reported file.
+    auto waveform = build_imported_rectangle(512, 0.207, 15.086, -3.92, 1.0 / 300000, 0.25);
+
+    auto guessedLabel = WaveformProcessor::try_guess_waveform_label(waveform);
+    REQUIRE(magic_enum::enum_name(guessedLabel) == magic_enum::enum_name(WaveformLabel::CUSTOM));
+
+    auto processed = WaveformProcessor::calculate_basic_processed_data(waveform);
+    REQUIRE(magic_enum::enum_name(processed.get_label()) == magic_enum::enum_name(WaveformLabel::CUSTOM));
+    // Measured, not assumed: the duty must track the real high time, not be 0.5.
+    REQUIRE_THAT(processed.get_duty_cycle().value(), Catch::Matchers::WithinAbs(0.207, 0.01));
+}
+
+TEST_CASE("Test_Imported_Sine_Still_Classifies_Sinusoidal", "[processor][waveform-processor][smoke-test]") {
+    // The other side of the fix: tightening the error metric must not cost us
+    // the genuine sine, or every analytical path would start reporting CUSTOM.
+    std::vector<double> data;
+    std::vector<double> time;
+    const size_t numberPoints = 512;
+    const double period = 1.0 / 300000;
+    for (size_t i = 0; i < numberPoints; ++i) {
+        data.push_back(3.0 * sin(2 * 3.14159265358979323846 * i / numberPoints) + 1.0);
+        time.push_back(period * i / numberPoints);
+    }
+    Waveform waveform;
+    waveform.set_data(data);
+    waveform.set_time(time);
+
+    auto guessedLabel = WaveformProcessor::try_guess_waveform_label(waveform);
+    REQUIRE(magic_enum::enum_name(guessedLabel) == magic_enum::enum_name(WaveformLabel::SINUSOIDAL));
+}
+
+TEST_CASE("Test_Phase_Shifted_Non_Sine_Stays_Custom", "[processor][waveform-processor][smoke-test]") {
+    // Guarding the other direction: making the comparison phase-aware must not
+    // let a triangle or a square through as a sine. Both sit around 0.27-0.36
+    // mean relative error against their own best-phase sine, far above the 0.05
+    // the classifier accepts, at every phase.
+    const double pi = 3.14159265358979323846;
+    const size_t numberPoints = 512;
+    const double period = 1.0 / 100000;
+
+    for (double shift : {0.0, 0.125, 0.25, 0.5, 0.8}) {
+        std::vector<double> triangle;
+        std::vector<double> square;
+        std::vector<double> time;
+        for (size_t i = 0; i < numberPoints; ++i) {
+            double positionInPeriod = std::fmod(double(i) / numberPoints + shift, 1.0);
+            triangle.push_back(positionInPeriod < 0.5 ? 4 * positionInPeriod - 1 : 3 - 4 * positionInPeriod);
+            square.push_back(positionInPeriod < 0.5 ? 1.0 : -1.0);
+            time.push_back(period * i / numberPoints);
+        }
+        // Sampled at 512 points these are imported data, not the 3- and 5-point
+        // analytical shapes the vertex tests recognise, so CUSTOM is the honest
+        // answer — the point here is that it is never SINUSOIDAL.
+        for (const auto& data : {triangle, square}) {
+            Waveform waveform;
+            waveform.set_data(data);
+            waveform.set_time(time);
+
+            INFO("shift " << shift << " of a period");
+            REQUIRE(magic_enum::enum_name(WaveformProcessor::try_guess_waveform_label(waveform)) !=
+                    magic_enum::enum_name(WaveformLabel::SINUSOIDAL));
+        }
+    }
+}
+
+TEST_CASE("Test_Triangular_Recognised_At_Every_Duty", "[processor][waveform-processor][smoke-test]") {
+    // A triangle's apex only lands ON a sample when the duty divides the sample
+    // count. At any other duty compression cannot pick one vertex, emits both
+    // neighbours, and the 3-point test missed a mathematically perfect triangle:
+    // an ideal 1024-point triangle was TRIANGULAR at duty 0.5 and CUSTOM at 0.1,
+    // 0.2, 0.3, 0.7 and 0.8.
+    //
+    // The duty came out wrong with it. Falling through to CUSTOM sent the
+    // measurement to the mid-level crossing, which a triangle crosses halfway up
+    // and halfway down whatever its ramps — so every duty reported 0.5.
+    const size_t numberPoints = 1024;
+    const double period = 1.0 / 100000;
+
+    for (double duty : {0.1, 0.2, 0.3, 0.5, 0.7, 0.8}) {
+        std::vector<double> data;
+        std::vector<double> time;
+        for (size_t i = 0; i < numberPoints; ++i) {
+            double position = double(i) / numberPoints;
+            data.push_back(position < duty ? (position / duty) * 2 - 1
+                                           : 1 - ((position - duty) / (1 - duty)) * 2);
+            time.push_back(period * i / numberPoints);
+        }
+        Waveform waveform;
+        waveform.set_data(data);
+        waveform.set_time(time);
+
+        INFO("duty " << duty);
+        auto processed = WaveformProcessor::calculate_basic_processed_data(waveform);
+        REQUIRE(magic_enum::enum_name(processed.get_label()) ==
+                magic_enum::enum_name(WaveformLabel::TRIANGULAR));
+        REQUIRE_THAT(processed.get_duty_cycle().value(), Catch::Matchers::WithinAbs(duty, 0.01));
+    }
+}
+
+TEST_CASE("Test_Rectangular_Duty_Unaffected_By_Triangle_Path", "[processor][waveform-processor][smoke-test]") {
+    // The control for the test above: rectangles already reported their duty
+    // correctly, and the triangle work must not disturb either the label or the
+    // measurement. A rectangle's duty IS its mid-level crossing.
+    const size_t numberPoints = 1024;
+    const double period = 1.0 / 100000;
+
+    for (double duty : {0.2, 0.5, 0.8}) {
+        std::vector<double> data;
+        std::vector<double> time;
+        for (size_t i = 0; i < numberPoints; ++i) {
+            data.push_back(double(i) / numberPoints < duty ? 1.0 : -1.0);
+            time.push_back(period * i / numberPoints);
+        }
+        Waveform waveform;
+        waveform.set_data(data);
+        waveform.set_time(time);
+
+        INFO("duty " << duty);
+        auto processed = WaveformProcessor::calculate_basic_processed_data(waveform);
+        REQUIRE(magic_enum::enum_name(processed.get_label()) ==
+                magic_enum::enum_name(WaveformLabel::RECTANGULAR));
+        REQUIRE_THAT(processed.get_duty_cycle().value(), Catch::Matchers::WithinAbs(duty, 0.01));
+    }
+}
+
+TEST_CASE("Test_Noisy_Triangle_Still_Triangular_And_Noisy_Sine_Still_Sinusoidal",
+          "[processor][waveform-processor][smoke-test]") {
+    // Measured data never survives the vertex tests: noise above about 1e-6
+    // relative leaves a real triangle compressing to 27-32 points, never 3, so
+    // TRIANGULAR was unreachable for anything measured. A quarter of the
+    // CoreDataX exchange is triangular and was reaching CUSTOM this way.
+    //
+    // The tolerance path recognises it, and must not do so by stealing sines.
+    const double pi = 3.14159265358979323846;
+    const size_t numberPoints = 1024;
+    const double period = 1.0 / 100000;
+    std::mt19937 generator(20260905);
+
+    for (double noise : {1e-5, 1e-4, 1e-3}) {
+        std::normal_distribution<double> jitter(0.0, noise);
+        std::vector<double> triangle;
+        std::vector<double> sine;
+        std::vector<double> time;
+        for (size_t i = 0; i < numberPoints; ++i) {
+            double position = double(i) / numberPoints;
+            triangle.push_back((position < 0.3 ? (position / 0.3) * 2 - 1
+                                               : 1 - ((position - 0.3) / 0.7) * 2) + jitter(generator));
+            sine.push_back(sin(2 * pi * position) + jitter(generator));
+            time.push_back(period * i / numberPoints);
+        }
+
+        INFO("relative noise " << noise);
+        Waveform noisyTriangle;
+        noisyTriangle.set_data(triangle);
+        noisyTriangle.set_time(time);
+        auto triangleProcessed = WaveformProcessor::calculate_basic_processed_data(noisyTriangle);
+        REQUIRE(magic_enum::enum_name(triangleProcessed.get_label()) ==
+                magic_enum::enum_name(WaveformLabel::TRIANGULAR));
+        REQUIRE_THAT(triangleProcessed.get_duty_cycle().value(), Catch::Matchers::WithinAbs(0.3, 0.02));
+
+        Waveform noisySine;
+        noisySine.set_data(sine);
+        noisySine.set_time(time);
+        REQUIRE(magic_enum::enum_name(WaveformProcessor::try_guess_waveform_label(noisySine)) ==
+                magic_enum::enum_name(WaveformLabel::SINUSOIDAL));
+    }
+}
+
+TEST_CASE("Test_Sampled_Sine_Classifies_Sinusoidal_At_Any_Phase", "[processor][waveform-processor][smoke-test]") {
+    // The reference sine was built at phase zero, so a perfect sine that did not
+    // start at a rising zero crossing was compared against a rotated reference and
+    // came back CUSTOM — a cosine was never recognised as a sine at all. Every
+    // analytical waveform MKF generates itself starts at a rising zero crossing,
+    // so nothing here presented a shifted one.
+    //
+    // Goes through calculate_basic_processed_data on purpose. An earlier attempt
+    // at this was verified only through try_guess_waveform_label on the raw
+    // samples, passed, and still broke every real import — because
+    // calculate_basic_processed_data used to classify from the COMPRESSED
+    // waveform, which no phase or distortion measure can be taken on.
+    const double pi = 3.14159265358979323846;
+    const size_t numberPoints = 1024;
+    const double period = 1.0 / 100000;
+
+    for (double phaseDegrees : {0.0, 45.0, 90.0, 180.0, 270.0, 290.0, 327.0}) {
+        std::vector<double> data;
+        std::vector<double> time;
+        for (size_t i = 0; i < numberPoints; ++i) {
+            data.push_back(0.1 * sin(2 * pi * i / numberPoints + phaseDegrees * pi / 180) + 0.02);
+            time.push_back(period * i / numberPoints);
+        }
+        Waveform waveform;
+        waveform.set_data(data);
+        waveform.set_time(time);
+
+        INFO("phase " << phaseDegrees << " degrees");
+        REQUIRE(magic_enum::enum_name(WaveformProcessor::calculate_basic_processed_data(waveform).get_label()) ==
+                magic_enum::enum_name(WaveformLabel::SINUSOIDAL));
+    }
+}
+
+TEST_CASE("Test_Phase_Shifted_Non_Sine_Never_Sinusoidal", "[processor][waveform-processor][smoke-test]") {
+    // Guarding the other direction: a phase-aware comparison must not start
+    // admitting triangles and squares. Which named label they land on is the
+    // vertex tests' business; the invariant here is that neither is ever called a
+    // sine, at any shift.
+    const size_t numberPoints = 1024;
+    const double period = 1.0 / 100000;
+
+    for (double shift : {0.0, 0.125, 0.25, 0.375, 0.5}) {
+        std::vector<double> triangle;
+        std::vector<double> square;
+        std::vector<double> time;
+        for (size_t i = 0; i < numberPoints; ++i) {
+            double positionInPeriod = std::fmod(double(i) / numberPoints + shift, 1.0);
+            triangle.push_back(positionInPeriod < 0.5 ? 4 * positionInPeriod - 1 : 3 - 4 * positionInPeriod);
+            square.push_back(positionInPeriod < 0.5 ? 1.0 : -1.0);
+            time.push_back(period * i / numberPoints);
+        }
+        for (const auto& data : {triangle, square}) {
+            Waveform waveform;
+            waveform.set_data(data);
+            waveform.set_time(time);
+
+            INFO("shift " << shift << " of a period");
+            REQUIRE(magic_enum::enum_name(WaveformProcessor::calculate_basic_processed_data(waveform).get_label()) !=
+                    magic_enum::enum_name(WaveformLabel::SINUSOIDAL));
+        }
+    }
 }

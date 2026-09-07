@@ -44,3 +44,83 @@ TEST_CASE("New shape families inherit parent geometry", "[corepiece][newfamilies
         REQUIRE_THAT(leC, Catch::Matchers::WithinRel(leP, 1e-9));
     }
 }
+
+// ABT #274 / #264: validate the piece-and-plate effective parameters against PUBLISHED vendor
+// values rather than against another MKF result.
+//
+// Source: Magnetics 2022 Ferrite Catalog, "U, I Cores", printed pages 38-39
+// (https://www.mag-inc.com/Media/Magnetics/File-Library/Product%20Literature/Ferrite%20Literature/Magnetics-2022-Ferrite-Catalog.pdf).
+// An I bar has no closed magnetic path of its own, so the le/Ae printed on an I-core row are those
+// of the U+I COMBINATION it is used in -- which is exactly what a UI shape models. Those rows are
+// the reference below.
+//
+// IEC 60205:2016 has no clause for a piece closed by a plate (every 5.x clause is "Pair of
+// X-cores"), so CorePieceUi applies the standard's general method -- C1 = sum(l/A), C2 =
+// sum(l/A^2), le = C1^2/C2, Ae = C1/C2, corners per clause 4.6. This test is what keeps that
+// derivation honest.
+TEST_CASE("Test_Ui_Effective_Parameters_Match_Vendor_Catalogue", "[core][shape-families][ui]") {
+    settings.reset();
+    clear_databases();
+
+    struct Reference {
+        std::string shapeName;
+        double effectiveLengthMillimetres;   // catalogue le, from the I-core row
+        double effectiveAreaSquareMillimetres;
+    };
+    // UI 93/76/16 pairs with plate I 93/28/16: catalogue le 257 mm, Ae 450 mm^2.
+    // PQI 16/7.8 from TDK's planar series: published Ae 41.8 mm^2 and Ve 815 mm^3, so the
+    // published le is Ve/Ae = 19.50 mm. (IEC 60205 clause 5.12 covers the PQ + PLT(plate)
+    // combination; the geometry keeps the PQ's logarithmic radial-spreading yoke.)
+    std::vector<Reference> references = {
+        {"UI 93/76/16", 257.0, 450.0},
+        {"PQI 16/7.8",   19.50,  41.8},
+    };
+
+    for (const auto& reference : references) {
+        auto shape = find_core_shape_by_name(reference.shapeName);
+        auto piece = CorePiece::factory(shape, true);
+        REQUIRE(piece != nullptr);
+        auto effectiveParameters = piece->get_partial_effective_parameters();
+
+        double effectiveLength = effectiveParameters.get_effective_length() * 1000;
+        double effectiveArea = effectiveParameters.get_effective_area() * 1e6;
+        UNSCOPED_INFO(reference.shapeName << ": le = " << effectiveLength << " mm (catalogue "
+                      << reference.effectiveLengthMillimetres << "), Ae = " << effectiveArea
+                      << " mm2 (catalogue " << reference.effectiveAreaSquareMillimetres << ")");
+        // 5% covers the catalogue's three-significant-figure rounding and the dimensional
+        // tolerances; the derivation itself lands well inside 1% on these parts.
+        CHECK_THAT(effectiveLength, Catch::Matchers::WithinRel(reference.effectiveLengthMillimetres, 0.05));
+        CHECK_THAT(effectiveArea, Catch::Matchers::WithinRel(reference.effectiveAreaSquareMillimetres, 0.05));
+    }
+    settings.reset();
+}
+
+// ABT #264: the PIECE_AND_PLATE branch of the geometrical-description switch used to be an empty
+// `break`, so a piece-and-plate core produced NO geometry for CAD/3D consumers to draw. It must
+// emit the shaped half plus the closing plate, using MAS's own PLATE element type rather than a
+// second mirrored HALF_SET.
+TEST_CASE("Test_Piece_And_Plate_Emits_Piece_And_Plate_Geometry", "[core][shape-families][ui]") {
+    settings.reset();
+    clear_databases();
+
+    auto core = OpenMagneticsTesting::get_quick_core("UI 93/76/16", json::array(), 1, "3C97");
+    REQUIRE(core.get_functional_description().get_type() == CoreType::PIECE_AND_PLATE);
+
+    auto geometricalDescription = core.get_geometrical_description();
+    REQUIRE(geometricalDescription);
+
+    size_t halfSets = 0;
+    size_t plates = 0;
+    for (const auto& element : geometricalDescription.value()) {
+        if (element.get_type() == CoreGeometricalDescriptionElementType::HALF_SET) {
+            halfSets++;
+        }
+        else if (element.get_type() == CoreGeometricalDescriptionElementType::PLATE) {
+            plates++;
+        }
+    }
+    // Exactly one shaped half and one closing plate -- not two mirrored halves.
+    CHECK(halfSets == 1);
+    CHECK(plates == 1);
+    settings.reset();
+}

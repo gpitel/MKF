@@ -240,7 +240,13 @@ void Painter::paint_litz_wire(double xCoordinate, double yCoordinate, Wire wire,
                 double internalYCoordinate = conductingDiameter / 2 * (*cciCoords)[i].second;
 
                 if (advancedMode) {
-                    Painter::paint_round_wire(xCoordinate + internalXCoordinate, -(yCoordinate + internalYCoordinate), strand);
+                    // The strand sits at the TURN's centre plus the packing offset. Negating the
+                    // whole y mirrored every strand about the coil axis, so a turn at +16 mm had
+                    // its copper drawn at -16 mm: the upper turns came out as empty outlines and
+                    // their strands piled onto the lower ones (only invisible in the single-wire
+                    // preview, where the turn is at y=0 and the two agree). Same expression as
+                    // the simple branch below.
+                    Painter::paint_round_wire(xCoordinate + internalXCoordinate, yCoordinate - internalYCoordinate, strand);
                 }
                 else {
                     paint_circle(xCoordinate + internalXCoordinate, yCoordinate - internalYCoordinate, strandOuterDiameter / 2, "copper", shapes, 360, 0, {0, 0}, label);
@@ -257,7 +263,8 @@ void Painter::paint_litz_wire(double xCoordinate, double yCoordinate, Wire wire,
                 double internalYCoordinate = currentRadius * sin(currentAngle / 180 * std::numbers::pi);
 
                 if (advancedMode) {
-                    Painter::paint_round_wire(xCoordinate + internalXCoordinate, -(yCoordinate + internalYCoordinate), strand);
+                    // Same mirrored-y bug as the cci branch above.
+                    Painter::paint_round_wire(xCoordinate + internalXCoordinate, yCoordinate - internalYCoordinate, strand);
                 }
                 else {
                     paint_circle(xCoordinate + internalXCoordinate, yCoordinate - internalYCoordinate, strandOuterDiameter / 2, "copper", shapes, 360, 0, {0, 0}, label);
@@ -457,10 +464,33 @@ void Painter::paint_coil_connections(Magnetic magnetic) {
     // leads. Transparency lets overlapping leads and the turns beneath them stay visible.
     _root.style(".connection_transition").set_attr("opacity", "0.5").set_attr("fill", "#1E88E5");  // blue
     _root.style(".connection_terminal").set_attr("opacity", "0.5").set_attr("fill", "#FF00FF");     // magenta
+    // ABT #685 (Alf, 2026-08-16): when real winding was requested but the ABT #650 gate DECLINED
+    // to apply the blocking (ideal wind does not fit), the markers exist but the turns were never
+    // displaced around them — a normal-looking overlay would masquerade as a real layout (it did:
+    // pushpull's turns sat a full radius inside their "reserved" rows). Paint the markers as RED
+    // DASHED OUTLINES so the declined state is unmistakable at a glance.
+    const bool blockingDeclined = settings.get_coil_use_real_winding_geometry() &&
+                                  !coil.is_real_winding_blocking_applied();
+    if (blockingDeclined) {
+        for (const char* cls : {".connection_transition", ".connection_terminal"}) {
+            _root.style(cls)
+                .set_attr("opacity", "0.85")
+                .set_attr("fill", "none")
+                .set_attr("stroke", "#FF0000")
+                .set_attr("stroke-width", "2")
+                .set_attr("stroke-dasharray", "6,4");
+        }
+    }
     for (const auto& space : reservedSpaces) {
         // Only the centre-to-centre / centre-to-border link entries (no layer) are drawn; the
         // per-layer entries are squeeze-only book-keeping for the filling factor.
         if (!space.layer.empty()) {
+            continue;
+        }
+        // ABT #492: a Z interleaved return's dragback routes on the core's front/back (YZ) face —
+        // out of this XY drawing plane — so it must not be painted here (a dedicated YZ view is a
+        // separate future feature).
+        if (space.plane == RoutePlane::FRONT_YZ) {
             continue;
         }
         std::string cssClassName = space.isTerminal ? "connection_terminal" : "connection_transition";
@@ -740,6 +770,141 @@ void Painter::paint_two_piece_set_coil_turns(Magnetic magnetic, bool skipMarginA
                 }
             }
         }
+    }
+}
+
+// ABT #685 (Alf, 2026-08-18): "add in the painter for toroidals ... in translucent copper
+// colour the connection between inner and outer crossings, as they would be wound later, with
+// straight segments, not with the curved Z, and drawing the core on top of the ones below it and
+// the crossing on top of the core in the ones that go on top."
+//
+// A toroidal turn is two runs across the core's faces: the wire leaves its INNER station, crosses
+// the TOP face outward to its own outer crossing, comes down the rim, and crosses the BOTTOM face
+// back to the NEXT turn's inner station. Both are straight in this projection -- deliberately not
+// the round-Z the 3D builder may draw, because what is being reviewed here is the path MKF's
+// layout implies, not the fillets that realize it.
+//
+// `below` selects which half, and the caller paints the below-core half BEFORE the core and the
+// above-core half after it, so the drawing stacks the way the wire actually lies.
+void Painter::paint_toroidal_turn_connections(Magnetic magnetic, bool below) {
+    auto core = magnetic.get_mutable_core();
+    if (core.get_shape_family() != CoreShapeFamily::T) {
+        return;   // concentric cores have no face crossings to draw
+    }
+    Coil coil = magnetic.get_coil();
+    if (!coil.get_turns_description()) {
+        return;
+    }
+    auto turns = coil.get_turns_description().value();
+    auto wirePerWinding = coil.get_wires();
+    // The NEXT station of the same conductor, in winding order: that is where the below-core
+    // return lands.
+    std::map<std::pair<std::string, int64_t>, size_t> previousOfConductor;
+    std::map<size_t, size_t> nextTurnIndex;
+    for (size_t i = 0; i < turns.size(); ++i) {
+        auto key = std::make_pair(turns[i].get_winding(), turns[i].get_parallel());
+        auto found = previousOfConductor.find(key);
+        if (found != previousOfConductor.end()) {
+            nextTurnIndex[found->second] = i;
+        }
+        previousOfConductor[key] = i;
+    }
+    auto shapes = _root.add_child<SVG::Group>();
+    const std::string copperColor =
+        std::regex_replace(std::string(settings.get_painter_color_copper()), std::regex("0x"), "#");
+    // TERMINALS. ABT #685 (Alf, 2026-08-18/19): "the pink terminal in all their length, not just
+    // until the core ... outward past the core's outer radius, as the MVB++" and "the input
+    // terminal below the core, the output terminals over the core". So the entrance is drawn in
+    // the below-core pass (the core covers it) and the exit in the over-core pass (it covers the
+    // core), the same stacking the face crossings use. A conductor's FIRST station carries the
+    // input, its LAST the output -- and those stations have no outer crossing of their own.
+    double coreOuterRadius = 0.0;
+    if (magnetic.has_core() && magnetic.get_core().get_processed_description()) {
+        coreOuterRadius = magnetic.get_core().get_processed_description().value().get_width() / 2;
+    }
+    std::map<std::pair<std::string, int64_t>, std::pair<size_t, size_t>> firstLastOfConductor;
+    for (size_t i = 0; i < turns.size(); ++i) {
+        auto key = std::make_pair(turns[i].get_winding(), turns[i].get_parallel());
+        auto found = firstLastOfConductor.find(key);
+        if (found == firstLastOfConductor.end()) {
+            firstLastOfConductor[key] = {i, i};
+        }
+        else {
+            found->second.second = i;
+        }
+    }
+    const std::string terminalColor = "#FF00FF";
+    for (const auto& [key, firstLast] : firstLastOfConductor) {
+        const size_t stationIndex = below ? firstLast.first : firstLast.second;
+        const auto& station = turns[stationIndex];
+        if (station.get_coordinates().size() < 2) {
+            continue;
+        }
+        const double sx = station.get_coordinates()[0], sy = station.get_coordinates()[1];
+        const double stationRadius = std::hypot(sx, sy);
+        if (stationRadius < 1e-12) {
+            continue;
+        }
+        auto windingIndexT = coil.get_winding_index_by_name(station.get_winding());
+        double odT = wirePerWinding[windingIndexT].get_outer_diameter()
+                         ? resolve_dimensional_values(wirePerWinding[windingIndexT].get_outer_diameter().value())
+                         : wirePerWinding[windingIndexT].get_maximum_outer_height();
+        // Radially outward, past the core, by the same two-OD margin the 3D leads clear it with.
+        const double reach = std::max(coreOuterRadius, stationRadius) + 2.0 * odT;
+        const double ux = sx / stationRadius, uy = sy / stationRadius;
+        auto lead = shapes->add_child<SVG::Path>();
+        lead->line_to(sx * _scale, -sy * _scale);
+        lead->line_to(ux * reach * _scale, -uy * reach * _scale);
+        lead->set_attr("stroke", terminalColor);
+        lead->set_attr("stroke-width", odT * _scale);
+        lead->set_attr("fill", "none");
+        lead->set_attr("opacity", 0.8);
+        lead->set_attr("stroke-linecap", "round");
+        lead->add_child<SVG::Title>(station.get_name() +
+                                    (below ? " input terminal (under the core)"
+                                           : " output terminal (over the core)"));
+    }
+    for (size_t i = 0; i < turns.size(); ++i) {
+        if (!turns[i].get_additional_coordinates()) {
+            continue;
+        }
+        auto additionalCoordinates = turns[i].get_additional_coordinates().value();
+        if (additionalCoordinates.empty() || additionalCoordinates[0].size() < 2) {
+            continue;
+        }
+        const double outerX = additionalCoordinates[0][0];
+        const double outerY = additionalCoordinates[0][1];
+        double innerX = 0, innerY = 0;
+        if (below) {
+            auto found = nextTurnIndex.find(i);
+            if (found == nextTurnIndex.end()) {
+                continue;   // last station of its conductor: its return is the exit terminal
+            }
+            innerX = turns[found->second].get_coordinates()[0];
+            innerY = turns[found->second].get_coordinates()[1];
+        }
+        else {
+            innerX = turns[i].get_coordinates()[0];
+            innerY = turns[i].get_coordinates()[1];
+        }
+        auto windingIndex = coil.get_winding_index_by_name(turns[i].get_winding());
+        double od = 0;
+        if (wirePerWinding[windingIndex].get_outer_diameter()) {
+            od = resolve_dimensional_values(wirePerWinding[windingIndex].get_outer_diameter().value());
+        }
+        else {
+            od = wirePerWinding[windingIndex].get_maximum_outer_height();
+        }
+        auto path = shapes->add_child<SVG::Path>();
+        path->line_to(outerX * _scale, -outerY * _scale);
+        path->line_to(innerX * _scale, -innerY * _scale);
+        path->set_attr("stroke", copperColor);
+        path->set_attr("stroke-width", od * _scale);
+        path->set_attr("fill", "none");
+        path->set_attr("opacity", 0.5);
+        path->set_attr("stroke-linecap", "round");
+        path->add_child<SVG::Title>(turns[i].get_name() +
+                                    (below ? " return (under the core)" : " crossing (over the core)"));
     }
 }
 
@@ -1182,6 +1347,11 @@ void Painter::paint_two_piece_set_margin(Magnetic magnetic) {
     auto sections = magnetic.get_coil().get_sections_description().value();
     for (size_t i = 0; i < sections.size(); ++i){
         if (sections[i].get_margin()) {
+            // ABT #227.7: a lateral-window section's margin must be framed against ITS
+            // OWN window, not window 0's -- otherwise the margin rectangle for a
+            // multi-column lateral winding is drawn using the main column's window
+            // frame, in the wrong location entirely.
+            size_t sectionWindowIndex = magnetic.get_mutable_coil().resolve_section_winding_window_index(sections[i]);
             auto margins = Coil::resolve_margin(sections[i]);
             if (margins[0] > 0) {
                 auto bobbin = magnetic.get_mutable_coil().resolve_bobbin();
@@ -1190,9 +1360,9 @@ void Painter::paint_two_piece_set_margin(Magnetic magnetic) {
                 if (bobbinProcessedDescription.get_coordinates()) {
                     bobbinCoordinates = bobbinProcessedDescription.get_coordinates().value();
                 }
-                auto windingWindowDimensions = bobbin.get_winding_window_dimensions();
-                auto windingWindowCoordinates = bobbin.get_winding_window_coordinates();
-                auto sectionsOrientation = bobbin.get_winding_window_sections_orientation();
+                auto windingWindowDimensions = bobbin.get_winding_window_dimensions(sectionWindowIndex);
+                auto windingWindowCoordinates = bobbin.get_winding_window_coordinates(sectionWindowIndex);
+                auto sectionsOrientation = bobbin.get_winding_window_sections_orientation(sectionWindowIndex);
                 double xCoordinate;
                 double yCoordinate;
                 double marginWidth;
@@ -1219,9 +1389,9 @@ void Painter::paint_two_piece_set_margin(Magnetic magnetic) {
                     bobbinCoordinates = bobbinProcessedDescription.get_coordinates().value();
                 }
                 auto margins = Coil::resolve_margin(sections[i]);
-                auto windingWindowDimensions = bobbin.get_winding_window_dimensions();
-                auto windingWindowCoordinates = bobbin.get_winding_window_coordinates();
-                auto sectionsOrientation = bobbin.get_winding_window_sections_orientation();
+                auto windingWindowDimensions = bobbin.get_winding_window_dimensions(sectionWindowIndex);
+                auto windingWindowCoordinates = bobbin.get_winding_window_coordinates(sectionWindowIndex);
+                auto sectionsOrientation = bobbin.get_winding_window_sections_orientation(sectionWindowIndex);
                 std::vector<std::vector<double>> marginPoints = {};
                 double xCoordinate;
                 double yCoordinate;
@@ -1415,15 +1585,95 @@ void Painter::paint_core(Magnetic magnetic) {
         case CoreShapeFamily::T:
             return paint_toroidal_core(core);
             break;
+        case CoreShapeFamily::DRUM:
+        case CoreShapeFamily::ROD:
+        case CoreShapeFamily::DRUM_RING:
+        case CoreShapeFamily::DRUM_SEMISHIELDED:
+        case CoreShapeFamily::MOLDED:
+            // Single-solid / piece-and-closer families: no mirrored halves to reconstruct.
+            return paint_drum_family_core(core);
+            break;
         default:
             return paint_two_piece_set_core(core);
             break;
     }
 }
 
+// ABT #366/#362/#357: 2D cross-section for the drum family and molded bodies, drawn directly
+// from the shape letters as axis-symmetric rectangles in the winding painter's frame
+// (x = radial distance from the axis, y = height; historical right-half view). The two-piece
+// reconstruction in paint_two_piece_set_core assumes a mirrored half-set and drew these
+// families as nonsense.
+void Painter::paint_drum_family_core(Core core) {
+    CoreShape shape = core.resolve_shape();
+    auto dimensions = flatten_dimensions(shape.get_dimensions().value());
+    auto family = shape.get_family();
+
+    auto shapes = _root.add_child<SVG::Group>();
+    auto addRectangle = [&](double innerRadius, double outerRadius, double bottom, double top) {
+        std::vector<SVG::Point> points = {
+            {innerRadius, bottom}, {outerRadius, bottom}, {outerRadius, top}, {innerRadius, top}};
+        *shapes << SVG::Polygon(scale_points(points, 0, _scale));
+        auto polygon = _root.get_children<SVG::Polygon>().back();
+        polygon->set_attr("class", "ferrite");
+    };
+
+    if (family == CoreShapeFamily::MOLDED) {
+        // Post + two plates + return shell around the (empty-drawn) coil cavity.
+        // Pot-core letters: D cavity height, E cavity OD, F post diameter.
+        double bodyHalfWidth = dimensions["A"] / 2;
+        double bodyHalfHeight = dimensions["B"] / 2;
+        double cavityHalfHeight = dimensions["D"] / 2;
+        double cavityRadius = dimensions["E"] / 2;
+        double postRadius = dimensions["F"] / 2;
+        addRectangle(0, postRadius, -cavityHalfHeight, cavityHalfHeight);
+        addRectangle(0, bodyHalfWidth, cavityHalfHeight, bodyHalfHeight);
+        addRectangle(0, bodyHalfWidth, -bodyHalfHeight, -cavityHalfHeight);
+        addRectangle(cavityRadius, bodyHalfWidth, -cavityHalfHeight, cavityHalfHeight);
+    }
+    else {
+        // Drum body: post between two flanges (drum letters; A2 asymmetric flanges are drawn
+        // with the primary A — a refinement once the top/bottom assignment is standardised).
+        double flangeRadius = dimensions["A"] / 2;
+        double halfHeight = dimensions["B"] / 2;
+        double postRadius = dimensions["C"] / 2;
+        double topFlangeThickness = dimensions["D"];
+        double bottomFlangeThickness = dimensions["F"];
+        addRectangle(0, postRadius, -halfHeight + bottomFlangeThickness, halfHeight - topFlangeThickness);
+        addRectangle(0, flangeRadius, halfHeight - topFlangeThickness, halfHeight);
+        addRectangle(0, flangeRadius, -halfHeight, -halfHeight + bottomFlangeThickness);
+        if (family == CoreShapeFamily::DRUM_RING) {
+            addRectangle(dimensions["K"] / 2, dimensions["J"] / 2, -dimensions["L"] / 2, dimensions["L"] / 2);
+        }
+        else if (family == CoreShapeFamily::DRUM_SEMISHIELDED) {
+            addRectangle(flangeRadius, dimensions["J"] / 2, -dimensions["L"] / 2, dimensions["L"] / 2);
+        }
+    }
+    _root.autoscale();
+}
+
 void Painter::paint_bobbin(Magnetic magnetic) {
     Core core = magnetic.get_core();
     _imageHeight = core.get_processed_description()->get_height();
+
+    // A bobbin with NO WALL and NO COLUMN is not a physical part, and drawing one puts an
+    // object in the picture that does not exist. MKF synthesises exactly that whenever the
+    // wire goes straight onto the core: a MOULDED inductor has its coil embedded in the
+    // composite and no former at all, and drum-family parts are wound in the core's own
+    // groove. The 3-D viewer already skips it on this same test; the 2-D painter drew it, so
+    // the two views disagreed about whether a bobbin was there.
+    //
+    // Thickness, not family, is the test — it is the property that says whether the bobbin
+    // encloses any material, and it keeps holding for any family that later gets a
+    // zero-thickness placeholder.
+    auto bobbin = magnetic.get_mutable_coil().resolve_bobbin();
+    if (bobbin.get_processed_description()) {
+        auto processed = bobbin.get_processed_description().value();
+        if (processed.get_wall_thickness() <= 0 && processed.get_column_thickness() <= 0) {
+            return;
+        }
+    }
+
     CoreShape shape = core.resolve_shape();
     switch(shape.get_family()) {
         case CoreShapeFamily::T:
@@ -4497,6 +4747,552 @@ void Painter::paint_waveform(std::vector<double> data, std::optional<std::vector
 void Painter::paint_curve(Curve2D curve2D, bool logScale) {
     // For basic painter, ignore logScale and just plot
     paint_waveform(curve2D.get_y_points(), std::make_optional(curve2D.get_x_points()));
+}
+
+
+void Painter::paint_magnetic(Magnetic magnetic, PainterProjection projection) {
+    if (projection == PainterProjection::XY) {
+        // Toroids: the below-core returns go down FIRST so the core covers them, then the core,
+        // then the turns, then the over-core crossings on top of it all (ABT #685).
+        paint_toroidal_turn_connections(magnetic, /*below=*/true);
+        paint_core(magnetic);
+        paint_bobbin(magnetic);
+        paint_coil_turns(magnetic);
+        paint_toroidal_turn_connections(magnetic, /*below=*/false);
+        paint_coil_connections(magnetic);
+        return;
+    }
+    if (projection == PainterProjection::XZ) {
+        return paint_xz_projection(magnetic);
+    }
+    paint_yz_projection(magnetic);
+}
+
+// CONNECTION-FACE (YZ) projection — ABT #617 (Alf, 2026-08-10). Horizontal axis: depth z,
+// vertical: axial y. Painted WITHOUT symmetry: a turn appears TWICE (its -z and +z face
+// crossings), each at zPos + the DRAGBACK RIDE displacement of that space side, and every
+// dragback descent is drawn as a vertical copper lane at its own displaced depth — the same
+// model the 3D ConductorBuilder realizes:
+//   zPos(turn)   = turnX + (bobbinColumnHalfDepth - bobbinColumnHalfWidth)   [the crossing face]
+//   ride(z,side) = sum of the ride levels at or inside z on that side; one level per DISTINCT
+//                  return destination depth (merged within half a wire), one OD tall each.
+//   A return = consecutive same-conductor turns at different depths, EXCEPT the tangential
+//   single-turn-layer continuation (intra-section, source turn alone in its layer), which
+//   reserves nothing. Inter-section returns route at MKF's own drawn band row instead of a
+//   plain descent, so they are drawn as stub-run-stub at the band height.
+// Side convention: isolationSide PRIMARY faces -z; every other side faces +z.
+void Painter::paint_yz_projection(Magnetic magnetic) {
+    Core core = magnetic.get_core();
+    Coil coil = magnetic.get_coil();
+    if (core.get_type() != CoreType::TWO_PIECE_SET) {
+        throw std::runtime_error("Painter: YZ projection is implemented for two-piece-set cores only");
+    }
+    if (!coil.get_turns_description()) {
+        throw CoilNotProcessedException("Winding turns not created");
+    }
+    auto bobbin = coil.resolve_bobbin();
+    if (bobbin.get_winding_window_shape() != WindingWindowShape::RECTANGULAR) {
+        throw std::runtime_error("Painter: YZ projection is implemented for rectangular winding windows only");
+    }
+    auto bobbinPd = bobbin.get_processed_description().value();
+    const double halfD = bobbinPd.get_column_depth();
+    const double halfW = bobbinPd.get_column_width().value_or(0.0);
+    if (halfD <= 0 || halfW <= 0) {
+        throw std::runtime_error("Painter: YZ projection needs the bobbin column half depth and half width");
+    }
+    const double zoff = halfD - halfW;
+    auto wirePerWinding = coil.get_wires();
+    auto turns = coil.get_turns_description().value();
+
+    // --- Ride levels, mirroring the 3D builder's pre-scan -------------------------------
+    auto sideOfWinding = [&](const std::string& windingName) -> int {
+        auto windingIndex = coil.get_winding_index_by_name(windingName);
+        return coil.get_functional_description()[windingIndex].get_isolation_side() == IsolationSide::PRIMARY ? 0 : 1;
+    };
+    auto wireOdAlongDepth = [&](size_t windingIndex) {
+        auto wire = wirePerWinding[windingIndex];
+        const double od = wire.get_maximum_outer_width();
+        if (od > 0) {
+            return od;
+        }
+        throw std::runtime_error("Painter: YZ projection needs the wire outer width");
+    };
+    std::map<std::string, int> turnsInLayer;
+    for (const auto& turn : turns) {
+        if (turn.get_layer()) {
+            turnsInLayer[turn.get_layer().value()]++;
+        }
+    }
+    struct YzReturn {
+        double srcZ, dstZ, srcY, dstY, od;
+        int side;
+        bool interSection;
+        std::string label;
+    };
+    std::vector<YzReturn> yzReturns;
+    std::vector<std::pair<double, double>> rideLevels[2];   // {dstZ, od} per space side
+    std::map<std::pair<std::string, int64_t>, std::vector<const Turn*>> conductorTurns;
+    for (const auto& turn : turns) {
+        conductorTurns[{turn.get_winding(), turn.get_parallel()}].push_back(&turn);
+    }
+    for (auto& [key, ct] : conductorTurns) {
+        const int side = sideOfWinding(key.first);
+        const double od = wireOdAlongDepth(coil.get_winding_index_by_name(key.first));
+        for (size_t i = 0; i + 1 < ct.size(); ++i) {
+            const double srcZ = ct[i]->get_coordinates()[0] + zoff;
+            const double dstZ = ct[i + 1]->get_coordinates()[0] + zoff;
+            if (std::abs(dstZ - srcZ) <= 1e-12) {
+                continue;
+            }
+            const bool interSection = ct[i]->get_section() != ct[i + 1]->get_section();
+            const bool sourceAlone = ct[i]->get_layer()
+                && turnsInLayer[ct[i]->get_layer().value()] == 1;
+            if (!interSection && sourceAlone) {
+                continue;   // tangential single-turn-layer continuation: no lane, no level
+            }
+            yzReturns.push_back({srcZ, dstZ, ct[i]->get_coordinates()[1],
+                                 ct[i + 1]->get_coordinates()[1], od, side, interSection,
+                                 ct[i]->get_name() + " return"});
+            auto& levels = rideLevels[side];
+            bool merged = false;
+            for (auto& lv : levels) {
+                if (std::abs(lv.first - dstZ) <= 0.5 * od) {
+                    lv.second = std::max(lv.second, od);
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) {
+                levels.push_back({dstZ, od});
+            }
+        }
+    }
+    std::sort(rideLevels[0].begin(), rideLevels[0].end());
+    std::sort(rideLevels[1].begin(), rideLevels[1].end());
+    auto rideFor = [&](double zPos, int side) {
+        double ride = 0.0;
+        for (const auto& lv : rideLevels[side]) {
+            if (lv.first <= zPos + 0.5 * lv.second) {
+                ride += lv.second;
+            }
+        }
+        return ride;
+    };
+
+    // --- Core + bobbin silhouettes at the x = 0 cut -------------------------------------
+    auto shapes = _root.add_child<SVG::Group>();
+    const auto processedDescription = core.get_processed_description().value();
+    const double coreDepth = processedDescription.get_depth();
+    const double coreHeight = processedDescription.get_height();
+    const auto mainColumn = core.get_columns()[0];
+    const double windowHeight = mainColumn.get_height();
+    const double plateThickness = (coreHeight - windowHeight) / 2;
+    paint_rectangle(0, windowHeight / 2 + plateThickness / 2, coreDepth, plateThickness, "ferrite", shapes);
+    paint_rectangle(0, -windowHeight / 2 - plateThickness / 2, coreDepth, plateThickness, "ferrite", shapes);
+    paint_rectangle(0, 0, mainColumn.get_depth(), windowHeight, "ferrite", shapes);
+    {
+        const auto& windingWindow = bobbinPd.get_winding_windows()[0];
+        const double windowWidth = windingWindow.get_width().value();
+        const double bobbinWindowHeight = windingWindow.get_height().value();
+        const double flangeHalfDepth = halfD + windowWidth;
+        const double wallThickness = (windowHeight - bobbinWindowHeight) / 2;
+        // The flange is an annulus around the column: at the x = 0 cut it exists only
+        // OUTBOARD of the column hole — nothing is drawn in front of the ferrite column
+        // (Alf, 25_psps YZ review: "the flanges are not visible in the section" there).
+        const double flangeInnerZ = mainColumn.get_depth() / 2;
+        const double flangeSpan = flangeHalfDepth - flangeInnerZ;
+        if (wallThickness > 1e-9 && flangeSpan > 1e-9) {
+            for (double sgn : {-1.0, +1.0}) {
+                paint_rectangle(sgn * (flangeInnerZ + flangeSpan / 2),
+                                bobbinWindowHeight / 2 + wallThickness / 2, flangeSpan,
+                                wallThickness, "bobbin", shapes);
+                paint_rectangle(sgn * (flangeInnerZ + flangeSpan / 2),
+                                -bobbinWindowHeight / 2 - wallThickness / 2, flangeSpan,
+                                wallThickness, "bobbin", shapes);
+            }
+        }
+        const double tubeThickness = halfD - mainColumn.get_depth() / 2;
+        if (tubeThickness > 1e-9) {
+            paint_rectangle(+(halfD - tubeThickness / 2), 0, tubeThickness, bobbinWindowHeight,
+                            "bobbin", shapes);
+            paint_rectangle(-(halfD - tubeThickness / 2), 0, tubeThickness, bobbinWindowHeight,
+                            "bobbin", shapes);
+        }
+    }
+
+    // --- Dragback lanes and band hops -----------------------------------------------------
+    // Each connection is ONE continuous stroked ribbon whose endpoints sit exactly on the
+    // centres of the two crossings it joins (Alf: "some indication of how the dragback is
+    // connected" — disjoint rectangles read as connecting anywhere left or right). Round
+    // caps/joins make the path read as a single wire.
+    auto paintWirePath = [&](const std::vector<std::pair<double, double>>& points, double od,
+                             const std::string& label) {
+        auto path = shapes->add_child<SVG::Path>();
+        for (const auto& [px, py] : points) {
+            path->line_to(px * _scale, -py * _scale);
+        }
+        auto copperColor = std::regex_replace(std::string(settings.get_painter_color_copper()),
+                                              std::regex("0x"), "#");
+        path->set_attr("stroke", copperColor);
+        path->set_attr("stroke-width", od * _scale);
+        path->set_attr("fill", "none");
+        path->set_attr("opacity", 0.55);
+        path->set_attr("stroke-linecap", "round");
+        path->set_attr("stroke-linejoin", "round");
+        path->add_child<SVG::Title>(label);
+    };
+    for (const auto& r : yzReturns) {
+        const double sign = (r.side == 0) ? -1.0 : 1.0;
+        const double srcFaceZ = sign * (r.srcZ + rideFor(r.srcZ, r.side));
+        const double dstFaceZ = sign * (r.dstZ + rideFor(r.dstZ, r.side));
+        if (!r.interSection) {
+            // Plain descent: from the source crossing OUT to the descent lane (displaced by
+            // the levels INSIDE the destination face; its own level's room is the lane
+            // itself: destRide - od), down it, and IN to the destination crossing.
+            const double laneZ = sign * (r.dstZ + rideFor(r.dstZ, r.side) - r.od);
+            paintWirePath({{srcFaceZ, r.srcY},
+                           {laneZ, r.srcY},
+                           {laneZ, r.dstY},
+                           {dstFaceZ, r.dstY}},
+                          r.od, r.label);
+        }
+        else {
+            // Band-routed inter-section hop: stub from the source crossing to the band row
+            // (the endpoint turns' outer edge — MKF's stage-2 alternation puts them adjacent
+            // to the band), run over the intervening sections, stub to the receiving crossing.
+            const double bandY = (std::abs(r.srcY) > std::abs(r.dstY) ? r.srcY : r.dstY);
+            paintWirePath({{srcFaceZ, r.srcY},
+                           {srcFaceZ, bandY},
+                           {dstFaceZ, bandY},
+                           {dstFaceZ, r.dstY}},
+                          r.od, r.label + " (band)");
+        }
+    }
+
+    // --- Terminal leads (Alf, 2026-08-10): each winding/parallel's entrance and exit ------
+    // ribbon, in the XY markers' terminal magenta so the visual language carries over. The lead
+    // attaches at its connecting turn's ride-displaced crossing on the winding's face, stubs
+    // to its drawn edge row when MKF drew one, and runs outward to the COMMON TIP PLANE.
+    //
+    // The tip plane is measured on the DISPLACED depths, exactly as the 3D builder computes
+    // leadTipRadius: an attach point sitting on a deep dragback ride stack is further out
+    // than MKF's 2D radial border (the drawn run's far edge), so deriving the reach from
+    // that border alone made the lead run BACKWARD, inward across its own winding's turns
+    // (Alf 2026-08-10 on 25_psps: the Secondary exit ran 17.31 -> 15.6 mm). This is the same
+    // defect the 3D path had before maxRide entered leadTipRadius; measuring the plane from
+    // the deepest displaced copper is the one rule that cannot invert.
+    {
+        // Terminal magenta — the SAME colour the XY view's .connection_terminal markers use
+        // (yellow is the margin's, Alf 2026-08-10).
+        const std::string terminalColor = "#FF00FF";
+        auto paintTerminalPath = [&](const std::vector<std::pair<double, double>>& points,
+                                     double od, const std::string& label) {
+            auto path = shapes->add_child<SVG::Path>();
+            for (const auto& [px, py] : points) {
+                path->line_to(px * _scale, -py * _scale);
+            }
+            path->set_attr("stroke", terminalColor);
+            path->set_attr("stroke-width", od * _scale);
+            path->set_attr("fill", "none");
+            path->set_attr("opacity", 0.8);
+            path->set_attr("stroke-linecap", "round");
+            path->set_attr("stroke-linejoin", "round");
+            path->add_child<SVG::Title>(label);
+        };
+        auto spaces = coil.get_connection_reserved_spaces();
+        double tipZ = 0.0;
+        double widestOd = 0.0;
+        for (const auto& turn : turns) {
+            const double od = wireOdAlongDepth(coil.get_winding_index_by_name(turn.get_winding()));
+            widestOd = std::max(widestOd, od);
+            const double zPos = turn.get_coordinates()[0] + zoff;
+            for (int probeSide : {0, 1}) {
+                tipZ = std::max(tipZ, zPos + rideFor(zPos, probeSide));
+            }
+        }
+        for (const auto& sp : spaces) {
+            if (sp.isTerminal && sp.dimensions.size() >= 2 && sp.coordinates.size() >= 2
+                && sp.dimensions[0] >= sp.dimensions[1]) {
+                tipZ = std::max(tipZ, sp.coordinates[0] + sp.dimensions[0] / 2 + zoff);
+            }
+        }
+        tipZ += 2 * widestOd;
+        for (auto& [key, ct] : conductorTurns) {
+            const int side = sideOfWinding(key.first);
+            const double sign = (side == 0) ? -1.0 : 1.0;
+            const double od = wireOdAlongDepth(coil.get_winding_index_by_name(key.first));
+            for (bool entrance : {true, false}) {
+                const Turn* attach = entrance ? ct.front() : ct.back();
+                const double zAttachAbs = attach->get_coordinates()[0] + zoff;
+                const double zAttach = sign * (zAttachAbs + rideFor(zAttachAbs, side));
+                const double yTurn = attach->get_coordinates()[1];
+                // The drawn run for this lead: the terminal marker of this conductor whose
+                // radial span contains the attach turn (entrance) or starts at it (exit) —
+                // horizontal (run) markers only; its y is the edge row, its far x edge the
+                // border reach. Fall back to a straight-out run at the turn's own row.
+                double edgeY = yTurn;
+                for (const auto& sp : spaces) {
+                    if (!sp.isTerminal || sp.winding != key.first || sp.parallel != key.second
+                        || !sp.layer.empty()) {
+                        continue;
+                    }
+                    if (sp.dimensions.size() < 2 || sp.coordinates.size() < 2
+                        || sp.dimensions[0] < sp.dimensions[1]) {
+                        continue;   // vertical stub: the path below rebuilds it from edgeY
+                    }
+                    const double x0 = sp.coordinates[0] - sp.dimensions[0] / 2;
+                    const double x1 = sp.coordinates[0] + sp.dimensions[0] / 2;
+                    const double attachX = attach->get_coordinates()[0];
+                    (void)x1;
+                    if (attachX < x0 - od || attachX > x1 + od) {
+                        continue;
+                    }
+                    edgeY = sp.coordinates[1];
+                }
+                // A stub shorter than half a wire lies inside the run's own body (the same
+                // absorption rule the 3D lead builder uses): drop it AND its row, so the run
+                // stays level with the turn instead of picking up a sub-wire slope.
+                std::vector<std::pair<double, double>> points;
+                const bool hasStub = std::abs(edgeY - yTurn) > od / 2;
+                const double runY = hasStub ? edgeY : yTurn;
+                points.push_back({zAttach, yTurn});
+                if (hasStub) {
+                    points.push_back({zAttach, runY});
+                }
+                points.push_back({sign * tipZ, runY});
+                paintTerminalPath(points, od,
+                                  key.first + " parallel " + std::to_string(key.second) +
+                                      (entrance ? " entrance" : " exit"));
+            }
+        }
+    }
+
+    // --- Turn crossings: BOTH faces, each with its own side's ride displacement ---------
+    for (const auto& turn : turns) {
+        const auto windingIndex = coil.get_winding_index_by_name(turn.get_winding());
+        const auto& wire = wirePerWinding[windingIndex];
+        const double zPos = turn.get_coordinates()[0] + zoff;
+        const double y = turn.get_coordinates()[1];
+        const double zFrontAbs = zPos + rideFor(zPos, 0);
+        const double zBackAbs = zPos + rideFor(zPos, 1);
+        for (double z : {-zFrontAbs, +zBackAbs}) {
+            if (wire.get_type() == WireType::ROUND) {
+                paint_round_wire(z, y, wire, turn.get_name());
+            }
+            else if (wire.get_type() == WireType::LITZ) {
+                paint_litz_wire(z, y, wire, turn.get_name());
+            }
+            else {
+                paint_rectangular_wire(z, y, wire, 0, {0, 0}, turn.get_name());
+            }
+        }
+    }
+    _root.autoscale();
+}
+
+// TOP-DOWN (XZ) PROJECTION — ABT #685 (Alf, 2026-08-16: "the projection of the turns ...
+// where we see the dragbacks and bumps ... useful for debug"). Looking ALONG the column axis:
+// horizontal is x, vertical is z. This is the only view that shows the winding the way it is
+// actually laid — as rings around a column, with each return occupying a lane through them and
+// each ring outside a lane BULGING over it. The XY cross-section cannot show a lane at all (it
+// is out of plane) and the YZ face view shows the lanes but flattens the rings, so a bump reads
+// there as a depth offset rather than as what it is.
+//
+// Everything drawn here comes from Coil::get_connection_layout(): the routes, their kinds, and
+// the ride levels. Nothing is re-derived from turn coordinates — that duplication is exactly
+// what the layout exists to end.
+void Painter::paint_xz_projection(Magnetic magnetic) {
+    Core core = magnetic.get_core();
+    Coil coil = magnetic.get_coil();
+    if (core.get_type() != CoreType::TWO_PIECE_SET) {
+        throw std::runtime_error("Painter: XZ projection is implemented for two-piece-set cores only");
+    }
+    if (!coil.get_turns_description()) {
+        throw CoilNotProcessedException("Winding turns not created");
+    }
+    auto bobbin = coil.resolve_bobbin();
+    if (bobbin.get_winding_window_shape() != WindingWindowShape::RECTANGULAR) {
+        throw std::runtime_error("Painter: XZ projection is implemented for rectangular winding windows only");
+    }
+    auto bobbinPd = bobbin.get_processed_description().value();
+    const double halfD = bobbinPd.get_column_depth();
+    const double halfW = bobbinPd.get_column_width().value_or(0.0);
+    if (halfD <= 0 || halfW <= 0) {
+        throw std::runtime_error("Painter: XZ projection needs the bobbin column half depth and half width");
+    }
+    // The SAME mapping the 3D builder uses: a turn at winding-frame x wraps a racetrack of
+    // half-width x and half-depth x + zoff, so the extra clearance a rectangular column has on
+    // its z faces lands the wire deeper there than on its x faces. zoff is 0 for a round column.
+    const double zoff = halfD - halfW;
+    const auto shape = bobbinPd.get_column_shape();
+    auto turns = coil.get_turns_description().value();
+    auto wirePerWinding = coil.get_wires();
+    const auto layout = coil.get_connection_layout();
+
+    auto sideOfWinding = [&](const std::string& windingName) -> int {
+        auto windingIndex = coil.get_winding_index_by_name(windingName);
+        return coil.get_functional_description()[windingIndex].get_isolation_side()
+                       == IsolationSide::PRIMARY ? 0 : 1;
+    };
+    auto odOfWinding = [&](const std::string& windingName) {
+        auto windingIndex = coil.get_winding_index_by_name(windingName);
+        const double od = wirePerWinding[windingIndex].get_maximum_outer_width();
+        if (od <= 0) {
+            throw std::runtime_error("Painter: XZ projection needs the wire outer width");
+        }
+        return od;
+    };
+
+    auto shapes = _root.add_child<SVG::Group>();
+    auto strokedPath = [&](const std::vector<std::pair<double, double>>& points, double width,
+                           const std::string& colorSetting, double opacity,
+                           const std::string& label, bool closed = false) {
+        if (points.size() < 2) {
+            return;
+        }
+        auto path = shapes->add_child<SVG::Path>();
+        for (const auto& [px, pz] : points) {
+            path->line_to(px * _scale, -pz * _scale);
+        }
+        if (closed) {
+            path->line_to(points.front().first * _scale, -points.front().second * _scale);
+        }
+        path->set_attr("stroke", std::regex_replace(colorSetting, std::regex("0x"), "#"));
+        path->set_attr("stroke-width", width * _scale);
+        path->set_attr("fill", "none");
+        path->set_attr("opacity", opacity);
+        path->set_attr("stroke-linecap", "round");
+        path->set_attr("stroke-linejoin", "round");
+        path->add_child<SVG::Title>(label);
+    };
+    // The ring a turn at radial position `x` follows, sampled. One helper for all three column
+    // shapes: a round column gives a circle, an oblong one a stadium, a rectangular one a
+    // racetrack whose corner radius is how far the wire stands off the column corner.
+    auto ringPoints = [&](double x) {
+        const double ax = x, az = x + zoff;
+        double cornerR = ax;                        // ROUND: the circle IS the corner
+        if (shape == ColumnShape::RECTANGULAR) {
+            cornerR = std::max(0.0, x - halfW);
+        }
+        else if (shape == ColumnShape::OBLONG) {
+            cornerR = std::min(ax, az);
+        }
+        cornerR = std::min(cornerR, std::min(ax, az));
+        const double flatX = ax - cornerR, flatZ = az - cornerR;
+        std::vector<std::pair<double, double>> points;
+        const int perQuarter = 24;
+        // four straights joined by four corner quarters, walked anticlockwise from +x
+        const double cx[4] = {+flatX, -flatX, -flatX, +flatX};
+        const double cz[4] = {+flatZ, +flatZ, -flatZ, -flatZ};
+        for (int q = 0; q < 4; ++q) {
+            for (int k = 0; k <= perQuarter; ++k) {
+                const double a = (q * 90.0 + 90.0 * k / perQuarter) * std::numbers::pi / 180.0;
+                points.push_back({cx[q] + cornerR * std::cos(a), cz[q] + cornerR * std::sin(a)});
+            }
+        }
+        return points;
+    };
+
+    // --- the core, seen from above -------------------------------------------------------
+    {
+        const auto processedDescription = core.get_processed_description().value();
+        const double coreWidth = processedDescription.get_width();
+        const double coreDepth = processedDescription.get_depth();
+        paint_rectangle(0, 0, coreWidth, coreDepth, "ferrite", shapes);
+        // The central column the coil wraps, painted back over the plate so the winding
+        // annulus reads as the free space it is.
+        const auto mainColumn = core.get_columns()[0];
+        if (mainColumn.get_shape() == ColumnShape::ROUND) {
+            paint_circle(0, 0, mainColumn.get_width() / 2, "white", shapes);
+        }
+        else {
+            paint_rectangle(0, 0, mainColumn.get_width(), mainColumn.get_depth(), "white", shapes);
+        }
+    }
+
+    // --- the rings, each displaced by the bumps it rides over -----------------------------
+    // A turn is drawn TWICE, once per face side, because the two faces genuinely differ: a
+    // return laid on one side displaces only that side's copper. This is the same asymmetry the
+    // YZ view paints, seen from the other axis.
+    std::set<std::pair<std::string, double>> ringsDrawn;
+    for (const auto& turn : turns) {
+        const double x = turn.get_coordinates()[0];
+        const int side = sideOfWinding(turn.get_winding());
+        const double od = odOfWinding(turn.get_winding());
+        const double ride = layout.ride_at(x, side);
+        const auto key = std::make_pair(turn.get_winding(), std::round((x + ride) * 1e9) / 1e9);
+        if (!ringsDrawn.insert(key).second) {
+            continue;   // one ring per (winding, displaced radius): turns stack along y
+        }
+        strokedPath(ringPoints(x + ride), od,
+                    std::string(settings.get_painter_color_copper()), ride > 0 ? 0.75 : 0.45,
+                    turn.get_winding() + " ring at r=" + std::to_string((x + ride) * 1000) +
+                        " mm" + (ride > 0 ? " (riding " + std::to_string(ride * 1000) + " mm)" : ""),
+                    /*closed=*/true);
+    }
+
+    // --- the bumps themselves --------------------------------------------------------------
+    // One dashed ring per ride level, at the radius where the lane sits: everything at or
+    // outside it is displaced by its height.
+    for (const auto& level : layout.rideLevels) {
+        auto points = ringPoints(level.radius);
+        auto path = shapes->add_child<SVG::Path>();
+        for (const auto& [px, pz] : points) {
+            path->line_to(px * _scale, -pz * _scale);
+        }
+        path->line_to(points.front().first * _scale, -points.front().second * _scale);
+        path->set_attr("stroke", std::regex_replace(
+            std::string(settings.get_painter_color_lines()), std::regex("0x"), "#"));
+        path->set_attr("stroke-width", 0.15 * level.height * _scale);
+        path->set_attr("stroke-dasharray", std::to_string(0.6 * level.height * _scale) + " " +
+                                           std::to_string(0.6 * level.height * _scale));
+        path->set_attr("fill", "none");
+        path->add_child<SVG::Title>("bump: lane at r=" + std::to_string(level.radius * 1000) +
+                                    " mm displaces everything outside it by " +
+                                    std::to_string(level.height * 1000) + " mm (side " +
+                                    std::to_string(level.side) + ")");
+    }
+
+    // --- the connections, on the connection plane ------------------------------------------
+    // Every route MKF drew is a radial run on the connection plane (-z for the primary side,
+    // +z for the others), so in this view it is a straight line from its inner radius out. They
+    // are spread along x by one wire each so siblings are legible: WHERE round the column each
+    // one finally sits is still the 3D builder's fan, not MKF's — when that allocation moves
+    // here (Alf: the parallels' azimuth should fall out of their pitch) this view will show the
+    // real angles instead of a legend.
+    std::map<std::pair<std::string, int>, int> laneIndex;
+    for (const auto& route : layout.routes) {
+        if (route.waypoints.size() < 2) {
+            continue;
+        }
+        const double od = odOfWinding(route.winding);
+        const double sign = (route.side == 0) ? -1.0 : 1.0;
+        double rInner = route.waypoints.front()[0], rOuter = route.waypoints.front()[0];
+        for (const auto& waypoint : route.waypoints) {
+            rInner = std::min(rInner, waypoint[0]);
+            rOuter = std::max(rOuter, waypoint[0]);
+        }
+        const int slot = laneIndex[{route.winding, route.side}]++;
+        const double xLane = (0.5 + slot) * od;
+        const bool isReturn = route.kind == ConnectionKind::Z_DRAGBACK ||
+                              route.kind == ConnectionKind::EDGE_CONTINUATION;
+        std::string kindName = "connection";
+        switch (route.kind) {
+            case ConnectionKind::Z_DRAGBACK:      kindName = "Z dragback"; break;
+            case ConnectionKind::EDGE_CONTINUATION: kindName = "inter-section run"; break;
+            case ConnectionKind::U_ADJACENT:      kindName = "U turnaround"; break;
+            case ConnectionKind::U_TANGENTIAL:    kindName = "U tangential link"; break;
+            case ConnectionKind::TERMINAL_ENTRANCE: kindName = "entrance terminal"; break;
+            case ConnectionKind::TERMINAL_EXIT:   kindName = "exit terminal"; break;
+            default: break;
+        }
+        strokedPath({{xLane, sign * (rInner + zoff)}, {xLane, sign * (rOuter + zoff)}}, od,
+                    std::string(settings.get_painter_color_copper()), isReturn ? 0.9 : 0.6,
+                    route.winding + " parallel " + std::to_string(route.parallel) + ": " +
+                        kindName + " r=" + std::to_string(rInner * 1000) + ".." +
+                        std::to_string(rOuter * 1000) + " mm");
+    }
+    _root.autoscale();
 }
 
 } // namespace OpenMagnetics

@@ -328,142 +328,17 @@ bool Inputs::include_dc_offset_into_magnetizing_current(OperatingPoint operating
 
 
 double Inputs::try_guess_duty_cycle(Waveform waveform, WaveformLabel label, double frequency) {
-    if (label != WaveformLabel::CUSTOM) {
-        switch(label) {
-            case WaveformLabel::TRIANGULAR: {
-                if (waveform.get_time()->size() == 3) {
-                    return (waveform.get_time().value()[1] - waveform.get_time()->front()) / (waveform.get_time()->back() - waveform.get_time()->front());
-                }
-                else if (waveform.get_time()->size() == 4) {
-                    return ((waveform.get_time().value()[1] + waveform.get_time().value()[2]) / 2 - waveform.get_time()->front()) / (waveform.get_time()->back() - waveform.get_time()->front());
-                }
-                break;
-            }
-            case WaveformLabel::UNIPOLAR_TRIANGULAR: {
-                return (waveform.get_time().value()[1] - waveform.get_time()->front()) / (waveform.get_time()->back() - waveform.get_time()->front());
-            }
-            case WaveformLabel::RECTANGULAR: {
-                return (waveform.get_time().value()[2] - waveform.get_time()->front()) / (waveform.get_time()->back() - waveform.get_time()->front());
-            }
-            case WaveformLabel::UNIPOLAR_RECTANGULAR: {
-                return (waveform.get_time().value()[2] - waveform.get_time()->front()) / (waveform.get_time()->back() - waveform.get_time()->front());
-            }
-            case WaveformLabel::BIPOLAR_RECTANGULAR: {
-                return (waveform.get_time().value()[3] - waveform.get_time().value()[2]) / (waveform.get_time()->back() - waveform.get_time()->front());
-            }
-            case WaveformLabel::BIPOLAR_TRIANGULAR: {
-                return (waveform.get_time().value()[2] - waveform.get_time().value()[1]) / (waveform.get_time()->back() - waveform.get_time()->front());
-            }
-            case WaveformLabel::FLYBACK_PRIMARY:{
-                if (waveform.get_time()->size() == 4) {
-                    return (waveform.get_time().value()[1] - waveform.get_time()->front()) / (waveform.get_time()->back() - waveform.get_time()->front());
-                }
-                else if (waveform.get_time()->size() == 5) {
-                    return (waveform.get_time().value()[2] - waveform.get_time()->front()) / (waveform.get_time()->back() - waveform.get_time()->front());
-                }
-                break;
-            }
-            case WaveformLabel::FLYBACK_SECONDARY:{
-                if (waveform.get_time()->size() == 4) {
-                    return (waveform.get_time().value()[1] - waveform.get_time()->front()) / (waveform.get_time()->back() - waveform.get_time()->front());
-                }
-                else if (waveform.get_time()->size() == 5) {
-                    return (waveform.get_time().value()[2] - waveform.get_time()->front()) / (waveform.get_time()->back() - waveform.get_time()->front());
-                }
-                break;
-            }
-            case WaveformLabel::SINUSOIDAL: {
-                return 0.5;
-            }
-            default:
-                break;
-            }
-    }
-
-    Waveform sampledWaveform;
-    if (!is_waveform_sampled(waveform)) {
-        if (frequency > 0) {
-            sampledWaveform = Inputs::calculate_sampled_waveform(waveform, frequency);
-        }
-        else if (waveform.get_time() && waveform.get_time()->size() >= 3) {
-            // Can compute duty cycle directly from the waveform time points without sampling
-            auto timeVec = waveform.get_time().value();
-            auto dataVec = waveform.get_data();
-            double totalPeriod = timeVec.back() - timeVec.front();
-            if (totalPeriod <= 0) {
-                return 0.5;
-            }
-            if (dataVec.size() == 3) {
-                // 3-point triangular: peak at middle time point
-                return roundFloat((timeVec[1] - timeVec[0]) / totalPeriod, 2);
-            }
-            else if (dataVec.size() == 4) {
-                // 4-point waveform: duty cycle from average of middle two points
-                return roundFloat(((timeVec[1] + timeVec[2]) / 2 - timeVec[0]) / totalPeriod, 2);
-            }
-            else if (dataVec.size() == 5) {
-                // 5-point rectangular: time from point 0 to 2 over total
-                return roundFloat((timeVec[2] - timeVec[0]) / totalPeriod, 2);
-            }
-            else {
-                // Cannot compute duty cycle without frequency for arbitrary waveforms
-                return 0.5;
-            }
-        }
-        else {
-            // Cannot sample without frequency, return default duty cycle
-            return 0.5;
-        }
-    }
-    else {
-        sampledWaveform = waveform;
-    }
- 
-    std::vector<double> data = sampledWaveform.get_data();
-    std::vector<double> diff_data;
-    std::vector<double> diff_diff_data;
-
-    for (size_t i = 0; i < data.size() - 1; ++i) {
-        diff_data.push_back(roundFloat(data[i + 1] - data[i], 9));
-    }
-    for (size_t i = 0; i < diff_data.size() - 1; ++i) {
-        diff_diff_data.push_back(fabs(roundFloat(diff_data[i + 1] - diff_data[i], 9)));
-    }
-
-    double maximum = *max_element(diff_diff_data.begin(), diff_diff_data.end());
-    size_t maximum_index = 0;
-    size_t distanceToMiddle = settings.get_inputs_number_points_sampled_waveforms();
-    for (size_t i = 0; i < diff_diff_data.size(); ++i)
-    {
-        if (diff_diff_data[i] == maximum) {
-            if (fabs(double(settings.get_inputs_number_points_sampled_waveforms()) / 2 - i) < distanceToMiddle) {
-                distanceToMiddle = fabs(double(settings.get_inputs_number_points_sampled_waveforms()) / 2 - i);
-                maximum_index = i;
-            }
-        }
-    }
-    auto dutyCycle = roundFloat((maximum_index + 1.0) / settings.get_inputs_number_points_sampled_waveforms(), 2);
-
-    if (dutyCycle <= 0.03 || dutyCycle >= 0.97) {
-
-        double maximum = *max_element(data.begin(), data.end());
-        double threshold = maximum * 0.05;
-
-        double numberPointsOn = 0;
-        double numberPointsOff = 0;
-        for (size_t i = 0; i < data.size() - 1; ++i) {
-            if (data[i] < threshold) {
-                numberPointsOff++;
-            }
-            else {
-                numberPointsOn++;
-            }
-        }
-
-        dutyCycle = numberPointsOn / data.size();
-    }
-
-    return dutyCycle;
+    // Delegates to WaveformProcessor, which fixed the same classifier bug
+    // (ABT #602): three unconditional `return 0.5` defaults for genuinely
+    // unrecognised shapes, and a second-difference heuristic that divided an
+    // index into `data` by numberPointsSampledWaveforms (a 128-vs-512
+    // mismatch for imported waveforms) and thresholded at 5% of the maximum
+    // (duty = 1 for any DC-biased signal). This used to be a verbatim,
+    // independently-bugged twin of that logic — kept as a delegating wrapper
+    // so the two can no longer drift apart, matching every other Inputs::X
+    // waveform-DSP method in this file.
+    return WaveformProcessor::try_guess_duty_cycle(waveform, label, frequency,
+                                                   settings.get_inputs_number_points_sampled_waveforms());
 }
 
 bool Inputs::is_standardized(SignalDescriptor signal) {
@@ -778,7 +653,10 @@ SignalDescriptor Inputs::get_common_mode_choke_magnetizing_current(OperatingPoin
 
     ProcessedWaveform triangularProcessed;
     triangularProcessed.set_label(WaveformLabel::TRIANGULAR);
-    triangularProcessed.set_offset(peakToPeak / 2);
+    // Centered around zero, as documented above: a CMC carries no DC flux bias, so the
+    // triangular swings ±pp/2. The previous offset of pp/2 shifted the waveform to 0..pp,
+    // doubling the peak the saturation/loss models saw — contradicting this very comment.
+    triangularProcessed.set_offset(0);
     triangularProcessed.set_peak_to_peak(peakToPeak);
     auto waveform = create_waveform(triangularProcessed, frequency);
     SignalDescriptor magnetizingCurrent;
@@ -1307,7 +1185,24 @@ SignalDescriptor Inputs::reflect_waveform(SignalDescriptor signal,
 std::pair<bool, std::string> Inputs::check_integrity() {
     auto operatingPoints = get_mutable_operating_points();
     auto turnsRatios = get_design_requirements().get_turns_ratios();
-    auto magnetizingInductance = resolve_dimensional_values(get_design_requirements().get_magnetizing_inductance());
+    // The required magnetizing inductance is needed by ONE branch below: deriving a
+    // magnetizing current for an excitation that carries a voltage but no current.
+    // Resolving it eagerly here threw for every input that never reaches that branch --
+    // in particular a MAS file carrying only a magnetic, whose operatingPoints array is
+    // empty, so the loop body never runs. from_file computes the inductance from the
+    // geometry and hands it to this constructor precisely so such a file loads, but that
+    // value is only applied later in process(), leaving this line to reject the file
+    // first with "DimensionWithTolerance has neither nominal, minimum nor maximum set" --
+    // a complaint about a requirement nothing had asked for. Resolve where it is used, so
+    // a genuinely missing inductance still throws, but only when it is genuinely needed.
+    std::optional<double> resolvedMagnetizingInductance;
+    auto magnetizing_inductance = [&]() {
+        if (!resolvedMagnetizingInductance) {
+            resolvedMagnetizingInductance =
+                resolve_dimensional_values(get_design_requirements().get_magnetizing_inductance());
+        }
+        return resolvedMagnetizingInductance.value();
+    };
     std::pair<bool, std::string> result;
     result.first = true;
     result.second = "";
@@ -1343,12 +1238,25 @@ std::pair<bool, std::string> Inputs::check_integrity() {
                 excitation.set_current(currentExcitation);
             }
             else {
+                // ABT #825: with no current the current is derived from the voltage — which was
+                // dereferenced unconditionally, twice. An excitation carrying neither (or a voltage
+                // with no waveform) therefore died on an empty optional, and "bad optional access"
+                // named neither the operating point, the winding, nor what was actually needed.
+                if (!excitation.get_voltage() || !excitation.get_voltage()->get_waveform()) {
+                    std::string operatingPointLabel = "operating point " + std::to_string(i) +
+                        (operatingPoints[i].get_name() ? " ('" + operatingPoints[i].get_name().value() + "')" : "");
+                    throw std::invalid_argument(
+                        operatingPointLabel + ", winding " + std::to_string(processedExcitationsPerWinding.size()) +
+                        ": the excitation has no current, so one has to be derived from the voltage — and it has no"
+                        " voltage waveform either. Give the winding a current, or a voltage to derive it from.");
+                }
                 auto voltageWaveform = excitation.get_voltage()->get_waveform().value();
                 auto sampledWaveform = calculate_sampled_waveform(voltageWaveform, excitation.get_frequency());
                 bool includeDcOffsetIntoMagnetizingCurrent = include_dc_offset_into_magnetizing_current(operatingPoints[i], turnsRatiosValues);
                 // bool includeDcOffsetIntoMagnetizingCurrent = include_dc_offset_into_magnetizing_current_rosano(sampledWaveform);
                 excitation.set_current(
-                    calculate_magnetizing_current(excitation, sampledWaveform, magnetizingInductance, true, includeDcOffsetIntoMagnetizingCurrent));
+                    calculate_magnetizing_current(excitation, sampledWaveform, magnetizing_inductance(), true, includeDcOffsetIntoMagnetizingCurrent,
+                                                  operatingPoints[i].get_excitations_per_winding().size() > 1));
             }
             processedExcitationsPerWinding.push_back(excitation);
         }
@@ -1357,28 +1265,56 @@ std::pair<bool, std::string> Inputs::check_integrity() {
 
     for (size_t i = 0; i < operatingPoints.size(); ++i) {
 
+        // ABT #825: the secondary is synthesised by reflecting the primary, and the primary's
+        // voltage and current were both dereferenced unconditionally. An operating point that
+        // gives a current and no voltage — a perfectly ordinary way to describe an inductor's
+        // winding — therefore died on an empty optional, with "bad optional access" naming
+        // neither the operating point, nor the winding, nor the field. Reflect whatever the
+        // primary actually has, and when it has nothing to reflect, say so.
         if (turnsRatios.size() > operatingPoints[i].get_excitations_per_winding().size() - 1) {
+            std::string operatingPointLabel = "operating point " + std::to_string(i) +
+                (operatingPoints[i].get_name() ? " ('" + operatingPoints[i].get_name().value() + "')" : "");
+
             if (turnsRatios.size() == 1 && operatingPoints[i].get_excitations_per_winding().size() == 1) {
                 // We are missing excitation only for secondary
                 for (size_t turnsRatioIndex = 0; turnsRatioIndex < turnsRatios.size(); ++turnsRatioIndex) {
                     if (turnsRatioIndex >= operatingPoints[i].get_excitations_per_winding().size() - 1) {
                         double turnsRatio = resolve_dimensional_values(turnsRatios[turnsRatioIndex]);
                         auto excitationOfPrimaryWinding = operatingPoints[i].get_excitations_per_winding()[0];
+
+                        if (!excitationOfPrimaryWinding.get_voltage() && !excitationOfPrimaryWinding.get_current()) {
+                            throw std::invalid_argument(
+                                operatingPointLabel + ": the design requirements declare " +
+                                std::to_string(turnsRatios.size() + 1) + " windings but only one excitation was"
+                                " given, so the secondary has to be reflected from the primary — and winding 0"
+                                " has neither a voltage nor a current to reflect. Give winding 0 a voltage or a"
+                                " current, or supply the secondary excitation directly.");
+                        }
+
                         OperatingPointExcitation excitationOfThisWinding(excitationOfPrimaryWinding);
 
-                        excitationOfThisWinding.set_voltage(
-                            reflect_waveform(excitationOfPrimaryWinding.get_voltage().value(), 1 / turnsRatio));
-
-
-                        excitationOfThisWinding.set_current(
-                            reflect_waveform(excitationOfPrimaryWinding.get_current().value(), turnsRatio));
+                        // Reflect only what the primary actually carries. Inventing the other half
+                        // would be making up an operating point nobody asked for.
+                        if (excitationOfPrimaryWinding.get_voltage()) {
+                            excitationOfThisWinding.set_voltage(
+                                reflect_waveform(excitationOfPrimaryWinding.get_voltage().value(), 1 / turnsRatio));
+                        }
+                        if (excitationOfPrimaryWinding.get_current()) {
+                            excitationOfThisWinding.set_current(
+                                reflect_waveform(excitationOfPrimaryWinding.get_current().value(), turnsRatio));
+                        }
                         operatingPoints[i].get_mutable_excitations_per_winding().push_back(excitationOfThisWinding);
                     }
                 }
                 result.second = "Had to create the excitations of some windings based on primary";
             }
             else {
-                throw std::invalid_argument("Missing excitation for more than one secondary. Only one can be guessed");
+                throw std::invalid_argument(
+                    operatingPointLabel + ": the design requirements declare " +
+                    std::to_string(turnsRatios.size() + 1) + " windings but only " +
+                    std::to_string(operatingPoints[i].get_excitations_per_winding().size()) +
+                    " excitation(s) were given. Only a single missing secondary can be reflected from the"
+                    " primary; supply an excitation per winding.");
             }
         }
     }
@@ -1437,58 +1373,13 @@ double calculate_offset(Waveform waveform, WaveformLabel label) {
 }
 
 ProcessedWaveform Inputs::calculate_basic_processed_data(Waveform waveform) {
-    ProcessedWaveform processed;
-    std::vector<double> dataToProcess;
-    auto sampledWaveform = waveform;
-    auto compressedWaveform = waveform;
-
-    for (size_t i = 0; i < waveform.get_data().size(); ++i) {
-        if (std::isnan(waveform.get_data()[i])) {
-            throw std::invalid_argument("Waveform data contains NaN");
-        }
-    }
-
-    if (is_waveform_sampled(waveform)) {
-        compressedWaveform = compress_waveform(waveform);
-    }
-
-    WaveformLabel label;
-
-    label = try_guess_waveform_label(compressedWaveform);
-    processed.set_label(label);
-
-    if (is_waveform_sampled(waveform)) {
-        processed.set_average(std::accumulate(std::begin(sampledWaveform.get_data()), std::end(sampledWaveform.get_data()), 0.0) /
-                         sampledWaveform.get_data().size());
-    }
-    else {
-        // auto average = calculate_waveform_average(compressedWaveform);
-        // processed.set_average(average);
-    }
-
-    double offset = calculate_offset(compressedWaveform, label);
-    processed.set_offset(offset);
-
-    processed.set_peak_to_peak(*max_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end()) -
-                               *min_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end()));
-
-    if (label == WaveformLabel::FLYBACK_PRIMARY ||
-        label == WaveformLabel::FLYBACK_SECONDARY) {
-        // Flyback waveforms include a 0-level floor, so max - min overstates the
-        // ramp peak-to-peak by the offset. UNIPOLAR_* waveforms never touch 0
-        // (their minimum IS the offset), so max - min is already correct for them.
-        processed.set_peak_to_peak(processed.get_peak_to_peak().value() - offset);
-    }
-
-    double positivePeak = *max_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end());
-    double negativePeak = *min_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end());
-    processed.set_peak(std::max(positivePeak, -negativePeak));
-    processed.set_positive_peak(positivePeak);
-    processed.set_negative_peak(negativePeak);
-
-    processed.set_duty_cycle(try_guess_duty_cycle(compressedWaveform, label));
-
-    return processed;
+    // Delegates to WaveformProcessor, which additionally fixed part of ABT
+    // #602 this copy never had: the duty-cycle measurement for a CUSTOM label
+    // (i.e. real imported/simulated data) needs the UNCOMPRESSED waveform —
+    // this copy always passed the compressed one, so real SPICE data (which
+    // compress_waveform collapses to 50-60 points instead of an analytical
+    // 3/4/5-point shape) had its duty measured against a thinned-out signal.
+    return WaveformProcessor::calculate_basic_processed_data(waveform, settings.get_inputs_number_points_sampled_waveforms());
 }
 
 ProcessedWaveform Inputs::calculate_processed_data(Waveform waveform,
@@ -1556,13 +1447,16 @@ OperatingPoint Inputs::prune_harmonics(OperatingPoint operatingPoint, double win
     bool allExcitationsHaveVoltage = true;
 
     for (auto excitation : operatingPoint.get_excitations_per_winding()) {
-        if (!excitation.get_current()) {
+        // A signal only takes part in pruning if it actually carries harmonics;
+        // the branches below dereference get_harmonics().value() (ABT #599: a
+        // SignalDescriptor present without harmonics threw bad_optional_access).
+        if (!excitation.get_current() || !excitation.get_current()->get_harmonics()) {
             allExcitationsHaveCurrent = false;
         }
-        if (!excitation.get_magnetizing_current()) {
+        if (!excitation.get_magnetizing_current() || !excitation.get_magnetizing_current()->get_harmonics()) {
             allExcitationsHaveMagnetizingCurrent = false;
         }
-        if (!excitation.get_voltage()) {
+        if (!excitation.get_voltage() || !excitation.get_voltage()->get_harmonics()) {
             allExcitationsHaveVoltage = false;
         }
     }
@@ -1802,43 +1696,12 @@ Waveform Inputs::compress_waveform(const Waveform& waveform) {
     return compressedWaveform;
 }
 
-double get_ac_ripple(Waveform waveform, double frequency) {
-    Waveform sampledWaveform;
-    if (!Inputs::is_waveform_sampled(waveform)) {
-        if (frequency > 0) {
-            sampledWaveform = Inputs::calculate_sampled_waveform(waveform, frequency);
-        }
-        else {
-            // Cannot calculate ripple without frequency
-            return 0.0;
-        }
-    }
-    else {
-        sampledWaveform = waveform;
-    }
- 
-    std::vector<double> data = sampledWaveform.get_data();
-
-    double maximum = *max_element(data.begin(), data.end());
-    double threshold = maximum * 0.05;
-
-    double minimumAcRipple = DBL_MAX;
-    double maximumAcRipple = 0;
-    for (size_t i = 0; i < data.size(); ++i) {
-        if (fabs(data[i]) > threshold) {
-            minimumAcRipple = std::min(minimumAcRipple, data[i]);
-            maximumAcRipple = std::max(maximumAcRipple, data[i]);
-        }
-    }
-
-    return maximumAcRipple - minimumAcRipple;
-}
-
 SignalDescriptor Inputs::calculate_magnetizing_current(OperatingPointExcitation& excitation,
                                                                 Waveform voltageSampledWaveform,
                                                                 double magnetizingInductance,
                                                                 bool compress,
-                                                                bool addOffset) {
+                                                                bool addOffset,
+                                                                bool alternatingConduction) {
     double dcCurrent = 0;
     if (magnetizingInductance <= 0) {
         throw InvalidInputException(ErrorCode::INVALID_INPUT, "magnetizingInductance cannot be zero or negative");
@@ -1856,7 +1719,6 @@ SignalDescriptor Inputs::calculate_magnetizing_current(OperatingPointExcitation&
         }
 
         if (excitation.get_current()->get_waveform()) {
-            double acRipple = get_ac_ripple(excitation.get_current()->get_waveform().value(), excitation.get_frequency());
             if (!excitation.get_current()->get_processed()->get_peak()) {
                 auto currentExcitation = excitation.get_current().value();
                 auto processed = calculate_processed_data(excitation.get_current()->get_waveform().value());
@@ -1865,7 +1727,35 @@ SignalDescriptor Inputs::calculate_magnetizing_current(OperatingPointExcitation&
 
             }
 
-            dcCurrent = excitation.get_current()->get_processed()->get_peak().value() - acRipple / 2;
+            if (alternatingConduction) {
+                // Several windings conducting alternately (flyback style): this winding's
+                // measured waveform contains commutation steps (the other winding's
+                // ampere-turns handed over at the switching instant), which move no flux,
+                // so neither its midpoint nor its pk-pk ripple describe the magnetizing
+                // current. What IS exact is the peak: at this winding's current peak it
+                // carries the whole magnetizing MMF, so peak(i_mag) == peak(i_winding).
+                // Anchor there, subtracting the magnetizing excursion above its mean taken
+                // from the same zero-mean volt-second integral the overload below builds
+                // the waveform from. The previous code subtracted half this winding's own
+                // pk-pk ripple (commutation step included), understating the DC anchor and
+                // with it B_dc and B_peak by ~30% on CCM flyback/flybuck (ABT #907).
+                auto centeredMagnetizingWaveform = calculate_integral_waveform(voltageSampledWaveform, true);
+                centeredMagnetizingWaveform = multiply_waveform(centeredMagnetizingWaveform, 1.0 / magnetizingInductance);
+                double excursionAboveMean = *max_element(centeredMagnetizingWaveform.get_data().begin(),
+                                                         centeredMagnetizingWaveform.get_data().end());
+                dcCurrent = excitation.get_current()->get_processed()->get_peak().value() - excursionAboveMean;
+            }
+            else {
+                // Single winding: the measured current IS the magnetizing current, and the
+                // measurement is the only source of DC truth (the voltage integral carries
+                // none). Anchor at its midpoint. (Named locals: MAS getters return by
+                // value, so chaining into get_data() would dangle.)
+                auto currentSignal = excitation.get_current().value();
+                auto currentWaveform = currentSignal.get_waveform().value();
+                const std::vector<double>& currentData = currentWaveform.get_data();
+                dcCurrent = (*max_element(currentData.begin(), currentData.end()) +
+                             *min_element(currentData.begin(), currentData.end())) / 2;
+            }
         }
         else {
             dcCurrent = excitation.get_current()->get_processed()->get_offset();
@@ -1877,18 +1767,19 @@ SignalDescriptor Inputs::calculate_magnetizing_current(OperatingPointExcitation&
 SignalDescriptor Inputs::calculate_magnetizing_current(OperatingPointExcitation& excitation,
                                                                 double magnetizingInductance,
                                                                 bool compress,
-                                                                bool addOffset) {
+                                                                bool addOffset,
+                                                                bool alternatingConduction) {
     if (!excitation.get_voltage()) {
         throw std::invalid_argument("Missing voltage signal");
     }
     auto voltageExcitation = excitation.get_voltage().value();
     voltageExcitation = standardize_waveform(voltageExcitation, excitation.get_frequency());
     auto waveform = voltageExcitation.get_waveform().value();
- 
+
     if (!is_waveform_sampled(waveform)) {
         waveform = calculate_sampled_waveform(waveform, excitation.get_frequency());
     }
-    return calculate_magnetizing_current(excitation, waveform, magnetizingInductance, compress, addOffset);
+    return calculate_magnetizing_current(excitation, waveform, magnetizingInductance, compress, addOffset, alternatingConduction);
 }
 
 bool is_continuously_conducting_power(OperatingPointExcitation excitation) {
@@ -2395,7 +2286,8 @@ OperatingPoint Inputs::process_operating_point(OperatingPoint operatingPoint, do
                     if (windingIndex < voltageSampledWaveforms.size()) {
                         waveform = voltageSampledWaveforms[windingIndex];
                     }
-                    excitation.set_magnetizing_current(calculate_magnetizing_current(excitation, waveform, magnetizingInductance, false, includeDcOffsetIntoMagnetizingCurrent));
+                    excitation.set_magnetizing_current(calculate_magnetizing_current(excitation, waveform, magnetizingInductance, false, includeDcOffsetIntoMagnetizingCurrent,
+                                                                                     operatingPoint.get_excitations_per_winding().size() > 1));
                 }
                 processedExcitationsPerWinding[windingIndex] = excitation;
             }
@@ -2913,151 +2805,17 @@ double Inputs::calculate_instantaneous_power(OperatingPointExcitation excitation
 }
 
 WaveformLabel Inputs::try_guess_waveform_label(Waveform waveform) {
-    if (waveform.get_ancillary_label()) {
-        return waveform.get_ancillary_label().value();
-    }
-
-    auto compressedWaveform = waveform;
-    if (is_waveform_sampled(waveform))
-        compressedWaveform = compress_waveform(waveform);
-    double period = 0;
-    if (compressedWaveform.get_time()) {
-        period = compressedWaveform.get_time()->back() - compressedWaveform.get_time()->front();
-    }
-
-    if (compressedWaveform.get_data().size() == 3 && 
-        compressedWaveform.get_data()[0] == compressedWaveform.get_data()[2]) {
-            return WaveformLabel::TRIANGULAR;
-    }
-    else if (compressedWaveform.get_time()) {
-        if (compressedWaveform.get_data().size() == 4 &&
-            is_close_enough(compressedWaveform.get_time().value()[1], compressedWaveform.get_time().value()[2], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[2] == compressedWaveform.get_data()[3] &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[3]) {
-                return WaveformLabel::UNIPOLAR_TRIANGULAR;
-        }
-        else if (compressedWaveform.get_data().size() == 5 &&
-            !is_close_enough((compressedWaveform.get_time().value()[2] - compressedWaveform.get_time().value()[0]) * compressedWaveform.get_data()[2] + (compressedWaveform.get_time().value()[4] - compressedWaveform.get_time().value()[2]) * compressedWaveform.get_data()[4], 0 , period) &&
-            is_close_enough(compressedWaveform.get_time().value()[0], compressedWaveform.get_time().value()[1], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[1] == compressedWaveform.get_data()[2] &&
-            is_close_enough(compressedWaveform.get_time().value()[2], compressedWaveform.get_time().value()[3], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[3] == compressedWaveform.get_data()[4] &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[4]) {
-                return WaveformLabel::UNIPOLAR_RECTANGULAR;
-        }
-        else if (compressedWaveform.get_data().size() == 5 &&
-            !is_close_enough((compressedWaveform.get_time().value()[2] - compressedWaveform.get_time().value()[0]) * compressedWaveform.get_data()[2] + (compressedWaveform.get_time().value()[4] - compressedWaveform.get_time().value()[2]) * compressedWaveform.get_data()[4], 0 , period) &&
-            is_close_enough(compressedWaveform.get_time().value()[0], compressedWaveform.get_time().value()[1], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[1] == compressedWaveform.get_data()[2] &&
-            is_close_enough(compressedWaveform.get_time().value()[2], compressedWaveform.get_time().value()[3], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[3] == compressedWaveform.get_data()[4] &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[4]) {
-                return WaveformLabel::UNIPOLAR_RECTANGULAR;
-        }
-        else if (compressedWaveform.get_data().size() == 5 &&
-            is_close_enough((compressedWaveform.get_time().value()[2] - compressedWaveform.get_time().value()[0]) * compressedWaveform.get_data()[2] + (compressedWaveform.get_time().value()[4] - compressedWaveform.get_time().value()[2]) * compressedWaveform.get_data()[4], 0 , period) &&
-            is_close_enough(compressedWaveform.get_time().value()[0], compressedWaveform.get_time().value()[1], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[1] == compressedWaveform.get_data()[2] &&
-            is_close_enough(compressedWaveform.get_time().value()[2], compressedWaveform.get_time().value()[3], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[3] == compressedWaveform.get_data()[4] &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[4]) {
-                return WaveformLabel::RECTANGULAR;
-        }
-        else if (compressedWaveform.get_data().size() == 5 &&
-            is_close_enough((compressedWaveform.get_time().value()[1] - compressedWaveform.get_time().value()[0]) * compressedWaveform.get_data()[1] + (compressedWaveform.get_time().value()[3] - compressedWaveform.get_time().value()[2]) * compressedWaveform.get_data()[3], 0 , period) &&
-            is_close_enough(compressedWaveform.get_time().value()[1], compressedWaveform.get_time().value()[2], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[1] &&
-            is_close_enough(compressedWaveform.get_time().value()[3], compressedWaveform.get_time().value()[4], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[2] == compressedWaveform.get_data()[3] &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[4]) {
-                return WaveformLabel::RECTANGULAR;
-        }
-        else if (compressedWaveform.get_data().size() == 10 &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[1] &&
-            is_close_enough(compressedWaveform.get_time().value()[1], compressedWaveform.get_time().value()[2], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[2] == compressedWaveform.get_data()[3] &&
-            is_close_enough(compressedWaveform.get_time().value()[3], compressedWaveform.get_time().value()[4], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[4] == compressedWaveform.get_data()[5] &&
-            is_close_enough(compressedWaveform.get_time().value()[5], compressedWaveform.get_time().value()[6], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[6] == compressedWaveform.get_data()[7] &&
-            is_close_enough(compressedWaveform.get_time().value()[7], compressedWaveform.get_time().value()[8], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[8] == compressedWaveform.get_data()[9] &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[9]) {
-                return WaveformLabel::BIPOLAR_RECTANGULAR;
-        }
-        else if (compressedWaveform.get_data().size() == 6 &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[1] &&
-            is_close_enough(compressedWaveform.get_time().value()[2] - compressedWaveform.get_time().value()[1], compressedWaveform.get_time().value()[4] - compressedWaveform.get_time().value()[3], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[2] == compressedWaveform.get_data()[3] &&
-            compressedWaveform.get_data()[4] == compressedWaveform.get_data()[5] &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[5]) {
-                return WaveformLabel::BIPOLAR_TRIANGULAR;
-        }
-        else if (compressedWaveform.get_data().size() == 5 &&
-            is_close_enough(compressedWaveform.get_time().value()[0], compressedWaveform.get_time().value()[1], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[1] < compressedWaveform.get_data()[2] &&
-            is_close_enough(compressedWaveform.get_time().value()[2], compressedWaveform.get_time().value()[3], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[3] == compressedWaveform.get_data()[4] &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[4]) {
-                return WaveformLabel::FLYBACK_PRIMARY;
-        }
-        else if (compressedWaveform.get_data().size() == 5 &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[1] &&
-            is_close_enough(compressedWaveform.get_time().value()[1], compressedWaveform.get_time().value()[2], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[2] > compressedWaveform.get_data()[3] &&
-            is_close_enough(compressedWaveform.get_time().value()[3], compressedWaveform.get_time().value()[4], 1.5 * period / settings.get_inputs_number_points_sampled_waveforms()) &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[4]) {
-                return WaveformLabel::FLYBACK_SECONDARY;
-        }
-        else {
-            double error = 0;
-            double area = 0;
-            double maximum = *max_element(waveform.get_data().begin(), waveform.get_data().end());
-            double minimum = *min_element(waveform.get_data().begin(), waveform.get_data().end());
-
-            double peakToPeak = maximum - minimum;
-            double offset = (maximum + minimum) / 2; // FIXED: BUG-08
-
-            for (size_t i = 0; i < waveform.get_data().size(); ++i) {
-                double angle = i * 2 * std::numbers::pi / settings.get_inputs_number_points_sampled_waveforms();
-                double calculated_data = (sin(angle) * peakToPeak / 2) + offset;
-                area += fabs(waveform.get_data()[i]);
-                error += fabs(calculated_data - waveform.get_data()[i]);
-            }
-            error /= waveform.get_data().size();
-            error /= area;
-            if (error < 0.05) {
-                return WaveformLabel::SINUSOIDAL;
-            }
-            else {
-                return WaveformLabel::CUSTOM;
-            }
-        }
-    }
-    else {
-        double error = 0;
-        double area = 0;
-        double maximum = *max_element(waveform.get_data().begin(), waveform.get_data().end());
-        double minimum = *min_element(waveform.get_data().begin(), waveform.get_data().end());
-
-        double peakToPeak = maximum - minimum;
-        double offset = (maximum + minimum) / 2; // FIXED: BUG-08
-
-        for (size_t i = 0; i < waveform.get_data().size(); ++i) {
-            double angle = i * 2 * std::numbers::pi / settings.get_inputs_number_points_sampled_waveforms();
-            double calculated_data = (sin(angle) * peakToPeak / 2) + offset;
-            area += fabs(waveform.get_data()[i]);
-            error += fabs(calculated_data - waveform.get_data()[i]);
-        }
-        error /= waveform.get_data().size();
-        error /= area;
-        if (error < 0.05) {
-            return WaveformLabel::SINUSOIDAL;
-        }
-        else {
-            return WaveformLabel::CUSTOM;
-        }
-    }
+    // Delegates to WaveformProcessor, which fixed this classifier (ABT #602):
+    // the sine-vs-custom fallback divided its error metric by N twice
+    // (error /= data.size() then error /= area, where area was already a sum
+    // over N points), so the 5% acceptance threshold became an effective
+    // 2560% relative error at N=512 and every imported waveform — rectangles
+    // and triangles included — was labelled sinusoidal; the reference sine
+    // also ran off the nominal sample count instead of this waveform's own.
+    // This used to be a verbatim, independently-bugged twin of that logic —
+    // kept as a delegating wrapper so the two can no longer drift apart,
+    // matching every other Inputs::X waveform-DSP method in this file.
+    return WaveformProcessor::try_guess_waveform_label(waveform, settings.get_inputs_number_points_sampled_waveforms());
 }
 
 void Inputs::scale_time_to_frequency(Inputs& inputs, double newFrequency, bool cleanFrequencyDependentFields, bool processSignals, bool useCurrentAsBase){

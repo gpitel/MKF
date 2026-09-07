@@ -597,7 +597,13 @@ TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_Low_Power", "[adviser][core
     for (auto [mas, scoring] : masMagnetics) {
         auto name = mas.get_magnetic().get_core().get_name().value_or("unnamed");
         auto stacks = mas.get_magnetic().get_core().get_functional_description().get_number_stacks().value_or(1);
-        if (name.find("EFD 10/5/3 - 3C95") != std::string::npos) {
+        // Re-pinned 2026-08-02 (ABT #551): under the restored ABT #378 Zhang fringing
+        // correction (7f50d4dc) the previously expected EFD 10/5/3 loses the inductance
+        // over-prediction that favoured it and drops out of the top ranks; its family
+        // successor EFD 12/6/3.5 sits in the current top-5 (full top-5: E 13/6.5/3.7,
+        // EP 7 x2, EFD 12/6/3.5, EPX 8 — all sane low-power cores). Shape-level match:
+        // the material/gap choice may legitimately drift with loss-model improvements.
+        if (name.find("EFD 12/6/3.5") != std::string::npos) {
             if (stacks == 1) {
                 found = true;
             }
@@ -637,7 +643,10 @@ TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_Low_Power_Low_Losses", "[ad
     for (auto [mas, scoring] : masMagnetics) {
         auto name = mas.get_magnetic().get_core().get_name().value_or("unnamed");
         auto stacks = mas.get_magnetic().get_core().get_functional_description().get_number_stacks().value_or(1);
-        if (name.find("EFD 10/5/3") != std::string::npos) {
+        // Re-pinned 2026-08-02 (ABT #551): same ABT #378 root cause as the Low_Power
+        // variant above — EFD 10/5/3 fell out of the top-20 under the corrected
+        // fringing model; EFD 12/6/3.5 holds five of the current top-20 slots.
+        if (name.find("EFD 12/6/3.5") != std::string::npos) {
             if (stacks == 1) {
                 found = true;
             }
@@ -2477,6 +2486,12 @@ TEST_CASE("Test_CoreAdviser_Flyback_From_Frontend_Inputs", "[adviser][core-advis
         shapes.push_back(shape);
     }
 
+    // Inputs built field-by-field carry only the processed values the caller filled in;
+    // effectiveFrequency and the harmonics are DERIVED, and nothing derives them until
+    // process() runs. The json constructor processes by default, which is why the
+    // frontend path never hit this — but a hand-built Inputs must ask.
+    inputs.process();
+
     auto masMagnetics = coreAdviser.get_advised_core(inputs, &shapes, 5);
 
 
@@ -2613,6 +2628,10 @@ TEST_CASE("Test_CoreAdviser_LLC_From_Frontend_Inputs", "[adviser][core-adviser][
     secCurrentProcessed.set_average(0.0);
     secCurrentProcessed.set_rms(10.0);  // Higher current on secondary
     secCurrentProcessed.set_peak(14.0);
+    // This excitation carries no waveform, only a processed block, so nothing can derive the
+    // peak-to-peak the way it can for the primary — it has to be stated. 28 A for a 14 A
+    // sinusoidal peak, matching how the primary above states 6.21 for its 3.105 peak.
+    secCurrentProcessed.set_peak_to_peak(28.0);
     secCurrentProcessed.set_duty_cycle(0.5);
     secondaryCurrent.set_processed(secCurrentProcessed);
     secondaryExcitation.set_current(secondaryCurrent);
@@ -2639,6 +2658,12 @@ TEST_CASE("Test_CoreAdviser_LLC_From_Frontend_Inputs", "[adviser][core-adviser][
     for (auto [name, shape] : coreShapeDatabase) {
         shapes.push_back(shape);
     }
+
+    // Inputs built field-by-field carry only the processed values the caller filled in;
+    // effectiveFrequency and the harmonics are DERIVED, and nothing derives them until
+    // process() runs. The json constructor processes by default, which is why the
+    // frontend path never hit this — but a hand-built Inputs must ask.
+    inputs.process();
 
     auto masMagnetics = coreAdviser.get_advised_core(inputs, &shapes, 5);
 
@@ -3071,6 +3096,40 @@ TEST_CASE("Test_CoreAdviser_PFC_Boost_Inductor_StandardCores", "[core-adviser][a
         WARN("  standard: " << reference);
         CHECK(reference.find("available-cores catalogue") != std::string::npos);
     }
+    settings.reset();
+}
+
+// ABT #774 (from Heaviside): a candidate whose required gap exceeds its own winding column is
+// simply INFEASIBLE — it must be rejected by the gapping stage like any other filter reject.
+// It used to sail on with an UNPROCESSED gap (process_gap()'s false was ignored), and the
+// first downstream calculation that called process_gap_or_throw aborted the entire advise
+// with GAP_INVALID_DIMENSIONS: one bad candidate cost every good one behind it.
+TEST_CASE("Test_Abt774_Gap_Infeasible_Candidate_Is_Rejected_Not_Thrown", "[adviser][core-adviser][abt774]") {
+    settings.reset();
+    OpenMagnetics::Inputs inputs;
+    // Flyback-class energy storage at a brutal peak current: the energy/saturation gap a
+    // tiny E 13 core would need is orders of magnitude longer than its winding column.
+    prepare_test_parameters(60, 25, 100000, {}, 100e-6, inputs);
+    inputs.get_mutable_design_requirements().set_topology(MAS::Topology::FLYBACK_CONVERTER);
+
+    auto gapping = OpenMagneticsTesting::get_ground_gap(0.0001);
+    auto core = OpenMagneticsTesting::get_quick_core("E 13/7/4", gapping, 1, "3C97");
+
+    std::vector<std::pair<OpenMagnetics::Magnetic, double>> magneticsWithScoring;
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(OpenMagnetics::Coil());
+    magneticsWithScoring.push_back({magnetic, 1.0});
+
+    CoreAdviser coreAdviser;
+    // The contract under test: no throw, and no candidate left carrying an unprocessed gap.
+    REQUIRE_NOTHROW(coreAdviser.add_gapping_standard_cores(&magneticsWithScoring, inputs));
+    for (auto& [candidate, scoring] : magneticsWithScoring) {
+        INFO("surviving candidate " << candidate.get_core().get_name().value_or("?"));
+        CHECK(candidate.get_mutable_core().is_gap_processed());
+    }
+    // This particular candidate is infeasible and must be gone.
+    CHECK(magneticsWithScoring.empty());
     settings.reset();
 }
 

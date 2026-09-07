@@ -18,7 +18,7 @@
 namespace OpenMagnetics {
 
 
-Curve2D Sweeper::sweep_impedance_over_frequency(Magnetic magnetic, double start, double stop, size_t numberElements, std::string mode, std::string title, bool fast) {
+Curve2D Sweeper::sweep_impedance_over_frequency(Magnetic magnetic, double start, double stop, size_t numberElements, std::string mode, std::string title, bool fast, bool fastCapacitance) {
     std::vector<double> frequencies;
     if (mode == "linear") {
         frequencies = linear_spaced_array(start, stop, numberElements);
@@ -47,7 +47,7 @@ Curve2D Sweeper::sweep_impedance_over_frequency(Magnetic magnetic, double start,
     // effective resistance (adds proximity), more accurate but slower per point.
     const double temperature = Defaults().ambientTemperature;
     double referenceFrequency = frequencies[frequencies.size() / 2];
-    auto impedanceModel = OpenMagnetics::Impedance();
+    auto impedanceModel = OpenMagnetics::Impedance(fastCapacitance);
     auto model = impedanceModel.build_wideband_impedance_model(magnetic, referenceFrequency, temperature, fast);
 
     std::vector<double> impedances;
@@ -59,7 +59,7 @@ Curve2D Sweeper::sweep_impedance_over_frequency(Magnetic magnetic, double start,
     return Curve2D(frequencies, impedances, title);
 }
 
-Curve2D Sweeper::sweep_common_mode_impedance_over_frequency(Magnetic magnetic, double start, double stop, size_t numberElements, std::string mode, std::string title) {
+Curve2D Sweeper::sweep_common_mode_impedance_over_frequency(Magnetic magnetic, double start, double stop, size_t numberElements, std::string mode, std::string title, bool fastCapacitance) {
     std::vector<double> frequencies;
     if (mode == "linear") {
         frequencies = linear_spaced_array(start, stop, numberElements);
@@ -77,7 +77,7 @@ Curve2D Sweeper::sweep_common_mode_impedance_over_frequency(Magnetic magnetic, d
     // damping), shunted by the winding self-capacitance. The frequency-independent
     // building blocks (reluctance, stray capacitance) are computed ONCE here; only
     // µ(f) and the complex arithmetic run per point.
-    auto impedanceModel = OpenMagnetics::Impedance();
+    auto impedanceModel = OpenMagnetics::Impedance(fastCapacitance);
     auto model = impedanceModel.build_common_mode_impedance_model(magnetic);
 
     std::vector<double> impedances;
@@ -309,21 +309,33 @@ Curve2D Sweeper::sweep_core_resistance_over_frequency(Magnetic magnetic, double 
     auto magnetizingInductance = resolve_dimensional_values(magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(core, coil).get_magnetizing_inductance());
 
     std::vector<double> coreResistances;
-    auto coreLossesModelSteinmetz = CoreLossesModel::factory(std::map<std::string, std::string>({{"coreLosses", "Steinmetz"}}));
-    auto coreLossesModelProprietary = CoreLossesModel::factory(std::map<std::string, std::string>({{"coreLosses", "Proprietary"}}));
+    // ABT #388: the model was chosen as "Steinmetz if the material has Steinmetz, else
+    // Proprietary" — a two-way choice that silently assumed every non-Steinmetz material is a
+    // vendor-proprietary one. A LOSS-FACTOR material (tan_delta/mu_i vs frequency, which is how
+    // NiZn makers publish loss and often the ONLY thing they publish) therefore landed in the
+    // proprietary branch and was rejected with "No proprietary volumetric losses method",
+    // blocking the whole subcircuit export for it — 101 of 118 shielded-drum models on just two
+    // datasheet-sourced grades. MKF already has a LossFactor model; the selection simply never
+    // offered it. Ask for the model that fits the material instead of guessing between two.
     auto coreLossesMethods = Core::get_available_core_losses_methods(core.resolve_material());
-
-    if (std::find(coreLossesMethods.begin(), coreLossesMethods.end(), VolumetricCoreLossesMethodType::STEINMETZ) != coreLossesMethods.end()) {
-        for (auto frequency : frequencies) {
-            auto coreResistance =  coreLossesModelSteinmetz->get_core_losses_series_resistance(core, frequency, temperature, magnetizingInductance);
-            coreResistances.push_back(coreResistance);
-        }
+    auto hasMethod = [&](VolumetricCoreLossesMethodType method) {
+        return std::find(coreLossesMethods.begin(), coreLossesMethods.end(), method) != coreLossesMethods.end();
+    };
+    std::string coreLossesModelName;
+    if (hasMethod(VolumetricCoreLossesMethodType::STEINMETZ)) {
+        coreLossesModelName = "Steinmetz";
+    }
+    else if (hasMethod(VolumetricCoreLossesMethodType::LOSS_FACTOR)) {
+        coreLossesModelName = "LossFactor";
     }
     else {
-        for (auto frequency : frequencies) {
-            auto coreResistance =  coreLossesModelProprietary->get_core_losses_series_resistance(core, frequency, temperature, magnetizingInductance);
-            coreResistances.push_back(coreResistance);
-        }
+        coreLossesModelName = "Proprietary";
+    }
+    auto coreLossesModel = CoreLossesModel::factory(std::map<std::string, std::string>({{"coreLosses", coreLossesModelName}}));
+
+    for (auto frequency : frequencies) {
+        auto coreResistance = coreLossesModel->get_core_losses_series_resistance(core, frequency, temperature, magnetizingInductance);
+        coreResistances.push_back(coreResistance);
     }
 
 
@@ -363,12 +375,18 @@ Curve2D Sweeper::sweep_core_losses_over_frequency(Magnetic magnetic, OperatingPo
 
     for (auto frequency : frequencies) {
 
-        Inputs::scale_time_to_frequency(operatingPoint, frequency, true);
-        
-        // operatingPoint = Inputs::process_operating_point(operatingPoint, magnetizingInductance);
+        // Keep BOTH signals through the rescale. The third argument used to be `true`
+        // (cleanFrequencyDependentFields), which with the default useCurrentAsBase=true
+        // DELETES the voltage and keeps the current — so every point on the curve was
+        // evaluated at the same magnetizing current, hence the same flux density, and
+        // the losses climbed as f^alpha. A real design is voltage-driven: raise the
+        // switching frequency at a fixed applied voltage and B falls as 1/f, so its
+        // core losses go DOWN, not up. The two only ever agreed at the operating
+        // point's own frequency, which is why the graph read tens of watts where the
+        // Core Info panel and the datasheet read a fraction of one (ABT: user report).
+        Inputs::scale_time_to_frequency(operatingPoint, frequency, false);
+
         OperatingPointExcitation excitation = Inputs::get_primary_excitation(operatingPoint);
-        auto voltageExcitation = Inputs::calculate_induced_voltage(excitation, magnetizingInductance);
-        excitation.set_voltage(voltageExcitation);
 
         if (numberWindings == 1 && excitation.get_current()) {
             Inputs::set_current_as_magnetizing_current(&operatingPoint);
@@ -433,8 +451,13 @@ Curve2D Sweeper::sweep_winding_losses_over_frequency(Magnetic magnetic, Operatin
 
     std::vector<double> windingLossesPerFrequency;
     for (auto frequency : frequencies) {
-        Inputs::scale_time_to_frequency(operatingPoint, frequency, true);
-        operatingPoint = Inputs::process_operating_point(operatingPoint, magnetizingInductance);
+        // Rescale the time axis and recompute the harmonics the loss model needs, but
+        // do NOT reshape the excitation. process_operating_point() reflects waveforms,
+        // re-derives the magnetizing current and synthesises a voltage; fed an operating
+        // point whose voltage had just been deleted by the rescale, it handed the loss
+        // model different currents from the ones the Winding Losses panel uses, and the
+        // curve sat ~44% above the panel even at the operating point's own frequency.
+        Inputs::scale_time_to_frequency(operatingPoint, frequency, false, true);
 
         auto windingLosses =  WindingLosses().calculate_losses(magnetic, operatingPoint, temperature).get_winding_losses();
 

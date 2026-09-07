@@ -4,6 +4,8 @@
 #include "physical_models/ReluctanceNetwork.h"
 #include "physical_models/MagneticField.h"
 #include "physical_models/Reluctance.h"
+#include "physical_models/InitialPermeability.h"
+#include "constructive_models/CorePiece.h"
 #include "support/Settings.h"
 #include "support/Utils.h"
 
@@ -43,7 +45,572 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
 }
 
 
+
+// ===================== Open-core (drum / rod) magnetizing inductance, ABT #331 =====================
+// An open shape's magnetic circuit closes through the surrounding air, so the closed-circuit
+// reluctance path (le/Ae of a closed core) does not apply — no closed le exists. The literature
+// model is the demagnetising-factor effective permeability (Bozorth, "Ferromagnetism", 1945;
+// cylinder refinements in Chen/Brug/Goldfarb, IEEE Trans. Magn. 27 (1991) 3601):
+//
+//     mu_rod = mu_i / (1 + N_d (mu_i - 1)),   N_d = axial factor of the equivalent spheroid.
+//
+// For a DRUM (post + two flanges) no exact closed form exists, so the estimate is the log-midpoint
+// of two PHYSICAL BOUNDS:
+//   upper: the flange-envelope spheroid (treats the whole drum as solid ferrite of flange
+//          diameter) — measured bias +14% on the validation set;
+//   lower: series reluctance of the envelope air return plus the ferrite post — bias -12%.
+// The midpoint validates at mean 5.4% / max 9.9% against the published AL of the four Fair-Rite
+// bobbins whose dimension mapping is weight-verified (9643001015: 38 nH, 9677282509: 95 nH,
+// 9677182209: 65 nH, 9677282009: 100 nH) — see the pinned test. A key property this reproduces:
+// AL is nearly material-independent (Fair-Rite publishes the SAME AL for 43 (mu_i 800) and 77
+// (mu_i 2000) variants of one geometry) because for mu_i >> 1/N_d the result saturates at the
+// geometry-set limit ~1/N_d.
+static double open_core_axial_demagnetizing_factor(double aspectLengthOverDiameter) {
+    double m = aspectLengthOverDiameter;
+    if (fabs(m - 1) < 1e-4) {
+        return 1.0 / 3;
+    }
+    if (m > 1) {
+        double s = sqrt(m * m - 1);
+        return (1 / (m * m - 1)) * ((m / s) * log(m + s) - 1);
+    }
+    double s = sqrt(1 - m * m);
+    return (1 / (1 - m * m)) * (1 - m * acos(m) / s);
+}
+
+double MagnetizingInductance::calculate_open_core_magnetizing_inductance(Core core, double numberTurns, double temperature) {
+    auto dimensions = flatten_dimensions(core.resolve_shape().get_dimensions().value());
+    for (auto required : {"A", "B", "C", "D", "E", "F"}) {
+        if (dimensions.find(required) == dimensions.end()) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                std::string("Open-core (drum) shape is missing dimension ") + required);
+        }
+    }
+    // Only REAL gaps are rejected: process_gap() distributes residual bookkeeping entries onto
+    // the columns of every non-toroidal core, drums included, so emptiness is not the test.
+    for (auto& gap : core.get_functional_description().get_gapping()) {
+        if (gap.get_type() != GapType::RESIDUAL && gap.get_length() > 1e-6) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "An open-circuit (drum) core cannot be gapped: its return path is already air");
+        }
+    }
+    // Asymmetric drums (A2 = second flange OD): the envelope the air return sees is between the
+    // two flange discs; the geometric mean keeps the symmetric case exact and matched the WE-TI
+    // reconstruction (both bounds are envelope-driven, so this is the sensitive choice).
+    double flangeDiameter = dimensions["A"];
+    if (dimensions.find("A2") != dimensions.end() && dimensions["A2"] > 0) {
+        flangeDiameter = sqrt(dimensions["A"] * dimensions["A2"]);
+    }
+    double height = dimensions["B"];
+    double postDiameter = dimensions["C"];
+    double bore = (dimensions.find("H") != dimensions.end()) ? dimensions["H"] : 0.0;
+    double grooveHeight = dimensions["E"];
+    double initialPermeability = InitialPermeability::get_initial_permeability(core.resolve_material(), temperature);
+
+    double vacuumPermeability = Constants().vacuumPermeability;
+    double demagnetizingFactor = open_core_axial_demagnetizing_factor(height / flangeDiameter);
+    double envelopeArea = std::numbers::pi / 4 * pow(flangeDiameter, 2);
+    double postArea = std::numbers::pi / 4 * (pow(postDiameter, 2) - pow(bore, 2));
+    double rodPermeability = initialPermeability / (1 + demagnetizingFactor * (initialPermeability - 1));
+
+    double upperBound = vacuumPermeability * rodPermeability * envelopeArea / grooveHeight * pow(numberTurns, 2);
+    double airReluctance = demagnetizingFactor * height / (vacuumPermeability * envelopeArea);
+    double ferriteReluctance = height / (vacuumPermeability * initialPermeability * postArea);
+    double lowerBound = pow(numberTurns, 2) / (airReluctance + ferriteReluctance);
+
+    return sqrt(upperBound * lowerBound);
+}
+
+// ===================== ROD magnetizing inductance (open circuit), ABT #933 =====================
+// A bare cylinder has NO return limb: every line of flux that leaves one end travels back through
+// the surrounding air. The closed-circuit machinery (le/Ae over one mu) has nothing to describe
+// here — le does not exist — so a rod uses the same demagnetising-factor treatment the drum does
+// (Bozorth, "Ferromagnetism", 1945; cylinder refinements in Chen/Brug/Goldfarb, IEEE Trans. Magn.
+// 27 (1991) 3601):
+//
+//     mu_rod = mu_i / (1 + N_d (mu_i - 1)),   N_d = axial demagnetising factor of the ROD.
+//
+// N_d is a property of the ROD's own slenderness B/A and of nothing else. That is the physical
+// content of an open circuit and it is worth stating plainly, because it bounds what this model
+// can and cannot explain: lengthening the WINDING on a fixed rod does not change N_d.
+//
+// The winding length enters through the other term. The rod-core inductor is the air solenoid
+// lifted by mu_rod, and an air solenoid's inductance goes as N^2 A / l_winding, so a SHORT coil
+// on a long rod has more inductance per turn than a full-length one. That is the only route by
+// which the coil's own geometry reaches the answer, and it is bounded: over the full rod the two
+// bracket bounds below collapse onto each other and the coil length drops out entirely.
+//
+// Same log-midpoint bracket idiom as the drum:
+//   upper: the solenoid formula on the rod cross-section at mu_rod — exact for a long thin rod
+//          fully wound, optimistic for a short coil because it ignores the flux that leaves the
+//          rod alongside the winding;
+//   lower: series reluctance of the external air return (N_d B / mu0 A_rod) and the rod itself
+//          (B / mu0 mu_i A_rod) — pessimistic for the same reason, mirrored.
+// For a fully wound rod the two agree to a fraction of a percent (for N_d = 0.2, mu_i = 400 they
+// differ by 0.25%), so the bracket is not doing hidden work: it only opens up as the winding is
+// shortened, which is exactly where the uncertainty actually lives.
+static std::pair<double, double> rod_open_core_bounds(Core core, double numberTurns,
+                                                     double windingLength, double temperature) {
+    auto dimensions = flatten_dimensions(core.resolve_shape().get_dimensions().value());
+    for (auto required : {"A", "B"}) {
+        if (dimensions.find(required) == dimensions.end()) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                std::string("Open-core (rod) shape is missing dimension ") + required +
+                " (a rod is A = diameter, B = length, H = optional bore)");
+        }
+    }
+    // Only REAL gaps are rejected: process_gap() distributes residual bookkeeping entries onto
+    // the columns of every non-toroidal core, rods included, so emptiness is not the test.
+    for (auto& gap : core.get_functional_description().get_gapping()) {
+        if (gap.get_type() != GapType::RESIDUAL && gap.get_length() > 1e-6) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "An open-circuit (rod) core cannot be gapped: its return path is already air");
+        }
+    }
+    double rodDiameter = dimensions["A"];
+    double rodLength = dimensions["B"];
+    double bore = (dimensions.find("H") != dimensions.end()) ? dimensions["H"] : 0.0;
+    if (rodDiameter <= 0 || rodLength <= 0) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Rod core has a non-positive diameter A or length B");
+    }
+    if (bore < 0 || bore >= rodDiameter) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Rod core bore H must be non-negative and smaller than the diameter A");
+    }
+    if (!(windingLength > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Rod magnetizing inductance needs the axial length of the winding, and none was "
+            "available; a rod imposes no groove, so the coil must state it (bobbin winding "
+            "window height)");
+    }
+    if (windingLength > rodLength * (1 + 1e-9)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "The winding is longer (" + std::to_string(windingLength) + " m) than the rod it sits on (" +
+            std::to_string(rodLength) + " m); the overhanging turns are air-cored and this model "
+            "does not describe them");
+    }
+    double initialPermeability = InitialPermeability::get_initial_permeability(core.resolve_material(), temperature);
+
+    double vacuumPermeability = Constants().vacuumPermeability;
+    double demagnetizingFactor = open_core_axial_demagnetizing_factor(rodLength / rodDiameter);
+    double rodArea = std::numbers::pi / 4 * (pow(rodDiameter, 2) - pow(bore, 2));
+    double rodPermeability = initialPermeability / (1 + demagnetizingFactor * (initialPermeability - 1));
+
+    double upperBound = vacuumPermeability * rodPermeability * rodArea / windingLength * pow(numberTurns, 2);
+    double airReluctance = demagnetizingFactor * rodLength / (vacuumPermeability * rodArea);
+    double ferriteReluctance = rodLength / (vacuumPermeability * initialPermeability * rodArea);
+    double lowerBound = pow(numberTurns, 2) / (airReluctance + ferriteReluctance);
+
+    return {lowerBound, upperBound};
+}
+
+double MagnetizingInductance::calculate_rod_magnetizing_inductance(Core core, double numberTurns,
+                                                                  double windingLength, double temperature) {
+    auto [lowerBound, upperBound] = rod_open_core_bounds(core, numberTurns, windingLength, temperature);
+    return sqrt(upperBound * lowerBound);
+}
+
+// ABT #362: semi-shielded drum — a ferrite drum closed by a MAGNETIC-EPOXY shell. The circuit
+// crosses TWO materials, so neither the closed-circuit path (one mu over le/Ae) nor a gap
+// model fits: reluctance is applied PER SECTION using the piece's c1 split. The shell material
+// rides the core coating {type: magneticEpoxy, material: <core material NAME>}; per the
+// no-fallbacks rule every missing link throws — the model never assumes air or guesses a mu.
+double MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(Core core, double numberTurns, double temperature) {
+    auto corePiece = CorePiece::factory(core.resolve_shape());
+    auto mixedConstants = corePiece->get_mixed_material_constants();
+    if (!mixedConstants) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Semi-shielded drum piece did not expose its mixed-material shape constants");
+    }
+    double coreMaterialC1 = (*mixedConstants)[0];
+    double shellMaterialC1 = (*mixedConstants)[2];
+    double drumPermeability = InitialPermeability::get_initial_permeability(core.resolve_material(), temperature);
+
+    auto coatingUnion = core.get_functional_description().get_coating();
+    if (!coatingUnion) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Semi-shielded drum requires a magneticEpoxy coating carrying the shell material — none present");
+    }
+    if (!std::holds_alternative<CoreCoating>(coatingUnion.value())) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Semi-shielded drum coating must be an explicit CoreCoating object (type magneticEpoxy + "
+            "shell material name), not a name-only coating");
+    }
+    auto coating = std::get<CoreCoating>(coatingUnion.value());
+    if (!coating.get_type() || coating.get_type().value() != CoatingType::MAGNETIC_EPOXY) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Semi-shielded drum requires coating type 'magneticEpoxy' (the glue shell IS the return path)");
+    }
+    if (!coating.get_material() || !std::holds_alternative<std::string>(coating.get_material().value())) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Semi-shielded drum magneticEpoxy coating must reference the shell CORE material by name");
+    }
+    auto shellMaterial = find_core_material_by_name(std::get<std::string>(coating.get_material().value()));
+    double shellPermeability = InitialPermeability::get_initial_permeability(shellMaterial, temperature);
+
+    double vacuumPermeability = Constants().vacuumPermeability;
+    double reluctance = (coreMaterialC1 / drumPermeability + shellMaterialC1 / shellPermeability) / vacuumPermeability;
+    return pow(numberTurns, 2) / reluctance;
+}
+
+// ABT #576: a shielded drum and its closing ring are routinely DIFFERENT grades — WE-DPC-6040 is
+// an ACME P47 MnZn drum (mu_i 3000) inside an ACME B45 NiZn ring (mu_i 450), a 6.7x difference
+// across two material SYSTEMS. The grades are declared on functionalDescription.material as a
+// LIST, primary piece first: ["P47", "B45"] is the drum then its ring. That field is the one the
+// schema designates for analytical models; geometricalDescription is the CAD-facing view and is
+// REGENERATED whenever absent, so a material declared only there would silently vanish and take
+// the inductance 15% with it.
+//
+// A single material is not an error — the overwhelming majority of drumRing cores are one grade,
+// and they keep the standard path. But a list that names MORE than two pieces is: a drumRing has
+// exactly a drum and a ring, so anything else means the data does not describe this shape and we
+// refuse rather than quietly using the first two.
+static std::optional<CoreMaterial> resolve_drum_ring_ring_material(Core& core) {
+    auto materials = core.resolve_materials();
+    if (materials.size() == 1) {
+        return std::nullopt;
+    }
+    if (materials.size() != 2) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "drumRing names " + std::to_string(materials.size()) + " materials; it has exactly two "
+            "pieces (drum then ring), so the list must hold one or two entries");
+    }
+    return materials[1];
+}
+
+// Sectioned reluctance for a two-grade shielded drum: the drum sections take the drum's mu, the
+// ring sections take the ring's mu, and the two STRUCTURAL annular clearances (ABT #366/#368,
+// synthesised by Core::process_gap from A/K/D/F) are added on top exactly as before. Those
+// clearances carry most of the reluctance in practice, which is why the single-material
+// approximation is only ~15% out on inductance — but the grades differ far more than that for
+// saturation and losses, so the split still matters.
+double MagnetizingInductance::calculate_drum_ring_magnetizing_inductance(Core core,
+                                                                        CoreMaterial ringMaterial,
+                                                                        double numberTurns,
+                                                                        double temperature) {
+    auto corePiece = CorePiece::factory(core.resolve_shape());
+    auto mixedConstants = corePiece->get_mixed_material_constants();
+    if (!mixedConstants) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "drumRing piece did not expose its split drum/ring shape constants");
+    }
+    double drumC1 = (*mixedConstants)[0];
+    double ringC1 = (*mixedConstants)[2];
+    double drumPermeability = InitialPermeability::get_initial_permeability(core.resolve_material(), temperature);
+    double ringPermeability = InitialPermeability::get_initial_permeability(ringMaterial, temperature);
+
+    double vacuumPermeability = Constants().vacuumPermeability;
+    double ferriteReluctance = (drumC1 / drumPermeability + ringC1 / ringPermeability) / vacuumPermeability;
+
+    auto reluctanceModelForGaps = ReluctanceModel::factory(Defaults().reluctanceModelDefault);
+    double clearanceReluctance = reluctanceModelForGaps->get_gapping_reluctance(core).get_gapping_reluctance().value();
+
+    return pow(numberTurns, 2) / (ferriteReluctance + clearanceReluctance);
+}
+
+// ABT #1002: the WE moulded families are pressed in up to three steps and each pressing can be
+// its own powder -- Inner / Outer in the MAPI and MAIA lists of parts, SUB / COR / COV (base,
+// post, cover) in the MXGI one. The single fitted "effective" permeability the one-grade model
+// absorbs those into is not a property of any powder, and it hides the fact that the post and
+// the return path saturate at different currents. Here every region takes its own grade's mu at
+// its own field: R = sum_r c1_r / (mu0 mu_r(H_r)), with H_r from the flux the DC magnetizing
+// current drives through the whole series circuit, B_r = phi / Ae_r, iterated (damped, so a
+// steep knee cannot make it ring) until every region's mu has settled.
+double MagnetizingInductance::calculate_molded_magnetizing_inductance(Core core, double numberTurns, double temperature,
+                                                                      std::optional<double> frequency,
+                                                                      std::optional<double> magnetizingCurrentDcBias) {
+    if (core.get_shape_family() != CoreShapeFamily::MOLDED) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "per-region moulded inductance asked of a core that is not a moulded body");
+    }
+    auto corePiece = CorePiece::factory(core.resolve_shape());
+    auto regionConstants = corePiece->get_region_shape_constants();
+    if (!regionConstants) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "moulded piece did not expose its per-region shape constants");
+    }
+    auto regionMaterials = core.resolve_region_materials();
+    if (regionMaterials.size() == 1) {
+        regionMaterials = std::vector<std::optional<CoreMaterial>>(regionConstants->size(), regionMaterials[0]);
+    }
+    if (regionMaterials.size() != regionConstants->size()) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "moulded body has " + std::to_string(regionConstants->size()) + " regions but its material "
+            "list resolves to " + std::to_string(regionMaterials.size()));
+    }
+    if (!core.get_functional_description().get_gapping().empty()) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "a moulded body has no discrete gaps: its distributed gap lives in the powder");
+    }
+
+    double vacuumPermeability = Constants().vacuumPermeability;
+    size_t numberRegions = regionConstants->size();
+    auto permeabilityAt = [&](size_t regionIndex, std::optional<double> magneticFieldDcBias) {
+        if (!regionMaterials[regionIndex]) {
+            return 1.0;
+        }
+        return InitialPermeability::get_initial_permeability(regionMaterials[regionIndex].value(), temperature,
+                                                             magneticFieldDcBias, frequency);
+    };
+    auto reluctanceOf = [&](const std::vector<double>& permeabilities) {
+        double reluctance = 0;
+        for (size_t regionIndex = 0; regionIndex < numberRegions; ++regionIndex) {
+            reluctance += (*regionConstants)[regionIndex].c1 / (vacuumPermeability * permeabilities[regionIndex]);
+        }
+        return reluctance;
+    };
+
+    std::vector<double> permeabilities(numberRegions);
+    for (size_t regionIndex = 0; regionIndex < numberRegions; ++regionIndex) {
+        permeabilities[regionIndex] = permeabilityAt(regionIndex, std::nullopt);
+    }
+    double reluctance = reluctanceOf(permeabilities);
+
+    if (magnetizingCurrentDcBias && *magnetizingCurrentDcBias != 0) {
+        bool converged = false;
+        for (size_t iteration = 0; iteration < 500 && !converged; ++iteration) {
+            double magneticFlux = numberTurns * fabs(*magnetizingCurrentDcBias) / reluctance;
+            double worstChange = 0;
+            std::vector<double> updated(numberRegions);
+            for (size_t regionIndex = 0; regionIndex < numberRegions; ++regionIndex) {
+                auto& region = (*regionConstants)[regionIndex];
+                double regionEffectiveArea = region.c1 / region.c2;
+                double magneticFluxDensity = magneticFlux / regionEffectiveArea;
+                double magneticFieldDcBias = magneticFluxDensity / (vacuumPermeability * permeabilities[regionIndex]);
+                double target = permeabilityAt(regionIndex, magneticFieldDcBias);
+                worstChange = std::max(worstChange, fabs(target - permeabilities[regionIndex]) / permeabilities[regionIndex]);
+                // Geometric damping: mu(H) is decreasing, so the undamped fixed point can
+                // oscillate around a steep knee; the half-step in log space cannot.
+                updated[regionIndex] = sqrt(permeabilities[regionIndex] * target);
+            }
+            permeabilities = updated;
+            reluctance = reluctanceOf(permeabilities);
+            converged = worstChange < 1e-5;
+        }
+        if (!converged) {
+            throw std::runtime_error("per-region moulded DC-bias iteration did not converge at " +
+                                     std::to_string(*magnetizingCurrentDcBias) + " A");
+        }
+    }
+    if (std::isnan(reluctance) || reluctance <= 0) {
+        throw NaNResultException("moulded per-region reluctance must be a positive number");
+    }
+    return pow(numberTurns, 2) / reluctance;
+}
+
+// The DC component of the current that magnetizes the core, for the per-region moulded path:
+// the magnetizing current when the caller already derived one, else the winding current of a
+// single-winding part. Processed data is computed from the waveform when it is absent.
+static std::optional<double> excitation_dc_current(const OperatingPointExcitation& excitation) {
+    std::optional<SignalDescriptor> signal;
+    if (excitation.get_magnetizing_current()) {
+        signal = excitation.get_magnetizing_current();
+    }
+    else if (excitation.get_current()) {
+        signal = excitation.get_current();
+    }
+    if (!signal) {
+        return std::nullopt;
+    }
+    if (signal->get_processed()) {
+        return signal->get_processed()->get_offset();
+    }
+    if (signal->get_waveform()) {
+        // Same construction as the standard path: a power-of-two resample, its harmonics on the
+        // descriptor, then the processed data -- calculate_processed_data reads the harmonics.
+        auto sampled = Inputs::calculate_sampled_waveform(signal->get_waveform().value(), excitation.get_frequency());
+        signal->set_harmonics(Inputs::calculate_harmonics_data(sampled, excitation.get_frequency()));
+        auto processed = Inputs::calculate_processed_data(*signal, sampled, false);
+        return processed.get_offset();
+    }
+    return std::nullopt;
+}
+
+// ABT #362/#331: the drum-family paths below return early with their own inductance model, so
+// they must ALSO produce the magnetic flux density this function is contracted to return —
+// MagneticSimulator feeds result.second straight into the core-loss stage, and a default-
+// constructed SignalDescriptor makes IGSE throw bad_optional_access deep inside
+// Inputs::get_magnetic_flux_density_peak_to_peak, naming nothing. Same construction as the
+// main path: flux from the magnetizing current through the driving-point reluctance, then
+// divided by the flux-carrying area.
+static SignalDescriptor calculate_flux_density_for_family_model(double magnetizingInductance,
+                                                                double numberTurns,
+                                                                double fluxCarryingArea,
+                                                                OperatingPoint* operatingPoint) {
+    SignalDescriptor magneticFluxDensity;
+    if (!operatingPoint || operatingPoint->get_mutable_excitations_per_winding().empty() ||
+        !operatingPoint->get_mutable_excitations_per_winding()[0].get_magnetizing_current()) {
+        return magneticFluxDensity;
+    }
+    double drivingPointReluctance = pow(numberTurns, 2) / magnetizingInductance;
+    auto magneticFlux = OpenMagnetics::MagneticField::calculate_magnetic_flux(
+        operatingPoint->get_mutable_excitations_per_winding()[0].get_magnetizing_current().value(),
+        drivingPointReluctance, numberTurns);
+    return OpenMagnetics::MagneticField::calculate_magnetic_flux_density(magneticFlux, fluxCarryingArea);
+}
+
 std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::calculate_inductance_and_magnetic_flux_density(Core core, Coil coil, OperatingPoint* operatingPoint) {
+
+    // ABT #417: a drumRing core's two structural annular-clearance gaps are DERIVED
+    // (Core::process_gap synthesizes them from A/K/D/F — nothing is ever hand-authored
+    // in functionalDescription.gapping for this family, unlike a normal gapped E-core).
+    // Core's free from_json (used whenever a Core is deserialized as a MEMBER — e.g.
+    // Magnetic::from_json, which every PyOM/WASM binding reaches) never calls
+    // process_data()/process_gap(), unlike the Core(json) constructor. A drumRing core
+    // arriving here via that path has gapping==[] and ReluctanceModel::get_gapping_reluctance
+    // silently treats "empty" as "no gap" instead of "not yet derived", dropping the
+    // dominant reluctance term and reporting an inductance 3.8-10.7x too high. gapping is
+    // NEVER legitimately empty for this family (single- or dual-material), so self-heal
+    // unconditionally here — process_gap() is idempotent and a no-op if already derived.
+    if (core.get_shape_family() == CoreShapeFamily::DRUM_RING && core.get_functional_description().get_gapping().empty()) {
+        core.process_gap_or_throw();
+    }
+
+    // Semi-shielded drums (ABT #362): mixed-material sectioned reluctance, drum mu + glue mu.
+    if (core.get_shape_family() == CoreShapeFamily::DRUM_SEMISHIELDED) {
+        double semishieldedTemperature = operatingPoint ? operatingPoint->get_conditions().get_ambient_temperature()
+                                                        : Defaults().ambientTemperature;
+        double numberTurnsSemishielded = coil.get_functional_description()[0].get_number_turns();
+        double semishieldedInductance = calculate_semishielded_drum_magnetizing_inductance(core, numberTurnsSemishielded, semishieldedTemperature);
+        MagnetizingInductanceOutput semishieldedOutput;
+        DimensionWithTolerance semishieldedWithTolerance;
+        semishieldedWithTolerance.set_nominal(semishieldedInductance);
+        // Provisional envelope: unvalidated against the vendor set yet — the heimdall 290-part
+        // sweep (ABT #362 acceptance) pins this; tighten when it lands.
+        semishieldedWithTolerance.set_minimum(semishieldedInductance * 0.8);
+        semishieldedWithTolerance.set_maximum(semishieldedInductance * 1.2);
+        semishieldedOutput.set_magnetizing_inductance(semishieldedWithTolerance);
+        semishieldedOutput.set_method_used("SemiShieldedMixedSectionReluctance");
+        semishieldedOutput.set_origin(ResultOrigin::SIMULATION);
+        std::pair<MagnetizingInductanceOutput, SignalDescriptor> semishieldedResult;
+        semishieldedResult.first = semishieldedOutput;
+        // Flux crosses the post: the drum's own central column carries it.
+        semishieldedResult.second = calculate_flux_density_for_family_model(
+            semishieldedInductance, numberTurnsSemishielded,
+            core.get_columns()[0].get_area(), operatingPoint);
+        return semishieldedResult;
+    }
+
+    // Shielded drums whose ring is a different grade from the drum (ABT #576). Gated on a
+    // distinct ring grade actually being declared: with one grade this is a no-op and the core
+    // falls through to the standard path below, so nothing already validated changes.
+    if (core.get_shape_family() == CoreShapeFamily::DRUM_RING) {
+        auto ringMaterial = resolve_drum_ring_ring_material(core);
+        if (ringMaterial) {
+            double drumRingTemperature = operatingPoint ? operatingPoint->get_conditions().get_ambient_temperature()
+                                                        : Defaults().ambientTemperature;
+            double numberTurnsDrumRing = coil.get_functional_description()[0].get_number_turns();
+            double drumRingInductance = calculate_drum_ring_magnetizing_inductance(
+                core, ringMaterial.value(), numberTurnsDrumRing, drumRingTemperature);
+            MagnetizingInductanceOutput drumRingOutput;
+            DimensionWithTolerance drumRingWithTolerance;
+            drumRingWithTolerance.set_nominal(drumRingInductance);
+            drumRingWithTolerance.set_minimum(drumRingInductance * 0.8);
+            drumRingWithTolerance.set_maximum(drumRingInductance * 1.2);
+            drumRingOutput.set_magnetizing_inductance(drumRingWithTolerance);
+            drumRingOutput.set_method_used("DrumRingMixedSectionReluctance");
+            drumRingOutput.set_origin(ResultOrigin::SIMULATION);
+            std::pair<MagnetizingInductanceOutput, SignalDescriptor> drumRingResult;
+            drumRingResult.first = drumRingOutput;
+            // Flux crosses the post, same as every other drum-family model here.
+            drumRingResult.second = calculate_flux_density_for_family_model(
+                drumRingInductance, numberTurnsDrumRing,
+                core.get_columns()[0].get_area(), operatingPoint);
+            return drumRingResult;
+        }
+    }
+
+    // Moulded bodies pressed from more than one powder (ABT #1002). Gated on the material list
+    // actually resolving to more than one region, so every single-grade moulded core keeps the
+    // standard path below unchanged.
+    if (core.get_shape_family() == CoreShapeFamily::MOLDED && core.resolve_region_materials().size() > 1) {
+        double moldedTemperature = operatingPoint ? operatingPoint->get_conditions().get_ambient_temperature()
+                                                  : Defaults().ambientTemperature;
+        double numberTurnsMolded = coil.get_functional_description()[0].get_number_turns();
+        // The same reference frequency the standard path evaluates mu at when no operating point
+        // is given, so a body that lists one grade three times reproduces the single-grade result.
+        std::optional<double> moldedFrequency = Defaults().coreAdviserFrequencyReference;
+        std::optional<double> moldedDcBias;
+        if (operatingPoint && !operatingPoint->get_excitations_per_winding().empty()) {
+            auto excitation = Inputs::get_primary_excitation(*operatingPoint);
+            moldedFrequency = excitation.get_frequency();
+            moldedDcBias = excitation_dc_current(excitation);
+        }
+        double moldedInductance = calculate_molded_magnetizing_inductance(
+            core, numberTurnsMolded, moldedTemperature, moldedFrequency, moldedDcBias);
+        MagnetizingInductanceOutput moldedOutput;
+        DimensionWithTolerance moldedWithTolerance;
+        moldedWithTolerance.set_nominal(moldedInductance);
+        moldedWithTolerance.set_minimum(moldedInductance * 0.8);
+        moldedWithTolerance.set_maximum(moldedInductance * 1.2);
+        moldedOutput.set_magnetizing_inductance(moldedWithTolerance);
+        moldedOutput.set_method_used("MoldedPerRegionReluctance");
+        moldedOutput.set_origin(ResultOrigin::SIMULATION);
+        std::pair<MagnetizingInductanceOutput, SignalDescriptor> moldedResult;
+        moldedResult.first = moldedOutput;
+        // Flux crosses the post, the region with the smallest section.
+        moldedResult.second = calculate_flux_density_for_family_model(
+            moldedInductance, numberTurnsMolded, core.get_columns()[0].get_area(), operatingPoint);
+        return moldedResult;
+    }
+
+    // Rods (ABT #933): the most open shape there is — a bare cylinder with no return limb at all.
+    // Its demagnetising model needs one thing a drum's does not, the axial length of the winding,
+    // because a rod has no groove to imply it. That length is the coil's, so it is read here where
+    // the coil is in scope and passed in; there is no default and no guess.
+    if (core.get_shape_family() == CoreShapeFamily::ROD) {
+        double rodTemperature = operatingPoint ? operatingPoint->get_conditions().get_ambient_temperature()
+                                               : Defaults().ambientTemperature;
+        double numberTurnsRod = coil.get_functional_description()[0].get_number_turns();
+        double windingLength = coil.resolve_bobbin().get_winding_window_dimensions(0)[1];
+        auto [rodLowerBound, rodUpperBound] = rod_open_core_bounds(core, numberTurnsRod, windingLength, rodTemperature);
+        double rodInductance = sqrt(rodUpperBound * rodLowerBound);
+        MagnetizingInductanceOutput rodOutput;
+        DimensionWithTolerance rodWithTolerance;
+        rodWithTolerance.set_nominal(rodInductance);
+        // The two PHYSICAL bounds are themselves the honest uncertainty statement for this
+        // geometry — no pinned percentage. Unlike the drum's validated +-12% this is not a
+        // constant: it collapses to nothing on a fully wound rod and opens as the coil shortens,
+        // which is exactly where the model's real uncertainty lives.
+        rodWithTolerance.set_minimum(rodLowerBound);
+        rodWithTolerance.set_maximum(rodUpperBound);
+        rodOutput.set_magnetizing_inductance(rodWithTolerance);
+        rodOutput.set_method_used("RodOpenCoreDemagnetizingFactor");
+        rodOutput.set_origin(ResultOrigin::SIMULATION);
+        std::pair<MagnetizingInductanceOutput, SignalDescriptor> rodResult;
+        rodResult.first = rodOutput;
+        // Flux crosses the rod itself (the bore is already subtracted from its column area).
+        rodResult.second = calculate_flux_density_for_family_model(
+            rodInductance, numberTurnsRod, core.get_columns()[0].get_area(), operatingPoint);
+        return rodResult;
+    }
+
+    // Open shapes (drums, rods): route to the open-core model — the closed-circuit reluctance
+    // machinery below would silently drop the dominant air-return reluctance (ABT #331).
+    if (core.get_shape_family() == CoreShapeFamily::DRUM) {
+        double openCoreTemperature = operatingPoint ? operatingPoint->get_conditions().get_ambient_temperature()
+                                                    : Defaults().ambientTemperature;
+        double numberTurnsOpenCore = coil.get_functional_description()[0].get_number_turns();
+        double openCoreInductance = calculate_open_core_magnetizing_inductance(core, numberTurnsOpenCore, openCoreTemperature);
+        MagnetizingInductanceOutput openCoreOutput;
+        DimensionWithTolerance openCoreWithTolerance;
+        openCoreWithTolerance.set_nominal(openCoreInductance);
+        // Documented model envelope from the Fair-Rite validation set (max 9.9%).
+        openCoreWithTolerance.set_minimum(openCoreInductance * 0.88);
+        openCoreWithTolerance.set_maximum(openCoreInductance * 1.12);
+        openCoreOutput.set_magnetizing_inductance(openCoreWithTolerance);
+        openCoreOutput.set_method_used("OpenCoreDemagnetizingFactor");
+        openCoreOutput.set_origin(ResultOrigin::SIMULATION);
+        std::pair<MagnetizingInductanceOutput, SignalDescriptor> openCoreResult;
+        openCoreResult.first = openCoreOutput;
+        // Flux crosses the drum post (the bore is already subtracted from its column area).
+        openCoreResult.second = calculate_flux_density_for_family_model(
+            openCoreInductance, numberTurnsOpenCore,
+            core.get_columns()[0].get_area(), operatingPoint);
+        return openCoreResult;
+    }
+
 
     double frequency = Defaults().coreAdviserFrequencyReference;
     double temperature = Defaults().ambientTemperature;
@@ -218,7 +785,8 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
                                                                                                 sampledVoltageWaveform,
                                                                                                 modifiedMagnetizingInductance,
                                                                                                 false,
-                                                                                                addOffset);
+                                                                                                addOffset,
+                                                                                                operatingPoint->get_excitations_per_winding().size() > 1);
 
                         auto sampledMagnetizingCurrentWaveform = Inputs::calculate_sampled_waveform(magnetizingCurrent.get_waveform().value(), excitation.get_frequency());
                         // Replace the stored waveform with the resampled (power-of-2)
@@ -427,12 +995,39 @@ int MagnetizingInductance::calculate_number_turns_from_gapping_and_inductance(Co
         if (next == numberTurnsPrimary) break;
         numberTurnsPrimary = next;
     }
-    // Ensure the operating inductance actually clears the target (integer
-    // rounding and real permeability rolloff can leave it just under).
-    for (int bump = 0; bump < 100; ++bump) {
-        double inductance = inductanceAtTurns(numberTurnsPrimary);
-        if (inductance <= 0 || inductance >= desiredMagnetizingInductance) break;
-        numberTurnsPrimary += 1;
+    if (preferredValue == DimensionalValues::MINIMUM) {
+        // The caller asked for a lower bound (e.g. the core adviser sizes
+        // against the minimum requirement): the target is a hard floor, so
+        // bump until the operating inductance actually clears it (integer
+        // rounding and real permeability rolloff can leave it just under).
+        for (int bump = 0; bump < 100; ++bump) {
+            double inductance = inductanceAtTurns(numberTurnsPrimary);
+            if (inductance <= 0 || inductance >= desiredMagnetizingInductance) break;
+            numberTurnsPrimary += 1;
+        }
+    }
+    else {
+        // A nominal/typical target is not a hard floor: integer turns cannot
+        // hit it exactly, so pick the neighbour with the smallest absolute
+        // error. Ceil-style bumping here accepted a +26.6% overshoot to avoid
+        // a -0.6% undershoot (ABT #600).
+        double bestError = std::numeric_limits<double>::infinity();
+        int bestTurns = numberTurnsPrimary;
+        for (int candidate : {numberTurnsPrimary - 1, numberTurnsPrimary, numberTurnsPrimary + 1}) {
+            if (candidate < 1) {
+                continue;
+            }
+            double inductance = inductanceAtTurns(candidate);
+            if (inductance <= 0) {
+                continue;
+            }
+            double error = std::abs(inductance - desiredMagnetizingInductance);
+            if (error < bestError) {
+                bestError = error;
+                bestTurns = candidate;
+            }
+        }
+        numberTurnsPrimary = bestTurns;
     }
 
     return std::max(1, numberTurnsPrimary);
@@ -506,7 +1101,7 @@ double MagnetizingInductance::calculate_gap_from_saturation_constraint(Core core
             gapping.push_back(lateralGap);
         }
         testCore.get_mutable_functional_description().set_gapping(gapping);
-        testCore.process_gap();
+        testCore.process_gap_or_throw();
         
         // Calculate total reluctance manually (classic formula)
         // Core reluctance: R_core = l_e / (μ₀ * μ_r * A_e), using the MATERIAL's
@@ -557,7 +1152,7 @@ Core get_core_with_ground_gapping(Core core, double gapLength) {
         gapping.push_back(basicLateralGap);
     }
     core.get_mutable_functional_description().set_gapping(gapping);
-    core.process_gap();
+    core.process_gap_or_throw();
     return core;
 }
 
@@ -577,7 +1172,7 @@ Core get_core_with_distributed_gapping(Core core, double gapLength, size_t numbe
         gapping.push_back(basicLateralGap);
     }
     core.get_mutable_functional_description().set_gapping(gapping);
-    core.process_gap();
+    core.process_gap_or_throw();
     return core;
 }
 
@@ -594,7 +1189,7 @@ Core get_core_with_spacer_gapping(Core core, double gapLength) {
         gapping.push_back(basicLateralGap);
     }
     core.get_mutable_functional_description().set_gapping(gapping);
-    core.process_gap();
+    core.process_gap_or_throw();
     return core;
 }
 
@@ -618,10 +1213,20 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
 
     double numberTurnsPrimary = coil.get_functional_description()[0].get_number_turns();
     double desiredMagnetizingInductance = resolve_dimensional_values(inputs->get_design_requirements().get_magnetizing_inductance());
+
+    // ABT #635: a caller may hand us a Core built from a bare functionalDescription (no
+    // processedDescription yet) -- that is a legal MAS core and every neighbouring entry point
+    // accepts it. Dereferencing the optional unconditionally turned that into an opaque
+    // "bad optional access" for the whole API. Process it here instead, exactly as
+    // calculate_core_maximum_magnetic_energy() and friends already do. `core` is taken BY VALUE,
+    // so processing it is local to this call and cannot surprise the caller.
+    if (!core.get_processed_description()) {
+        core.process_data();
+        core.process_gap_or_throw();
+    }
     double effectiveArea = core.get_processed_description()->get_effective_parameters().get_effective_area();
     OpenMagnetics::InitialPermeability initialPermeability;
-    size_t timeout = 10;
-    double modifiedInitialPermeability;
+    size_t timeout;
     double currentInitialPermeability;
 
     ReluctanceModels reluctanceModelEnum;
@@ -636,22 +1241,22 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
         inputs->set_operating_point_by_index(operatingPoint, 0);
     }
 
-    while (true) {
-        if (!excitation.get_magnetizing_current()) {
-            break;
-        }
+    // DC bias (ABT #1093). The flux density the target inductance imposes is known
+    // (B = N·I/(R·Ae) with the NEEDED reluctance: at the solution the gapped core has
+    // exactly that reluctance), and the material permeability under that bias is its
+    // reversible permeability at the field strength that carries B on the material's
+    // own magnetisation curve. The former fixed-point iteration µ ← µ(B/(µ0·µ)) is a
+    // secant through the incremental curve; it diverges wherever |dµ/dH|·B/(µ0·µ²) > 1,
+    // the knee of any ferrite, ran away to a saturated permeability, and the search then
+    // clamped at the residual gap for any target above a few tens of µH.
+    if (excitation.get_magnetizing_current()) {
         auto magneticFlux = OpenMagnetics::MagneticField::calculate_magnetic_flux(operatingPoint.get_mutable_excitations_per_winding()[0].get_magnetizing_current().value(), neededTotalReluctance, numberTurnsPrimary);
         auto magneticFluxDensity = OpenMagnetics::MagneticField::calculate_magnetic_flux_density(magneticFlux, effectiveArea);
-        auto magneticFieldStrength = OpenMagnetics::MagneticField::calculate_magnetic_field_strength(magneticFluxDensity, currentInitialPermeability);
-
-        modifiedInitialPermeability = initialPermeability.get_initial_permeability(core.resolve_material(), temperature, magneticFieldStrength.get_processed().value().get_offset(), frequency);
-
-        if (fabs(currentInitialPermeability - modifiedInitialPermeability) < 1 || timeout == 0) {
-            break;
-        }
-        else {
-            currentInitialPermeability = modifiedInitialPermeability;
-            timeout--;
+        double biasFluxDensity = fabs(magneticFluxDensity.get_processed().value().get_offset());
+        if (biasFluxDensity > 0) {
+            auto material = core.resolve_material();
+            double biasFieldStrength = InitialPermeability::get_magnetic_field_dc_bias_for_flux_density(material, biasFluxDensity, temperature, frequency);
+            currentInitialPermeability = initialPermeability.get_initial_permeability(material, temperature, biasFieldStrength, frequency);
         }
     }
 
@@ -952,7 +1557,7 @@ std::pair<double, double> MagnetizingInductance::calculate_optimal_gap_and_turns
     // Step 7: Refine turns with actual gap (accounts for fringing via reluctance model)
     Core gappedCore = tempCore;
     gappedCore.set_ground_gapping(gapLength);
-    gappedCore.process_gap();
+    gappedCore.process_gap_or_throw();
     
     double finalTurns = calculate_turns_for_gap(gappedCore, targetInductance, temperature, frequency);
     
