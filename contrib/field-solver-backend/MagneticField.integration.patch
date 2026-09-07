@@ -1,0 +1,189 @@
+diff --git a/src/physical_models/MagneticField.cpp b/src/physical_models/MagneticField.cpp
+index bee5e341..5b56bef2 100644
+--- a/src/physical_models/MagneticField.cpp
++++ b/src/physical_models/MagneticField.cpp
+@@ -9,6 +9,9 @@
+ #include "physical_models/InitialPermeability.h"
+ #include "support/Settings.h"
+ #include "support/Utils.h"
++#include "physical_models/FieldSolverBackend.h"
++#include "physical_models/CpuFieldSolver.h"
++#include "physical_models/GpuFieldSolver.h"
+ 
+ #include <cmath>
+ #include <magic_enum.hpp>
+@@ -316,6 +319,11 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
+     
+     auto turns = magnetic.get_coil().get_turns_description().value();
+ 
++    CpuFieldSolver cpuFieldSolver;
++    auto gpuFieldSolver = GpuFieldSolver::create();  // nullptr on native / no GPU
++    FieldSolverBackend* fieldSolverBackend =
++        gpuFieldSolver ? static_cast<FieldSolverBackend*>(gpuFieldSolver.get()) : &cpuFieldSolver;
++
+     // Set up ALBACH model if being used
+     if (_magneticFieldStrengthModel == MagneticFieldStrengthModels::ALBACH) {
+         auto albach2DModel = std::dynamic_pointer_cast<MagneticFieldStrengthAlbach2DModel>(_model);
+@@ -492,47 +500,51 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
+             }
+         }
+ 
+-        for (auto& inducedFieldPoint : inducedFields[harmonicIndex].get_data()) {
+-            double totalInducedFieldX = 0;
+-            double totalInducedFieldY = 0;
+-
+-            // ROSHEN and SULLIVAN fringing are computed per-point in this loop (not via equivalent current loops)
+-            // Skip if using ALBACH H-field model since fringing is already added in the ALBACH branch above
+-            // ALBACH fringing model uses equivalent current loops which are added to inducingFields and processed below
+-            if (!isAlbach && (_magneticFieldStrengthFringingEffectModel == MagneticFieldStrengthFringingEffectModels::ROSHEN ||
+-                              _magneticFieldStrengthFringingEffectModel == MagneticFieldStrengthFringingEffectModels::SULLIVAN)) {
+-                // For the main harmonic we calculate the fringing effect for each gap
+-                if (includeFringing && inducedFields[harmonicIndex].get_frequency() == operatingPoint.get_excitations_per_winding()[0].get_frequency()) {
+-                    if (!operatingPoint.get_excitations_per_winding()[0].get_magnetizing_current()) {
+-                        auto magnetizingInductance = MagneticSimulator().calculate_magnetizing_inductance(operatingPoint, magnetic);
+-                        auto includeDcCurrent = Inputs::include_dc_offset_into_magnetizing_current(operatingPoint, magnetic.get_turns_ratios());
+-                        auto magnetizingCurrent = Inputs::calculate_magnetizing_current(operatingPoint.get_mutable_excitations_per_winding()[0],
+-                                                                                               resolve_dimensional_values(magnetizingInductance.get_magnetizing_inductance()),
+-                                                                                               true, includeDcCurrent);
+-
+-                        operatingPoint.get_mutable_excitations_per_winding()[0].set_magnetizing_current(magnetizingCurrent);
+-                        // throw std::runtime_error("Operating point is missing magnetizing current");
+-                    }
+-                    if (!operatingPoint.get_excitations_per_winding()[0].get_magnetizing_current()->get_processed()) {
+-                        auto excitations = operatingPoint.get_excitations_per_winding();
+-                        auto magnetizingCurrent = excitations[0].get_magnetizing_current().value();
+-                        auto processed = Inputs::calculate_basic_processed_data(magnetizingCurrent.get_waveform().value());
+-                        magnetizingCurrent.set_processed(processed);
+-                        excitations[0].set_magnetizing_current(magnetizingCurrent);
+-                        operatingPoint.set_excitations_per_winding(excitations);
+-                        // throw std::runtime_error("Operating point is missing magnetizing current processed data");
+-                    }
+-                    double frequency = inducingFields[harmonicIndex].get_frequency();
+-                    double magneticFieldStrengthGap = get_magnetic_field_strength_gap(operatingPoint, magnetic, frequency);
++        // --- hoist winding-index lookup out of the O(N^2) loop --------------------
++        const auto& inducingData = inducingFields[harmonicIndex].get_data();
++        const auto& inducedData = inducedFields[harmonicIndex].get_data();
++        std::vector<std::optional<size_t>> windingIndexPerInducingPoint(inducingData.size(), std::nullopt);
++        for (size_t inducingPointIndex = 0; inducingPointIndex < inducingData.size(); ++inducingPointIndex) {
++            if (inducingData[inducingPointIndex].get_turn_index()) {
++                windingIndexPerInducingPoint[inducingPointIndex] =
++                    magnetic.get_mutable_coil().get_winding_index_by_name(
++                        turns[inducingData[inducingPointIndex].get_turn_index().value()].get_winding());
++            }
++        }
+ 
++        // --- ROSHEN / SULLIVAN gap-fringing seed per induced point ----------------
++        std::vector<std::pair<double, double>> inducedSeed;
++        if (!isAlbach && (_magneticFieldStrengthFringingEffectModel == MagneticFieldStrengthFringingEffectModels::ROSHEN ||
++                          _magneticFieldStrengthFringingEffectModel == MagneticFieldStrengthFringingEffectModels::SULLIVAN)) {
++            if (includeFringing && inducedFields[harmonicIndex].get_frequency() == operatingPoint.get_excitations_per_winding()[0].get_frequency()) {
++                if (!operatingPoint.get_excitations_per_winding()[0].get_magnetizing_current()) {
++                    auto magnetizingInductance = MagneticSimulator().calculate_magnetizing_inductance(operatingPoint, magnetic);
++                    auto includeDcCurrent = Inputs::include_dc_offset_into_magnetizing_current(operatingPoint, magnetic.get_turns_ratios());
++                    auto magnetizingCurrent = Inputs::calculate_magnetizing_current(operatingPoint.get_mutable_excitations_per_winding()[0],
++                                                                                           resolve_dimensional_values(magnetizingInductance.get_magnetizing_inductance()),
++                                                                                           true, includeDcCurrent);
++                    operatingPoint.get_mutable_excitations_per_winding()[0].set_magnetizing_current(magnetizingCurrent);
++                }
++                if (!operatingPoint.get_excitations_per_winding()[0].get_magnetizing_current()->get_processed()) {
++                    auto excitations = operatingPoint.get_excitations_per_winding();
++                    auto magnetizingCurrent = excitations[0].get_magnetizing_current().value();
++                    auto processed = Inputs::calculate_basic_processed_data(magnetizingCurrent.get_waveform().value());
++                    magnetizingCurrent.set_processed(processed);
++                    excitations[0].set_magnetizing_current(magnetizingCurrent);
++                    operatingPoint.set_excitations_per_winding(excitations);
++                }
++                double frequency = inducingFields[harmonicIndex].get_frequency();
++                double magneticFieldStrengthGap = get_magnetic_field_strength_gap(operatingPoint, magnetic, frequency);
++
++                inducedSeed.assign(inducedData.size(), {0.0, 0.0});
++                for (size_t inducedPointIndex = 0; inducedPointIndex < inducedData.size(); ++inducedPointIndex) {
+                     for (auto& gap : gapping) {
+                         if (gap.get_coordinates().value()[0] < 0) {
+                             continue;
+                         }
+-                        auto complexFieldPoint = _fringingEffectModel->get_magnetic_field_strength_between_gap_and_point(gap, magneticFieldStrengthGap, inducedFieldPoint);
+-
+-                        totalInducedFieldX += complexFieldPoint.get_real();
+-                        totalInducedFieldY += complexFieldPoint.get_imaginary();
++                        auto complexFieldPoint = _fringingEffectModel->get_magnetic_field_strength_between_gap_and_point(gap, magneticFieldStrengthGap, inducedData[inducedPointIndex]);
++                        inducedSeed[inducedPointIndex].first += complexFieldPoint.get_real();
++                        inducedSeed[inducedPointIndex].second += complexFieldPoint.get_imaginary();
+                         if (std::isnan(complexFieldPoint.get_real())) {
+                             throw NaNResultException("NaN found in fringing field calculation");
+                         }
+@@ -542,53 +554,17 @@ WindingWindowMagneticStrengthFieldOutput MagneticField::calculate_magnetic_field
+                     }
+                 }
+             }
++        }
+ 
+-            for (auto& inducingFieldPoint : inducingFields[harmonicIndex].get_data()) {
+-                std::optional<size_t> windingIndex = std::nullopt;
+-                if (inducingFieldPoint.get_turn_index()) {
+-                    windingIndex = magnetic.get_mutable_coil().get_winding_index_by_name(turns[inducingFieldPoint.get_turn_index().value()].get_winding());
+-                }
+-                if (inducingFieldPoint.get_turn_index()) {
+-                    if (inducedFieldPoint.get_turn_index()) {
+-                        if (inducedFieldPoint.get_turn_index().value() == inducingFieldPoint.get_turn_index().value()) {
+-                            continue;
+-                        }
+-                    }
+-                    // else if (is_inside_inducing_turns(inducingFieldPoint, inducedFieldPoint, &_wirePerWinding[windingIndex])) {
+-                    //     continue;
+-                    // }
+-                    // else if (is_inside_turns(turns, inducedFieldPoint, _wirePerWinding, magnetic)) {
+-                    //     continue;
+-                    // }
+-                    else if (is_inside_core(inducedFieldPoint, coreColumnWidth, coreWidth, coreShapeFamily)) {
+-                        continue;
+-                    }
+-                }
+-
+-                auto complexFieldPoint = _model->get_magnetic_field_strength_between_two_points(inducingFieldPoint, inducedFieldPoint, windingIndex);
+-
+-                totalInducedFieldX += complexFieldPoint.get_real();
+-                totalInducedFieldY += complexFieldPoint.get_imaginary();
+-                if (std::isnan(complexFieldPoint.get_real())) {
+-                    throw NaNResultException("NaN found in magnetic field calculation");
+-                }
+-                if (std::isnan(complexFieldPoint.get_imaginary())) {
+-                    throw NaNResultException("NaN found in magnetic field calculation");
+-                }
+-            }
+-            ComplexFieldPoint complexFieldPoint;
+-            complexFieldPoint.set_point(inducedFieldPoint.get_point());
+-            complexFieldPoint.set_real(totalInducedFieldX);
+-            complexFieldPoint.set_imaginary(totalInducedFieldY);
+-            if (inducedFieldPoint.get_turn_index()) {
+-                complexFieldPoint.set_turn_index(inducedFieldPoint.get_turn_index().value());
+-            }
+-            if (inducedFieldPoint.get_label()) {
+-                complexFieldPoint.set_label(inducedFieldPoint.get_label().value());
+-            }
+-            fieldPoints.push_back(complexFieldPoint);
++        // --- dispatch the all-pairs Biot-Savart sum to the backend ----------------
++        FieldSolveHarmonicInputs solveInputs{
++            inducingData, inducedData, windingIndexPerInducingPoint, inducedSeed,
++            coreColumnWidth, coreWidth, coreShapeFamily};
++        auto solved = fieldSolverBackend->solve(solveInputs, *_model);
++        if (!solved) {
++            solved = cpuFieldSolver.solve(solveInputs, *_model);
+         }
+-        complexFieldPerHarmonic[harmonicIndex].set_data(fieldPoints);
++        complexFieldPerHarmonic[harmonicIndex].set_data(solved.value());
+     }
+ 
+     WindingWindowMagneticStrengthFieldOutput windingWindowMagneticStrengthFieldOutput;
+@@ -1203,6 +1179,11 @@ void MagneticFieldStrengthAlbach2DModel::setupFromMagnetic(
+         throw std::runtime_error("Missing turns description in coil");
+     }
+     auto turns = magnetic.get_coil().get_turns_description().value();
++
++    CpuFieldSolver cpuFieldSolver;
++    auto gpuFieldSolver = GpuFieldSolver::create();  // nullptr on native / no GPU
++    FieldSolverBackend* fieldSolverBackend =
++        gpuFieldSolver ? static_cast<FieldSolverBackend*>(gpuFieldSolver.get()) : &cpuFieldSolver;
+     
+     // Set up all turns from the coil
+     _turns.clear();
