@@ -180,15 +180,39 @@ const std::vector<MagneticEntry> kTopThreeWinding = {
     // 0.04 mm gap needing 21 turns (conservative sizing for L at +tolerance) and
     // re-ranks slot 3 to the 95-material 9-turn stack. Regenerated on main
     // 17e1f850, user-approved.
-    {"79 E 10/3 gapped 0.04 mm, Turns: 21, Order: 012, Non-Interleaved, Margin Taped 00",
+    // Slot 0 re-pinned 2026-07-30 (ABT #377), user-approved. The value moved +0.061%
+    // (2.30960636439206812 -> 2.31102462762095229) while EVERYTHING ELSE held: same winning
+    // reference, same wire triple, and slots 1 and 2 unchanged (1.88518538772831645 exactly,
+    // 0.70004398 vs 0.70004337 — inside kRelTol). A global normalisation shift would have moved
+    // all three, so this is one candidate's score, not a re-ranking.
+    // NOT caused by the drum/molded family work: reverting the TAK/SDE/B45 material additions
+    // reproduces the identical new value, so does reverting the ABT #358 per-shape-family DC-bias
+    // fix, and the windingOrder propagation cannot reach it (no catalogue record carries
+    // windingOrder). ~50 physics/constructive commits landed between the previous pin and this
+    // one — among them the ABT #339 permeability-curve fixes and the #358 DC-bias work — and the
+    // exact one responsible was not isolated; bisect recipe if it ever matters: check out each
+    // candidate, rebuild, run this test, watch for 2.30960636439206812.
+    // Refreshed 2026-08-20 (ABT #834, user-approved). A REAL re-ranking, and the one
+    // snapshot in that ticket whose head actually changed identity: the 95-material
+    // E 8/2 2-stack at 13 turns (gapped 0.02 mm) now wins over the 79-material
+    // E 10/3 at 21 turns, which drops to slot 2. NOT the winding-loss physics: with
+    // the #832/#835/#837 loss fixes reverted in isolation this scenario produced the
+    // IDENTICAL new head ("want 79 E 10/3 ... got 95 E 8/2" both ways), so the driver
+    // is the same catalogue evolution as the sibling tables (135 MAS data/ commits
+    // since 2026-06-16). The family was already competitive — the old slot 3 was a
+    // 95-material E 8/2 3-stack at 9 turns — and the wire triple is unchanged across
+    // all slots. Slots 0 and 1 are the same design differing only in winding order
+    // (021 vs 012) with scores 0.0005% apart: a documented near-tie, not a meaningful
+    // preference. Score scale moved (2.31 -> 1.70) with the normalization pool.
+    {"95 E 8/2 2 stacks gapped 0.02 mm, Turns: 13, Order: 021, Non-Interleaved, Margin Taped 01",
      "Round 33.0 - Single Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
-     2.3096063643920681},
-    {"79 E 10/3 gapped 0.04 mm, Turns: 21, Order: 012, Non-Interleaved, Margin Taped 01",
-     "Round 33.0 - Heavy Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
-     1.8851853877283165},
-    {"95 E 8/2 3 stacks gapped 0.01 mm, Turns: 9, Order: 021, Non-Interleaved, Margin Taped 00",
+     1.7000769237774718},
+    {"95 E 8/2 2 stacks gapped 0.02 mm, Turns: 13, Order: 012, Non-Interleaved, Margin Taped 01",
      "Round 33.0 - Single Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
-     0.70004336813583523},
+     1.7},
+    {"79 E 10/3 gapped 0.04 mm, Turns: 21, Order: 021, Non-Interleaved, Margin Taped 00",
+     "Round 33.0 - Single Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
+     1},
 };
 
 } // namespace
@@ -225,7 +249,7 @@ TEST_CASE("MagneticAdviser 3-winding end-to-end top-3 snapshot",
 //
 
 TEST_CASE("Benchmark MagneticAdviser 3-winding end-to-end (top-3)",
-          "[adviser][magnetic-adviser][!benchmark][benchmark-magnetic-adviser]") {
+          "[!benchmark][benchmark-magnetic-adviser]") {
     settings.reset();
     settings.set_coil_allow_margin_tape(true);
     settings.set_coil_allow_insulated_wire(false);

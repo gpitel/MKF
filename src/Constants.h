@@ -73,6 +73,15 @@ struct Constants {
 
     const double roshenMagneticFieldStrengthStep = 0.1;
     const double foilToSectionMargin = 0.05;
+    // A FOIL IS WOUND WITH A FILM (2026-09-04). Foil winding machines carry two synchronised
+    // de-reelers -- one foil, one insulation -- and lay one film per turn interval, so a foil
+    // winding's layer pitch is the foil PLUS that film; the sheets never touch, or every turn
+    // would be shorted. The published homogenisation convention is exactly this split:
+    // b = b_c + b_i with fill factor lambda = b_c / b (arXiv 2503.13010). 25 um is the standard
+    // polyester: PPI's laminate range is PET 0.025 or 0.050 mm per face, Power Integrations
+    // AN-18 puts the minimum tape base film at 0.025 mm, and US4323870 states 0.010-0.050 mm of
+    // PET between turns for foil of 0.01-3 mm. A wire that DECLARES a coating overrides it.
+    const double foilInterlayerInsulationThickness = 25e-6;
     const double planarToSectionMargin = 0.05;
 };
 
@@ -104,8 +113,19 @@ namespace ThermalDefaults {
     // FR4 PCB
     constexpr double kFR4_ThermalConductivity = 0.3;           // [W/(m·K)] through-plane
     
-    // Angular tolerance for convection blocking detection on toroidal cores
-    constexpr double kConvection_AngularBlockingTolerance = 0.3; // [rad] ~17 degrees
+    // Surface-to-surface gap below which the air between two solid surfaces is
+    // treated as stagnant (no convection to ambient through the crevice). At the
+    // sizes of wound components the natural-convection boundary layer is millimetres
+    // thick (delta ~ L/Nu; e.g. a 12 mm toroid at h~10 W/m2K, k_air 0.026 -> Nu ~ 4.4,
+    // delta ~ 2.7 mm), so sub-millimetre crevices between adjacent turns, or between
+    // the winding and the core surface it wraps, sit entirely inside the stagnant
+    // film and exchange heat by conduction internally, not by convection to ambient.
+    // NOTE (ABT #906): the previous blocking checks compared CENTER-to-center
+    // distances against one wire dimension — geometrically impossible to satisfy for
+    // touching same-size wires (their centers are never closer than one diameter),
+    // so every turn face of a packed toroidal winding convected its full developed
+    // surface and the predicted temperature rise came out ~2.5x low.
+    constexpr double kConvection_StagnantAirGap = 1.0e-3;      // [m]
     
     // TIM
     constexpr double kTIM_DefaultResistance = 0.5;             // [K/W]

@@ -610,6 +610,10 @@ TEST_CASE("Test_CoilAdviser_Insulation_No_Margin", "[adviser][coil-adviser][smok
 
 TEST_CASE("Test_CoilAdviser_Insulation_Margin", "[adviser][coil-adviser][margin][smoke-test]") {
     // OpenMagnetics::set_log_verbosity(2);
+    // ABT #721: this test pins the historical 50/50 tape split (margin == creepage/2 per
+    // section); margin equalization (default-on) re-splits it by section space — disable
+    // to keep the pinned contract.
+    settings.set_coil_equalize_margins(false);
     auto gapping = OpenMagneticsTesting::get_ground_gap(0.003);
     std::vector<double> turnsRatios;
     int64_t numberStacks = 1;
@@ -992,13 +996,14 @@ TEST_CASE("Test_CoilAdviser_Random_0", "[adviser][coil-adviser][bug]") {
     CoilAdviser coilAdviser;
     auto masMagneticsWithCoil = coilAdviser.get_advised_coil(masMagnetic, 2);
 
-    // The adviser silently returning 0 candidates used to pass this test (the JsonLV failure mode).
-    REQUIRE(masMagneticsWithCoil.size() > 0);
-    if (masMagneticsWithCoil.size() > 0) {
-        auto masMagneticWithCoil = masMagneticsWithCoil[0];
-        OpenMagneticsTesting::check_wire_standards(masMagneticWithCoil.get_mutable_magnetic().get_mutable_coil());
-        OpenMagneticsTesting::check_turns_description(masMagneticWithCoil.get_magnetic().get_coil());
-    }
+    // ABT #415 (measured): this random spec is genuinely INFEASIBLE — 82+5 turns in an EP 20
+    // window; the best electrically-adequate wire ('Round 21.0 - Single Build') needs 14.18x
+    // the section area, and even the permissive allow-not-fitting retry returns nothing.
+    // The adviser refusing is the CORRECT behaviour, and this pin protects the refusal: if a
+    // future adviser change starts "finding" a coil here, it is fabricating an unbuildable
+    // design and must fail this test. (The former REQUIRE(size > 0) asserted the impossible;
+    // owner-approved conversion 2026-08-02, ABT #551.)
+    REQUIRE(masMagneticsWithCoil.size() == 0);
 }
 
 TEST_CASE("Test_CoilAdviser_Random_1", "[adviser][coil-adviser][bug]") {
@@ -1675,23 +1680,15 @@ TEST_CASE("Test_CoilAdviser_Random_10", "[adviser][coil-adviser][bug]") {
     CoilAdviser coilAdviser;
     auto masMagneticsWithCoil = coilAdviser.get_advised_coil(masMagnetic, 2);
 
-    // The adviser silently returning 0 candidates used to pass this test (the JsonLV failure mode).
-    REQUIRE(masMagneticsWithCoil.size() > 0);
-    if (masMagneticsWithCoil.size() > 0) {
-        auto masMagneticWithCoil = masMagneticsWithCoil[0];
-        // OpenMagneticsTesting::check_wire_standards(masMagneticWithCoil.get_mutable_magnetic().get_mutable_coil());
-        // OpenMagneticsTesting::check_turns_description(masMagneticWithCoil.get_magnetic().get_coil());
-        auto outputFilePath = std::filesystem::path{ std::source_location::current().file_name() }.parent_path().append("..").append("output");
-        auto outFile = outputFilePath;
-        std::string filename = "Test_CoilAdviser" + std::to_string(OpenMagnetics::TestUtils::randomInt(0, RAND_MAX)) + ".svg";
-        outFile.append(filename);
-        Painter painter(outFile);
-
-        painter.paint_core(masMagneticWithCoil.get_mutable_magnetic());
-        painter.paint_bobbin(masMagneticWithCoil.get_mutable_magnetic());
-        painter.paint_coil_turns(masMagneticWithCoil.get_mutable_magnetic());
-        painter.export_svg();
-    }
+    // ABT #415 (measured): this random spec is genuinely INFEASIBLE — 49x3 + 80 + 78 + 1x2
+    // turns across four isolation sides in an E 50/15 window; the best electrically-adequate
+    // wire needs 2.13x the section area, and even the permissive allow-not-fitting retry
+    // returns nothing. The adviser refusing is the CORRECT behaviour, and this pin protects
+    // the refusal: if a future adviser change starts "finding" a coil here, it is fabricating
+    // an unbuildable design and must fail this test. (The former REQUIRE(size > 0) asserted
+    // the impossible; owner-approved conversion 2026-08-02, ABT #551.)
+    REQUIRE(masMagneticsWithCoil.size() == 0);
+    settings.reset();
 }
 
 TEST_CASE("Test_CoilAdviser_Random_11", "[adviser][coil-adviser][bug]") {
@@ -2794,6 +2791,42 @@ TEST_CASE("Test_WireAdviser_HFInductor_SynthesizesLitz", "[adviser][coil-adviser
     REQUIRE(wire.get_type() == WireType::LITZ);
     REQUIRE(winding > 0);
     REQUIRE(winding < 5.0);
+    settings.reset();
+}
+
+TEST_CASE("Test_CoilAdviser_Real_Winding_Adds_Reversed_Patterns", "[adviser][coil-adviser][real-geometry]") {
+    // ABT #609: an ideal winding is radially symmetric under pattern reversal, so get_patterns
+    // caps the enumeration at n!/2 and a 2-winding transformer gets ONE pattern (order 01). A
+    // REAL winding is not symmetric: leads, margins and blocking load the two orders differently
+    // — 13_current_sense is the proof (order 01 over-subscribes the ER 9.5 window ~2x, order 10
+    // fits and builds watertight 3D). Under the real-winding setting the reversals are appended
+    // AFTER the base set, so the adviser's candidate loop only reaches them when the base
+    // patterns under-deliver — more combinations, no extra time on the happy path (Alf: "try
+    // more pattern combinations, but make sure that time is not increased").
+    auto standards = std::vector<InsulationStandards>{InsulationStandards::IEC_606641};
+    altitude.set_maximum(2000);
+    mainSupplyVoltage.set_nominal(400);
+    OpenMagnetics::Inputs inputs = OpenMagneticsTesting::get_quick_insulation_inputs(
+        altitude, cti, IsolationClass::FUNCTIONAL, mainSupplyVoltage, overvoltageCategory,
+        pollutionDegree, standards, maximumVoltageRms, maximumVoltagePeak, frequency,
+        WiringTechnology::WOUND);
+    DimensionWithTolerance turnsRatio;
+    turnsRatio.set_nominal(1);
+    inputs.get_mutable_design_requirements().set_turns_ratios({turnsRatio});
+    inputs.get_mutable_design_requirements().set_isolation_sides(
+        std::vector<IsolationSide>{IsolationSide::PRIMARY, IsolationSide::SECONDARY});
+
+    settings.set_coil_use_real_winding_geometry(false);
+    auto idealPatterns = OpenMagnetics::Coil::get_patterns(inputs, CoreType::TWO_PIECE_SET);
+    REQUIRE(idealPatterns.size() == 1);
+    REQUIRE(idealPatterns[0] == std::vector<size_t>{0, 1});
+
+    settings.set_coil_use_real_winding_geometry(true);
+    auto realPatterns = OpenMagnetics::Coil::get_patterns(inputs, CoreType::TWO_PIECE_SET);
+    REQUIRE(realPatterns.size() == 2);
+    // Base set FIRST and unchanged (priority and happy-path runtime identical), reversal after.
+    REQUIRE(realPatterns[0] == std::vector<size_t>{0, 1});
+    REQUIRE(realPatterns[1] == std::vector<size_t>{1, 0});
     settings.reset();
 }
 

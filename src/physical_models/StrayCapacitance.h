@@ -1,4 +1,5 @@
 #pragma once
+#include <set>
 #include "Defaults.h"
 #include "constructive_models/Magnetic.h"
 #include "support/Utils.h"
@@ -34,7 +35,12 @@ class StrayCapacitanceParallelPlateModel {
 // https://sci-hub.st/https://ieeexplore.ieee.org/document/602562
 class StrayCapacitanceMassariniModel : public StrayCapacitanceModel {
     public:
-        std::string methodName = "Massarini";
+        // Sets the INHERITED methodName rather than redeclaring one. A redeclaration here shadows
+        // the base member, and StrayCapacitance holds the model through a
+        // shared_ptr<StrayCapacitanceModel>, so `_model->methodName` bound to the BASE member and
+        // every result reported "Default" -- including results where the requested model really
+        // had been applied. See ABT #950.
+        StrayCapacitanceMassariniModel() { methodName = "Massarini"; }
         double calculate_static_capacitance_between_two_turns(double wireCoatingThickness, double averageTurnLength, double conductingRadius, double distanceThroughLayers, double distanceThroughAir, double relativePermittivityWireCoating, double relativePermittivityInsulationLayers);
 
 };
@@ -42,7 +48,12 @@ class StrayCapacitanceMassariniModel : public StrayCapacitanceModel {
 // Based on "Equivalent capacitances of transformer windings" by W. T. Duerdoth
 class StrayCapacitanceDuerdothModel : public StrayCapacitanceModel {
     public:
-        std::string methodName = "Duerdoth";
+        // Sets the INHERITED methodName rather than redeclaring one. A redeclaration here shadows
+        // the base member, and StrayCapacitance holds the model through a
+        // shared_ptr<StrayCapacitanceModel>, so `_model->methodName` bound to the BASE member and
+        // every result reported "Default" -- including results where the requested model really
+        // had been applied. See ABT #950.
+        StrayCapacitanceDuerdothModel() { methodName = "Duerdoth"; }
         double calculate_static_capacitance_between_two_turns(double wireCoatingThickness, double averageTurnLength, double conductingRadius, double distanceThroughLayers, double distanceThroughAir, double relativePermittivityWireCoating, double relativePermittivityInsulationLayers);
 
 };
@@ -50,7 +61,12 @@ class StrayCapacitanceDuerdothModel : public StrayCapacitanceModel {
 // Based on "Induktivitäten in der Leistungselektronik", pages 49-50, by Manfred Albach
 class StrayCapacitanceAlbachModel : public StrayCapacitanceModel {
     public:
-        std::string methodName = "Albach";
+        // Sets the INHERITED methodName rather than redeclaring one. A redeclaration here shadows
+        // the base member, and StrayCapacitance holds the model through a
+        // shared_ptr<StrayCapacitanceModel>, so `_model->methodName` bound to the BASE member and
+        // every result reported "Default" -- including results where the requested model really
+        // had been applied. See ABT #950.
+        StrayCapacitanceAlbachModel() { methodName = "Albach"; }
         double calculate_static_capacitance_between_two_turns(double wireCoatingThickness, double averageTurnLength, double conductingRadius, double distanceThroughLayers, double distanceThroughAir, double relativePermittivityWireCoating, double relativePermittivityInsulationLayers);
 
 };
@@ -60,7 +76,12 @@ class StrayCapacitanceAlbachModel : public StrayCapacitanceModel {
 // https://www.pes-publications.ee.ethz.ch/uploads/tx_ethpublications/biela_IEEETrans_ReviewStrayCap.pdf
 class StrayCapacitanceKochModel : public StrayCapacitanceModel {
     public:
-        std::string methodName = "Koch";
+        // Sets the INHERITED methodName rather than redeclaring one. A redeclaration here shadows
+        // the base member, and StrayCapacitance holds the model through a
+        // shared_ptr<StrayCapacitanceModel>, so `_model->methodName` bound to the BASE member and
+        // every result reported "Default" -- including results where the requested model really
+        // had been applied. See ABT #950.
+        StrayCapacitanceKochModel() { methodName = "Koch"; }
         double calculate_static_capacitance_between_two_turns(double wireCoatingThickness, double averageTurnLength, double conductingRadius, double distanceThroughLayers, double distanceThroughAir, double relativePermittivityWireCoating, double relativePermittivityInsulationLayers);
 
 };
@@ -70,9 +91,14 @@ class StrayCapacitance{
     private:
         std::shared_ptr<StrayCapacitanceModel> _model;
         StrayCapacitanceModels _modelName;
+        // WHICH MODEL ACTUALLY COMPUTED THE PAIRS, which is not always the one selected. Any pair
+        // involving a flat conductor is routed to ParallelPlate regardless of the caller's choice,
+        // so reporting the SELECTED name for such a winding says the model ran when it did not.
+        // Recorded per pair as the dispatch decides, and reported at the end (ABT #950).
+        std::set<std::string> _methodsUsed;
         static double calculate_area_between_two_turns_using_diagonals(Turn firstTurn, Turn secondTurn);
         static double calculate_area_between_two_turns_using_vecticals_and_horizontals(Turn firstTurn, Turn secondTurn);
-        StrayCapacitanceOutput calculate_capacitance_with_voltages(Coil coil, std::map<std::string, double> voltageRmsPerWinding, std::optional<Core> core = std::nullopt);
+        StrayCapacitanceOutput calculate_capacitance_with_voltages(Coil coil, std::map<std::string, double> voltageRmsPerWinding, std::optional<Core> core = std::nullopt, std::optional<double> frequency = std::nullopt);
     public:
 
         StrayCapacitance(StrayCapacitanceModels strayCapacitanceModel = StrayCapacitanceModels::ALBACH){
@@ -107,7 +133,7 @@ class StrayCapacitance{
         // Total capacitance from one winding to the (equipotential) ferrite core: the
         // parallel sum of its turns' turn-to-core elements. Two of these in series through
         // the core node give the inter-winding capacitance for separated windings.
-        static double calculate_winding_to_core_capacitance(Coil coil, Core core, std::string windingName);
+        static double calculate_winding_to_core_capacitance(Coil coil, Core core, std::string windingName, std::optional<double> frequency = std::nullopt);
 
         // Inter-winding capacitance between two SEPARATED windings through the floating,
         // equipotential ferrite core (turn -> core -> turn). Energy method: weights each
@@ -119,15 +145,39 @@ class StrayCapacitance{
         static double calculate_through_core_capacitance(Coil coil, Core core,
                                                          const std::string& firstWindingName,
                                                          const std::string& secondWindingName,
-                                                         const std::vector<double>& voltagesPerTurn);
+                                                         const std::vector<double>& voltagesPerTurn,
+                                                         std::optional<double> frequency = std::nullopt);
+
+        // Energy stored in ONE winding's turn-to-core elements against the floating core
+        // (ABT #848): same per-turn elements and charge-balanced core node as
+        // calculate_through_core_capacitance, but for a single winding driven alone —
+        // the missing HALF of a winding's self-capacitance. The turn-to-turn chain the
+        // energy method already sums shrinks as ctt/(N-1), while this term GROWS with
+        // turn count (each added turn couples to the same core), which is what measured
+        // toroid self-resonances demand. Returns ENERGY (J at the given per-turn
+        // potentials), to be added to the self-pair energy before the 2E/dV^2 reduction.
+        static double calculate_winding_to_core_self_energy(Coil coil, Core core,
+                                                            const std::string& windingName,
+                                                            const std::vector<double>& voltagesPerTurn,
+                                                            std::optional<double> frequency = std::nullopt);
+
+        // ABT #848: how much of an image plane the core is for the turns, from its MAS
+        // permittivity (complex, with conduction) against the dielectric on its surface:
+        // beta = (|eps_core| - eps_ext) / (|eps_core| + eps_ext). 1 for MnZn, nanocrystalline
+        // and any conductor; ~0.6 for NiZn at 10 MHz; 1 when the database has neither
+        // permittivity nor resistivity for the material. The floating-core terms above are
+        // scaled by it when a frequency is given; with no frequency they keep beta = 1.
+        static double core_image_factor(const Core& core, double frequency);
 
         std::map<std::pair<size_t, size_t>, double> calculate_capacitance_among_turns(Coil coil);
 
         // The optional core supplies the through-core inter-winding capacitance for
         // separated (non-adjacent) windings; omit it to keep the legacy behaviour where
         // separated windings have zero mutual capacitance.
-        StrayCapacitanceOutput calculate_capacitance(Coil coil, std::optional<Core> core = std::nullopt);
-        StrayCapacitanceOutput calculate_capacitance(Coil coil, OperatingPoint operatingPoint, std::optional<Core> core = std::nullopt);
+        // frequency: where the capacitance is wanted (the impedance path passes its resonance);
+        // it only sets the core image factor (see core_image_factor) — omit it for beta = 1.
+        StrayCapacitanceOutput calculate_capacitance(Coil coil, std::optional<Core> core = std::nullopt, std::optional<double> frequency = std::nullopt);
+        StrayCapacitanceOutput calculate_capacitance(Coil coil, OperatingPoint operatingPoint, std::optional<Core> core = std::nullopt, std::optional<double> frequency = std::nullopt);
     
     // Bipolar coordinate system for round-round energy density computation
     struct BipolarParams {
@@ -164,7 +214,13 @@ class StrayCapacitanceOneLayer{
         StrayCapacitanceOneLayer(){
         };
         virtual ~StrayCapacitanceOneLayer() = default;
-        double calculate_capacitance(Coil coil);
+        // The core is optional for backwards compatibility, but for a TOROID it changes the
+        // physics: the winding wraps the core cross-section (turn length from the core's
+        // column width and depth, not a circle of the radial half-thickness), and the core is
+        // a FLOATING conductor, so the turn-to-core capacitances form an energy-weighted
+        // network that grows with the number of turns instead of the grounded-shield
+        // cas/cab ladder, which converges to a turn-count-independent fixed point (ABT #845).
+        double calculate_capacitance(Coil coil, std::optional<Core> core = std::nullopt);
 
 
 };

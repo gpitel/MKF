@@ -665,6 +665,13 @@ cmrc_add_resource_library(insulation_standards ALIAS data::insulation_standards 
 cmrc_add_resource_library(core_losses_data ALIAS data::core_losses_data NAMESPACE coreLossesData src/data/core_losses/ciGSE_coefficients.json)
 target_link_libraries(MKF PUBLIC ${LIBS})
 
+# ABT #327: a range-for over a MAS getter's .value() (or a by-value get_*()) binds a
+# reference to a destroyed temporary — undefined behaviour that either segfaults or
+# silently reads freed memory. GCC catches it as -Wdangling-reference; promote it to a
+# hard error on MKF's own targets so the next one cannot land silently. GNU-only (this is
+# a GCC diagnostic; the generator expression leaves Clang/MSVC untouched).
+target_compile_options(MKF PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Werror=dangling-reference>)
+
 # Kirchhoff bridge: MKF links libKirchhoffApi.so and includes ONLY KirchhoffApi.hpp (the string facade),
 # so KH's `namespace MAS` types never enter an MKF TU. src/converter_models/KirchhoffBridge.cpp is picked
 # up by the SOURCES glob; here we add the include path + the imported .so + the build-order dependency.
@@ -677,7 +684,14 @@ if(MKF_USE_KIRCHHOFF)
     if(KIRCHHOFF_SOURCE_DIR)
         set(_kirchhoff_include_dir "${KIRCHHOFF_SOURCE_DIR}/src")
     else()
-        set(_kirchhoff_include_dir "${CMAKE_BINARY_DIR}/kirchhoff_ext-prefix/src/kirchhoff_ext/src")
+        # CURRENT, not CMAKE_BINARY_DIR: ExternalProject_Add's default prefix is relative to the
+        # directory that declares it, so the clone lands in THIS project's binary dir. The two are
+        # the same when MKF is built standalone and differ by the FetchContent path when MKF is a
+        # subproject -- MVB++'s fresh build tree looked for the header in
+        # <top>/kirchhoff_ext-prefix/... while it sat in <top>/_deps/mkf-build/kirchhoff_ext-prefix/...,
+        # and every KirchhoffBridge.cpp compile failed with "KirchhoffApi.hpp: No such file or
+        # directory". Only a fresh tree shows it: an incremental build already had the header.
+        set(_kirchhoff_include_dir "${CMAKE_CURRENT_BINARY_DIR}/kirchhoff_ext-prefix/src/kirchhoff_ext/src")
     endif()
     # PUBLIC so consumers/tests that include KirchhoffBridge.h (-> KirchhoffApi.hpp) find it too.
     target_include_directories(MKF PUBLIC "${_kirchhoff_include_dir}")
@@ -745,11 +759,33 @@ if(INCLUDE_MKF_TESTS)
     
     # TestingUtils.cpp holds shared fixtures; explicitly added below.
     list(FILTER ALL_TEST_SOURCES EXCLUDE REGEX "TestingUtils\\.cpp$")
-    
+
+    # Three test TUs cannot build without Kirchhoff, and the test target had no guard for
+    # any of them -- so INCLUDE_MKF_TESTS=ON with MKF_USE_KIRCHHOFF=OFF, which is the
+    # DEFAULT for both options, could not build MKF_tests at all. Two fail to compile
+    # ("fatal error: NgspiceRunner.cpp/.hpp: No such file or directory") because their
+    # includes resolve only through the Kirchhoff source include dir the MKF target
+    # propagates when Kirchhoff is on; the third fails to LINK against
+    # design_converter_tas / design_requirements_from_tas / simulate_tas, which live in
+    # src/converter_models/KirchhoffBridge.cpp -- already removed from SOURCES above under
+    # this same condition, and for the same stated reason.
+    #
+    # The ngspice link settings below were guarded; the sources never were. Filter them to
+    # match so the default configuration is testable. With Kirchhoff ON, all three build
+    # exactly as before.
+    if(NOT MKF_USE_KIRCHHOFF)
+        list(FILTER ALL_TEST_SOURCES EXCLUDE REGEX "KirchhoffNgspiceRunnerShim\\.cpp$")
+        list(FILTER ALL_TEST_SOURCES EXCLUDE REGEX "TestMutualResistanceExport\\.cpp$")
+        list(FILTER ALL_TEST_SOURCES EXCLUDE REGEX "TestKirchhoffBridge\\.cpp$")
+    endif()
+
     add_executable(MKF_tests ${ALL_TEST_SOURCES} "tests/TestingUtils.cpp")
     target_link_libraries(MKF_tests PRIVATE Catch2::Catch2WithMain)
     target_link_libraries(MKF_tests PUBLIC MKF)
     target_include_directories(MKF_tests PUBLIC "${PROJECT_SOURCE_DIR}/src/")
+    # ABT #327: the same dangling-reference guard on the test TUs (where three of the four
+    # originally-found sites lived). GNU-only.
+    target_compile_options(MKF_tests PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Werror=dangling-reference>)
 
     # tests/KirchhoffNgspiceRunnerShim.cpp compiles Kirchhoff's in-process libngspice runner
     # (Kirchhoff::run_ngspice_in_process) into the test binary: libKirchhoffApi.so hides it

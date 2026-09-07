@@ -1652,6 +1652,47 @@ TEST_CASE("Test_Reflect_Flyback_Primary_Web", "[processor][inputs][smoke-test]")
     REQUIRE(processed.get_label() == WaveformLabel::FLYBACK_SECONDARY);
 }
 
+TEST_CASE("Test_Imported_Rectangle_Is_Custom_Not_Sinusoidal_Via_Inputs", "[processor][inputs][mas-migration][bug]") {
+    // ABT #602: Inputs::calculate_basic_processed_data / try_guess_waveform_label /
+    // try_guess_duty_cycle used to be a verbatim, independently-bugged twin of
+    // WaveformProcessor's classifier (fixed in 6be9b794 but deliberately left
+    // untouched here at the time). Every real entry point — every PyOM/WASM
+    // binding — reaches THIS Inputs-facing copy, not WaveformProcessor's
+    // directly, so the user-reported symptom (a 300 kHz FlyBuck switch-node
+    // waveform, true duty ~20.7%, read back as label=sinusoidal, dutyCycle=0.5)
+    // is only actually closed once this copy is fixed too. Reproduces the
+    // reported file's shape: a two-level rectangle with finite edges and
+    // plateau ripple, which compress_waveform does NOT collapse to an exact
+    // 5-point analytical shape (real SPICE data never does).
+    const size_t numberPoints = 512;
+    const double dutyCycle = 0.207;
+    const double high = 15.086;
+    const double low = -3.92;
+    const double period = 1.0 / 300000;
+    const double ripple = 0.25;
+    size_t pointsHigh = static_cast<size_t>(numberPoints * dutyCycle);
+
+    std::vector<double> data;
+    std::vector<double> time;
+    for (size_t i = 0; i < numberPoints; ++i) {
+        double value = (i < pointsHigh) ? high : low;
+        if (i == pointsHigh || i == pointsHigh + 1) {
+            value = high + (low - high) * (i - pointsHigh + 1) / 3.0;
+        }
+        value += ripple * sin(2 * M_PI * i * 7 / numberPoints);
+        data.push_back(value);
+        time.push_back(period * i / numberPoints);
+    }
+    Waveform waveform;
+    waveform.set_data(data);
+    waveform.set_time(time);
+
+    auto processed = OpenMagnetics::Inputs::calculate_basic_processed_data(waveform);
+    REQUIRE(processed.get_label() == WaveformLabel::CUSTOM);
+    // Measured, not assumed: the duty must track the real high time, not be 0.5.
+    REQUIRE_THAT(processed.get_duty_cycle().value(), Catch::Matchers::WithinAbs(dutyCycle, 0.01));
+}
+
 TEST_CASE("Test_Flyback_Json", "[processor][inputs][smoke-test]") {
     json masJson = OpenMagneticsTesting::fixtures::get_json("mas-flyback-3-winding-lv");
 
@@ -1839,3 +1880,134 @@ TEST_CASE("Test_Standardize_Signal_Descriptor_Non_Multiple_Harmonics", "[process
     REQUIRE(processed.get_rms().value() > 0);
 }
 }  // namespace
+
+// ABT #375/#190: check_integrity resolved designRequirements.magnetizingInductance eagerly, at the
+// top of the function, although exactly one branch needs it — deriving a magnetizing current for an
+// excitation that carries a voltage but no current. Inputs that never reach that branch were
+// rejected for a requirement nothing had asked for, with a message naming neither the field nor the
+// caller: "resolve_dimensional_values: DimensionWithTolerance has neither nominal, minimum nor
+// maximum set". The visible casualties were a MAS file carrying only a magnetic — from_file
+// explicitly supports that, computing the inductance from the geometry and handing it to this
+// constructor, but the eager resolve rejected the file before that value was ever applied — and
+// Test_Flyback_Simulation.
+//
+// The distinction being pinned: an inputs object with NO operating points needs no inductance,
+// because there is no waveform to derive anything for. One WITH an operating point does need it
+// (the induced voltage of a current-driven excitation, and the magnetizing current of a
+// voltage-driven one, are both proportional to L), and a missing value must still be refused there
+// rather than defaulted. So this is not a relaxation — it moves the requirement to where it is real.
+TEST_CASE("Test_Inputs_Magnetizing_Inductance_Resolved_Only_Where_Needed", "[processor][inputs][smoke-test]") {
+    json inputsJson;
+    inputsJson["operatingPoints"] = json::array();
+    inputsJson["designRequirements"] = json();
+    inputsJson["designRequirements"]["magnetizingInductance"] = json::object();
+    inputsJson["designRequirements"]["turnsRatios"] = json::array();
+
+    // Nothing to process, so the absent inductance is nobody's problem.
+    REQUIRE_NOTHROW(OpenMagnetics::Inputs(inputsJson));
+
+    // Add an operating point and the inductance becomes genuinely required: it sets the induced
+    // voltage across the magnetizing branch. Still absent, so this must be refused, loudly.
+    json inputsWithOperatingPointJson = inputsJson;
+    json operatingPoint = json();
+    operatingPoint["name"] = "Nominal";
+    operatingPoint["conditions"]["ambientTemperature"] = 42;
+    json excitation = json();
+    excitation["frequency"] = 100000;
+    excitation["current"]["waveform"]["data"] = {-5, 5, -5};
+    excitation["current"]["waveform"]["time"] = {0, 0.0000025, 0.00001};
+    operatingPoint["excitationsPerWinding"] = json::array({excitation});
+    inputsWithOperatingPointJson["operatingPoints"].push_back(operatingPoint);
+    REQUIRE_THROWS(OpenMagnetics::Inputs(inputsWithOperatingPointJson));
+
+    // Supply it and the same input processes.
+    json satisfiedInputsJson = inputsWithOperatingPointJson;
+    satisfiedInputsJson["designRequirements"]["magnetizingInductance"]["nominal"] = 100e-6;
+    OpenMagnetics::Inputs satisfiedInputs(satisfiedInputsJson);
+    REQUIRE(satisfiedInputs.get_operating_points().size() == 1);
+    auto processedExcitation = satisfiedInputs.get_operating_points()[0].get_excitations_per_winding()[0];
+    CHECK(processedExcitation.get_voltage());  // derived from the current and the inductance
+}
+
+TEST_CASE("Test_Reflected_Secondary_Reflects_Only_What_The_Primary_Has", "[processor][inputs]") {
+    // ABT #825: with one turns ratio the design has two windings, so a lone excitation means the
+    // secondary is reflected from the primary. That reflection dereferenced the primary's voltage
+    // AND current unconditionally, so an operating point giving a current and no voltage — an
+    // ordinary way to describe an inductor's winding — died with a bare "bad optional access"
+    // naming neither the operating point, the winding, nor the field.
+    json inputsJson = json();
+    inputsJson["designRequirements"]["magnetizingInductance"]["nominal"] = 100e-6;
+    inputsJson["designRequirements"]["turnsRatios"] = json::array({json{{"nominal", 0.5}}});
+
+    json excitation = json();
+    excitation["frequency"] = 100000;
+    excitation["current"]["processed"]["dutyCycle"] = 0.5;
+    excitation["current"]["processed"]["label"] = "Triangular";
+    excitation["current"]["processed"]["offset"] = 0;
+    excitation["current"]["processed"]["peakToPeak"] = 10;
+
+    json operatingPoint = json();
+    operatingPoint["name"] = "Nominal";
+    operatingPoint["conditions"]["ambientTemperature"] = 25;
+    operatingPoint["excitationsPerWinding"] = json::array({excitation});
+    inputsJson["operatingPoints"] = json::array({operatingPoint});
+
+    // Current only: the secondary is reflected from the current alone rather than throwing.
+    OpenMagnetics::Inputs inputs(inputsJson);
+    auto excitations = inputs.get_operating_points()[0].get_excitations_per_winding();
+    REQUIRE(excitations.size() == 2);
+    CHECK(excitations[1].get_current());
+
+    // Nothing to reflect at all: still refused, but the message must name the operating point and
+    // say what is missing, never "bad optional access".
+    json emptyExcitationJson = inputsJson;
+    emptyExcitationJson["operatingPoints"][0]["excitationsPerWinding"][0].erase("current");
+    try {
+        OpenMagnetics::Inputs refused(emptyExcitationJson);
+        FAIL("an excitation with neither voltage nor current must be refused");
+    }
+    catch (const std::exception& e) {
+        std::string message(e.what());
+        CHECK(message.find("Nominal") != std::string::npos);
+        CHECK(message != "bad optional access");
+    }
+}
+
+TEST_CASE("Test_Missing_Required_Field_Names_The_Object", "[processor][inputs]") {
+    // ABT #829: a missing required field escaped as nlohmann's own
+    // "[json.exception.out_of_range.403] key 'bobbin' not found", which names the key but not the
+    // object — and "name" is ambiguous across the magnetic, the core, the shape, the bobbin,
+    // manufacturerInfo and every winding. The field IS required (coil.json's anyOf requires it in
+    // every branch); the message simply has to say whose it is.
+    json coilJson = json();
+    coilJson["functionalDescription"] = json::array({json{
+        {"name", "primary"},
+        {"numberTurns", 10},
+        {"numberParallels", 1},
+        {"isolationSide", "primary"},
+        {"wire", "Round 0.5 - Grade 1"}}});
+
+    try {
+        auto coil = coilJson.get<OpenMagnetics::Coil>();
+        FAIL("a coil without a bobbin must be refused");
+    }
+    catch (const std::exception& e) {
+        std::string message(e.what());
+        CHECK(message.find("coil") != std::string::npos);
+        CHECK(message.find("bobbin") != std::string::npos);
+        CHECK(message.find("out_of_range") == std::string::npos);
+    }
+
+    json windingMissingWireJson = coilJson;
+    windingMissingWireJson["bobbin"] = "Dummy";
+    windingMissingWireJson["functionalDescription"][0].erase("wire");
+    try {
+        auto coil = windingMissingWireJson.get<OpenMagnetics::Coil>();
+        FAIL("a winding without a wire must be refused");
+    }
+    catch (const std::exception& e) {
+        std::string message(e.what());
+        CHECK(message.find("winding") != std::string::npos);
+        CHECK(message.find("wire") != std::string::npos);
+    }
+}

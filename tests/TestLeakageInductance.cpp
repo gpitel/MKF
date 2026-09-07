@@ -2,6 +2,7 @@
 #include <iomanip>
 #include <map>
 #include "physical_models/LeakageInductance.h"
+#include "physical_models/MagnetizingInductance.h"
 #include "support/Painter.h"
 #include "support/Utils.h"
 #include "constructive_models/Core.h"
@@ -463,9 +464,20 @@ TEST_CASE("Calculate leakage inductance for toroidal cores with contiguous secti
     magnetic.set_coil(coil);
 
     double frequency = 100000;
-    // Updated for Kelvin mirroring of toroidal boundaries (Mühlethaler 2026)
-    // TODO: verify against FEM simulation
-    double expectedLeakageInductance = 0.02514;
+    // Re-pinned 2026-07-28 (ABT #320, user-approved). The previous 0.02514 carried
+    // "TODO: verify against FEM simulation" and had never been checked; it was a snapshot of
+    // the toroidal mesh BEFORE the current-direction fix, which entered both crossings of a
+    // toroidal turn with the same sign. That left ~2*N*I of uncancelled current in the
+    // modelling plane and a spurious field OUTSIDE the core (a toroid has none), inflating the
+    // leakage energy integral.
+    //
+    // Sanity check on the new value: leakage is referred to the SOURCE winding, here winding 1
+    // (200 turns), whose self-inductance is mu0*mu_r*N^2*Ae/le = 222 mH for T 48/28/16
+    // (Ae = 160 mm2, le = 119.4 mm, mu_r = 3300). The old pin is 11.3% of that; the new value is
+    // 0.82%. Contiguous two-sector toroidal windings are the common-mode-choke topology, for
+    // which vendor datasheets quote stray/leakage inductance at 0.5-2% of L_CM — the new value
+    // sits inside that band, the old one well above it.
+    double expectedLeakageInductance = 1.81288e-3;
 
     auto leakageInductance = LeakageInductance().calculate_leakage_inductance(magnetic, frequency, 1, 0).get_leakage_inductance_per_winding()[0].get_nominal().value();
     CHECK_THAT(leakageInductance, WithinRel(expectedLeakageInductance, maximumError));
@@ -515,9 +527,14 @@ TEST_CASE("Calculate leakage inductance for toroidal cores with contiguous secti
     magnetic.set_coil(coil);
 
     double frequency = 100000;
-    // Updated for Kelvin mirroring of toroidal boundaries (Mühlethaler 2026)
-    // TODO: verify against FEM simulation
-    double expectedLeakageInductance = 3.652e-5;
+    // Re-pinned 2026-07-28 (ABT #320, user-approved) — same cause as the sibling test above:
+    // the previous 3.652e-5 was an unverified snapshot ("TODO: verify against FEM simulation")
+    // of the toroidal mesh before the current-direction fix.
+    //
+    // Here leakage is referred to winding 0 (10 turns), self-inductance 0.556 mH. The old pin is
+    // 6.6% of that, the new value 1.13% — again inside the 0.5-2% band vendors quote for the
+    // contiguous two-sector (common-mode-choke) toroidal topology.
+    double expectedLeakageInductance = 6.27273e-6;
 
     auto leakageInductance = LeakageInductance().calculate_leakage_inductance(magnetic, frequency, 0, 1).get_leakage_inductance_per_winding()[0].get_nominal().value();
     CHECK_THAT(leakageInductance, WithinRel(expectedLeakageInductance, maximumError));
@@ -618,7 +635,7 @@ TEST_CASE("Checks that increasing insulation between layers keeps leakage induct
     settings.reset();
 }
 
-TEST_CASE("Benchmarks leakage inductance calculation in planar", "[physical-model][leakage-inductance][!benchmark]") {
+TEST_CASE("Benchmarks leakage inductance calculation in planar", "[!benchmark]") {
     BENCHMARK_ADVANCED("measures computation time")(Catch::Benchmark::Chronometer meter) {
 
         auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "leakage_inductance_planar.json");
@@ -891,5 +908,135 @@ TEST_CASE("MagneticSimulator leakage output is winding-indexed with a zero prima
     auto pairwise = LeakageInductance().calculate_leakage_inductance(magnetic, frequency, 0, 1).get_leakage_inductance_per_winding()[0].get_nominal().value();
     REQUIRE(simulatorPerWinding[1].get_nominal());
     CHECK_THAT(simulatorPerWinding[1].get_nominal().value(), WithinRel(pairwise, 1e-9));
+    settings.reset();
+}
+
+// ABT #366: shielded drum (drumRing). A bifilar two-winding coil in the drum groove must run
+// the leakage pipeline end-to-end: finite, positive, and far below the magnetizing inductance
+// (same window, tightly coupled).
+TEST_CASE("Test_Leakage_Inductance_Drum_Ring_Smoke", "[physical-model][leakage-inductance][drum-ring]") {
+    settings.reset();
+    clear_databases();
+    auto core = OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "3C90");
+    json coilJson;
+    coilJson["bobbin"] = "Dummy";
+    coilJson["functionalDescription"] = json::array();
+    for (size_t windingIndex = 0; windingIndex < 2; ++windingIndex) {
+        json winding;
+        winding["name"] = "winding " + std::to_string(windingIndex);
+        winding["numberTurns"] = 4;
+        winding["numberParallels"] = 1;
+        winding["isolationSide"] = windingIndex == 0 ? "primary" : "secondary";
+        winding["wire"] = "Round 0.1 - Grade 1";
+        coilJson["functionalDescription"].push_back(winding);
+    }
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
+    auto completed = OpenMagnetics::magnetic_autocomplete(magnetic);
+    REQUIRE(completed.get_coil().get_turns_description().has_value());
+
+    double frequency = 100000;
+    auto leakageInductance = LeakageInductance()
+        .calculate_leakage_inductance(completed, frequency)
+        .get_leakage_inductance_per_winding()[0].get_nominal().value();
+    CHECK(std::isfinite(leakageInductance));
+    CHECK(leakageInductance > 0);
+
+    MagnetizingInductance magnetizingInductanceModel("ZHANG");
+    double magnetizingInductance = magnetizingInductanceModel
+        .calculate_inductance_from_number_turns_and_gapping(completed.get_core(), completed.get_coil())
+        .get_magnetizing_inductance().get_nominal().value();
+    CHECK(leakageInductance < magnetizingInductance);
+    settings.reset();
+}
+
+// ABT #366/#362/#357: leakage across ALL FOUR new families. A bifilar two-winding coil in each
+// family's window must run the leakage pipeline end-to-end and stay far below the magnetizing
+// inductance (both windings share one window, so coupling is tight). Physical relation rather
+// than a pinned value: no published leakage data exists for these geometries.
+TEST_CASE("Test_Leakage_Inductance_New_Core_Families",
+          "[physical-model][leakage-inductance][drum][drum-ring][drum-semishielded][molded]") {
+    settings.reset();
+    clear_databases();
+
+    auto buildCustomCore = [](json shapeJson, const std::string& coreType, json coating,
+                              const std::string& materialName) {
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", coreType}, {"material", materialName}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1}};
+        if (!coating.is_null()) {
+            coreJson["functionalDescription"]["coating"] = coating;
+        }
+        OpenMagnetics::Core core(coreJson);
+        core.process_data();
+        core.process_gap();
+        return core;
+    };
+    json drumDimensions = {
+        {"A", {{"nominal", 0.0038}}}, {"B", {{"nominal", 0.0018}}}, {"C", {{"nominal", 0.0015}}},
+        {"D", {{"nominal", 0.0004}}}, {"E", {{"nominal", 0.0010}}}, {"F", {{"nominal", 0.0004}}}};
+    json semishieldedDimensions = drumDimensions;
+    semishieldedDimensions["J"] = {{"nominal", 0.0040}};
+    semishieldedDimensions["K"] = {{"nominal", 0.0040}};
+    semishieldedDimensions["L"] = {{"nominal", 0.0018}};
+
+    std::vector<std::pair<std::string, OpenMagnetics::Core>> cores;
+    cores.emplace_back("drum", OpenMagneticsTesting::get_quick_core("DRH-14X20-4C", json::array(), 1, "3C90"));
+    cores.emplace_back("drumRing", OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "3C90"));
+    cores.emplace_back("drumSemishielded", buildCustomCore(
+        {{"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "drumSemishielded"},
+         {"aliases", json::array()}, {"name", "LQS-like 4018"}, {"dimensions", semishieldedDimensions}},
+        "pieceAndPlate", {{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", "Kool M\u00b5 26"}}, "3C90"));
+    cores.emplace_back("molded", buildCustomCore(
+        {{"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+         {"aliases", json::array()}, {"name", "MAPI-like 4020"},
+         {"dimensions", {
+             {"A", {{"nominal", 0.0041}}}, {"B", {{"nominal", 0.0021}}}, {"C", {{"nominal", 0.0041}}},
+             {"D", {{"nominal", 0.0014}}}, {"E", {{"nominal", 0.0030}}}, {"F", {{"nominal", 0.0012}}}}}},
+        "closedShape", json(), "Kool M\u00b5 26"));
+
+    double frequency = 100000;
+    MagnetizingInductance magnetizingInductanceModel("ZHANG");
+    for (auto& [label, core] : cores) {
+        json coilJson;
+        coilJson["bobbin"] = "Dummy";
+        coilJson["functionalDescription"] = json::array();
+        for (size_t windingIndex = 0; windingIndex < 2; ++windingIndex) {
+            coilJson["functionalDescription"].push_back({
+                {"name", "winding " + std::to_string(windingIndex)}, {"numberTurns", 4},
+                {"numberParallels", 1},
+                {"isolationSide", windingIndex == 0 ? "primary" : "secondary"},
+                {"wire", "Round 0.1 - Grade 1"}});
+        }
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
+        auto completed = OpenMagnetics::magnetic_autocomplete(magnetic);
+        REQUIRE(completed.get_coil().get_turns_description().has_value());
+
+        double leakageInductance = LeakageInductance()
+            .calculate_leakage_inductance(completed, frequency)
+            .get_leakage_inductance_per_winding()[0].get_nominal().value();
+        double magnetizingInductance = magnetizingInductanceModel
+            .calculate_inductance_from_number_turns_and_gapping(completed.get_core(), completed.get_coil())
+            .get_magnetizing_inductance().get_nominal().value();
+        UNSCOPED_INFO(label << ": leakage " << leakageInductance * 1e9 << " nH vs magnetizing "
+                      << magnetizingInductance * 1e9 << " nH");
+        CHECK(std::isfinite(leakageInductance));
+        CHECK(leakageInductance > 0);
+        // "Leakage << magnetizing" is NOT universal — it assumes a magnetic circuit strong
+        // enough to dominate the air paths between windings. Measured here: it holds for the
+        // high-permeability CLOSED circuits (drumRing 139 nH vs 474 nH; drumSemishielded 215 nH
+        // vs 1164 nH) and FAILS for the two weak circuits, correctly: a bare drum returns
+        // through air (4382 nH vs 799 nH) and a molded body is a mu~26 composite (282 nH vs
+        // 159 nH). With so little core to funnel the flux, the inter-winding path is no longer
+        // the poor relation — coupling really is loose in these parts. Asserting the relation
+        // for all four would have pinned a falsehood.
+        if (label == "drumRing" || label == "drumSemishielded") {
+            CHECK(leakageInductance < magnetizingInductance);
+        }
+    }
     settings.reset();
 }

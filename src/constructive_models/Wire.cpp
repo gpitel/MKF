@@ -1048,6 +1048,8 @@ namespace OpenMagnetics {
             }
             case WireType::PLANAR:
             case WireType::FOIL:
+                // The film is WIDER than the foil (the cuff) but that breadth belongs to the
+                // insulation, not to the conductor: the foil's own height is what it conducts on.
                 return resolve_dimensional_values(wire.get_conducting_height().value(), preferredValue);
             default:
                 throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Cannot calculate outer height for ROUND or LITZ");
@@ -1056,6 +1058,27 @@ namespace OpenMagnetics {
 
     double Wire::calculate_outer_height(OpenMagnetics::DimensionalValues preferredValue) {
         return calculate_outer_height(*this, preferredValue);
+    }
+
+    // THE INTERLEAVED FILM OF A FOIL WINDING (2026-09-04). A foil is wound together with an
+    // insulating film -- one film per turn interval -- so its layer pitch is the foil plus that
+    // film, and its parallels, which are wound N-filar, are separated by the same film (they are
+    // common at the terminals but must not touch along their length, or the asymmetric coupling
+    // between them circulates current: US12555713). Unlike a round wire's enamel, which wraps the
+    // conductor and is therefore counted on BOTH faces, the interleaf lies between one turn and
+    // the next and is counted ONCE. A declared coating gives its thickness; with none declared a
+    // foil would be bare copper touching bare copper, which is not a winding, so the standard
+    // polyester of Constants::foilInterlayerInsulationThickness is used and the choice is here to
+    // be seen rather than hidden in a fill factor.
+    double Wire::get_foil_interlayer_insulation(const Wire& wire) {
+        auto coating = Wire::resolve_coating(wire);
+        if (coating && coating->get_type() == InsulationWireCoatingType::BARE) {
+            return 0.0;
+        }
+        if (coating) {
+            return Wire::get_coating_thickness(coating.value());
+        }
+        return constants.foilInterlayerInsulationThickness;
     }
 
     double Wire::calculate_outer_width(Wire wire, OpenMagnetics::DimensionalValues preferredValue) {
@@ -1081,8 +1104,11 @@ namespace OpenMagnetics {
                     return resolve_dimensional_values(wire.get_conducting_width().value(), preferredValue);
                 }
             }
-            case WireType::PLANAR:
             case WireType::FOIL:
+                // The interleaved film: the pitch a foil layer occupies is foil + film.
+                return resolve_dimensional_values(wire.get_conducting_width().value(), preferredValue) +
+                       Wire::get_foil_interlayer_insulation(wire);
+            case WireType::PLANAR:
                 return resolve_dimensional_values(wire.get_conducting_width().value(), preferredValue);
             default:
                 throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Cannot calculate outer width for ROUND or LITZ");
@@ -1502,6 +1528,16 @@ namespace OpenMagnetics {
     double Wire::get_maximum_outer_width() {
         switch (get_type()) {
             case WireType::LITZ:
+                if (get_outer_diameter())
+                    return resolve_dimensional_values(get_outer_diameter().value());
+                else
+                    // NOT get_maximum_conducting_width(): for litz that returns the STRAND
+                    // diameter, so the fallback made a bundle as wide as one of its strands
+                    // and, worse, made outer == conducting so get_coating_thickness() derived
+                    // exactly 0. No catalogue litz sets outerDiameter, so this fired every
+                    // time. calculate_outer_diameter() already knows the real bundle envelope
+                    // (bare/served/insulated, from strand count, grade, layers and standard).
+                    return calculate_outer_diameter(*this);
             case WireType::ROUND:
                 if (get_outer_diameter())
                     return resolve_dimensional_values(get_outer_diameter().value());
@@ -1522,6 +1558,11 @@ namespace OpenMagnetics {
     double Wire::get_maximum_outer_height() {
         switch (get_type()) {
             case WireType::LITZ:
+                if (get_outer_diameter())
+                    return resolve_dimensional_values(get_outer_diameter().value());
+                else
+                    // A litz bundle is round: same envelope as the width. See the note there.
+                    return calculate_outer_diameter(*this);
             case WireType::ROUND:
                 if (get_outer_diameter())
                     return resolve_dimensional_values(get_outer_diameter().value());
@@ -1616,14 +1657,42 @@ namespace OpenMagnetics {
         }
     }
 
-    void Wire::cut_foil_wire_to_section(Section section) {
+    void Wire::cut_foil_wire_to_section(Section section, double reservedPerEdge) {
         if (get_type() != WireType::FOIL) {
             throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Method only valid for Foil wire");
         }
+        // A SHEET MAY NOT SPAN A LEAD'S CORRIDOR (ABT #1001, 2026-09-04). An inner winding's
+        // lead-out crosses the window at one edge to reach its pin, and a foil is as tall as the
+        // space it is wound in -- so unless the sheet is cut short of that corridor, the lead runs
+        // straight through it. Measured on two_switch_forward_transformer_complete: the primary's
+        // exit lead occupies y 12.845..13.634 mm and the sheets reached 12.968, so every one of
+        // the eight was cut by it; that was the whole remaining overlap class on the design.
+        // Real practice routes an inner lead-out in the MARGIN or through a notch in the foil
+        // edge, never through the sheet.
+        //
+        // The reservation is symmetric -- the same depth taken from both edges -- so the sheet
+        // stays CENTRED on its section. Reserving asymmetrically would be less copper lost, but
+        // it would put the sheet off-centre, and nothing in the foil path moves a sheet off its
+        // layer's centre (ABT #1004). The caller passes the deepest corridor of either edge.
         DimensionWithTolerance dimensionWithTolerance;
-        dimensionWithTolerance.set_maximum(section.get_dimensions()[1] * (1 - constants.foilToSectionMargin));
+        const double cutHeight = section.get_dimensions()[1] * (1 - constants.foilToSectionMargin) -
+                                 2.0 * std::max(0.0, reservedPerEdge);
+        if (cutHeight <= 0) {
+            throw InvalidInputException(
+                ErrorCode::INVALID_WIRE_DATA,
+                "Foil wire '" + get_name().value_or("<unnamed>") + "': the connection leads crossing"
+                " section '" + section.get_name() + "' reserve " + std::to_string(reservedPerEdge) +
+                " m at each edge, which leaves no height for the sheet in a section of " +
+                std::to_string(section.get_dimensions()[1]) + " m");
+        }
+        dimensionWithTolerance.set_maximum(cutHeight);
         set_conducting_height(dimensionWithTolerance);
-        set_outer_width(get_conducting_width());
+        // The width the layer occupies is the foil PLUS its interleaved film (see
+        // get_foil_interlayer_insulation); the height is the foil's own.
+        DimensionWithTolerance outerWidth;
+        outerWidth.set_nominal(resolve_dimensional_values(get_conducting_width().value()) +
+                               Wire::get_foil_interlayer_insulation(*this));
+        set_outer_width(outerWidth);
         set_outer_height(get_conducting_height());
     }
 
@@ -1700,6 +1769,38 @@ namespace OpenMagnetics {
     }
 
     double Wire::get_coating_thickness(Wire wire) {
+        // LITZ: the wire's OWN coating describes the SERVING around the bundle, not the
+        // insulation that separates one conductor from another. Every strand is individually
+        // enamelled, and that enamel is what makes even an unserved bundle safe to wind
+        // against its neighbour — so the strand's coating is the honest answer here.
+        //
+        // Deriving it from the envelope instead would give (bundleOuterDiameter -
+        // strandDiameter) / 2, which is mostly air and neighbouring strands rather than
+        // dielectric. Before the bundle diameter was wired up it was worse still: outer fell
+        // back to the strand diameter, so this returned exactly 0 for every catalogue litz and
+        // close-wound litz was reported as shorted turns.
+        if (wire.get_type() == WireType::LITZ) {
+            auto strand = resolve_strand(wire);
+            auto strandCoating = resolve_coating(strand);
+            if (!strandCoating) {
+                return 0;  // genuinely bare strands: no insulation between conductors
+            }
+            if (strandCoating->get_type() &&
+                strandCoating->get_type().value() == InsulationWireCoatingType::BARE) {
+                return 0;
+            }
+            if (strandCoating->get_thickness()) {
+                return resolve_dimensional_values(strandCoating->get_thickness().value());
+            }
+            // Grade-based enamel: take it from the standard's own table for the strand
+            // diameter rather than the generic 30 um guess further down.
+            auto standard = wire.get_standard().value_or(WireStandard::IEC_60317);
+            auto strandConductingDiameter = resolve_dimensional_values(strand.get_conducting_diameter());
+            auto grade = require_coating_field(strandCoating->get_grade(), "strand grade");
+            double strandOuterDiameter = get_outer_diameter_round(strandConductingDiameter, grade, standard);
+            return (strandOuterDiameter - strandConductingDiameter) / 2;
+        }
+
         auto coating = resolve_coating(wire);
 
         if (!coating) {
@@ -1713,6 +1814,46 @@ namespace OpenMagnetics {
 
         if (coating->get_thickness_layers() && coating->get_number_layers()) {
             return coating->get_thickness_layers().value() * coating->get_number_layers().value();
+        }
+
+        if (coating->get_type() && coating->get_type().value() == InsulationWireCoatingType::BARE) {
+            return 0;
+        }
+
+        // ABT #853: a flat wire that DECLARES a coating but carries neither a thickness nor an
+        // outer dimension used to fall through to (outer - conducting) / 2 with the outer
+        // dimension itself defaulted to the conducting one -- i.e. "absent" read as "equal to
+        // the conductor", and a coated wire reported as bare metal. That zero then reached the
+        // shorted-turns guard and declared close-wound parallels a short circuit. Enamelled
+        // rectangular wire is resolved from the standard's own table for its grade, exactly as
+        // the litz branch above does for the strand; anything else that cannot be resolved is
+        // an incomplete wire and says so, instead of deriving 0.
+        bool isFlat = wire.get_type() == WireType::RECTANGULAR || wire.get_type() == WireType::FOIL ||
+                      wire.get_type() == WireType::PLANAR;
+        bool outerDimensionAbsent = isFlat ? (!wire.get_outer_width() && !wire.get_outer_height())
+                                           : !wire.get_outer_diameter();
+        if (outerDimensionAbsent) {
+            bool isEnamelled = !coating->get_type() ||
+                               coating->get_type().value() == InsulationWireCoatingType::ENAMELLED;
+            auto standard = wire.get_standard().value_or(WireStandard::IEC_60317);
+            if (wire.get_type() == WireType::RECTANGULAR && isEnamelled && coating->get_grade()) {
+                auto conductingWidth = resolve_dimensional_values(wire.get_conducting_width().value());
+                auto conductingHeight = resolve_dimensional_values(wire.get_conducting_height().value());
+                auto grade = coating->get_grade().value();
+                double coatingThicknessWidth = (get_outer_width_rectangular(conductingWidth, grade, standard) - conductingWidth) / 2;
+                double coatingThicknessHeight = (get_outer_height_rectangular(conductingHeight, grade, standard) - conductingHeight) / 2;
+                return std::min(coatingThicknessWidth, coatingThicknessHeight);
+            }
+            if (wire.get_type() == WireType::ROUND && isEnamelled && coating->get_grade()) {
+                auto conductingDiameter = resolve_dimensional_values(wire.get_conducting_diameter().value());
+                return (get_outer_diameter_round(conductingDiameter, coating->get_grade().value(), standard) - conductingDiameter) / 2;
+            }
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA,
+                "Wire " + wire.get_name().value_or("(unnamed)") + " declares a coating but gives neither its thickness"
+                " (coating.thickness, or thicknessLayers x numberLayers) nor an outer dimension (outerDiameter, or"
+                " outerWidth/outerHeight), and it is not an enamelled round/rectangular wire with a grade that the"
+                " standard's table could resolve; the coating thickness cannot be derived (it is NOT zero -- the wire"
+                " is not bare).");
         }
 
         auto maximumOuterWidth = wire.get_maximum_outer_width();
@@ -1745,8 +1886,12 @@ namespace OpenMagnetics {
         }
         
         // Default values based on common coating materials
-        // These are typical values from literature
-        auto coatingType = wire.resolve_coating();
+        // These are typical values from literature.
+        // ABT #857: read the type from the same coating the material came from, or litz
+        // would resolve its material from the strand enamel and then pick its default
+        // from the bundle serving -- the exact self-disagreement this ticket exists to
+        // remove.
+        auto coatingType = resolve_insulating_coating(wire);
         if (coatingType) {
             auto coatingTypeEnum = coatingType->get_type();
             if (coatingTypeEnum == InsulationWireCoatingType::INSULATED) {
@@ -1822,8 +1967,33 @@ namespace OpenMagnetics {
         return resolve_coating_insulation_material(*this);
     }
 
+    // ABT #857: the coating that actually insulates one CONDUCTOR from another.
+    //
+    // For a litz wire that is the STRAND's enamel, not the wire's own coating: a litz
+    // wire's own coating describes the bundle SERVING, which in every real MAS is
+    // {type: served, material: null}. Asking the serving for a material therefore threw
+    // "Coating is missing material information" and took the whole thermal model down --
+    // measured over the production bug queue, 11 of 29 recent designs failed
+    // plot_temperature_field and every one of them was litz, while every round, foil and
+    // planar design succeeded. Two users reported it as temperature estimation being
+    // broken or "lagy" (web bug reports #165 and #167).
+    //
+    // The engine already knew which coating it meant. Temperature.cpp's litz matrix
+    // conductivity is documented as "the strand enamel/insulation that heat must cross
+    // between conductors", and get_coating_thermal_conductivity carries a SERVED branch
+    // that no call could ever reach, because this resolution threw first.
+    //
+    // Same reasoning as e01aeaf1, which made get_coating_thickness read the strand: one
+    // definition of "what insulates this conductor", so litz cannot disagree with itself.
+    std::optional<InsulationWireCoating> Wire::resolve_insulating_coating(const Wire& wire) {
+        if (wire.get_type() == WireType::LITZ) {
+            return resolve_coating(resolve_strand(wire));
+        }
+        return resolve_coating(wire);
+    }
+
     InsulationMaterial Wire::resolve_coating_insulation_material(Wire wire) {
-        auto coating = resolve_coating(wire);
+        auto coating = resolve_insulating_coating(wire);
 
         if (!coating) {
             throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Wire has no coating");
@@ -2057,6 +2227,35 @@ namespace OpenMagnetics {
     }
     
 
+    // ABT #898: a synthesised wire must DECLARE the coating whose table sized it.
+    //
+    // The outer diameter below comes from get_outer_diameter_round(d, grade 1, IEC 60317),
+    // whose key is literally "round enamelled 1 IEC 60317" -- so this wire IS a grade-1
+    // enamelled round wire, and the gap between its outer and conducting diameters IS that
+    // enamel. Leaving the coating unset did not make the wire coating-less, it made the
+    // wire DISAGREE WITH ITSELF: Wire::get_coating_thickness() reads "no coating object"
+    // as bare metal and answers 0 regardless of the outer diameter (that is deliberate --
+    // ABT #395 -- because absent must not be guessed at). Every turn of the fast adviser's
+    // dummy coil (CoreAdviserDataset::get_dummy_coil, the only `exact` caller) was therefore
+    // reported as bare copper, and StrayCapacitance has no dielectric to work with between
+    // two bare conductors: the turn-to-turn capacitance diverged and took the SPICE export
+    // of every fast-advised magnetic with it.
+    //
+    // Note this was NOT #406's shorted-turns case and its guard was right not to fire: the
+    // turns are laid one OUTER diameter apart, so the copper really was ~31 um clear. The
+    // geometry was sound throughout; only the wire's own description of itself was wrong.
+    //
+    // This is NOT a fabricated default -- nothing here is invented. The grade and standard
+    // were already chosen by the line that computes the outer diameter; they were simply
+    // not recorded. Stating them makes get_coating_thickness() derive exactly
+    // (outer - conducting) / 2, the dielectric the geometry already describes.
+    static InsulationWireCoating enamelled_grade_1_coating() {
+        InsulationWireCoating coating;
+        coating.set_type(InsulationWireCoatingType::ENAMELLED);
+        coating.set_grade(1);
+        return coating;
+    }
+
     Wire Wire::get_wire_for_frequency(double effectiveFrequency, double temperature, bool exact) {
         auto skinDepth = WindingSkinEffectLosses::calculate_skin_depth("copper", effectiveFrequency, temperature);
         double wireConductingDiameter = skinDepth * 2;
@@ -2068,6 +2267,8 @@ namespace OpenMagnetics {
             wire.set_material("copper");
             wire.set_type(WireType::ROUND);
             wire.set_number_conductors(1);
+            wire.set_standard(WireStandard::IEC_60317);
+            wire.set_coating(enamelled_grade_1_coating());
             return wire;
         }
         else {
@@ -2086,6 +2287,9 @@ namespace OpenMagnetics {
             wire.set_material("copper");
             wire.set_type(WireType::ROUND);
             wire.set_number_conductors(1);
+            // ABT #898, same reasoning as get_wire_for_frequency above.
+            wire.set_standard(WireStandard::IEC_60317);
+            wire.set_coating(enamelled_grade_1_coating());
             return wire;
         }
         else {

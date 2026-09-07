@@ -2,6 +2,7 @@
 #include "support/Exceptions.h"
 #include <algorithm>
 #include <cmath>
+#include <set>
 
 namespace OpenMagnetics {
 
@@ -93,7 +94,7 @@ ReluctanceNetwork::ReluctanceNetwork(Core core, double ungappedCoreReluctance, s
     }
     for (auto& gap : gapping) {
         if (!gap.get_coordinates()) {
-            _core.process_gap();
+            _core.process_gap_or_throw();
             gapping = _core.get_functional_description().get_gapping();
             break;
         }
@@ -128,13 +129,56 @@ static std::optional<int64_t> resolve_window_from_sections(const OpenMagnetics::
     return std::nullopt;
 }
 
+// ABT #227.4: every distinct winding window a winding's CONDUCTION sections reference,
+// not just the first (resolve_window_from_sections above stops at the first match,
+// which is right for the common case -- one winding, one window -- but hides a winding
+// interleaved across two windows behind whichever section happens to be listed first).
+static std::set<int64_t> resolve_distinct_windows_from_sections(const OpenMagnetics::Coil& coil, const std::string& windingName) {
+    std::set<int64_t> distinctWindows;
+    auto sectionsDescription = coil.get_sections_description();
+    if (!sectionsDescription) {
+        return distinctWindows;
+    }
+    for (const auto& section : sectionsDescription.value()) {
+        if (section.get_type() != ElectricalType::CONDUCTION || !section.get_winding_window()) {
+            continue;
+        }
+        for (const auto& partialWinding : section.get_partial_windings()) {
+            if (partialWinding.get_winding() == windingName) {
+                distinctWindows.insert(section.get_winding_window().value());
+            }
+        }
+    }
+    return distinctWindows;
+}
+
 std::vector<size_t> ReluctanceNetwork::resolve_winding_column_indexes(Magnetic magnetic) {
     auto core = magnetic.get_core();
     if (!core.get_processed_description()) {
         throw CoreNotProcessedException("Core is not processed, cannot resolve winding columns");
     }
+    // A winding's window index is BOBBIN-relative whenever the coil carries an inline
+    // processed bobbin: MAS defines it as an index into "the windingWindows list of the
+    // governing bobbin or core processed description", and both the winder
+    // (Coil::resolve_section_column_frame) and the Painter already read it that way.
+    // Resolving it against the CORE instead rejected every split-bobbin coil with more
+    // chambers than the core has windows -- a two-chamber bobbin on a U core is 2 vs 1,
+    // and it threw before any solving happened. A named bobbin needs no special case: its
+    // windows are either single or built by create_quick_bobbin, which copies the columns
+    // straight off the core, so both lists resolve to the same column either way.
     auto windingWindows = core.get_winding_windows();
+    auto bobbinDataOrName = magnetic.get_coil().get_bobbin();
+    if (std::holds_alternative<Bobbin>(bobbinDataOrName)) {
+        auto bobbin = std::get<Bobbin>(bobbinDataOrName);
+        if (bobbin.get_processed_description()) {
+            auto bobbinWindingWindows = bobbin.get_processed_description().value().get_winding_windows();
+            if (!bobbinWindingWindows.empty()) {
+                windingWindows = bobbinWindingWindows;
+            }
+        }
+    }
     size_t mainColumnIndex = core.get_main_column_index();
+    auto columns = core.get_processed_description().value().get_columns();
     std::vector<size_t> columnIndexPerWinding;
     for (auto& winding : magnetic.get_coil().get_functional_description()) {
         auto windowIndex = winding.get_winding_window();
@@ -153,10 +197,56 @@ std::vector<size_t> ReluctanceNetwork::resolve_winding_column_indexes(Magnetic m
         if (windowIndex.value() < 0 || static_cast<size_t>(windowIndex.value()) >= windingWindows.size()) {
             throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
                                         "Winding " + winding.get_name() + " references winding window " +
-                                            std::to_string(windowIndex.value()) + " but the core has " +
+                                            std::to_string(windowIndex.value()) + " but the governing bobbin/core has " +
                                             std::to_string(windingWindows.size()) + " winding windows");
         }
-        columnIndexPerWinding.push_back(core.get_winding_window_column_index(static_cast<size_t>(windowIndex.value())));
+        // Resolve a window index to its core column. Core::get_winding_window_column_index
+        // resolves only against the CORE's own window list, and the list resolved above may
+        // be the BOBBIN's -- so read the column edge off the window actually in hand. Shared
+        // by this winding and by every other window it occupies, so both sides of the
+        // cross-column check below speak one coordinate system.
+        auto resolveColumnIndex = [&](size_t windowIdx) -> size_t {
+            auto column = windingWindows[windowIdx].get_column();
+            if (!column) {
+                // Schema default: a window with no column edge wraps the main column. This is
+                // the stacked-chamber split bobbin, which the winder treats the same way.
+                return mainColumnIndex;
+            }
+            if (column.value() < 0 || static_cast<size_t>(column.value()) >= columns.size()) {
+                throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                                            "Winding " + winding.get_name() + " is placed in winding window " +
+                                                std::to_string(windowIdx) + ", which wraps core column " +
+                                                std::to_string(column.value()) + ", but the core has " +
+                                                std::to_string(columns.size()) + " columns");
+            }
+            return static_cast<size_t>(column.value());
+        };
+
+        size_t resolvedColumnIndex = resolveColumnIndex(static_cast<size_t>(windowIndex.value()));
+
+        // ABT #227.4: this model injects a winding's WHOLE turns*current MMF into the
+        // ONE column resolved above -- it cannot represent a winding interleaved across
+        // two columns (some of its layers wound in the main window, others in a lateral
+        // one). That is reachable today: assign_windings_to_columns() does not stop the
+        // same winding index from appearing in more than one column's list. Detect it
+        // and fail loudly rather than silently attribute the whole winding's MMF to
+        // whichever section the winder happened to list first.
+        auto distinctWindows = resolve_distinct_windows_from_sections(magnetic.get_coil(), winding.get_name());
+        for (auto distinctWindow : distinctWindows) {
+            if (distinctWindow < 0 || static_cast<size_t>(distinctWindow) >= windingWindows.size()) {
+                continue;
+            }
+            size_t otherColumnIndex = resolveColumnIndex(static_cast<size_t>(distinctWindow));
+            if (otherColumnIndex != resolvedColumnIndex) {
+                throw NotImplementedException(
+                    "Winding " + winding.get_name() + " has sections in more than one column (window " +
+                    std::to_string(windowIndex.value()) + " and window " + std::to_string(distinctWindow) +
+                    "): the reluctance network attributes a winding's whole MMF to a single column and "
+                    "cannot yet represent one winding interleaved across columns");
+            }
+        }
+
+        columnIndexPerWinding.push_back(resolvedColumnIndex);
     }
     return columnIndexPerWinding;
 }

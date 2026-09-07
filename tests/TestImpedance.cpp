@@ -1,8 +1,10 @@
 #include <source_location>
 #include <algorithm>
 #include <fstream>
+#include <sstream>
 #include "support/Painter.h"
 #include "processors/Sweeper.h"
+#include "constructive_models/Bobbin.h"
 #include "physical_models/Impedance.h"
 #include "physical_models/ComplexPermeability.h"
 #include "physical_models/StrayCapacitance.h"
@@ -487,6 +489,39 @@ TEST_CASE("Test_Impedance_Complex_Permeability_No_Extrapolation", "[physical-mod
 }
 
 
+TEST_CASE("Test_Complex_Permeability_Keeps_Falling_Above_The_Anchor", "[physical-model][impedance]") {
+    // ABT #843. get_complex_permeability CLAMPS its interpolation to the tabulated
+    // frequency range, so a table that stopped at 100x the anchor handed back the same
+    // mu' and mu'' for every frequency above it. Nanoperm 80000 anchors at 18.8 kHz, so
+    // everything above 1.88 MHz read as mu' = 19210.6, mu'' = 13647.3 — identical at
+    // 4.33 MHz, 10 MHz, 50 MHz and 100 MHz, while the material's own initial-permeability
+    // table falls to 156 by 25.6 MHz. Downstream that moved a common-mode choke's
+    // modelled self-resonance from ~50 MHz to 4.33 MHz and overstated its peak impedance
+    // 12x.
+    settings.reset();
+    OpenMagnetics::ComplexPermeability complexPermeabilityModel;
+    auto coreMaterial = OpenMagnetics::find_core_material_by_name("Nanoperm 80000");
+
+    std::vector<double> frequencies = {1e6, 4.33e6, 1e7, 2.56e7, 5e7, 1e8};
+    std::vector<double> magnitudes;
+    for (auto frequency : frequencies) {
+        auto [real, imaginary] = complexPermeabilityModel.get_complex_permeability(coreMaterial, frequency);
+        magnitudes.push_back(sqrt(real * real + imaginary * imaginary));
+    }
+
+    // It must keep falling, not freeze: every step strictly below the one before it.
+    for (size_t index = 1; index < magnitudes.size(); ++index) {
+        CHECK(magnitudes[index] < magnitudes[index - 1]);
+    }
+
+    // And it must track the material's own curve, not merely differ. Nanoperm 80000's
+    // table falls 2,378 -> 156 between 1 MHz and 25.6 MHz; |mu| now reads 2,822 -> 184
+    // across the same span (the excess over mu' is mu''), against 30,116 -> 23,565 before.
+    CHECK(magnitudes.back() < 0.1 * magnitudes.front());
+    CHECK(magnitudes[3] < 400.0);   // 25.6 MHz, the material's last tabulated point (156)
+}
+
+
 TEST_CASE("PROBE_CMC622_CM_Curve_Dump", "[probe622]") {
     settings.reset();
     auto testDataPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "cmc_redexpert_744834622.json");
@@ -504,4 +539,136 @@ TEST_CASE("PROBE_CMC622_CM_Curve_Dump", "[probe622]") {
     CHECK(fs.size() == 120);
 }
 
+// ABT #383: a core carrying only its functionalDescription is a normal thing to hand around —
+// it is how MAS files are written when the constructive description is the source of truth and
+// the processed values are meant to be derived. Impedance reads the PROCESSED effective area and
+// length, and without them it returned garbage that looked like an answer: NaN for drumRing,
+// exactly 0 for drumSemishielded, ~1e-10 ohm for molded. The NaN then surfaced far away as
+// "Waveform data contains NaN" out of the waveform processor, which points at the wrong
+// component entirely — the reporter filed a model bug against impedance because of it.
+TEST_CASE("Test_Impedance_Refuses_Unprocessed_Core", "[physical-model][impedance]") {
+    settings.reset();
+    clear_databases();
+
+    auto processedCore = OpenMagneticsTesting::get_quick_core("E 42/21/20", json::array(), 1, "3C97");
+    auto coil = OpenMagneticsTesting::get_quick_coil({10}, {1}, "E 42/21/20");
+    OpenMagnetics::Magnetic processedMagnetic;
+    processedMagnetic.set_core(processedCore);
+    processedMagnetic.set_coil(coil);
+
+    // With the processed description present it answers, and the answer is finite and positive.
+    OpenMagnetics::Impedance impedanceModel;
+    auto processedImpedance = impedanceModel.calculate_impedance(processedMagnetic, 100000);
+    UNSCOPED_INFO("processed core impedance " << std::abs(processedImpedance));
+    CHECK(std::isfinite(std::abs(processedImpedance)));
+    CHECK(std::abs(processedImpedance) > 0);
+
+    // Strip the processed description and it must refuse rather than answer with NaN/0/1e-10.
+    auto unprocessedCore = processedCore;
+    unprocessedCore.set_processed_description(std::nullopt);
+    OpenMagnetics::Magnetic unprocessedMagnetic;
+    unprocessedMagnetic.set_core(unprocessedCore);
+    unprocessedMagnetic.set_coil(coil);
+    std::string message;
+    try {
+        impedanceModel.calculate_impedance(unprocessedMagnetic, 100000);
+        message = "no exception";
+    }
+    catch (const std::exception& exception) {
+        message = exception.what();
+    }
+    UNSCOPED_INFO("unprocessed core -> " << message);
+    CHECK(message.find("processed description") != std::string::npos);
+    settings.reset();
+}
+
+// Data-driven competitor cable-core impedance export. Reads /tmp/fr_parts.json
+// [{mpn, material, od, id, h}] (toroid dims in mm), computes |Z|(f) 1 MHz..1 GHz
+// for a 1-turn core in MKF, writes /tmp/fr_curves.json [{mpn, f[], z[]}]. Lets the
+// ingest compute vendor-agnostic curves from material + geometry (the OM way).
+TEST_CASE("Competitor_Cable_Core_Impedance_Export", "[cable-core-export]") {
+    std::ifstream in("/tmp/fr_parts.json");
+    if (!in.good()) { WARN("no /tmp/fr_parts.json — skipping"); return; }
+    json parts = json::parse(in);
+    json out = json::array();
+    for (auto& p : parts) {
+        json c;
+        c["mpn"] = p.value("mpn", std::string(""));
+        try {
+            double od = p.at("od").get<double>() / 1000.0;  // mm -> m
+            double id = p.at("id").get<double>() / 1000.0;
+            double h  = p.at("h").get<double>() / 1000.0;
+            std::string material = p.at("material").get<std::string>();
+            int turns = p.value("turns", 1);
+            json shapeJson = {
+                {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "t"},
+                {"aliases", json::array()}, {"name", "cable core"},
+                {"dimensions", {{"A", {{"nominal", od}}}, {"B", {{"nominal", id}}}, {"C", {{"nominal", h}}}}}
+            };
+            json coreJson;
+            coreJson["functionalDescription"] = {
+                {"type", "toroidal"}, {"material", material}, {"shape", shapeJson},
+                {"gapping", json::array()}, {"numberStacks", 1}
+            };
+            Core core(coreJson);
+            auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, true);
+            json coilJson;
+            to_json(coilJson["bobbin"], bobbin);
+            coilJson["functionalDescription"] = json::array();
+            json wj;
+            wj["name"] = "cable"; wj["numberTurns"] = turns; wj["numberParallels"] = 1;
+            wj["isolationSide"] = "primary"; wj["wire"] = "Round 0.475 - Grade 1";
+            coilJson["functionalDescription"].push_back(wj);
+            OpenMagnetics::Coil coil(coilJson);
+            OpenMagnetics::Magnetic magnetic;
+            magnetic.set_core(core);
+            magnetic.set_coil(coil);
+            auto curve = Sweeper().sweep_impedance_over_frequency(magnetic, 1e6, 1e9, 150);
+            c["f"] = curve.get_x_points();
+            c["z"] = curve.get_y_points();
+        } catch (const std::exception& e) {
+            c["error"] = e.what();
+        }
+        out.push_back(c);
+    }
+    std::ofstream of("/tmp/fr_curves.json");
+    of << out.dump();
+    of.close();
+    CHECK(out.size() == parts.size());
+}
+
 }  // namespace
+
+TEST_CASE("Test_Core_Dimensional_Attenuation_From_Real_Permittivity", "[physical-model][impedance][smoke-test]") {
+    // ABT #848: a MnZn ferrite core is a lossy dielectric with eps' ~ 1e5 (Ferroxcube handbook
+    // Table 5) and a conductor (resistivity), so across a 15 mm cross-section the wave is
+    // attenuated by 2-4x in the 0.3-1 MHz band. The factor must be ~1 at audio/low-RF, fall to
+    // the 0.2-0.5 range around 1 MHz on 15 mm, and be EXACTLY 1 for a material without
+    // permittivity data (no invented correction).
+    auto a07 = find_core_material_by_name("A07");
+    REQUIRE(a07.get_permittivity());
+    std::vector<double> dims = {0.005, 0.015};  // T25x15x15 cross-section: 5 mm radial, 15 mm high
+    auto mu10k = OpenMagnetics::ComplexPermeability().get_complex_permeability(a07, 1e4);
+    auto f10k = OpenMagnetics::Impedance::core_dimensional_attenuation(a07, 1e4, std::complex<double>(mu10k.first, mu10k.second), dims);
+    CHECK(std::abs(f10k) > 0.97);
+    auto mu1m = OpenMagnetics::ComplexPermeability().get_complex_permeability(a07, 1e6);
+    auto f1m = OpenMagnetics::Impedance::core_dimensional_attenuation(a07, 1e6, std::complex<double>(mu1m.first, mu1m.second), dims);
+    // Physical check: on a 5 x 15 mm section the field enters mainly through the faces 5 mm
+    // apart, and the 15 mm faces only ADD penetration — so the 2D result must be at least the
+    // slab factor of the 5 mm thickness (which ignores the extra faces), well above the slab
+    // factor of the 15 mm thickness, and below 1.
+    auto slab5 = OpenMagnetics::Impedance::core_dimensional_attenuation(a07, 1e6, std::complex<double>(mu1m.first, mu1m.second), {0.005});
+    auto slab15 = OpenMagnetics::Impedance::core_dimensional_attenuation(a07, 1e6, std::complex<double>(mu1m.first, mu1m.second), {0.015});
+    CHECK(std::abs(f1m) >= std::abs(slab5) * 0.98);
+    CHECK(std::abs(f1m) > std::abs(slab15));
+    CHECK(std::abs(f1m) < 1.0);
+    // monotone: stronger attenuation at higher frequency
+    auto mu300k = OpenMagnetics::ComplexPermeability().get_complex_permeability(a07, 3e5);
+    auto f300k = OpenMagnetics::Impedance::core_dimensional_attenuation(a07, 3e5, std::complex<double>(mu300k.first, mu300k.second), dims);
+    CHECK(std::abs(f300k) > std::abs(f1m));
+    // a material WITHOUT permittivity data gets no correction at all
+    auto n87 = find_core_material_by_name("N87");
+    REQUIRE(!n87.get_permittivity());
+    auto fNone = OpenMagnetics::Impedance::core_dimensional_attenuation(n87, 1e6, std::complex<double>(1000, 100), dims);
+    CHECK(std::abs(fNone - 1.0) < 1e-12);
+}

@@ -1,7 +1,11 @@
 #include <source_location>
 #include "processors/CircuitSimulatorInterface.h"
 #include "physical_models/MagnetizingInductance.h"
+#include "physical_models/InitialPermeability.h"
+#include "constructive_models/CorePiece.h"
+#include "physical_models/Reluctance.h"
 #include "constructive_models/Bobbin.h"
+#include "constructive_models/Magnetic.h"
 #include "TestingUtils.h"
 #include "support/Settings.h"
 #include "support/Utils.h"
@@ -347,6 +351,55 @@ namespace {
         REQUIRE_THAT(expectedValue, Catch::Matchers::WithinAbs(numberTurns, max_error * expectedValue));
     }
 
+    TEST_CASE("Test_NumberTurns_Nominal_Picks_Closest_Not_Ceil", "[physical-model][magnetizing-inductance][bug]") {
+        // ABT #600: with a NOMINAL target the recommender ceil()-ed against the
+        // target, accepting a +26.6% overshoot to avoid a -0.6% undershoot
+        // (E 42/21/15 / 3C95 / 1 mm gap / 10 uH: L(8)=9.94 uH, L(9)=12.58 uH,
+        // and it returned 9). NOMINAL must pick the neighbour with the smallest
+        // absolute error; MINIMUM keeps floor-clearing semantics.
+        settings.reset();
+        clear_databases();
+
+        double dcCurrent = 0;
+        double ambientTemperature = 25;
+        double desiredMagnetizingInductance = 10e-6;
+        double frequency = 100000;
+        std::string coreShape = "E 42/21/15";
+        std::string coreMaterial = "3C95";
+        auto gapping = OpenMagneticsTesting::get_ground_gap(0.001);
+
+        Core core;
+        OpenMagnetics::Coil winding;
+        OpenMagnetics::Inputs inputs;
+        MagnetizingInductance magnetizing_inductance("ZHANG");
+
+        prepare_test_parameters(dcCurrent, ambientTemperature, frequency, -1, desiredMagnetizingInductance, gapping,
+                                coreShape, coreMaterial, core, winding, inputs);
+
+        int numberTurns = magnetizing_inductance.calculate_number_turns_from_gapping_and_inductance(core, winding, &inputs);
+
+        auto inductanceAt = [&](int n) {
+            winding.get_mutable_functional_description()[0].set_number_turns(n);
+            auto operatingPoint = inputs.get_operating_point(0);
+            return resolve_dimensional_values(
+                magnetizing_inductance.calculate_inductance_from_number_turns_and_gapping(core, winding, &operatingPoint)
+                    .get_magnetizing_inductance());
+        };
+
+        // Neither neighbour may deliver an inductance closer to the target.
+        double errorAtN = std::fabs(inductanceAt(numberTurns) - desiredMagnetizingInductance);
+        REQUIRE(errorAtN <= std::fabs(inductanceAt(numberTurns + 1) - desiredMagnetizingInductance));
+        if (numberTurns > 1) {
+            REQUIRE(errorAtN <= std::fabs(inductanceAt(numberTurns - 1) - desiredMagnetizingInductance));
+        }
+
+        // The same target requested as a hard floor (MINIMUM) must clear it.
+        int numberTurnsMinimum = magnetizing_inductance.calculate_number_turns_from_gapping_and_inductance(
+            core, winding, &inputs, DimensionalValues::MINIMUM);
+        REQUIRE(numberTurnsMinimum >= numberTurns);
+        REQUIRE(inductanceAt(numberTurnsMinimum) >= desiredMagnetizingInductance * 0.999);
+    }
+
     TEST_CASE("Test_NumberTurns_Legacy_NoCoil_Overload_Matches_SingleWinding",
               "[physical-model][magnetizing-inductance][smoke-test]") {
         // The legacy 3-argument overload (no coil) must reproduce the coil-aware
@@ -404,6 +457,47 @@ namespace {
             core, winding, &inputs, GappingType::GROUND);
 
         REQUIRE_THAT(expectedValue, Catch::Matchers::WithinAbs(gapping[0].get_length(), max_error * expectedValue));
+    }
+
+    // ABT #1093: the DC-bias permeability used to come from a fixed-point iteration that
+    // diverges at the B-H knee; with 2 A of bias on a 15-turn P 11/7/I the search ran away to
+    // a saturated permeability and returned the residual gap for any target above ~20 µH.
+    // The bias is now solved on the material's own B-H curve, so the gap is real and the
+    // bias-aware inductance of the gapped core lands on the target.
+    TEST_CASE("Test_Gapping_With_Dc_Bias_Does_Not_Collapse_To_Residual", "[physical-model][magnetizing-inductance][gapping][dc-bias][smoke-test]") {
+        settings.reset();
+        clear_databases();
+        double dcCurrent = 2;
+        double ambientTemperature = 25;
+        double desiredMagnetizingInductance = 36.5e-6;
+        double numberTurns = 15;
+        double frequency = 100000;
+        std::string coreShape = "P 11/7/I";
+        std::string coreMaterial = "98";
+        Core core;
+        OpenMagnetics::Coil winding;
+        OpenMagnetics::Inputs inputs;
+        MagnetizingInductance magnetizing_inductance("ZHANG");
+        prepare_test_parameters(dcCurrent, ambientTemperature, frequency, numberTurns, desiredMagnetizingInductance, {},
+                                coreShape, coreMaterial, core, winding, inputs, 1);
+
+        auto gapping = magnetizing_inductance.calculate_gapping_from_number_turns_and_inductance(
+            core, winding, &inputs, GappingType::GROUND, 6);
+        UNSCOPED_INFO("ground gap " << gapping[0].get_length() * 1e6 << " um");
+        REQUIRE(gapping[0].get_length() > 50e-6);   // not the 5 um residual
+        REQUIRE(gapping[0].get_length() < 400e-6);
+
+        Core gappedCore(core);
+        gappedCore.get_mutable_functional_description().set_gapping(gapping);
+        gappedCore.set_processed_description(std::nullopt);
+        gappedCore.process_data();
+        gappedCore.process_gap();
+        auto operatingPoint = inputs.get_operating_point(0);
+        double inductance = magnetizing_inductance.calculate_inductance_from_number_turns_and_gapping(gappedCore, winding, &operatingPoint)
+                                .get_magnetizing_inductance().get_nominal().value();
+        UNSCOPED_INFO("bias-aware inductance " << inductance * 1e6 << " uH for target " << desiredMagnetizingInductance * 1e6);
+        REQUIRE_THAT(inductance, Catch::Matchers::WithinRel(desiredMagnetizingInductance, 0.25));
+        settings.reset();
     }
 
     TEST_CASE("Test_Gapping_U_Shape_Ferrite_Ground", "[physical-model][magnetizing-inductance][smoke-test]") {
@@ -480,7 +574,18 @@ namespace {
         OpenMagnetics::Inputs inputs;
         MagnetizingInductance magnetizing_inductance("ZHANG");
 
-        double expectedValue = 0.0004;
+        // Re-pinned 2026-07-30 (ABT #378, user-approved): 0.0004 -> 0.00039 after Zhang's h was
+        // read as the paper defines it (Fig. 7: "2h is the height of a segment of core limb"),
+        // dropping the old clamp of h up to the column WIDTH. Less modelled fringing means more
+        // reluctance per unit of gap, so a slightly SHORTER gap now reaches the same 23.3 mH —
+        // the shift is in the physically expected direction, and at 1e-5 m it is ten times the
+        // solver's 1e-6 rounding quantum, so it is a real change rather than noise. This is a
+        // solved SOLVER OUTPUT, not measured data.
+        // NOTE: this fixture is DISTRIBUTED gapping, which is exactly the case where MKF's h is
+        // still over-estimated — it measures to the limb end, while the paper's h is half the
+        // core segment SHARED with the neighbouring gap. Expect this value to move once that
+        // refinement lands (tracked on ABT #378).
+        double expectedValue = 0.00039;
 
         prepare_test_parameters(dcCurrent, ambientTemperature, frequency, numberTurns, desiredMagnetizingInductance, {},
                                 coreShape, coreMaterial, core, winding, inputs);
@@ -492,6 +597,14 @@ namespace {
         REQUIRE(7UL == gapping.size());
     }
 
+    // ABT #1093: these three web-shaped cases used to carry a 46 A DC current (41..51 A) that put
+    // 1.7 T, 765 T and 7.6 T in 3C95 (saturation 0.53 T); the old fixed-point bias iteration
+    // silently produced a saturated permeability and some gap. The bias is now solved on the
+    // material's magnetisation curve and a flux density above saturation is refused (see
+    // Test_Gapping_Bias_Beyond_Saturation_Throws), so the currents are 2 A DC with the same
+    // 10 A peak-to-peak, and Test_Gapping_Web asks 4.65 µH of its single turn instead of 4.65 mH
+    // (a thousand times the ungapped AL of an ETD 54). The cases still exercise what they were
+    // written for: the web JSON goes through distributed / ground gapping without crashing.
     TEST_CASE("Test_Gapping_Classic_Web", "[physical-model][magnetizing-inductance][smoke-test]") {
         settings.reset();
         clear_databases();
@@ -544,7 +657,7 @@ namespace {
             "turnsRatios": []}, "operatingPoints": [{"conditions": {"ambientRelativeHumidity": null,
             "ambientTemperature": 25.0, "cooling": null, "name": null}, "excitationsPerWinding":
             [{"current": {"harmonics": null, "processed": null, "waveform": {"ancillaryLabel": null,
-            "data": [41.0, 51.0, 41.0], "numberPeriods": null, "time": [0.0, 2.4999999999999998e-06, 1e-05]}},
+            "data": [-3.0, 7.0, -3.0], "numberPeriods": null, "time": [0.0, 2.4999999999999998e-06, 1e-05]}},
             "frequency": 100000.0, "magneticField": null, "magneticFluxDensity": null, "magnetizingCurrent":
             null, "name": "My Operating Point", "voltage": {"harmonics": null, "processed": null,
             "waveform": {"ancillaryLabel": null, "data": [7.5, 7.5, -2.4999999999999996, -2.4999999999999996,
@@ -561,6 +674,30 @@ namespace {
             magnetizing_inductance.calculate_gapping_from_number_turns_and_inductance(core, winding, &inputs, gappingType, 5);
 
         REQUIRE(gapping.size() == 5);
+    }
+
+    TEST_CASE("Test_Gapping_Bias_Beyond_Saturation_Throws", "[physical-model][magnetizing-inductance][gapping][dc-bias][smoke-test]") {
+        settings.reset();
+        clear_databases();
+        // 46 A of DC through 40 turns asking 412 µH on an ETD 29 puts ~6 T in the ferrite: no gap
+        // holds that inductance at that bias. Refused loudly instead of returning a gap that does
+        // not deliver the target (ABT #1093).
+        double dcCurrent = 46;
+        double ambientTemperature = 25;
+        double desiredMagnetizingInductance = 412.7e-6;
+        double numberTurns = 40;
+        double frequency = 100000;
+        std::string coreShape = "ETD 29";
+        std::string coreMaterial = "3C97";
+        Core core;
+        OpenMagnetics::Coil winding;
+        OpenMagnetics::Inputs inputs;
+        MagnetizingInductance magnetizing_inductance("ZHANG");
+        prepare_test_parameters(dcCurrent, ambientTemperature, frequency, numberTurns, desiredMagnetizingInductance, {},
+                                coreShape, coreMaterial, core, winding, inputs, 10);
+        REQUIRE_THROWS_WITH(magnetizing_inductance.calculate_gapping_from_number_turns_and_inductance(core, winding, &inputs, GappingType::GROUND, 5),
+                            Catch::Matchers::ContainsSubstring("above its saturation"));
+        settings.reset();
     }
 
     TEST_CASE("Test_Gapping_Web", "[physical-model][magnetizing-inductance][smoke-test]") {
@@ -590,12 +727,12 @@ namespace {
         json inputsData = json::parse(
             R"({"designRequirements": {"altitude": null, "cti": null, "insulationType": null,
             "leakageInductance": null, "magnetizingInductance": {"excludeMaximum": null, "excludeMinimum":
-            null, "maximum": null, "minimum": null, "nominal": 0.004654652816558039}, "name": null,
+            null, "maximum": null, "minimum": null, "nominal": 4.654652816558039e-06}, "name": null,
             "operatingTemperature": null, "overvoltageCategory": null, "pollutionDegree": null,
             "turnsRatios": []}, "operatingPoints": [{"conditions": {"ambientRelativeHumidity": null,
             "ambientTemperature": 25.0, "cooling": null, "name": null}, "excitationsPerWinding":
             [{"current": {"harmonics": null, "processed": null, "waveform": {"ancillaryLabel": null,
-            "data": [41.0, 51.0, 41.0], "numberPeriods": null, "time": [0.0, 2.4999999999999998e-06, 1e-05]}},
+            "data": [-3.0, 7.0, -3.0], "numberPeriods": null, "time": [0.0, 2.4999999999999998e-06, 1e-05]}},
             "frequency": 100000.0, "magneticField": null, "magneticFluxDensity": null, "magnetizingCurrent":
             null, "name": "My Operating Point", "voltage": {"harmonics": null, "processed": null,
             "waveform": {"ancillaryLabel": null, "data": [7.5, 7.5, -2.4999999999999996, -2.4999999999999996,
@@ -708,7 +845,7 @@ namespace {
             "turnsRatios": []}, "operatingPoints": [{"conditions": {"ambientRelativeHumidity": null,
             "ambientTemperature": 25.0, "cooling": null, "name": null}, "excitationsPerWinding":
             [{"current": {"harmonics": null, "processed": null, "waveform": {"ancillaryLabel": null,
-            "data": [41.0, 51.0, 41.0], "numberPeriods": null, "time": [0.0, 2.5e-06, 1e-05]}}, "frequency":
+            "data": [-3.0, 7.0, -3.0], "numberPeriods": null, "time": [0.0, 2.5e-06, 1e-05]}}, "frequency":
             100000.0, "magneticField": null, "magneticFluxDensity": null, "magnetizingCurrent": null, "name":
             "My Operating Point"}], "name": null}]})");
         GappingType gappingType = magic_enum::enum_cast<GappingType>("GROUND").value();
@@ -1148,3 +1285,739 @@ namespace {
     }
 
 }  // namespace
+
+// ABT #331: open-core (drum) magnetizing inductance, validated against PUBLISHED vendor data
+// rather than another MKF result. Fair-Rite sells bare drum cores ("bobbins") with AL printed on
+// every part page; the four parts below are the ones whose dimension-letter mapping was
+// WEIGHT-VERIFIED (computed volume x material density reproduces the listed grams to 3-4%).
+//
+// The model is the demagnetising-factor bracket (see MagnetizingInductance.cpp): upper bound =
+// flange-envelope spheroid, lower bound = envelope air return in series with the ferrite post,
+// estimate = log-midpoint. Measured envelope on this exact set: mean 5.4%, max 9.9%. The 12%
+// tolerance below is that envelope plus margin; if this test starts failing the MODEL drifted,
+// so investigate rather than widen.
+//
+// Note the physics this pins: Fair-Rite publishes the SAME AL for 43-material (mu_i 800) and
+// 77-material (mu_i 2000) variants of one geometry, because an open core's inductance saturates
+// at the geometry-set limit ~1/N_d. The model must reproduce that material-insensitivity.
+TEST_CASE("Test_Open_Core_Drum_Inductance_Matches_FairRite_AL", "[physical-model][magnetizing-inductance][drum][open-core]") {
+    settings.reset();
+    clear_databases();
+
+    struct Reference {
+        std::string shapeName;
+        std::string materialName;
+        double testCoilTurns;
+        double publishedAlNanoHenry;   // Fair-Rite part page, 1 kHz < 10 gauss
+    };
+    std::vector<Reference> references = {
+        {"Bobbin 9643001015", "43", 75, 38.0},
+        {"Bobbin 9677282509", "77", 55, 95.0},
+        {"Bobbin 9677182209", "77", 95, 65.0},
+        {"Bobbin 9677282009", "77", 40, 100.0},
+    };
+
+    for (const auto& reference : references) {
+        auto core = OpenMagneticsTesting::get_quick_core(reference.shapeName, json::array(), 1, reference.materialName);
+        REQUIRE(core.get_functional_description().get_type() == CoreType::OPEN_SHAPE);
+
+        double inductance = MagnetizingInductance::calculate_open_core_magnetizing_inductance(
+            core, reference.testCoilTurns, 25);
+        double publishedInductance = reference.publishedAlNanoHenry * 1e-9 * pow(reference.testCoilTurns, 2);
+        UNSCOPED_INFO(reference.shapeName << ": model " << inductance * 1e6 << " uH vs published "
+                      << publishedInductance * 1e6 << " uH ("
+                      << (inductance - publishedInductance) / publishedInductance * 100 << "%)");
+        CHECK_THAT(inductance, Catch::Matchers::WithinRel(publishedInductance, 0.12));
+    }
+
+    // Gapping an open core is meaningless and must throw, not silently compute.
+    auto gapped = json::array();
+    gapped.push_back(json{{"type", "additive"}, {"length", 0.0005}});
+    auto gappedCore = OpenMagneticsTesting::get_quick_core("Bobbin 9643001015", gapped, 1, "43");
+    CHECK_THROWS(MagnetizingInductance::calculate_open_core_magnetizing_inductance(gappedCore, 10, 25));
+    settings.reset();
+}
+
+// ABT #331: end-to-end DEMO on a real commercial unshielded drum inductor — WE-TI 7447720470
+// (Wurth, 47 uH +-10%, DCR typ 89 mOhm, envelope flanges 7.8/5.0 mm). The vendor does not publish
+// turns or internal core dims, so the fixture is a RECONSTRUCTION, documented as such: the
+// open-core model's AL is post-diameter-insensitive (envelope-dominated), giving N = 48; the wire
+// that then reproduces the vendor DCR (0.42 mm Cu, 4 layers) also FITS the groove. Three vendor
+// numbers, two assumptions, closed loop. This is a consistency demo on a finished part —
+// the strict model validation is the Fair-Rite AL test above.
+TEST_CASE("Test_Open_Core_WE_TI_Reconstruction_Consistency", "[physical-model][magnetizing-inductance][drum][open-core]") {
+    settings.reset();
+    clear_databases();
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "we_ti_7447720470_reconstructed.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    auto masJson = nlohmann::json::parse(file);
+    OpenMagnetics::Core core(masJson["magnetic"]["core"]);
+    core.process_data();
+    REQUIRE(core.get_functional_description().get_type() == CoreType::OPEN_SHAPE);
+
+    double numberTurns = masJson["magnetic"]["coil"]["functionalDescription"][0]["numberTurns"];
+    double inductance = MagnetizingInductance::calculate_open_core_magnetizing_inductance(core, numberTurns, 25);
+    // Vendor L = 47 uH +-10%; the model must land inside vendor tolerance + its own 12% envelope.
+    UNSCOPED_INFO("model L = " << inductance * 1e6 << " uH vs vendor 47 uH +-10%");
+    CHECK_THAT(inductance, Catch::Matchers::WithinRel(47e-6, 0.20));
+
+    // DCR of the reconstructed winding: N x MLT(post + buildup) x rho/A must reproduce the
+    // vendor's typ 89 mOhm within winding-tolerance slack.
+    double wireDiameter = 0.00042;
+    double wireArea = std::numbers::pi / 4 * pow(wireDiameter, 2);
+    double buildup = 4 * 0.000458;   // 4 layers of 0.458 OD
+    double meanTurnDiameter = 0.0035 + buildup;
+    double length = numberTurns * std::numbers::pi * meanTurnDiameter;
+    double dcr = 1.72e-8 * length / wireArea;
+    UNSCOPED_INFO("reconstructed DCR = " << dcr * 1000 << " mOhm vs vendor typ 89");
+    CHECK_THAT(dcr, Catch::Matchers::WithinRel(0.089, 0.30));
+    settings.reset();
+}
+
+// ABT #366: shielded drum (drumRing). No vendor publishes AL for an assembled drum+ring pair
+// (verified industry-wide 2026-07-29: Ferroxcube/Fair-Rite publish bare-drum AL only, with a
+// defined winding; ACME publishes matched DR+SRI geometry but no electricals), so this pins the
+// PHYSICS BRACKETS instead: the closed-through-clearance-gaps circuit must yield strictly MORE
+// inductance than the bare drum (the ferrite ring replaces most of the air return) and strictly
+// LESS than the same ferrite circuit with the clearance gaps shorted (core-only reluctance).
+// The analytic two-annular-gap estimate anchors the magnitude: for a mu_i ~2000 ferrite the two
+// clearance gaps dominate the closed circuit, and fringing can only lower their reluctance.
+// FEM validation of the absolute value is the follow-up recorded in ABT #366.
+TEST_CASE("Test_Drum_Ring_Inductance_Brackets", "[physical-model][magnetizing-inductance][drum-ring]") {
+    settings.reset();
+    clear_databases();
+    double numberTurns = 20;
+
+    // Bare drum with the SAME drum dimensions (custom shape: no bare-drum MAS record exists
+    // for the ACME DR2.3 drum, only the paired drumRing record).
+    json bareShapeJson = {
+        {"magneticCircuit", "open"}, {"type", "custom"}, {"family", "drum"},
+        {"aliases", json::array()}, {"name", "DR 2.3 bare"},
+        {"dimensions", {
+            {"A", {{"nominal", 0.0023}}}, {"B", {{"nominal", 0.001}}}, {"C", {{"nominal", 0.0011}}},
+            {"D", {{"nominal", 0.00021}}}, {"E", {{"nominal", 0.00058}}}, {"F", {{"nominal", 0.00021}}}}}
+    };
+    json bareCoreJson;
+    bareCoreJson["functionalDescription"] = {
+        {"type", "openShape"}, {"material", "3C90"}, {"shape", bareShapeJson},
+        {"gapping", json::array()}, {"numberStacks", 1}};
+    Core bareCore(bareCoreJson);
+    bareCore.process_data();
+    double bareInductance = MagnetizingInductance::calculate_open_core_magnetizing_inductance(bareCore, numberTurns, 25);
+
+    // The shielded assembly, from the MAS drumRing record (same drum + SRI 3x2.4x1.05 ring).
+    auto core = OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "3C90");
+    json windingData = json::parse(
+        R"({"bobbin": "Dummy", "functionalDescription": [{"isolationSide": "primary", "name": "Primary",
+            "numberParallels": 1, "numberTurns": 20, "wire": "Dummy"}]})");
+    OpenMagnetics::Coil winding(windingData);
+    MagnetizingInductance magnetizingInductanceModel("ZHANG");
+    double ringInductance = magnetizingInductanceModel
+        .calculate_inductance_from_number_turns_and_gapping(core, winding, nullptr)
+        .get_magnetizing_inductance().get_nominal().value();
+
+    // Upper limit: the same ferrite circuit with the clearance gaps shorted
+    // (get_core_reluctance() is core PLUS gaps; the ungapped field is the core alone).
+    auto reluctanceModel = ReluctanceModel::factory(ReluctanceModels::ZHANG);
+    auto reluctanceOutput = reluctanceModel->get_core_reluctance(core);
+    double coreOnlyReluctance = reluctanceOutput.get_ungapped_core_reluctance().value();
+    double shortedGapsInductance = pow(numberTurns, 2) / coreOnlyReluctance;
+
+    UNSCOPED_INFO("bare " << bareInductance * 1e6 << " uH < ring " << ringInductance * 1e6
+                          << " uH < shorted-gaps " << shortedGapsInductance * 1e6 << " uH");
+    CHECK(std::isfinite(ringInductance));
+    CHECK(bareInductance < ringInductance);
+    CHECK(ringInductance < shortedGapsInductance);
+
+    // The two annular gaps must be evaluated INDIVIDUALLY, combine in SERIES (single column:
+    // both land on the wound post, never in the parallel lateral term), and ENGAGE the fringing
+    // machinery (factor > 1 lowers their reluctance, raising L over the sharp-gap value).
+    REQUIRE(reluctanceOutput.get_reluctance_per_gap().has_value());
+    auto reluctancePerGap = reluctanceOutput.get_reluctance_per_gap().value();
+    REQUIRE(reluctancePerGap.size() == 2);
+    double gappingReluctance = reluctanceOutput.get_gapping_reluctance().value();
+    CHECK_THAT(gappingReluctance,
+               Catch::Matchers::WithinRel(reluctancePerGap[0].get_reluctance() + reluctancePerGap[1].get_reluctance(), 1e-9));
+    CHECK(reluctanceOutput.get_maximum_fringing_factor().value() > 1.0);
+
+    // Analytic anchor: two annular clearance gaps in series, no fringing.
+    double gapLength = (0.0024 - 0.0023) / 2;
+    double gapArea = 2 * std::numbers::pi * ((0.0023 + 0.0024) / 4) * 0.00021;
+    double basicTwoGapReluctance = 2 * gapLength / (4e-7 * std::numbers::pi * gapArea);
+    double basicEstimate = pow(numberTurns, 2) / basicTwoGapReluctance;
+    UNSCOPED_INFO("analytic two-gap estimate " << basicEstimate * 1e6 << " uH");
+    CHECK(ringInductance > 0.5 * basicEstimate);
+    CHECK(ringInductance < 3.0 * basicEstimate);
+    settings.reset();
+}
+
+// ABT #417: drumRing's two structural annular-clearance gaps are DERIVED (Core::process_gap
+// synthesizes them from A/K/D/F) — functionalDescription.gapping is legitimately empty in the
+// raw MAS record, unlike a normal gapped E-core where the user/adviser always specifies real
+// entries. Core's free from_json (used whenever a Core is deserialized as a struct MEMBER —
+// e.g. Magnetic::from_json, which every PyOM/WASM binding reaches for a loaded MAS document)
+// never calls process_data()/process_gap(), unlike the Core(json) constructor. A drumRing core
+// arriving via that path kept gapping==[], and ReluctanceModel::get_gapping_reluctance treated
+// "empty" as "no gap" instead of "not yet derived" — silently dropping the dominant reluctance
+// term and reporting an inductance 3.8-10.7x too high, so calculate_saturation_current
+// under-reported Isat by the same factor. Fixed in calculate_inductance_and_magnetic_flux_density:
+// self-heals (calls core.process_gap()) whenever a drumRing core arrives with empty gapping.
+TEST_CASE("Test_ABT417_DrumRing_Saturation_Current_Matches_Model_Inductance_Unprocessed", "[physical-model][magnetizing-inductance][drum-ring][bug]") {
+    settings.reset();
+    clear_databases();
+    int64_t numberTurns = 20;
+
+    // Raw catalog-style json (shape as a bare name string, gapping empty) round-tripped through
+    // Core's free from_json — reproduces the state a Magnetic loaded via Magnetic::from_json
+    // arrives in (NOT the Core(json) constructor, which self-processes and would mask this bug).
+    json rawCoreJson;
+    rawCoreJson["functionalDescription"]["name"] = "ABT417Test";
+    rawCoreJson["functionalDescription"]["type"] = "pieceAndPlate";
+    rawCoreJson["functionalDescription"]["material"] = "3C90";
+    rawCoreJson["functionalDescription"]["shape"] = "DR 2.3 + SRI 3.0";
+    rawCoreJson["functionalDescription"]["gapping"] = json::array();
+    rawCoreJson["functionalDescription"]["numberStacks"] = 1;
+
+    Core unprocessedCore;
+    OpenMagnetics::from_json(rawCoreJson, unprocessedCore);
+    REQUIRE(unprocessedCore.get_functional_description().get_gapping().empty());
+    // Populate processedDescription (effective area etc.) WITHOUT deriving the structural
+    // clearance gaps — process_data() and process_gap() are separate calls, and this is the
+    // partially-processed state a core can plausibly reach outside the Core(json) constructor
+    // (which always runs both together). get_effective_area() requires processedDescription,
+    // so calculate_saturation_current would throw CoreNotProcessedException without this —
+    // masking the numeric bug behind an exception instead of reproducing the ticket's reported
+    // finite-but-wrong Isat.
+    unprocessedCore.process_data();
+    REQUIRE(unprocessedCore.get_functional_description().get_gapping().empty());
+
+    json windingData = json::parse(
+        R"({"bobbin": "Dummy", "functionalDescription": [{"isolationSide": "primary", "name": "Primary",
+            "numberParallels": 1, "numberTurns": 20, "wire": "Dummy"}]})");
+    OpenMagnetics::Coil winding(windingData);
+
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(unprocessedCore);
+    magnetic.set_coil(winding);
+
+    MagnetizingInductance magnetizingInductanceModel("ZHANG");
+    double modelInductance = magnetizingInductanceModel
+        .calculate_inductance_from_number_turns_and_gapping(magnetic.get_core(), magnetic.get_coil(), nullptr)
+        .get_magnetizing_inductance().get_nominal().value();
+
+    double saturationCurrent = magnetic.calculate_saturation_current(25, false);
+    double bSat = magnetic.get_mutable_core().get_magnetic_flux_density_saturation(25, false);
+    double effectiveArea = magnetic.get_mutable_core().get_effective_area();
+    double impliedInductance = bSat * numberTurns * effectiveArea / saturationCurrent;
+
+    // Ground truth: the SAME shape/material/turns, but the core built through the
+    // Core(json) constructor path (which always derives the clearance gaps regardless of
+    // this fix — see Test_Drum_Ring_Inductance_Brackets). Comparing modelInductance only
+    // against impliedInductance is not enough: before the fix, BOTH go through the same
+    // unhealed generic path and agree with each other while being 30x too high together.
+    // This reference catches that — it must independently derive the same, correct answer.
+    auto referenceCore = OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "3C90");
+    double referenceInductance = magnetizingInductanceModel
+        .calculate_inductance_from_number_turns_and_gapping(referenceCore, winding, nullptr)
+        .get_magnetizing_inductance().get_nominal().value();
+
+    UNSCOPED_INFO("model inductance " << modelInductance * 1e6 << " uH, saturation-implied inductance "
+                                      << impliedInductance * 1e6 << " uH, reference (always-processed) "
+                                      << referenceInductance * 1e6 << " uH");
+    CHECK_THAT(impliedInductance, Catch::Matchers::WithinRel(modelInductance, 0.05));
+    CHECK_THAT(modelInductance, Catch::Matchers::WithinRel(referenceInductance, 0.05));
+
+    CHECK(unprocessedCore.get_shape_family() == CoreShapeFamily::DRUM_RING);
+    settings.reset();
+}
+
+// ABT #357: molded composite body (WE-MAPI class). The whole circuit is IN the low-mu
+// material — no discrete gap dilutes it — so L must scale essentially linearly with the
+// composite permeability (Kool Mu 60 vs 26 => ratio ~2.31), and the magnitude must agree
+// with mu0 * mu * N^2 * Ae / le computed from the piece's own effective parameters. This is
+// the property the ABT #357 phase-2 material extraction inverts (mu from measured L0).
+TEST_CASE("Test_Molded_Inductance_Permeability_Scaling", "[physical-model][magnetizing-inductance][molded]") {
+    settings.reset();
+    clear_databases();
+    double numberTurns = 10;
+    json windingData = json::parse(
+        R"({"bobbin": "Dummy", "functionalDescription": [{"isolationSide": "primary", "name": "Primary",
+            "numberParallels": 1, "numberTurns": 10, "wire": "Dummy"}]})");
+
+    auto buildCore = [](const std::string& materialName) {
+        json shapeJson = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+            {"aliases", json::array()}, {"name", "MAPI-like 4020"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0041}}}, {"B", {{"nominal", 0.0021}}}, {"C", {{"nominal", 0.0041}}},
+                {"D", {{"nominal", 0.0014}}}, {"E", {{"nominal", 0.0030}}}, {"F", {{"nominal", 0.0012}}}}}
+        };
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", "closedShape"}, {"material", materialName}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1}};
+        Core core(coreJson);
+        core.process_data();
+        core.process_gap();
+        return core;
+    };
+
+    MagnetizingInductance magnetizingInductanceModel("ZHANG");
+    auto core26 = buildCore("Kool Mµ 26");
+    auto core60 = buildCore("Kool Mµ 60");
+    double inductance26 = magnetizingInductanceModel
+        .calculate_inductance_from_number_turns_and_gapping(core26, OpenMagnetics::Coil(windingData))
+        .get_magnetizing_inductance().get_nominal().value();
+    double inductance60 = magnetizingInductanceModel
+        .calculate_inductance_from_number_turns_and_gapping(core60, OpenMagnetics::Coil(windingData))
+        .get_magnetizing_inductance().get_nominal().value();
+
+    UNSCOPED_INFO("L(mu26) = " << inductance26 * 1e9 << " nH, L(mu60) = " << inductance60 * 1e9 << " nH");
+    CHECK(std::isfinite(inductance26));
+    CHECK(inductance26 > 0);
+    // Linear-in-mu within the tolerance the vendor DC-bias fits leave at H=0.
+    CHECK(inductance60 / inductance26 > 1.9);
+    CHECK(inductance60 / inductance26 < 2.5);
+
+    // Magnitude agrees with the closed-circuit formula on the piece's own effective
+    // parameters (same le/Ae source, so the band only absorbs the permeability fit at H=0).
+    auto effectiveParameters = core26.get_processed_description().value().get_effective_parameters();
+    double handEstimate = 4e-7 * std::numbers::pi * 26 * pow(numberTurns, 2) *
+                          effectiveParameters.get_effective_area() / effectiveParameters.get_effective_length();
+    CHECK(inductance26 > 0.7 * handEstimate);
+    CHECK(inductance26 < 1.4 * handEstimate);
+    settings.reset();
+}
+
+// ABT #357 phase 2: MKF's molded model against the REAL WE-MAPI catalogue. The reconstruction
+// (scripts/fit_we_mapi_internals.py) fitted each part's cavity geometry, turn count, wire gauge
+// and composite mu_eff0 from PUBLIC data only — datasheet L0 + DCR + body dimensions + the
+// measured L(I) curves — using a PYTHON MIRROR of CorePieceMolded's c1/c2. That mirror is the
+// risk this test exists to kill: if the C++ and the fit ever disagree, every reconstruction
+// silently rots. So here MKF itself rebuilds each part from its reconstructed letters and must
+// reproduce the part's DATASHEET inductance.
+//
+// Honest scope (see the fit's own degeneracy analysis, carried in we_mapi_fitted_materials.json):
+// the public data pins N, wire gauge and the mu(H) rolloff shape well, but mu_eff0 only to about
+// +-25% (L0/DCR/packing leave a broad valley; a B-at-drop physical band selects the branch). So
+// the assertion is on MKF-vs-DATASHEET agreement at the fit's own residual level, NOT on mu being
+// the true composite permeability.
+TEST_CASE("Test_Molded_WE_MAPI_Reconstructions_Reproduce_Datasheet_Inductance",
+          "[physical-model][magnetizing-inductance][molded][we-mapi]") {
+    settings.reset();
+    clear_databases();
+    namespace fs = std::filesystem;
+    auto reconstructionsPath = fs::path{std::source_location::current().file_name()}
+                                   .parent_path().append("testData").append("we_mapi_reconstructions.json");
+    auto stubsPath = fs::path{std::source_location::current().file_name()}
+                         .parent_path().append("testData").append("we_mapi_datasheet_stubs.ndjson");
+    std::ifstream reconstructionsFile(reconstructionsPath);
+    std::ifstream stubsFile(stubsPath);
+    REQUIRE(reconstructionsFile.good());
+    REQUIRE(stubsFile.good());
+    json reconstructions = json::parse(reconstructionsFile);
+    REQUIRE(reconstructions.size() == 183);
+
+    // Datasheet inductance per order code, straight from the RedExpert-derived stubs.
+    std::map<std::string, double> datasheetInductance;
+    std::string stubLine;
+    while (std::getline(stubsFile, stubLine)) {
+        if (stubLine.empty()) continue;
+        json stub = json::parse(stubLine);
+        auto& manufacturerInfo = stub.at("manufacturerInfo");
+        datasheetInductance[manufacturerInfo.at("reference").get<std::string>()] =
+            manufacturerInfo.at("datasheetInfo").at("electrical").at(0)
+                            .at("inductance").at("nominal").get<double>();
+    }
+    REQUIRE(datasheetInductance.size() == 183);
+
+    MagnetizingInductance magnetizingInductanceModel("ZHANG");
+    std::vector<double> relativeErrors;
+    size_t evaluated = 0;
+    size_t withinTwentyPercent = 0;
+    for (auto& reconstruction : reconstructions) {
+        auto orderCode = reconstruction.at("orderCode").get<std::string>();
+        // The 4012 family is a 1-2 turn (almost certainly stamped/flat-wire) construction the
+        // round-wire reconstruction cannot represent — the fit flags it, so it is excluded here
+        // rather than silently widening the band for everyone else.
+        if (reconstruction.at("caseCode").get<std::string>() == "4012") continue;
+        double numberTurns = reconstruction.at("numberTurns").get<double>();
+        double permeability = reconstruction.at("mu_eff0").get<double>();
+
+        // Inline material carrying the FITTED composite permeability (labelled as such; this is
+        // a fixture, not a catalogue material record).
+        json materialJson = {
+            {"name", "WE metal alloy (fitted mu_eff0)"}, {"type", "custom"},
+            {"material", "powder"}, {"materialComposition", "proprietary"},
+            {"manufacturerInfo", {{"name", "FITTED — not vendor material data"}}},
+            {"permeability", {{"initial", {{"value", permeability}}}}},
+            {"resistivity", json::array({{{"value", 1.0}}})},
+            {"density", 5500},
+            {"curieTemperature", 500},
+            {"saturation", json::array({{{"magneticFluxDensity", 1.2}, {"magneticField", 40000}, {"temperature", 25}}})},
+            {"volumetricLosses", {{"default", json::array({{{"method", "lossFactor"},
+                {"factors", json::array({{{"value", 1e-5}, {"frequency", 100000}}})}}})}}}
+        };
+        json shapeJson = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+            {"aliases", json::array()}, {"name", "WE-MAPI " + orderCode},
+            {"dimensions", {
+                {"A", {{"nominal", reconstruction.at("A").get<double>()}}},
+                {"B", {{"nominal", reconstruction.at("B").get<double>()}}},
+                {"C", {{"nominal", reconstruction.at("C").get<double>()}}},
+                {"D", {{"nominal", reconstruction.at("D").get<double>()}}},
+                {"E", {{"nominal", reconstruction.at("E").get<double>()}}},
+                {"F", {{"nominal", reconstruction.at("F").get<double>()}}}}}
+        };
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", "closedShape"}, {"material", materialJson}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1}};
+        Core core(coreJson);
+        core.process_data();
+        core.process_gap();
+
+        json coilJson;
+        coilJson["bobbin"] = "Dummy";
+        coilJson["functionalDescription"] = json::array({{
+            {"name", "winding 0"}, {"numberTurns", int(numberTurns)}, {"numberParallels", 1},
+            {"isolationSide", "primary"}, {"wire", "Dummy"}}});
+        OpenMagnetics::Coil coil(coilJson);
+
+        double modelInductance = magnetizingInductanceModel
+            .calculate_inductance_from_number_turns_and_gapping(core, coil)
+            .get_magnetizing_inductance().get_nominal().value();
+        double relativeError = modelInductance / datasheetInductance.at(orderCode) - 1;
+        relativeErrors.push_back(std::abs(relativeError));
+        if (std::abs(relativeError) < 0.20) withinTwentyPercent++;
+        evaluated++;
+    }
+    REQUIRE(evaluated >= 175);
+
+    std::sort(relativeErrors.begin(), relativeErrors.end());
+    double medianRelativeError = relativeErrors[relativeErrors.size() / 2];
+    double worstRelativeError = relativeErrors.back();
+    UNSCOPED_INFO("MKF vs datasheet over " << evaluated << " WE-MAPI parts: median |err| "
+                  << medianRelativeError * 100 << "%, worst " << worstRelativeError * 100
+                  << "%, within 20%: " << withinTwentyPercent);
+    // The fit's own median |L residual| is 3.9%; MKF must land in the same neighbourhood, which
+    // is what proves the C++ and the python mirror agree. A drift here means CorePieceMolded's
+    // sectioning changed and the reconstructions need refitting — do NOT widen this band.
+    CHECK(medianRelativeError < 0.10);
+    CHECK(withinTwentyPercent > evaluated * 8 / 10);
+    settings.reset();
+}
+
+// ABT #362: semi-shielded drum — mixed-material sectioned reluctance (ferrite drum + magnetic-
+// epoxy shell). No public vendor data pairs a drum+glue geometry with L (the 290-part
+// validation set is confidential and runs on heimdall's side), so this pins the PHYSICS:
+// the glue return must beat the bare drum's air return; a higher glue mu must give more L
+// (monotonicity, saturating towards the all-ferrite limit); and every missing material link
+// must THROW (no-fallbacks: the model never assumes air or guesses a mu). Glue stand-ins are
+// existing catalogue powder/ferrite materials — real glue records are ABT #364.
+TEST_CASE("Test_Drum_Semishielded_Inductance", "[physical-model][magnetizing-inductance][drum-semishielded]") {
+    settings.reset();
+    clear_databases();
+    double numberTurns = 20;
+
+    auto buildCore = [](json coatingJson) {
+        json shapeJson = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "drumSemishielded"},
+            {"aliases", json::array()}, {"name", "LQS-like 4018"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0038}}}, {"B", {{"nominal", 0.0018}}}, {"C", {{"nominal", 0.0015}}},
+                {"D", {{"nominal", 0.0004}}}, {"E", {{"nominal", 0.0010}}}, {"F", {{"nominal", 0.0004}}},
+                {"J", {{"nominal", 0.0040}}}, {"K", {{"nominal", 0.0040}}}, {"L", {{"nominal", 0.0018}}}}}
+        };
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", "pieceAndPlate"}, {"material", "3C90"}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1}};
+        if (!coatingJson.is_null()) {
+            coreJson["functionalDescription"]["coating"] = coatingJson;
+        }
+        Core core(coreJson);
+        core.process_data();
+        core.process_gap();
+        return core;
+    };
+    auto glueCoating = [](const std::string& materialName) {
+        return json{{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", materialName}};
+    };
+
+    // Bare drum with the SAME drum dimensions: the air return the glue replaces.
+    json bareShapeJson = {
+        {"magneticCircuit", "open"}, {"type", "custom"}, {"family", "drum"},
+        {"aliases", json::array()}, {"name", "LQS drum bare"},
+        {"dimensions", {
+            {"A", {{"nominal", 0.0038}}}, {"B", {{"nominal", 0.0018}}}, {"C", {{"nominal", 0.0015}}},
+            {"D", {{"nominal", 0.0004}}}, {"E", {{"nominal", 0.0010}}}, {"F", {{"nominal", 0.0004}}}}}
+    };
+    json bareCoreJson;
+    bareCoreJson["functionalDescription"] = {
+        {"type", "openShape"}, {"material", "3C90"}, {"shape", bareShapeJson},
+        {"gapping", json::array()}, {"numberStacks", 1}};
+    Core bareCore(bareCoreJson);
+    bareCore.process_data();
+    double bareInductance = MagnetizingInductance::calculate_open_core_magnetizing_inductance(bareCore, numberTurns, 25);
+
+    double glue26Inductance = MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(
+        buildCore(glueCoating("Kool Mµ 26")), numberTurns, 25);
+    double glue60Inductance = MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(
+        buildCore(glueCoating("Kool Mµ 60")), numberTurns, 25);
+    // All-ferrite shell = the drumRing-like upper limit of the same circuit.
+    double ferriteShellInductance = MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(
+        buildCore(glueCoating("3C90")), numberTurns, 25);
+
+    UNSCOPED_INFO("bare " << bareInductance * 1e6 << " uH < glue26 " << glue26Inductance * 1e6
+                          << " uH < glue60 " << glue60Inductance * 1e6 << " uH < ferrite shell "
+                          << ferriteShellInductance * 1e6 << " uH");
+    CHECK(std::isfinite(glue26Inductance));
+    CHECK(bareInductance < glue26Inductance);
+    CHECK(glue26Inductance < glue60Inductance);
+    CHECK(glue60Inductance < ferriteShellInductance);
+
+    // The routed path (family gate) must agree with the direct call.
+    json windingData = json::parse(
+        R"({"bobbin": "Dummy", "functionalDescription": [{"isolationSide": "primary", "name": "Primary",
+            "numberParallels": 1, "numberTurns": 20, "wire": "Dummy"}]})");
+    MagnetizingInductance magnetizingInductanceModel("ZHANG");
+    double routedInductance = magnetizingInductanceModel
+        .calculate_inductance_from_number_turns_and_gapping(buildCore(glueCoating("Kool Mµ 26")),
+                                                            OpenMagnetics::Coil(windingData))
+        .get_magnetizing_inductance().get_nominal().value();
+    CHECK_THAT(routedInductance, Catch::Matchers::WithinRel(glue26Inductance, 1e-9));
+
+    // No-fallbacks: every missing link throws.
+    CHECK_THROWS(MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(
+        buildCore(json()), numberTurns, 25));  // no coating at all
+    CHECK_THROWS(MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(
+        buildCore(json{{"type", "epoxy"}, {"thickness", 0.0001}}), numberTurns, 25));  // non-magnetic coating
+    CHECK_THROWS(MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(
+        buildCore(glueCoating("No Such Glue")), numberTurns, 25));  // unknown shell material
+    settings.reset();
+}
+
+TEST_CASE("Test_ABT635_Gapping_From_Inductance_Without_ProcessedDescription",
+          "[physical-model][magnetizing-inductance][bug]") {
+    // ABT #635: calculate_gapping_from_number_turns_and_inductance() dereferenced
+    // core.get_processed_description() unconditionally, so a Core built from a bare (and perfectly
+    // legal) functionalDescription -- no processedDescription -- failed with an opaque
+    // "bad optional access" instead of being processed. Every neighbouring entry point accepts
+    // that same core, so the API was inconsistent as well as unhelpful.
+    settings.reset();
+    clear_databases();
+
+    // identical core TWICE: once with only a functionalDescription, once pre-processed.
+    const std::string coreJson = R"({"name": "abt635", "functionalDescription": {
+        "type": "twoPieceSet", "material": "3C95",
+        "shape": {"type": "custom", "family": "pq", "name": "abt635 pq",
+                  "dimensions": {"A": 0.0273, "B": 0.009, "C": 0.019, "D": 0.0057,
+                                 "E": 0.0225, "F": 0.012, "G": 0.0155}},
+        "gapping": [], "numberStacks": 1}})";
+
+    Core bare = json::parse(coreJson);
+    Core processed = json::parse(coreJson);
+    processed.process_data();
+    processed.process_gap();
+
+    OpenMagnetics::Coil coil = json::parse(R"({"bobbin": "Dummy", "functionalDescription": [
+        {"name": "PRI", "numberTurns": 10, "numberParallels": 1, "isolationSide": "primary",
+         "wire": "Round 21.0 - Heavy Build"}]})");
+    OpenMagnetics::Inputs inputs = json::parse(R"({"designRequirements": {
+        "name": "abt635", "magnetizingInductance": {"nominal": 3.3e-06}, "turnsRatios": []},
+        "operatingPoints": []})");
+
+    MagnetizingInductance model(Defaults().reluctanceModelDefault);
+    GappingType gappingType = magic_enum::enum_cast<GappingType>("GROUND").value();
+
+    // the ticket's exact repro: this used to throw
+    std::vector<CoreGap> fromBare;
+    REQUIRE_NOTHROW(fromBare = model.calculate_gapping_from_number_turns_and_inductance(
+        bare, coil, &inputs, gappingType, 6));
+    REQUIRE(fromBare.size() > 0);
+    REQUIRE(fromBare[0].get_length() > 0);
+
+    // and it must agree with the pre-processed core -- processing internally must not change the
+    // answer, only remove the need for the caller to have done it.
+    auto fromProcessed = model.calculate_gapping_from_number_turns_and_inductance(
+        processed, coil, &inputs, gappingType, 6);
+    REQUIRE(fromProcessed.size() == fromBare.size());
+    CHECK_THAT(fromBare[0].get_length(),
+               Catch::Matchers::WithinRel(fromProcessed[0].get_length(), 1e-9));
+
+    settings.reset();
+}
+
+// ABT #907: on a CCM flybuck the magnetizing-current DC anchor was taken as
+// peak(I1) - pkpk(I1)/2, but the primary's pk-pk excursion contains the
+// commutation step (the secondary's ampere-turns handed over at turn-on),
+// which moves no flux. That understated the DC anchor (0.420 A instead of
+// 0.583 A) and with it B_dc (0.191 T instead of 0.266 T) and B_peak (0.259 T
+// instead of 0.334 T) — the saturation margin read 28% better than reality.
+// The anchor is now peak-based: peak(i_mag) == peak(I1) (at the primary peak
+// the secondary is off, so the primary carries the whole magnetizing MMF),
+// minus the magnetizing excursion above its mean from the volt-second
+// integral. User-reported design: High Flux 160 T10/6/5, 56:28 turns,
+// 170 kHz flybuck. The AC flux swing (67.8 mT peak) is pinned by Faraday's
+// law on the primary volt-seconds and must not move with this fix.
+TEST_CASE("Test_ABT907_Flybuck_Flux_Density_Dc_Offset_Uses_Net_Mmf_Anchor",
+          "[physical-model][magnetizing-inductance][flyback][abt907]") {
+    settings.reset();
+    clear_databases();
+    namespace fs = std::filesystem;
+    auto masPath = fs::path{std::source_location::current().file_name()}
+                       .parent_path().append("testData").append("flybuck_hf160_250u_abt907.json");
+    std::ifstream masFile(masPath);
+    REQUIRE(masFile.good());
+    json masJson = json::parse(masFile);
+
+    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+    OperatingPoint operatingPoint(masJson["inputs"]["operatingPoints"][0]);
+
+    MagnetizingInductance magnetizingInductanceModel;
+    auto [inductanceOutput, fluxDensity] = magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(
+        magnetic.get_core(), magnetic.get_coil(), &operatingPoint);
+    auto fluxProcessed = fluxDensity.get_processed().value();
+
+    // AC part: Faraday on the primary voltage waveform gives 75.9 uVs over
+    // 56 turns x 10 mm2 -> 135.6 mT pk-pk. Model-independent; unchanged by the fix.
+    CHECK_THAT(fluxProcessed.get_peak_to_peak().value(), Catch::Matchers::WithinRel(0.1356, 0.02));
+
+    // DC part: the magnetizing current i_m = I1 + (N2/N1)*I2 is a clean triangle
+    // running 0.4347 -> 0.7326 A (verified against the pointwise volt-second
+    // integral); its midpoint 0.5837 A through the core reluctance gives 0.266 T.
+    CHECK_THAT(fluxProcessed.get_offset(), Catch::Matchers::WithinRel(0.2657, 0.02));
+    CHECK_THAT(fluxProcessed.get_peak().value(), Catch::Matchers::WithinRel(0.3335, 0.02));
+
+    // The anchor itself: peak(i_mag) must coincide with the measured primary peak
+    // (0.7326 A), and the valley with the commutation-corrected 0.4347 A — NOT the
+    // primary waveform's own 0.108 A minimum.
+    auto magnetizingCurrentWaveform =
+        operatingPoint.get_excitations_per_winding()[0].get_magnetizing_current().value().get_waveform().value();
+    const std::vector<double>& magnetizingCurrentData = magnetizingCurrentWaveform.get_data();
+    double magnetizingCurrentMaximum = *max_element(magnetizingCurrentData.begin(), magnetizingCurrentData.end());
+    double magnetizingCurrentMinimum = *min_element(magnetizingCurrentData.begin(), magnetizingCurrentData.end());
+    CHECK_THAT(magnetizingCurrentMaximum, Catch::Matchers::WithinRel(0.7326, 0.01));
+    CHECK_THAT(magnetizingCurrentMinimum, Catch::Matchers::WithinRel(0.4347, 0.02));
+
+    settings.reset();
+}
+
+// ABT #1002: a moulded body pressed from more than one powder takes each region's own mu. The
+// brackets that pin the physics: listing one grade three times must reproduce the single-grade
+// model exactly (the regions sum to the piece), a stiffer post must raise the inductance but
+// never past the all-stiff body, a plastic-bobbin post must lower it and land on the analytic
+// series sum, and a DC bias must pull it down through each region's own knee.
+TEST_CASE("Test_Molded_Per_Region_Inductance", "[physical-model][magnetizing-inductance][molded][abt-1002]") {
+    settings.reset();
+    clear_databases();
+    double numberTurns = 12;
+    json shapeJson = {
+        {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+        {"aliases", json::array()}, {"name", "MAPI-like 4020"},
+        {"dimensions", {
+            {"A", {{"nominal", 0.0041}}}, {"B", {{"nominal", 0.0021}}}, {"C", {{"nominal", 0.0041}}},
+            {"D", {{"nominal", 0.0014}}}, {"E", {{"nominal", 0.0030}}}, {"F", {{"nominal", 0.0012}}}}}
+    };
+    json windingData = json::parse(
+        R"({"bobbin": "Dummy", "functionalDescription": [{"isolationSide": "primary", "name": "Primary",
+            "numberParallels": 1, "numberTurns": 12, "wire": "Dummy"}]})");
+    OpenMagnetics::Coil winding(windingData);
+    MagnetizingInductance magnetizingInductanceModel("ZHANG");
+
+    auto inductanceOf = [&](json material, std::string* methodUsed = nullptr) {
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", "closedShape"}, {"material", material}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1}};
+        Core core(coreJson);
+        core.process_data();
+        core.process_gap();
+        auto output = magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(core, winding, nullptr);
+        if (methodUsed) {
+            *methodUsed = output.get_method_used();
+        }
+        return output.get_magnetizing_inductance().get_nominal().value();
+    };
+
+    std::string bareMethod;
+    std::string listMethod;
+    double bare26 = inductanceOf("Kool Mµ 26", &bareMethod);
+    double listed26 = inductanceOf(json::array({"Kool Mµ 26", "Kool Mµ 26", "Kool Mµ 26"}), &listMethod);
+    double paired26 = inductanceOf(json::array({"Kool Mµ 26", "Kool Mµ 26"}));
+    UNSCOPED_INFO("bare " << bare26 * 1e6 << " uH (" << bareMethod << "), listed x3 " << listed26 * 1e6
+                          << " uH (" << listMethod << "), listed x2 " << paired26 * 1e6 << " uH");
+    CHECK(bareMethod != "MoldedPerRegionReluctance");
+    CHECK(listMethod == "MoldedPerRegionReluctance");
+    CHECK_THAT(listed26, Catch::Matchers::WithinRel(bare26, 1e-6));
+    CHECK_THAT(paired26, Catch::Matchers::WithinRel(bare26, 1e-6));
+
+    double bare60 = inductanceOf("Kool Mµ 60");
+    double stiffPost = inductanceOf(json::array({"Kool Mµ 60", "Kool Mµ 26"}));
+    double stiffBase = inductanceOf(json::array({"Kool Mµ 26", "Kool Mµ 26", "Kool Mµ 60"}));
+    CHECK(stiffPost > bare26);
+    CHECK(stiffPost < bare60);
+    CHECK(stiffBase > bare26);
+    CHECK(stiffBase < bare60);
+
+    // A coil on a plastic bobbin: the post is air. Analytic series sum from the piece's own
+    // region constants and the grade's zero-bias permeability.
+    double bobbinPost = inductanceOf(json::array({"air", "Kool Mµ 26", "Kool Mµ 26"}));
+    CHECK(bobbinPost < bare26);
+    json coreJson;
+    coreJson["functionalDescription"] = {
+        {"type", "closedShape"}, {"material", "Kool Mµ 26"}, {"shape", shapeJson},
+        {"gapping", json::array()}, {"numberStacks", 1}};
+    Core core(coreJson);
+    auto regions = CorePiece::factory(core.resolve_shape())->get_region_shape_constants().value();
+    // Evaluated at the reference frequency the standard path uses when no operating point is given.
+    double referenceFrequency = Defaults().coreAdviserFrequencyReference;
+    double permeability26 = InitialPermeability::get_initial_permeability(core.resolve_material(), 25.0, std::nullopt, referenceFrequency);
+    double vacuumPermeability = Constants().vacuumPermeability;
+    double expectedReluctance = regions[0].c1 / vacuumPermeability +
+                                (regions[1].c1 + regions[2].c1) / (vacuumPermeability * permeability26);
+    CHECK_THAT(bobbinPost, Catch::Matchers::WithinRel(pow(numberTurns, 2) / expectedReluctance, 1e-6));
+
+    // Four entries do not describe this body.
+    CHECK_THROWS(inductanceOf(json::array({"Kool Mµ 26", "Kool Mµ 26", "Kool Mµ 26", "Kool Mµ 26"})));
+
+    // DC bias pulls each region down its own mu(H); the post, with the smallest section, first.
+    json biasedCoreJson;
+    biasedCoreJson["functionalDescription"] = {
+        {"type", "closedShape"}, {"material", json::array({"Kool Mµ 60", "Kool Mµ 26"})}, {"shape", shapeJson},
+        {"gapping", json::array()}, {"numberStacks", 1}};
+    Core biasedCore(biasedCoreJson);
+    biasedCore.process_data();
+    biasedCore.process_gap();
+    double unbiased = MagnetizingInductance::calculate_molded_magnetizing_inductance(biasedCore, numberTurns, 25, referenceFrequency);
+    double biased = MagnetizingInductance::calculate_molded_magnetizing_inductance(biasedCore, numberTurns, 25, referenceFrequency, 20.0);
+    double moreBiased = MagnetizingInductance::calculate_molded_magnetizing_inductance(biasedCore, numberTurns, 25, referenceFrequency, 60.0);
+    UNSCOPED_INFO("unbiased " << unbiased * 1e6 << " uH, 20 A " << biased * 1e6 << " uH, 60 A " << moreBiased * 1e6 << " uH");
+    CHECK(biased < unbiased);
+    CHECK(moreBiased < biased);
+    CHECK_THAT(unbiased, Catch::Matchers::WithinRel(stiffPost, 1e-6));
+
+    // Through the public entry point WITH an operating point, the way every consumer calls it:
+    // a raw current waveform (no processed data, no harmonics) whose DC component is the bias.
+    // A symmetric ripple reproduces the unbiased figure; a 20 A offset reproduces the biased one.
+    auto operatingPointWithOffset = [&](double offset) {
+        json operatingPointJson = json::parse(R"({"conditions": {"ambientTemperature": 25.0},
+            "excitationsPerWinding": [{"name": "Primary", "frequency": 100000,
+              "current": {"waveform": {"data": [-0.05, 0.05, -0.05], "time": [0, 5e-6, 1e-5]}},
+              "voltage": {"waveform": {"data": [-1, 1, 1, -1, -1], "time": [0, 0, 5e-6, 5e-6, 1e-5]}}}]})");
+        for (auto& sample : operatingPointJson["excitationsPerWinding"][0]["current"]["waveform"]["data"]) {
+            sample = sample.get<double>() + offset;
+        }
+        return OperatingPoint(operatingPointJson);
+    };
+    auto rippleOnly = operatingPointWithOffset(0);
+    auto withOffset = operatingPointWithOffset(20);
+    auto rippleOutput = magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(biasedCore, winding, &rippleOnly);
+    auto offsetOutput = magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(biasedCore, winding, &withOffset);
+    CHECK(rippleOutput.get_method_used() == "MoldedPerRegionReluctance");
+    CHECK_THAT(rippleOutput.get_magnetizing_inductance().get_nominal().value(), Catch::Matchers::WithinRel(unbiased, 1e-3));
+    CHECK_THAT(offsetOutput.get_magnetizing_inductance().get_nominal().value(), Catch::Matchers::WithinRel(biased, 1e-3));
+    settings.reset();
+}
