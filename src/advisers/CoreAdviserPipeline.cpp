@@ -8,6 +8,7 @@
 // and shared helpers in advisers/CoreAdviserInternal.h.
 
 #include "advisers/CoreAdviser.h"
+#include "support/StableSortByIndex.h"
 #include "advisers/CoreAdviserInternal.h"
 #include "advisers/CoilAdviser.h"             // ABT #4 proximity re-rank winds a representative coil
 #include "Constants.h"                         // Constants::residualGap for the DMC gap pre-filter
@@ -323,10 +324,15 @@ std::vector<std::pair<Mas, double>> CoreAdviser::post_process_and_cut(std::vecto
     std::vector<std::pair<Mas, double>> masWithScoring;
     std::vector<std::string> usedShapes;
     const bool uniqueShapes = get_unique_core_shapes();
+    log_probe("entering post_process_and_cut", magneticsWithScoring.size());
+    size_t candidatesExamined = 0;
+    size_t candidatesDropped = 0;
+    std::map<std::string, std::vector<std::string>> alternativeMaterialsCache;
     for (auto& magneticWithScoring : magneticsWithScoring) {
         if (masWithScoring.size() >= maximumNumberResults) {
             break;
         }
+        ++candidatesExamined;
         std::string shapeName;
         if (uniqueShapes) {
             shapeName = magneticWithScoring.first.get_core().get_shape_name();
@@ -337,7 +343,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::post_process_and_cut(std::vecto
         std::vector<std::pair<Magnetic, double>> candidate{magneticWithScoring};
         correct_windings(&candidate, inputs);
         if (withAlternativeMaterials) {
-            add_alternative_materials(&candidate, inputs);
+            add_alternative_materials(&candidate, inputs, &alternativeMaterialsCache);
         }
         try {
             auto mas = post_process_core(candidate[0].first, inputs);
@@ -351,8 +357,13 @@ std::vector<std::pair<Mas, double>> CoreAdviser::post_process_and_cut(std::vecto
             // drop it and let the next-scored candidate backfill (ABT #126: the
             // old resize-first order silently returned ZERO results when the
             // top-N were unwindable while windable survivors had been discarded).
+            ++candidatesDropped;
             logEntry(std::string("CoreAdviser: dropping core that failed post-processing (backfilling): ") + e.what(), "CoreAdviser", 2);
         }
+        log_probe("post_process candidate " + std::to_string(candidatesExamined) +
+                  " (kept " + std::to_string(masWithScoring.size()) +
+                  ", dropped " + std::to_string(candidatesDropped) + ")",
+                  magneticsWithScoring.size());
     }
     return masWithScoring;
 }
@@ -365,6 +376,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
     MagneticCoreFilterCost filterCost(inputs);
     MagneticCoreFilterLosses filterLosses(inputs, _models);
     MagneticCoreFilterDimensions filterDimensions;
+    MagneticCoreFilterMagneticInductance filterMagneticInductance;
 
     filterAreaProduct.set_scorings(&_scorings);
     filterAreaProduct.set_filter_configuration(&_filterConfiguration);
@@ -376,6 +388,11 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
     filterLosses.set_filter_configuration(&_filterConfiguration);
     filterDimensions.set_scorings(&_scorings);
     filterDimensions.set_filter_configuration(&_filterConfiguration);
+    filterMagneticInductance.set_scorings(&_scorings);
+    filterMagneticInductance.set_filter_configuration(&_filterConfiguration);
+    // A stock core's turns are re-seeded on every pass (and the retries below), so a cached
+    // verdict from an earlier seeding would judge a different turn count.
+    filterMagneticInductance.set_cache_usage(false);
 
     std::vector<std::pair<Magnetic, double>> magneticsWithScoring = *magnetics;
     magneticsWithScoring = filterAreaProduct.filter_magnetics(&magneticsWithScoring, inputs, 1.0, true);  // Fixed weight: pre-filtering criterion, not efficiency scoring
@@ -390,6 +407,14 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
     log_stage("Energy Stored filter", magneticsWithScoring.size());
 
     add_initial_turns_by_inductance(&magneticsWithScoring, inputs);
+
+    // ABT #1411: this path had no inductance gate, so a stock core whose seeded turns
+    // miss the required band (powder toroids at 4.6-10.4 uH for a 28.5-38.5 uH spec)
+    // reached the results. Same gate, same place as the standard-cores and fast paths:
+    // after the turns are set, before saturation. Weight 0: a pure gate, so the ranking
+    // of the candidates that already met their band is unchanged.
+    magneticsWithScoring = filterMagneticInductance.filter_magnetics(&magneticsWithScoring, inputs, 0, true);
+    log_stage("Inductance filter", magneticsWithScoring.size());
 
     // Add saturation filter to reject cores that exceed magnetic flux density saturation
     MagneticCoreFilterSaturation filterSaturationAvailable;
@@ -421,6 +446,10 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
         }
     }
 
+    // No loss-optimal (N, gap) step here (ABT #1426, select_inductor_turns_and_gap_by_losses),
+    // unlike filter_standard_cores_power_application: this is available-cores mode, and a
+    // stock core's gap is part of the catalogue part, so it is excluded on purpose (Alf's
+    // decision). The losses below rank each part at its own gap.
     magneticsWithScoring = filterLosses.filter_magnetics(&magneticsWithScoring, inputs, weights[CoreAdviserFilters::EFFICIENCY], true);
     log_stage("Core Losses filter", magneticsWithScoring.size());
 
@@ -448,9 +477,51 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
         magneticsWithScoring = *magnetics;
         magneticsWithScoring = filterAreaProduct.filter_magnetics(&magneticsWithScoring, inputs, 1.0, true);
         magneticsWithScoring = filterEnergyStored.filter_magnetics(&magneticsWithScoring, inputs, 1.0, true);
+
+        // ABT #926: bound the retry BY SIZE, which is the thing it is actually looking for.
+        //
+        // Removing the cull entirely (what this did before) sent every surviving candidate —
+        // 8332 of them on the reported case — through add_initial_turns_by_inductance and the
+        // saturation filter, at ~44 ms each: 6 min 10 s of a 6 min 49 s call, 90 % of the whole
+        // thing. Re-instating the NORMAL cull is not the answer either, because that keeps the
+        // top-N by SCORE and the score favours small, cheap cores — exactly the ones already
+        // rejected, and the reason this retry exists.
+        //
+        // So cull on the retry's own criterion instead. The comment above states it and the
+        // classic area-product iteration (McLyman) is the same rule: try the NEXT LARGER core.
+        // Keeping the largest candidates preserves every core this pass could plausibly return
+        // — a core that fails saturation does so because it is too small — while bounding the
+        // work. Parallelising was the other candidate fix and is a dead end for users: the
+        // engine ships to the browser as WASM built without pthreads, so threads would speed up
+        // the CLI and leave the 6-minute wait exactly where the users are.
+        // From the configured cull, not this call's argument: the stacked second pass
+        // raises the argument, and the retry cap must not grow with it.
+        const size_t retryCap = std::max<size_t>(settings.get_core_adviser_maximum_magnetics_after_filtering() * 4, 1000);
+        auto keepLargestCores = [&](std::vector<std::pair<Magnetic, double>>& pool) {
+            if (pool.size() <= retryCap) {
+                return;
+            }
+            const size_t before = pool.size();
+            stable_sort_by_index(pool,
+                             [](const std::pair<Magnetic, double>& left,
+                                const std::pair<Magnetic, double>& right) {
+                                 return left.first.get_core().get_effective_area() >
+                                        right.first.get_core().get_effective_area();
+                             });
+            pool.resize(retryCap);
+            // Hand the rest of the pipeline the score order it expects; only the MEMBERSHIP of
+            // the pool was decided by size.
+            sort_magnetics_by_scoring(&pool);
+            logEntry("Retry pool culled from " + std::to_string(before) + " to " +
+                     std::to_string(retryCap) + " candidates, largest cores kept (the retry is "
+                     "looking for a bigger core, so the smallest cannot answer it).", "CoreAdviser");
+        };
+        keepLargestCores(magneticsWithScoring);
+
         add_initial_turns_by_inductance(&magneticsWithScoring, inputs);
+        magneticsWithScoring = filterMagneticInductance.filter_magnetics(&magneticsWithScoring, inputs, 0, true);
         magneticsWithScoring = filterSaturationAvailable.filter_magnetics(&magneticsWithScoring, inputs, 1, true);
-        log_stage("retry Saturation (no pruning)", magneticsWithScoring.size());
+        log_stage("retry Saturation (size-bounded)", magneticsWithScoring.size());
 
         // Stage 2: still nothing — relax the saturation MARGIN to 1.0 (still
         // physically non-saturating, just without the production headroom) and
@@ -466,7 +537,11 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
                 magneticsWithScoring = *magnetics;
                 magneticsWithScoring = filterAreaProduct.filter_magnetics(&magneticsWithScoring, inputs, 1.0, true);
                 magneticsWithScoring = filterEnergyStored.filter_magnetics(&magneticsWithScoring, inputs, 1.0, true);
+                // Same size bound as stage 1: this stage had none, so a design that failed
+                // stage 1 sized and saturation-checked the entire pool a second time.
+                keepLargestCores(magneticsWithScoring);
                 add_initial_turns_by_inductance(&magneticsWithScoring, inputs);
+                magneticsWithScoring = filterMagneticInductance.filter_magnetics(&magneticsWithScoring, inputs, 0, true);
                 magneticsWithScoring = filterSaturationAvailable.filter_magnetics(&magneticsWithScoring, inputs, 1, true);
             }
             reducedSaturationMargin = !magneticsWithScoring.empty();
@@ -519,7 +594,9 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
 }
 
 std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_suppression_application(std::vector<std::pair<Magnetic, double>>* magnetics, Inputs inputs, std::map<CoreAdviserFilters, double> weights, size_t maximumMagneticsAfterFiltering, size_t maximumNumberResults){
+    log_probe("entering pre_process_inputs (suppression)", magnetics->size());
     inputs = pre_process_inputs(inputs);
+    log_probe("pre_process_inputs (suppression)", magnetics->size());
 
     MagneticCoreFilterCost filterCost(inputs);
     MagneticCoreFilterLosses filterLosses(inputs, _models);
@@ -584,6 +661,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_suppress
             }
         }
         magneticsWithScoring = std::move(dmcFiltered);
+        log_probe("DMC material/gap pre-filter", magneticsWithScoring.size());
     }
 
     // (CMC powder pre-filter previously lived here. Removed in favour of the
@@ -601,10 +679,29 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_suppress
     // therefore pure waste: it never reached the output yet cost a full
     // per-candidate magnetizing-inductance/gapping solve (~157 ms each) on the
     // entire ~4.6k-core suppression set — minutes of work, and the hang behind
-    // ABT #9. The cheap impedance filter (~0.3 ms/core) does the real culling.
+    // ABT #9. The impedance filter does the real culling.
+    //
+    // ABT #859: that last sentence used to read "the cheap impedance filter
+    // (~0.3 ms/core)". It is only cheap when it runs on the FAST (OneLayer)
+    // capacitance path. Measured on Test_CoreAdviser_DMC_Default_Wizard_Hang_Repro
+    // (10 s budget), 4,834 candidates reaching this line:
+    //
+    //     full capacitance model   1,038,396 ms   (215 ms/candidate)
+    //     fast OneLayer path           1,452 ms   (0.3 ms/candidate)
+    //
+    // The 0.3 ms figure was measured against the fast path and then quoted as if
+    // it were unconditional, which is what made it look safe to run this filter
+    // over the whole catalogue after MKF d424c32e flipped Impedance's DEFAULT to
+    // the full model. build_magnetizing_tank WINDS THE COIL on the full path, so
+    // the filter went to 17.3 of the run's 17.4 minutes while every other stage
+    // together came to about 7 s. MagneticFilterCoreMinimumImpedance now pins
+    // fastCapacitance=true on its member (see MagneticFilter.h); if that ever
+    // reverts, this line's premise goes with it.
     magneticsWithScoring = filterMinimumImpedance.filter_magnetics(&magneticsWithScoring, inputs, 0.001, true);
+    log_probe("filterMinimumImpedance", magneticsWithScoring.size());
 
     magneticsWithScoring = filterTurnCount.filter_magnetics(&magneticsWithScoring, inputs, 1.0, false);
+    log_probe("filterTurnCount", magneticsWithScoring.size());
 
     // Cap before the two expensive per-candidate physical filters below
     // (saturation and losses each cost ~0.1 s/core: they wind the coil and run
@@ -619,12 +716,16 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_suppress
 
     magneticsWithScoring = filterSaturation.filter_magnetics(
         &magneticsWithScoring, inputs, 1, true);
+    log_probe("filterSaturation", magneticsWithScoring.size());
 
     magneticsWithScoring = filterCost.filter_magnetics(&magneticsWithScoring, inputs, weights[CoreAdviserFilters::COST], true);
+    log_probe("filterCost", magneticsWithScoring.size());
 
     magneticsWithScoring = filterDimensions.filter_magnetics(&magneticsWithScoring, inputs, weights[CoreAdviserFilters::DIMENSIONS], true);
+    log_probe("filterDimensions", magneticsWithScoring.size());
 
     magneticsWithScoring = filterMagneticInductance.filter_magnetics(&magneticsWithScoring, inputs, weights[CoreAdviserFilters::EFFICIENCY], true);
+    log_probe("filterMagneticInductance", magneticsWithScoring.size());
 
     {
         // Interference-suppression materials are characterised by complex
@@ -777,6 +878,16 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_standard_cores_power_app
                 log_pruned("Losses (ferrite)", ferriteCores.size());
             }
         }
+
+        // ABT #1426: the seeded (N, gap) is the saturation floor; move each surviving
+        // inductor to its loss-optimal pair before the losses rank it. On the pruned pool
+        // only: the step is per-candidate work, and the pool has already been cut on the
+        // criteria the turn count does not change (size, cost, inductance band).
+        // Standard cores only. Available-cores mode (filter_available_cores_power_application)
+        // is excluded on purpose: a stock core's gap is part of the catalogue part, so its
+        // (N, gap) is not the adviser's to re-solve (Alf's decision).
+        select_inductor_turns_and_gap_by_losses(&ferriteCores, inputs);
+        log_stage("Loss-optimal turns (ferrite)", ferriteCores.size());
 
         // Filter by losses
         ferriteCores = filterLosses.filter_magnetics(&ferriteCores, inputs, 1 * userWeight(CoreAdviserFilters::EFFICIENCY), true);

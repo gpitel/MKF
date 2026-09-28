@@ -10,7 +10,12 @@ enum class MagneticFieldStrengthModels : int {
     LAMMERANER,
     DOWELL,
     WANG,
-    ALBACH
+    ALBACH,
+    // ABT #1409: turns AND functional-gap MMF sheets imaged together in the core window, so the
+    // window carries ~no net current. Gap fringing is part of this model: the fringing-effect
+    // model setting is not consulted when it is selected. Appended last: bindings pass the
+    // enum as an int.
+    IMAGED_MMF_SHEETS
 };
 
 enum class MagneticFieldStrengthFringingEffectModels : int {
@@ -90,7 +95,20 @@ enum class WindingProximityEffectLossesModels : int {
     WOJDA,
     SULLIVAN,
     BARTOLI,
-    VANDELAC
+    VANDELAC,
+    // ABT #1188: proximity loss with FIELD EXCLUSION. Every other model here treats a conductor
+    // as transparent to the field that drives it; this one treats it as a body that excludes the
+    // field once it is more than a skin depth thick, which is what a real conductor does.
+    MARTINEZ,
+    // Ewald & Biela, EPE'23 (ETH Zurich): "Eddy currents in rectangular conductors: Analytical 2D
+    // loss model in the context of magnetic component design". The closest published state of the
+    // art for rectangular conductors, implemented here so MKF can be measured against it.
+    EWALD,
+    // ABT #1409: WANG with the width-resolved perpendicular (edge-crowding) term taken on the
+    // outline of the stack a flat conductor belongs to (conductors separated by slits narrower
+    // than half their width screen each other), each member carrying its share of that outline.
+    // Identical to WANG for a conductor that is not stacked. Appended last: bindings pass ints.
+    WANG_STACKED
 };
 
 

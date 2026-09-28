@@ -109,28 +109,70 @@ void check_top_n(const std::string& label,
 //   26 reference) takes slot 0 as a near-identical same-family match. NPH-L 26 (Poco High-Flux)
 //   also participates now that the curie-NaN crash is fixed (6 Poco NPN/NPU materials gained
 //   curieTemperature in MAS). Kool Mµ MAX 40 falls off the top-5.
+// Re-baselined 2026-07-27 (ABT #190c, user-approved re-pin) after advancing MAS past
+// 489ddd9. Only the two FERRITE tables move; both POWDER tables reproduce to the last
+// digit, which is the evidence that this is a material-set effect and not a scoring
+// change. What changed, and why it is benign:
+//  * FerriteDefault reshuffles inside a statistical tie — DMR95 2.70371, ML33D 2.70170,
+//    P45 2.70033, 3C95 2.68183, TPW33 2.67987 span 0.9%, with 0.007% between the top
+//    two. DMR95 leading is if anything the more defensible result: it is the classic
+//    3C97 equivalent (mu_i ~3480 vs 3341, same 0.53 T saturation, comparable losses).
+//    Because the head of this list is a coin flip, the smoke-level tests now assert
+//    shortlist MEMBERSHIP rather than an exact winner; this file keeps the full pin on
+//    purpose, as a refactor tripwire.
+//  * FerriteOnlyTdk keeps N95 at slot 0 with the same 25 °C justification as before;
+//    slots 1-4 gain PEM95 and PCL47, TDK materials that entered MAS after the last
+//    baseline, pushing N51/PC44 out of the top five.
+//  * Every score drifts (1e-5 to 0.9%) because scorings are normalised across the whole
+//    candidate set, so any material added to — or corrected in — MAS moves the
+//    denominators for everyone, including the A10/A102 permeability extension (ABT #178)
+//    and the POCO toroid fix (ABT #306) that landed the same day.
+// Re-pinned 2026-07-31 (ABT #398, user-approved). The JFE (MAS 0d65a56) and TDG
+// (MAS 56d8c84) material batches dropped six more MnZn power ferrites into a tie
+// band that is only 0.95% wide, so the head of this list reshuffled: MBT2 and
+// TPW30 enter at slots 3-4, pushing 3C95 and TPW33 out of the top five (they now
+// sit 11th and 12th, at 2.68183 and 2.67987). DMR95 and P45 keep their scores to
+// the last digit; ML33D's rose 2.70170 -> 2.70557 without its own data changing,
+// because these scores are MIN-MAX NORMALIZED over the whole candidate population
+// (CrossReferencerCommon.h::compute_normalized_scorings) — every material added to
+// the catalogue moves the normalization, and therefore everyone else's score. That
+// is why an absolute-score snapshot cannot hold still while the catalogue grows;
+// #398 tracks making the score discriminate (or reporting an explicit tie band).
+// Refreshed 2026-08-20 (ABT #834, user-approved): same catalogue-growth normalization
+// shift (135 MAS data/ commits; physics-reverted byte-identity verified — slot-0 score
+// 2.7030235692090656 with AND without the #832 loss fixes). The head coin flip flipped
+// again: DMR95 over ML33D by 0.003% — both materials verified to carry real Steinmetz
+// loss models and initial permeability, so neither wins by missing data. Same five
+// names; TPW30/MBT2 swap. The tie band remains ~0.1% wide; #398 still tracks making
+// the score discriminate instead of pinning a coin flip.
 const std::vector<TopEntry> kTopFerriteDefault = {
-    {"TPW33", 2.7280204415116578},
-    {"DMR95", 2.7229069637902059},
-    {"P45",   2.7216369780206886},
-    {"3C95",  2.7144498861636723},
-    {"T",     2.71339927430376},
+    {"DMR95", 2.7030235692090656},
+    {"ML33D", 2.7029322665532569},
+    {"TPW30", 2.7012756176446233},
+    {"MBT2",  2.6999765288775177},
+    {"P45",   2.6996579563546494},
 };
 
+// Refreshed 2026-08-20 (ABT #834): identical five names and order; scores +0.27%
+// from the same normalization shift.
 const std::vector<TopEntry> kTopFerriteOnlyTdk = {
-    {"N95",  2.556455278905954},
-    {"PC47", 2.4863443793547764},
-    {"N97",  2.4851490946728743},
-    {"N51",  2.458893344562656},
-    {"PC44", 2.4578606280817934},
+    {"N95",   2.5632063030546171},
+    {"PEM95", 2.5509949258323354},
+    {"PCL47", 2.5055538730926847},
+    {"PC47",  2.4923030895288774},
+    {"N97",   2.4920803486041487},
 };
 
+// Refreshed 2026-08-20 (ABT #834, user-approved): same normalization shift. Kool Mµ
+// MAX 40 enters at slot 0 over CSC Sendust 26 on a 0.06% margin (another tie-band
+// head; both carry real 'magnetics' loss models), Kool Mµ MAX 19 climbs to slot 2,
+// and NPH-L 26 leaves the five.
 const std::vector<TopEntry> kTopPowderDefault = {
-    {"CSC Sendust 26", 2.7250690223085345},
-    {"Kool Mµ Hƒ 26",  2.7212624022782093},
-    {"Kool Mµ 26",     2.7211505563536287},
-    {"NPH-L 26",       2.7191529873382989},
-    {"Kool Mµ MAX 19", 2.7171791666466776},
+    {"Kool Mµ MAX 40", 2.7166417605966702},
+    {"CSC Sendust 26", 2.7150314971044129},
+    {"Kool Mµ MAX 19", 2.7046770516050276},
+    {"Kool Mµ Hƒ 26",  2.7034810625383088},
+    {"Kool Mµ 26",     2.7031674272762469},
 };
 
 const std::vector<TopEntry> kTopPowderOnlyMicrometals = {
@@ -199,7 +241,7 @@ TEST_CASE("CoreMaterialCrossReferencer Kool Mµ MAX 26 only-Micrometals top-5 sn
 // =============================================================================
 
 TEST_CASE("Benchmark CoreMaterialCrossReferencer 3C97 (top-20)",
-          "[adviser][core-material-cross-referencer][!benchmark][benchmark-mat-xref]") {
+          "[!benchmark][benchmark-mat-xref]") {
     settings.reset();
     clear_databases();
 
@@ -213,7 +255,7 @@ TEST_CASE("Benchmark CoreMaterialCrossReferencer 3C97 (top-20)",
 }
 
 TEST_CASE("Benchmark CoreMaterialCrossReferencer Kool Mµ MAX 26 (top-20)",
-          "[adviser][core-material-cross-referencer][!benchmark][benchmark-mat-xref-powder]") {
+          "[!benchmark][benchmark-mat-xref-powder]") {
     settings.reset();
     clear_databases();
 

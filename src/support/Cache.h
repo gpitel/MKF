@@ -18,7 +18,7 @@ public:
         _cache.clear();
     }
 
-    size_t size(){
+    size_t size() const {
         return _cache.size();
     }
 
@@ -31,7 +31,7 @@ public:
         return _cache;
     }
 
-    std::vector<std::string> references() {
+    std::vector<std::string> references() const {
         std::vector<std::string> filteredReferences;
         filteredReferences.reserve(_cache.size());
         for (const auto& [reference, value] : _cache) {
@@ -41,7 +41,7 @@ public:
         return filteredReferences;
     }
 
-    std::vector<T> read() {
+    std::vector<T> read() const {
         std::vector<T> filteredValues;
         filteredValues.reserve(_cache.size());
         for (const auto& [reference, value] : _cache) {
@@ -50,23 +50,53 @@ public:
         return filteredValues;
     }
 
-    T read(std::string reference) {
-        if (_cache.contains(reference)) {
-            return _cache[reference];
-        } else {
+    // Reads go through find(), never operator[]. operator[] is a MUTATING
+    // member (it default-inserts a missing key), so concurrent readers of a
+    // shared cache — which magneticsCache now is (ABT #817) — would be a data
+    // race even when every key happens to be present.
+    T read(std::string reference) const {
+        auto entry = _cache.find(reference);
+        if (entry == _cache.end()) {
             throw std::runtime_error("No value found with reference: " + reference);
         }
+        return entry->second;
     }
 
-    std::vector<T> read(std::vector<std::string> references) {
+    std::vector<T> read(std::vector<std::string> references) const {
         std::vector<T> filteredValues;
         filteredValues.reserve(references.size());
-        for (auto reference : references) {
-            if (_cache.contains(reference)) {
-                filteredValues.push_back(_cache[reference]);
+        for (const auto& reference : references) {
+            auto entry = _cache.find(reference);
+            if (entry != _cache.end()) {
+                filteredValues.push_back(entry->second);
             }
         }
         return filteredValues;
+    }
+
+    // The entries for exactly `references`, keyed as in the cache -- e.g. to run the catalogue
+    // adviser over one family or one admin-chosen pool of a cache that holds several. A
+    // reference the cache does not hold THROWS, listing every missing one: silently searching
+    // fewer parts than asked for is how a failed or partial load goes unnoticed.
+    std::map<std::string, T> subset(const std::vector<std::string>& references) const {
+        std::map<std::string, T> entries;
+        std::vector<std::string> missing;
+        for (const auto& reference : references) {
+            auto entry = _cache.find(reference);
+            if (entry == _cache.end()) {
+                missing.push_back(reference);
+                continue;
+            }
+            entries.emplace(entry->first, entry->second);
+        }
+        if (!missing.empty()) {
+            std::string list;
+            for (size_t index = 0; index < missing.size() && index < 10; ++index) {
+                list += (index ? ", " : "") + missing[index];
+            }
+            throw std::runtime_error(std::to_string(missing.size()) + " of " + std::to_string(references.size()) + " requested references are not in the cache (" + list + (missing.size() > 10 ? ", ..." : "") + ")");
+        }
+        return entries;
     }
 
     // Move both the key and the value into the map. Previously this took
@@ -99,10 +129,32 @@ public:
 
 };
 
+// The loaded part catalogue. Its storage (`_cache`, inherited) is SHARED
+// between threads — see the magneticsCache declaration in Utils.h — because a
+// catalogue of fully expanded Magnetics is the largest structure in the
+// process (~1.9 GB for 5130 parts) and every thread wants the same read-only
+// copy, exactly like coreDatabase and friends.
+//
+// The energy cache is different in kind: it is not the catalogue, it is a memo
+// DERIVED from one operating point (compute_energy_cache clears and refills it
+// per call). Two threads advising different designs would overwrite each
+// other's energies, so it stays thread_local — shared storage, per-thread
+// derived state (ABT #817).
 class MagneticsCache : public Cache<OpenMagnetics::Magnetic> {
 private:
-    std::map<std::string, double> _magneticEnergyCache;
+    static thread_local std::map<std::string, double> _magneticEnergyCache;
+
+    // Mutating the shared storage while other threads read it is undefined
+    // behaviour, so the freeze flag that guards the other catalogues guards
+    // this one too: a load or clear inside a frozen (parallel) region is a
+    // loud failure rather than a race. Declared here rather than included from
+    // Utils.h, which includes this header.
+    static void throw_if_frozen(const std::string& operation);
 public:
+    void load(std::string reference, OpenMagnetics::Magnetic value) {
+        throw_if_frozen("load");
+        Cache<OpenMagnetics::Magnetic>::load(std::move(reference), std::move(value));
+    }
     void clear();
     void autocomplete_magnetics();
     size_t energy_cache_size();

@@ -115,7 +115,21 @@ inline std::map<std::string, OpenMagnetics::Bobbin> bobbinDatabase;
 inline std::map<std::string, OpenMagnetics::InsulationMaterial> insulationMaterialDatabase;
 inline std::map<std::string, MAS::WireMaterial> wireMaterialDatabase;
 
-inline thread_local OpenMagnetics::MagneticsCache magneticsCache;  // thread_local: see memo-cache note above (ABT #113)
+// The loaded part catalogue. SHARED between threads, under the same contract
+// as the catalogues above: load it before the parallel region (or freeze it
+// with set_databases_frozen(true)), then read from as many threads as you
+// like. It used to be thread_local, which meant every thread that wanted to
+// search had to load its own copy — for the 5130-part Midcom catalogue that is
+// ~1.9 GB and ~20 s each, so a service could only scale by processes, and a
+// request served by the "wrong" threadpool thread saw an empty cache and
+// reported "No magnetics found in cache" (ABT #817). Its per-operating-point
+// energy memo stays thread_local; see MagneticsCache in Cache.h.
+//
+// Advising is still a serialised operation: MagneticAdviser mutates the global
+// `settings` singleton and clears the shared core databases mid-run, so two
+// concurrent advises corrupt each other regardless of this cache. Concurrent
+// SIMULATION and catalogue reads are what this makes safe.
+inline OpenMagnetics::MagneticsCache magneticsCache;
 
 void add_scoring(std::string name, OpenMagnetics::MagneticFilters filter, double scoring);
 void clear_scoring();
@@ -135,8 +149,17 @@ bool check_requirement(DimensionWithTolerance requirement, double value);
 Core find_core_by_name(std::string name);
 CoreMaterial find_core_material_by_name(std::string name);
 CoreShape find_core_shape_by_name(std::string name);
+// Non-throwing lookup / existence check (ABT #631). Use these instead of
+// find_core_shape_by_name-in-a-try when a miss is an expected outcome of a catalogue
+// scan: a try/catch is compiled away wherever exception catching is disabled (the
+// Emscripten default), and the throw then escapes the scan instead of skipping a row.
+std::optional<CoreShape> try_find_core_shape_by_name(std::string name);
+bool core_shape_exists(std::string name);
 Wire find_wire_by_name(std::string name);
-Wire find_wire_by_dimension(double dimension, std::optional<WireType> wireType=std::nullopt, std::optional<WireStandard> wireStandard=std::nullopt, bool obfuscate=true);
+// coatingType: only wires whose coating is of that type are candidates (ABT #1473: a litz strand is an
+// enamelled round wire; an insulated TIW of the same copper diameter has no grade and cannot be a strand).
+// Throws WireNotFoundException when no catalogue wire passes the filters.
+Wire find_wire_by_dimension(double dimension, std::optional<WireType> wireType=std::nullopt, std::optional<WireStandard> wireStandard=std::nullopt, bool obfuscate=true, std::optional<InsulationWireCoatingType> coatingType=std::nullopt);
 Bobbin find_bobbin_by_name(std::string name);
 InsulationMaterial find_insulation_material_by_name(std::string name);
 WireMaterial find_wire_material_by_name(std::string name);
@@ -165,6 +188,9 @@ void clear_loaded_cores();
 void clear_loaded_core_shapes();
 void clear_databases();
 void load_cores(std::optional<std::string> fileToLoad=std::nullopt);
+// ABT #1328: the embedded catalogue load_cores() reads. Throws when useOnlyCoresInStock is set and
+// the stock catalogue is not embedded, instead of falling back to the full one.
+std::string select_embedded_cores_catalogue(bool useOnlyCoresInStock, bool stockCatalogueEmbedded);
 void load_core_materials(std::optional<std::string> fileToLoad=std::nullopt);
 void load_advanced_core_materials(std::string fileToLoad, bool onlyDataFromManufacturer = true);
 void load_core_shapes(bool withAliases=true, std::optional<std::string> fileToLoad=std::nullopt);
@@ -191,6 +217,23 @@ std::vector<CoreMaterial> get_materials(std::optional<std::string> manufacturer=
 std::vector<CoreShape> get_shapes(bool includeToroidal = true);
 std::vector<Wire> get_wires(std::optional<WireType> wireType=std::nullopt, std::optional<WireStandard> wireStandard=std::nullopt);
 std::vector<Bobbin> get_bobbins();
+/**
+ * @brief Catalogue toroid bases (family t bobbins with a `base`, MAS-RFC 0014 part B) that hold this
+ *        toroidal core (ABT #1173, WP4).
+ *
+ * The ring a base holds is the COATED ring: outer diameter A + 2 t and height C x stacks + 2 t, with
+ * t = Core::get_coating_thickness(). A base is returned when
+ *   - its mounting equals `mounting` (when given),
+ *   - the ring's outer diameter is within `maximumCoreOuterDiameter`, or, for a horizontal base that
+ *     states no such limit, within the minimum of `pocketInnerDiameter`; a base stating neither says
+ *     nothing about which ring fits and is NOT returned,
+ *   - the ring's height is within `maximumCoreHeight` when stated, and, on a vertical base, within the
+ *     minimum `boatWidth` when stated.
+ * @throws InvalidInputException when the core is not toroidal or its shape lacks A or C.
+ */
+std::vector<Bobbin> find_toroid_bases_for_core(Core core, std::optional<OrientationEnum> mounting = std::nullopt);
+// Same filter over the given candidates instead of the catalogue (records that are not toroid bases are skipped).
+std::vector<Bobbin> find_toroid_bases_for_core(Core core, const std::vector<Bobbin>& candidates, std::optional<OrientationEnum> mounting = std::nullopt);
 std::vector<InsulationMaterial> get_insulation_materials();
 std::vector<WireMaterial> get_wire_materials();
 
@@ -254,7 +297,14 @@ double amplitude_to_decibels(double amplitude);
 
 std::string fix_filename(std::string filename);
 Inputs inputs_autocomplete(Inputs inputs, std::optional<Magnetic> magnetic = std::nullopt, json configuration = {});
-Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration = {});
+// inputs, when provided, carries the design's declared insulation/environmental
+// requirements into the coil BEFORE it winds (ABT #620): without it, wind() has no
+// way to know an insulation standard applies and falls back to
+// calculate_mechanical_insulation() — a bare single mechanical layer, zero margin —
+// even for a design that declares reinforced insulation. Every caller that has an
+// Inputs available (mas_autocomplete, any consumer re-winding a functionalDescription-
+// only file for painter/3D/simulation) should pass it through.
+Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration = {}, std::optional<Inputs> inputs = std::nullopt);
 Mas mas_autocomplete(Mas mas, bool simulate = true, json configuration = {});
 
 std::map<std::string, double> normalize_scoring(std::map<std::string, double> scoring, double weight, std::map<std::string, bool> filterConfiguration);

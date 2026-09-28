@@ -1,3 +1,4 @@
+#include "advisers/MagneticFilter.h"
 #include <source_location>
 #include "support/Settings.h"
 #include "advisers/CoreAdviser.h"
@@ -14,6 +15,7 @@
 #include <cmath>
 #include <chrono>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -311,6 +313,53 @@ TEST_CASE("Test_CoreAdviserAvailableCores_Toroidal_Cores_With_Impedance", "[advi
     settings.reset();
 }
 
+// Regression for ABT #236: the standalone/web CMC core adviser returned ZERO
+// cores for the default CMC design (230 V / 10 A line, 500 Ohm @ 150 kHz). Root
+// cause: a common-mode choke is classified as an inductor (all windings on one
+// isolation side), so MagneticFilterSaturation applied its energy-storing-
+// inductor saturation-current gate against the RAW 10 A line-current peak.
+// But the CMC line current is DIFFERENTIAL — its flux cancels in the core — so
+// that gate rejected every EMI toroid (isat ~1-3 A << 10 A). The fix skips the
+// isat-current gate for common-mode chokes; the B-based gate (which uses the
+// common-mode magnetizing current) remains the saturation check. This test
+// feeds the EXACT inputs the web CMC wizard produces (captured from the
+// frontend), so it guards the real user-facing flow, unlike
+// Test_CoreAdviserAvailableCores_Toroidal_Cores_With_Impedance which drops the
+// DC current to 0 to dodge this very gate.
+TEST_CASE("Test_CoreAdviser_CMC_Default_Web_Design_Returns_Cores", "[adviser][core-adviser][available-cores][suppression]") {
+    clear_databases();
+    settings.set_use_toroidal_cores(true);
+    settings.set_use_concentric_cores(false);
+    settings.set_use_only_cores_in_stock(false);
+
+    auto inputsPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "cmc/cmc_default_web_inputs.json");
+    std::ifstream inputsFile(inputsPath);
+    REQUIRE(inputsFile.good());
+    json inputsJson;
+    inputsFile >> inputsJson;
+
+    OpenMagnetics::Inputs inputs(inputsJson);
+    // Sanity: this is a 2-winding common-mode choke carrying real DC line current.
+    REQUIRE(OpenMagnetics::Inputs::can_be_common_mode_choke(inputs.get_operating_points()[0]));
+
+    std::map<CoreAdviser::CoreAdviserFilters, double> weights;
+    weights[CoreAdviser::CoreAdviserFilters::COST] = 1.0 / 3;
+    weights[CoreAdviser::CoreAdviserFilters::EFFICIENCY] = 1.0 / 3;
+    weights[CoreAdviser::CoreAdviserFilters::DIMENSIONS] = 1.0 / 3;
+
+    CoreAdviser coreAdviser;
+    coreAdviser.set_mode(CoreAdviser::CoreAdviserModes::AVAILABLE_CORES);
+    coreAdviser.set_application(MAS::MagneticApplication::INTERFERENCE_SUPPRESSION);
+
+    auto masMagnetics = coreAdviser.get_advised_core(inputs, weights, 5);
+
+    REQUIRE(masMagnetics.size() > 0);
+    for (auto& [mas, scoring] : masMagnetics) {
+        CHECK(mas.get_mutable_magnetic().get_mutable_core().get_type() == CoreType::TOROIDAL);
+    }
+    settings.reset();
+}
+
 TEST_CASE("Test_CoreAdviserAvailableCores_All_Cores_Load_Internally_Only_Stock", "[adviser][core-adviser][available-cores][smoke-test]") {
     clear_databases();
     double voltagePeakToPeak = 600;
@@ -341,6 +390,38 @@ TEST_CASE("Test_CoreAdviserAvailableCores_All_Cores_Load_Internally_Only_Stock",
 
     REQUIRE(coreDatabase.size() < 3000);
     REQUIRE(masMagnetics.size() > 0);
+    settings.reset();
+}
+
+// ABT #1328: useOnlyCoresInStock (the default) used to mean "the stock catalogue if this build
+// embeds it, otherwise the full one". PyOpenMagnetics lists its own MAS resources and left
+// cores_stock.ndjson out, so every PyOM process silently loaded all 18943 cores (~2.4 GB) under a
+// setting that says 1573, and an available-cores MagneticAdviser run grew past 16 GB. A build
+// without the stock catalogue must refuse the setting, not quietly ignore it.
+TEST_CASE("Test_Cores_In_Stock_Without_The_Stock_Catalogue_Is_Refused_Not_Replaced_By_The_Full_One", "[adviser][core-adviser][available-cores][abt-1328]") {
+    REQUIRE_THROWS_AS(select_embedded_cores_catalogue(true, false), InvalidInputException);
+    REQUIRE_THROWS_WITH(select_embedded_cores_catalogue(true, false), Catch::Matchers::ContainsSubstring("cores_stock.ndjson"));
+    CHECK(select_embedded_cores_catalogue(true, true) == "MAS/data/cores_stock.ndjson");
+    CHECK(select_embedded_cores_catalogue(false, true) == "MAS/data/cores.ndjson");
+    CHECK(select_embedded_cores_catalogue(false, false) == "MAS/data/cores.ndjson");
+
+    // And this build, which embeds it, loads exactly the stock catalogue under the default setting.
+    settings.reset();
+    clear_databases();
+    REQUIRE(settings.get_use_only_cores_in_stock());
+    load_cores();
+    auto stockPath = std::filesystem::path(__FILE__).parent_path().parent_path() / "MAS" / "data" / "cores_stock.ndjson";
+    std::ifstream stockFile(stockPath);
+    REQUIRE(stockFile.is_open());
+    size_t stockRecords = 0;
+    std::string line;
+    while (std::getline(stockFile, line)) {
+        if (!line.empty()) {
+            stockRecords++;
+        }
+    }
+    REQUIRE(stockRecords > 0);
+    CHECK(coreDatabase.size() == stockRecords);
     settings.reset();
 }
 
@@ -550,7 +631,13 @@ TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_Low_Power", "[adviser][core
     for (auto [mas, scoring] : masMagnetics) {
         auto name = mas.get_magnetic().get_core().get_name().value_or("unnamed");
         auto stacks = mas.get_magnetic().get_core().get_functional_description().get_number_stacks().value_or(1);
-        if (name.find("EFD 10/5/3 - 3C95") != std::string::npos) {
+        // Re-pinned 2026-08-02 (ABT #551): under the restored ABT #378 Zhang fringing
+        // correction (7f50d4dc) the previously expected EFD 10/5/3 loses the inductance
+        // over-prediction that favoured it and drops out of the top ranks; its family
+        // successor EFD 12/6/3.5 sits in the current top-5 (full top-5: E 13/6.5/3.7,
+        // EP 7 x2, EFD 12/6/3.5, EPX 8 — all sane low-power cores). Shape-level match:
+        // the material/gap choice may legitimately drift with loss-model improvements.
+        if (name.find("EFD 12/6/3.5") != std::string::npos) {
             if (stacks == 1) {
                 found = true;
             }
@@ -590,7 +677,10 @@ TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_Low_Power_Low_Losses", "[ad
     for (auto [mas, scoring] : masMagnetics) {
         auto name = mas.get_magnetic().get_core().get_name().value_or("unnamed");
         auto stacks = mas.get_magnetic().get_core().get_functional_description().get_number_stacks().value_or(1);
-        if (name.find("EFD 10/5/3") != std::string::npos) {
+        // Re-pinned 2026-08-02 (ABT #551): same ABT #378 root cause as the Low_Power
+        // variant above — EFD 10/5/3 fell out of the top-20 under the corrected
+        // fringing model; EFD 12/6/3.5 holds five of the current top-20 slots.
+        if (name.find("EFD 12/6/3.5") != std::string::npos) {
             if (stacks == 1) {
                 found = true;
             }
@@ -2430,6 +2520,12 @@ TEST_CASE("Test_CoreAdviser_Flyback_From_Frontend_Inputs", "[adviser][core-advis
         shapes.push_back(shape);
     }
 
+    // Inputs built field-by-field carry only the processed values the caller filled in;
+    // effectiveFrequency and the harmonics are DERIVED, and nothing derives them until
+    // process() runs. The json constructor processes by default, which is why the
+    // frontend path never hit this — but a hand-built Inputs must ask.
+    inputs.process();
+
     auto masMagnetics = coreAdviser.get_advised_core(inputs, &shapes, 5);
 
 
@@ -2566,6 +2662,10 @@ TEST_CASE("Test_CoreAdviser_LLC_From_Frontend_Inputs", "[adviser][core-adviser][
     secCurrentProcessed.set_average(0.0);
     secCurrentProcessed.set_rms(10.0);  // Higher current on secondary
     secCurrentProcessed.set_peak(14.0);
+    // This excitation carries no waveform, only a processed block, so nothing can derive the
+    // peak-to-peak the way it can for the primary — it has to be stated. 28 A for a 14 A
+    // sinusoidal peak, matching how the primary above states 6.21 for its 3.105 peak.
+    secCurrentProcessed.set_peak_to_peak(28.0);
     secCurrentProcessed.set_duty_cycle(0.5);
     secondaryCurrent.set_processed(secCurrentProcessed);
     secondaryExcitation.set_current(secondaryCurrent);
@@ -2592,6 +2692,12 @@ TEST_CASE("Test_CoreAdviser_LLC_From_Frontend_Inputs", "[adviser][core-adviser][
     for (auto [name, shape] : coreShapeDatabase) {
         shapes.push_back(shape);
     }
+
+    // Inputs built field-by-field carry only the processed values the caller filled in;
+    // effectiveFrequency and the harmonics are DERIVED, and nothing derives them until
+    // process() runs. The json constructor processes by default, which is why the
+    // frontend path never hit this — but a hand-built Inputs must ask.
+    inputs.process();
 
     auto masMagnetics = coreAdviser.get_advised_core(inputs, &shapes, 5);
 
@@ -3023,6 +3129,71 @@ TEST_CASE("Test_CoreAdviser_PFC_Boost_Inductor_StandardCores", "[core-adviser][a
         auto reference = mas.get_magnetic().get_manufacturer_info().value().get_reference().value();
         WARN("  standard: " << reference);
         CHECK(reference.find("available-cores catalogue") != std::string::npos);
+    }
+    settings.reset();
+}
+
+// ABT #774 (from Heaviside): a candidate whose required gap exceeds its own winding column is
+// simply INFEASIBLE — it must be rejected by the gapping stage like any other filter reject.
+// It used to sail on with an UNPROCESSED gap (process_gap()'s false was ignored), and the
+// first downstream calculation that called process_gap_or_throw aborted the entire advise
+// with GAP_INVALID_DIMENSIONS: one bad candidate cost every good one behind it.
+TEST_CASE("Test_Abt774_Gap_Infeasible_Candidate_Is_Rejected_Not_Thrown", "[adviser][core-adviser][abt774]") {
+    settings.reset();
+    OpenMagnetics::Inputs inputs;
+    // Flyback-class energy storage at a brutal peak current: the energy/saturation gap a
+    // tiny E 13 core would need is orders of magnitude longer than its winding column.
+    prepare_test_parameters(60, 25, 100000, {}, 100e-6, inputs);
+    inputs.get_mutable_design_requirements().set_topology(MAS::Topology::FLYBACK_CONVERTER);
+
+    auto gapping = OpenMagneticsTesting::get_ground_gap(0.0001);
+    auto core = OpenMagneticsTesting::get_quick_core("E 13/7/4", gapping, 1, "3C97");
+
+    std::vector<std::pair<OpenMagnetics::Magnetic, double>> magneticsWithScoring;
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(OpenMagnetics::Coil());
+    magneticsWithScoring.push_back({magnetic, 1.0});
+
+    CoreAdviser coreAdviser;
+    // The contract under test: no throw, and no candidate left carrying an unprocessed gap.
+    REQUIRE_NOTHROW(coreAdviser.add_gapping_standard_cores(&magneticsWithScoring, inputs));
+    for (auto& [candidate, scoring] : magneticsWithScoring) {
+        INFO("surviving candidate " << candidate.get_core().get_name().value_or("?"));
+        CHECK(candidate.get_mutable_core().is_gap_processed());
+    }
+    // This particular candidate is infeasible and must be gone.
+    CHECK(magneticsWithScoring.empty());
+    settings.reset();
+}
+
+// ABT #1410: the design-mode dataset read only the HEIGHT of maximumDimensions, so a
+// 41 x 43 x 44 mm envelope admitted an ER 51/10/38 (51 mm wide). Field report: the
+// secondary resonant inductor of a 30 kW CLLC, one winding, 33.5 uH +/-15 %.
+TEST_CASE("Test_CoreAdviser_Standard_Cores_Respect_Every_Axis_Of_Maximum_Dimensions",
+          "[adviser][core-adviser][standard-cores][abt1410]") {
+    settings.reset();
+    clear_databases();
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "abt1410_cllc_resonant_inductor_inputs.json");
+    std::ifstream file(path);
+    REQUIRE(file.is_open());
+    OpenMagnetics::Inputs inputs(json::parse(file));
+    REQUIRE(inputs.get_design_requirements().get_maximum_dimensions());
+
+    std::map<CoreAdviser::CoreAdviserFilters, double> weights{
+        {CoreAdviser::CoreAdviserFilters::COST, 1},
+        {CoreAdviser::CoreAdviserFilters::EFFICIENCY, 1},
+        {CoreAdviser::CoreAdviserFilters::DIMENSIONS, 1}};
+    CoreAdviser coreAdviser;
+    coreAdviser.set_mode(CoreAdviser::CoreAdviserModes::STANDARD_CORES);
+    auto results = coreAdviser.get_advised_core(inputs, weights, 20);
+
+    REQUIRE(!results.empty());
+    for (auto& [mas, scoring] : results) {
+        auto core = mas.get_magnetic().get_core();
+        auto dimensions = core.get_maximum_dimensions();
+        INFO(core.get_name().value_or("?") << ": " << dimensions[0] * 1000 << " x " << dimensions[1] * 1000 << " x " << dimensions[2] * 1000 << " mm");
+        CHECK(MagneticFilterMaximumDimensions::core_fits(core, inputs));
     }
     settings.reset();
 }

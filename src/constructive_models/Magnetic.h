@@ -70,6 +70,16 @@ class Magnetic : public MAS::Magnetic {
             if (magnetic.get_manufacturer_info()) {
                 set_manufacturer_info(magnetic.get_manufacturer_info());
             }
+            // Shunts belong to the assembled magnetic (MAS-RFC 0015); dropping them here silently
+            // turned an integrated-leakage transformer into a plain one (ABT #1176).
+            set_shunts(magnetic.get_shunts());
+            // ABT #1167: the core's electrical reference decides how the winding-to-core
+            // capacitances appear at the terminals (floating C0/12 vs bonded C0/3) and whether
+            // the primary->core->secondary common-mode path closes through the core. It is a
+            // MAS::Magnetic field, so it survives a copy but NOT this field-by-field converting
+            // constructor -- without this line every magnetic loaded from a MAS document reached
+            // StrayCapacitance as floating, whatever the document said.
+            set_core_electrical_reference(magnetic.get_core_electrical_reference());
         }
 
         // MagneticManufacturerInfo accessors (shadow MAS::Magnetic's field with the same type).
@@ -83,6 +93,34 @@ class Magnetic : public MAS::Magnetic {
         Wire get_wire(size_t windingIndex=0);
         std::string get_reference() const;
         std::vector<double> get_maximum_dimensions();
+
+        // A catalogue part may carry only its datasheet (no core, no coil). These read what the
+        // datasheet states, so such a part can still be judged on the quantities it publishes.
+        //
+        // True when the datasheet's mechanical block gives a body size: a height plus either
+        // length and width, or a diameter.
+        bool has_datasheet_dimensions() const;
+        // The single-winding inductor entry of datasheetInfo.electrical, if there is exactly one.
+        // Several inductor entries throw: which configuration applies is not the caller's guess.
+        std::optional<MagneticDatasheetElectrical> get_datasheet_inductor_electrical() const;
+        // Inductance the datasheet gives at `dcBiasCurrent` (A) and `temperature` (degC), from
+        // its measured L(I) points: linear in current along each measured temperature, linear
+        // between the two measured temperatures bracketing `temperature`, and the nearest
+        // measured temperature outside that range (a datasheet quoting L(I) at 20 degC only is
+        // used at every temperature -- that is what the datasheet offers). Below the first
+        // measured current the first point holds (the small-signal plateau). Returns nullopt when
+        // `dcBiasCurrent` lies beyond the measured curve: the datasheet says nothing there, and
+        // it is past the deepest saturation the vendor measured. With no L(I) points at all, the
+        // stated inductance is returned. Throws when the datasheet gives neither.
+        std::optional<double> calculate_datasheet_inductance(double dcBiasCurrent, double temperature) const;
+        // A datasheet-only part whose datasheet states it as a coupled inductor (a coupledInductor
+        // electrical entry): two windings on one core. With no model to simulate, it is judged by
+        // its AMPERE-TURN current (Inputs::calculate_ampere_turn_current: the windings' currents
+        // summed in time, with phase and dot direction) -- saturation against its peak, inductance
+        // from L(I) at its DC -- because the windings share the core flux and WE's datasheets state
+        // Isat and L(I) per winding. Rated currents stay per winding, as stated. Never true for a
+        // part with a core and coil (MKF simulates those) nor for a common-mode choke.
+        bool is_datasheet_coupled_inductor() const;
         bool fits(MaximumDimensions maximumDimensions, bool allowRotation);
 
         // I_sat = B_sat(T)·N·A_e/L. By default B_sat is the PROPORTION-derated
@@ -187,15 +225,29 @@ inline void from_file(std::filesystem::path filepath, Magnetic & x) {
 }
 
 inline void from_json(const json & j, Magnetic& x) {
-    if (j.contains("coil") && !j.at("coil").is_null()) {
-        x.set_coil(j.at("coil").get<Coil>());
+    // migrate_pre_1_0 was previously only wired into from_file() below — a
+    // filesystem-path loader nothing in the product calls. Every real entry
+    // point (every PyOM/WASM binding) constructs a Magnetic straight from an
+    // in-memory json via this from_json, so any pre-1.0 MAS export (old
+    // Title-Case/spaced enum strings — "Industrial", "Printed", "Phase-Shifted
+    // Full-Bridge Converter", ...) threw the generic quicktype
+    // "Input JSON does not conform to schema!" here before ever reaching a
+    // physics call. Migrate first, exactly like from_file already does, so a
+    // bare-magnetic construction is migrated the same as a full-MAS one
+    // (Mas.h / Inputs.h already call this) (ABT #606).
+    auto migrated = j;
+    OpenMagnetics::compat::migrate_pre_1_0(migrated);
+
+    if (migrated.contains("coil") && !migrated.at("coil").is_null()) {
+        x.set_coil(migrated.at("coil").get<Coil>());
     }
-    if (j.contains("core") && !j.at("core").is_null()) {
-        x.set_core(j.at("core").get<Core>());
+    if (migrated.contains("core") && !migrated.at("core").is_null()) {
+        x.set_core(migrated.at("core").get<Core>());
     }
-    x.set_distributors_info(get_stack_optional<std::vector<DistributorInfo>>(j, "distributorsInfo"));
-    x.set_manufacturer_info(get_stack_optional<MagneticManufacturerInfo>(j, "manufacturerInfo"));
-    x.set_rotation(get_stack_optional<std::vector<double>>(j, "rotation"));
+    x.set_distributors_info(get_stack_optional<std::vector<DistributorInfo>>(migrated, "distributorsInfo"));
+    x.set_manufacturer_info(get_stack_optional<MagneticManufacturerInfo>(migrated, "manufacturerInfo"));
+    x.set_rotation(get_stack_optional<std::vector<double>>(migrated, "rotation"));
+    x.set_shunts(get_stack_optional<std::vector<MagneticShunt>>(migrated, "shunts"));
 }
 
 inline void to_json(json & j, const Magnetic & x) {
@@ -209,10 +261,18 @@ inline void to_json(json & j, const Magnetic & x) {
     j["distributorsInfo"] = x.get_distributors_info();
     j["manufacturerInfo"] = x.get_manufacturer_info();
     j["rotation"] = x.get_rotation();
+    if (x.get_shunts()) {
+        j["shunts"] = x.get_shunts();
+    }
 }
 
 inline void from_json(const json& j, std::vector<Magnetic>& v) {
     for (auto e : j) {
+        // Same migration this file's singular from_json(const json&, Magnetic&)
+        // does (ABT #606) — this overload is the untouched twin of that fix and
+        // would otherwise reject pre-1.0 MAS enum casing for any caller that
+        // deserializes a list of magnetics directly.
+        OpenMagnetics::compat::migrate_pre_1_0(e);
         Magnetic x;
         if (e.contains("coil") && !e.at("coil").is_null()) {
             x.set_coil(e.at("coil").get<Coil>());
@@ -223,6 +283,7 @@ inline void from_json(const json& j, std::vector<Magnetic>& v) {
         x.set_distributors_info(get_stack_optional<std::vector<DistributorInfo>>(e, "distributorsInfo"));
         x.set_manufacturer_info(get_stack_optional<MagneticManufacturerInfo>(e, "manufacturerInfo"));
         x.set_rotation(get_stack_optional<std::vector<double>>(e, "rotation"));
+        x.set_shunts(get_stack_optional<std::vector<MagneticShunt>>(e, "shunts"));
         v.push_back(x);
     }
 }
@@ -240,6 +301,9 @@ inline void to_json(json& j, const std::vector<Magnetic>& v) {
         e["distributorsInfo"] = x.get_distributors_info();
         e["manufacturerInfo"] = x.get_manufacturer_info();
         e["rotation"] = x.get_rotation();
+        if (x.get_shunts()) {
+            e["shunts"] = x.get_shunts();
+        }
         j.push_back(e);
     }
 }

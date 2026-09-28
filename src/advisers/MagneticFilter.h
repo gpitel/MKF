@@ -20,6 +20,11 @@ using namespace MAS;
 
 namespace OpenMagnetics {
 
+// Helpers the datasheet filters share for judging a datasheet coupled inductor by its ampere-turn
+// current (MagneticFilterDatasheet.cpp).
+std::vector<double> design_turns_ratios(const Inputs& inputs);
+std::vector<IsolationSide> design_isolation_sides(const Inputs& inputs, Magnetic* magnetic);
+
 class MagneticFilter {
     public: 
         static std::shared_ptr<MagneticFilter> factory(MagneticFilters filterName, std::optional<Inputs> inputs = std::nullopt);
@@ -27,6 +32,13 @@ class MagneticFilter {
         MagneticFilter() { };
         virtual ~MagneticFilter() = default;
         virtual std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr) = 0;
+
+        // Whether this filter can judge `magnetic` at all. Most filters compute from the core and
+        // coil, so a datasheet-only catalogue part (no construction, see Magnetic.h) is outside
+        // anything they can say: the catalogue adviser then records NO score for that part and
+        // filter -- never a made-up one -- and ranks the part on the filters that do apply to it.
+        // Filters that can read their answer from the datasheet override this.
+        virtual bool applies_to(Magnetic* magnetic) const { return magnetic->has_core() && magnetic->has_coil(); }
 };
 
 class MagneticFilterAreaProduct : public MagneticFilter {
@@ -170,7 +182,22 @@ class MagneticFilterTurnCount : public MagneticFilter {
 
 class MagneticFilterCoreMinimumImpedance : public MagneticFilter {
     private:
-        Impedance _impedanceModel;
+        // Candidate GATING runs the fast (OneLayer) capacitance path, explicitly, for exactly
+        // the reason 2047e169 gave for MagneticFilterImpedance -- which is a DIFFERENT class,
+        // and was the only one that commit fixed. MKF d424c32e made the full energy-based
+        // capacitance model Impedance's default, which is right for analysing ONE magnetic but
+        // wrong here: build_magnetizing_tank WINDS THE COIL and runs the per-turn energy sum on
+        // every call, and this filter calls calculate_impedance once per requirement frequency
+        // per candidate, plus up to five Newton re-bumps, for every core in the catalogue.
+        //
+        // Measured on Test_CoreAdviser_DMC_Default_Wizard_Hang_Repro (10 s budget), with the
+        // default-constructed member below: filterMinimumImpedance alone took 1,038,396 ms over
+        // 4,834 candidates -- 17.3 of the run's 17.4 minutes; every other stage in the pipeline
+        // summed to about 7 s. That is the 28-minute regression 2047e169 describes, still live,
+        // because the DMC/CMC suppression pipeline gates on THIS filter, not on that one.
+        //
+        // Rank the catalogue with the fast model; analyse the chosen design with the full one.
+        Impedance _impedanceModel{/*fastCapacitance=*/true};
     public:
         MagneticFilterCoreMinimumImpedance() {};
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
@@ -184,6 +211,32 @@ class MagneticFilterAreaNoParallels : public MagneticFilter {
         MagneticFilterAreaNoParallels(int maximumNumberParallels);
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
         std::pair<bool, double> evaluate_magnetic(Winding winding, Section section);
+        // The same verdict for a bare wire, without building a Winding around it. Scores nothing:
+        // every candidate this filter keeps scores 0, so it is a pure per-wire predicate.
+        bool wire_fits(Wire& wire, int64_t numberParallels, int64_t numberTurns, const Section& section) const;
+};
+
+/**
+ * @brief ABT #1177 (WP8, DFM rule R1): scores a wire candidate by the parity of the layer
+ * count its winding would land on inside the section.
+ *
+ * An odd layer count forces a drag-back - a bump, window loss, extra leakage, a 45 to 90
+ * degree wire crossing some safety standards forbid, and manual tape work. A single layer
+ * cannot drag back and is never penalised. The scoring is the penalty (0 for an acceptable
+ * candidate, 1 for an odd one), so it is inverted like every other cost-shaped filter. The
+ * filter never rejects a candidate: an odd layer count is manufacturable, just worse.
+ *
+ * The numbers behind the rule live in src/data/dfm_rules.json; the only one this filter
+ * needs is "a single layer is exempt", which is structural rather than tunable.
+ */
+class MagneticFilterLayerParity : public MagneticFilter {
+    public:
+        MagneticFilterLayerParity() {};
+        std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        std::pair<bool, double> evaluate_magnetic(Winding winding, Section section);
+        /// The number of layers the winding needs inside the section, or nullopt when the
+        /// section or the wire does not carry the dimensions to work it out.
+        static std::optional<size_t> calculate_number_layers(Winding winding, Section section);
 };
 
 class MagneticFilterAreaWithParallels : public MagneticFilter {
@@ -211,6 +264,32 @@ class MagneticFilterProximityFactor : public MagneticFilter {
         std::pair<bool, double> evaluate_magnetic(Winding winding, double effectiveSkinDepth, double temperature);
 };
 
+/**
+ * @class MagneticFilterWindability
+ *
+ * Can each winding's wire actually be bent around the corner of the former it is wound on?
+ * A turn wraps the column exactly the way the flexibility test wraps its mandrel, so the
+ * standards give the answer directly (see WireBend): the former's corner radius must be at
+ * least the mandrel's. Two thresholds, both citations rather than tuning knobs --
+ * IEC 60317-0-1 Table 6 (or -0-2 Table 6) is the bend the insulation must survive AT ALL, and
+ * Table 7 (or -0-2 clause 9) the bend it must survive and then be HEAT SHOCKED, which is what a
+ * coil gets when it is soldered, varnish-baked and cycled.
+ *
+ * The bend judged is the one the coil actually lays -- the turn tangent to the former, so
+ * former corner + standoff. A candidate is INVALID below the flexibility floor: that wire cannot
+ * be wound on that former without cracking its enamel, and the only way it could be is by
+ * standing off the former, which is not the layup the layout assumed. Below the heat-shock floor
+ * it stays valid but scores worse, in proportion to how far short the bend falls.
+ *
+ * Wire types the standards do not cover (litz, foil, planar) are passed through untouched rather
+ * than judged by a rule that was not written for them.
+ */
+class MagneticFilterWindability : public MagneticFilter {
+    public:
+        MagneticFilterWindability() {};
+        std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+};
+
 class MagneticFilterSolidInsulationRequirements : public MagneticFilter {
     private:
         double _maximumCurrent;
@@ -218,6 +297,8 @@ class MagneticFilterSolidInsulationRequirements : public MagneticFilter {
         MagneticFilterSolidInsulationRequirements() {};
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
         std::pair<bool, double> evaluate_magnetic(Winding winding, WireSolidInsulationRequirements wireSolidInsulationRequirements);
+        // The same verdict and scoring for a bare wire, without building a Winding around it.
+        std::pair<bool, double> evaluate_wire(Wire& wire, const WireSolidInsulationRequirements& wireSolidInsulationRequirements);
 };
 
 class MagneticFilterTurnsRatios : public MagneticFilter {
@@ -230,6 +311,12 @@ class MagneticFilterMaximumDimensions : public MagneticFilter {
     public:
         MagneticFilterMaximumDimensions() {};
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        bool applies_to(Magnetic* magnetic) const override;
+        // Design-mode checks: each axis as stated, no rotation, so a height limit stays a
+        // height limit (the catalogue check above allows rotation). core_fits is a necessary
+        // condition before any coil exists; magnetic_fits checks the wound assembly.
+        static bool core_fits(Core& core, const Inputs& inputs);
+        static bool magnetic_fits(Magnetic& magnetic, const Inputs& inputs);
 };
 
 class MagneticFilterSaturation : public MagneticFilter {
@@ -253,37 +340,45 @@ class MagneticFilterEffectiveCurrentDensity : public MagneticFilter {
 /**
  * @class MagneticFilterDatasheetLimits
  * @brief Gate a catalogue part against its OWN datasheet-published electrical
- *        limits (rated current / voltage / saturation-current peak).
+ *        limits (rated current / voltage / saturation current).
  *
- * Semantics — "only if it exists":
- *   - No `manufacturerInfo.datasheetInfo.electrical` (every designed/custom
- *     magnetic) → {valid=true, score=1.0}: a pure pass-through, never affects
- *     non-catalogue parts.
- *   - Catalogue parts → validate the operating point against EACH datasheet
- *     limit that is present, skipping limits that are absent. A part that
- *     publishes only `inductance` is not gated on current.
+ * Applies only to a part whose datasheet publishes at least one of those
+ * limits (applies_to): designed magnetics, and catalogue parts stating only an
+ * inductance, are not judged by it and get no score from it.
+ *
+ * Checks each published limit against the operating point, skipping limits
+ * that are absent:
+ *   - rated current vs winding current RMS: `ratedCurrents`, or when only the
+ *     ΔT-qualified `ratedCurrentPoints` is given, its smallest current;
+ *   - saturation current vs the largest winding peak: the smallest of
+ *     `saturationCurrentPeak` and every `saturationCurrents` criterion;
+ *   - rated AC voltage vs voltage RMS, rated DC voltage vs |voltage offset|.
  *
  * No analytical physics: operating values are read from `Inputs`
  * (current/voltage processed RMS/peak/offset), datasheet values from the MAS
- * model. score ∈ [0,1] is the worst (smallest) headroom margin across the
- * checked limits — clamp((limit − operating)/limit, 0, 1) — so the filter can
- * also RANK by how comfortably a part clears its ratings. Pass-through parts
- * score 1.0 (neutral). valid=false rejects when used strictlyRequired.
+ * model. score is the UTILISATION -- the largest operating/limit ratio across
+ * the checked limits, 1.0 at a limit. Lower is better, like every other
+ * filter's score, so the usual invert=true ranks the part with the most
+ * margin first. (Until 2026-09 this returned the smallest headroom, higher =
+ * better, which invert=true turned upside down: the part closest to its
+ * ratings ranked best.) valid=false when any limit is exceeded.
  *
  * `electrical` is a vector (one entry per connection configuration). The entry
  * whose `numberTurns` matches the candidate coil's turns is used; if none
- * matches (or `numberTurns` is unset) the most conservative entry — smallest
- * published rated current — is used rather than guessing.
+ * matches (or `numberTurns` is unset, or the part has no coil) the most
+ * conservative entry — smallest published rated current — is used rather
+ * than guessing.
  *
  * Note (ABT #19): the MKF-pinned MAS uses `ratedCurrents` (array). Catalogues
  * still on the older `ratedCurrent` (scalar) schema deserialise to
- * get_rated_currents()==nullopt ⇒ this filter is a silent no-op on them until
+ * get_rated_currents()==nullopt, so this filter does not apply to them until
  * the consumer's catalogue is migrated (asgard-side follow-up).
  */
 class MagneticFilterDatasheetLimits : public MagneticFilter {
     public:
         MagneticFilterDatasheetLimits() {};
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        bool applies_to(Magnetic* magnetic) const override;
 };
 
 class MagneticFilterImpedance : public MagneticFilter {
@@ -296,6 +391,7 @@ class MagneticFilterMagnetizingInductance : public MagneticFilter {
     public:
         MagneticFilterMagnetizingInductance() {};
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        bool applies_to(Magnetic* magnetic) const override;
 };
 
 /**
@@ -311,9 +407,23 @@ class MagneticFilterMagnetizingInductance : public MagneticFilter {
  *
  * @note Returns leakage inductance in Henries. Lower values score better when inverted.
  */
+enum class LeakageInductanceFilterMode {
+    // Score Lk/Lm, lower is better (common-mode chokes). The historical behaviour, and the default.
+    MINIMIZE_LEAKAGE_RATIO,
+    // Score the distance of Lk (source winding 0 to winding i + 1) to
+    // designRequirements.leakageInductance[i]; candidates outside the band are invalid (ABT #1176).
+    TARGET
+};
+
 class MagneticFilterLeakageInductance : public MagneticFilter {
+    private:
+        LeakageInductanceFilterMode _mode = LeakageInductanceFilterMode::MINIMIZE_LEAKAGE_RATIO;
+        std::pair<bool, double> evaluate_minimize_leakage_ratio(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs);
+        std::pair<bool, double> evaluate_target(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs);
     public:
         MagneticFilterLeakageInductance() {};
+        explicit MagneticFilterLeakageInductance(LeakageInductanceFilterMode mode) : _mode(mode) {};
+        LeakageInductanceFilterMode get_mode() const { return _mode; }
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 };
 
@@ -351,22 +461,69 @@ class MagneticFilterFringingFactor : public MagneticFilter {
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 };
 
+/**
+ * @class MagneticFilterInductorTurnsAndGapByLosses
+ * @brief ABT #1426: moves a gapped inductor candidate from its saturation-floor (N, gap) to
+ * the pair that minimises the estimated core + copper loss, never below the floor.
+ *
+ * Not a gate: evaluate_magnetic always returns valid and rewrites the candidate's turns and
+ * gap in place when a buildable lower-loss pair exists (see MagneticFilterLosses.cpp for
+ * the model and the search). The returned score is the estimated mean total loss (W) of
+ * the pair it settled on, 0 when the candidate is outside its scope.
+ */
+class MagneticFilterInductorTurnsAndGapByLosses : public MagneticFilter {
+    private:
+        std::map<std::string, std::string> _models;
+        MagnetizingInductance _magnetizingInductance;
+        std::shared_ptr<CoreLossesModel> _coreLossesModelSteinmetz;
+        std::shared_ptr<CoreLossesModel> _coreLossesModelProprietary;
+        MagneticFilterFringingFactor _fringingFactorFilter;
+        MagneticFilterMagnetizingInductance _inductanceFilter;
+        MagneticFilterSaturation _saturationFilter;
+        double _targetInductance = 0;
+        std::vector<double> _temperatures;
+        std::vector<double> _primaryReferredCurrentsRms;
+        std::vector<std::vector<double>> _primaryReferredCurrentHarmonicAmplitudes;
+        std::vector<std::vector<double>> _primaryReferredCurrentHarmonicFrequencies;
+        double _maximumEffectiveFrequency = 0;
+        std::vector<double> _turnsRatios;
+        std::vector<std::vector<SignalDescriptor>> _windingCurrents;
+
+        // Mean over the operating points of the core losses at the target inductance and
+        // numberTurns (the flux L i / N the re-solved gap delivers). NaN when the core has
+        // no loss model to evaluate (neither Steinmetz nor a proprietary formula).
+        double calculate_core_losses(const Core& core, double numberTurns, std::vector<OperatingPoint>& preparedOperatingPoints);
+
+    public:
+        MagneticFilterInductorTurnsAndGapByLosses(Inputs inputs, std::map<std::string, std::string> models);
+        // Designs this applies to: energy-storing inductors with an inductance target, not
+        // suppression chokes (sized by impedance).
+        static bool applies_to_design(const Inputs& inputs);
+        // Candidates this applies to: a discrete-gap core (not a toroid, not PQI/UI) with the
+        // adviser's one-winding stand-in coil.
+        static bool applies_to_candidate(const Magnetic& magnetic);
+        std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+};
+
 class MagneticFilterVolume : public MagneticFilter {
     public:
         MagneticFilterVolume() {};
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        bool applies_to(Magnetic* magnetic) const override;
 };
 
 class MagneticFilterArea : public MagneticFilter {
     public:
         MagneticFilterArea() {};
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        bool applies_to(Magnetic* magnetic) const override;
 };
 
 class MagneticFilterHeight : public MagneticFilter {
     public:
         MagneticFilterHeight() {};
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        bool applies_to(Magnetic* magnetic) const override;
 };
 
 class MagneticFilterTemperatureRise : public MagneticFilter {

@@ -5,6 +5,7 @@
 #include <cfloat>
 #include <cmath>
 #include <complex>
+#include <cstdio>
 #include <cstdint>
 #include <numeric>
 #include <optional>
@@ -126,7 +127,15 @@ bool is_close_enough(double x, double y, double error){
 double calculate_offset(Waveform waveform, WaveformLabel label) {
     switch (label) {
         case WaveformLabel::TRIANGULAR:
-            return (waveform.get_data()[0] + waveform.get_data()[1]) / 2;
+            // The midpoint between the two extremes. This used to read
+            // (data[0] + data[1]) / 2, which IS that midpoint for the 3-point
+            // analytical form [trough, peak, trough] and nothing at all for any
+            // other: on a SAMPLED triangle those are merely the first two
+            // samples. It went unnoticed while TRIANGULAR was unreachable for
+            // measured data, and returned 0.199 T instead of 0.266 T for the
+            // ABT #907 flybuck flux the moment it became reachable.
+            return (*max_element(waveform.get_data().begin(), waveform.get_data().end()) +
+                    *min_element(waveform.get_data().begin(), waveform.get_data().end())) / 2;
         case WaveformLabel::UNIPOLAR_TRIANGULAR:
             return *min_element(waveform.get_data().begin(), waveform.get_data().end());
         case WaveformLabel::RECTANGULAR:
@@ -191,11 +200,16 @@ bool WaveformProcessor::is_waveform_sampled(Waveform waveform, size_t numberPoin
 }
 
 double WaveformProcessor::calculate_waveform_average(Waveform waveform) {
+    // get_time() returns the optional BY VALUE, so indexing it inside the loop copied the whole
+    // time axis twice per sample: O(N^2), minutes for an imported waveform with a few hundred
+    // thousand points. Take it once.
+    const auto time = waveform.get_time().value();
+    const auto& data = waveform.get_data();
     double integration = 0;
-    double period = waveform.get_time()->back() - waveform.get_time()->front();
-    for (size_t i = 0; i < waveform.get_data().size() - 1; ++i)
+    double period = time.back() - time.front();
+    for (size_t i = 0; i < data.size() - 1; ++i)
     {
-        double area = (waveform.get_data()[i + 1] + waveform.get_data()[i]) / 2 * (waveform.get_time().value()[i + 1] - waveform.get_time().value()[i]);
+        double area = (data[i + 1] + data[i]) / 2 * (time[i + 1] - time[i]);
         integration += area;
     }
     return integration / period;
@@ -256,6 +270,92 @@ Waveform WaveformProcessor::compress_waveform(const Waveform& waveform) {
     return compressedWaveform;
 }
 
+// The fraction of the period a triangle spends rising: trough to peak.
+//
+// This is what a triangle's duty cycle MEANS, and it is not what the mid-level
+// crossing measures. A triangle crosses its mid-level exactly halfway up and
+// halfway down whatever its ramp rates, so measure_duty_cycle_from_samples
+// answers 0.5 for a 0.1-duty triangle and a 0.9-duty one alike. That is correct
+// for a rectangle, whose level IS the thing that changes, and wrong here.
+//
+// Read off the time axis when there is one, so it is right for a compressed
+// waveform whose points are not equally spaced; sample indices otherwise.
+static double triangle_duty_from_samples(const Waveform& waveform) {
+    const auto& data = waveform.get_data();
+    const size_t numberPoints = data.size();
+    size_t peakIndex = std::distance(data.begin(), max_element(data.begin(), data.end()));
+    size_t troughIndex = std::distance(data.begin(), min_element(data.begin(), data.end()));
+
+    const auto timeOptional = waveform.get_time();
+    if (timeOptional && timeOptional->size() == numberPoints && numberPoints > 1) {
+        const auto& time = *timeOptional;
+        double period = (time.back() - time.front()) * numberPoints / (numberPoints - 1.0);
+        if (period > 0) {
+            double rise = time[peakIndex] - time[troughIndex];
+            if (rise < 0) {
+                rise += period;
+            }
+            return rise / period;
+        }
+    }
+    double rise = double((peakIndex + numberPoints - troughIndex) % numberPoints);
+    return rise / numberPoints;
+}
+
+// Measure the duty cycle straight from the samples: the fraction of the period the
+// signal spends above its mid-level, (max + min) / 2.
+//
+// Mid-level is offset-immune. The previous heuristic thresholded at 5% OF THE
+// MAXIMUM, which reports duty = 1 for any unipolar or DC-biased signal, and derived
+// the duty from an index into `data` divided by numberPointsSampledWaveforms — a
+// 128-vs-512 mismatch for imported waveforms (ABT #602).
+//
+// Time-weighted whenever a time vector is present, so it is correct for the
+// uniformly-sampled raw waveform AND for a compressed one, whose points are not
+// equally spaced in time.
+static double measure_duty_cycle_from_samples(const Waveform& waveform) {
+    const auto& data = waveform.get_data();
+    if (data.size() < 2) {
+        throw std::invalid_argument("try_guess_duty_cycle: need at least 2 points to measure a duty cycle");
+    }
+
+    double maximum = *max_element(data.begin(), data.end());
+    double minimum = *min_element(data.begin(), data.end());
+    // Compare with >=, not >, so a constant (or identically zero) waveform — which
+    // Inputs does construct while completing an excitation — resolves to 1.0 by the
+    // definition itself rather than needing a special case: a DC signal sits at or
+    // above its own level for the whole period.
+    double midLevel = (maximum + minimum) / 2;
+
+    // get_time() returns the optional BY VALUE, so bind the copy to a named local
+    // — a reference into `waveform.get_time().value()` dangles the moment the
+    // temporary optional dies (-Werror=dangling-reference catches it).
+    const auto timeOptional = waveform.get_time();
+    if (timeOptional && timeOptional->size() == data.size()) {
+        const auto& time = *timeOptional;
+        double totalPeriod = time.back() - time.front();
+        if (totalPeriod > 0) {
+            double timeOn = 0;
+            for (size_t i = 0; i < data.size() - 1; ++i) {
+                if ((data[i] + data[i + 1]) / 2 >= midLevel) {
+                    timeOn += time[i + 1] - time[i];
+                }
+            }
+            return timeOn / totalPeriod;
+        }
+    }
+
+    // No usable time base: fall back to counting samples, which is exact for a
+    // uniformly-sampled waveform. Divide by the full count, not size() - 1.
+    size_t pointsOn = 0;
+    for (size_t i = 0; i < data.size(); ++i) {
+        if (data[i] >= midLevel) {
+            pointsOn++;
+        }
+    }
+    return static_cast<double>(pointsOn) / static_cast<double>(data.size());
+}
+
 double WaveformProcessor::try_guess_duty_cycle(Waveform waveform, WaveformLabel label, double frequency, size_t numberPointsSampledWaveforms) {
     if (label != WaveformLabel::CUSTOM) {
         switch(label) {
@@ -266,7 +366,11 @@ double WaveformProcessor::try_guess_duty_cycle(Waveform waveform, WaveformLabel 
                 else if (waveform.get_time()->size() == 4) {
                     return ((waveform.get_time().value()[1] + waveform.get_time().value()[2]) / 2 - waveform.get_time()->front()) / (waveform.get_time()->back() - waveform.get_time()->front());
                 }
-                break;
+                // A MEASURED triangle keeps far more than four vertices, and
+                // breaking here dropped it through to the mid-level crossing —
+                // which reports 0.5 for every triangle whatever its ramps, so a
+                // 0.1-duty measurement and a 0.8-duty one came back identical.
+                return triangle_duty_from_samples(waveform);
             }
             case WaveformLabel::UNIPOLAR_TRIANGULAR: {
                 return (waveform.get_time().value()[1] - waveform.get_time()->front()) / (waveform.get_time()->back() - waveform.get_time()->front());
@@ -309,90 +413,233 @@ double WaveformProcessor::try_guess_duty_cycle(Waveform waveform, WaveformLabel 
             }
     }
 
-    Waveform sampledWaveform;
     if (!is_waveform_sampled(waveform, numberPointsSampledWaveforms)) {
-        if (frequency > 0) {
-            sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform, frequency, std::nullopt, numberPointsSampledWaveforms);
-        }
-        else if (waveform.get_time() && waveform.get_time()->size() >= 3) {
-            // Can compute duty cycle directly from the waveform time points without sampling
+        if (waveform.get_time() && waveform.get_time()->size() >= 3) {
+            // A handful of vertices is an analytical shape described by its corner
+            // times — read the duty straight off them.
             auto timeVec = waveform.get_time().value();
             auto dataVec = waveform.get_data();
             double totalPeriod = timeVec.back() - timeVec.front();
-            if (totalPeriod <= 0) {
-                return 0.5;
+            if (totalPeriod > 0) {
+                if (dataVec.size() == 3) {
+                    // 3-point triangular: peak at middle time point
+                    return roundFloat((timeVec[1] - timeVec[0]) / totalPeriod, 2);
+                }
+                else if (dataVec.size() == 4) {
+                    // 4-point waveform: duty cycle from average of middle two points
+                    return roundFloat(((timeVec[1] + timeVec[2]) / 2 - timeVec[0]) / totalPeriod, 2);
+                }
+                else if (dataVec.size() == 5) {
+                    // 5-point rectangular: time from point 0 to 2 over total
+                    return roundFloat((timeVec[2] - timeVec[0]) / totalPeriod, 2);
+                }
             }
-            if (dataVec.size() == 3) {
-                // 3-point triangular: peak at middle time point
-                return roundFloat((timeVec[1] - timeVec[0]) / totalPeriod, 2);
-            }
-            else if (dataVec.size() == 4) {
-                // 4-point waveform: duty cycle from average of middle two points
-                return roundFloat(((timeVec[1] + timeVec[2]) / 2 - timeVec[0]) / totalPeriod, 2);
-            }
-            else if (dataVec.size() == 5) {
-                // 5-point rectangular: time from point 0 to 2 over total
-                return roundFloat((timeVec[2] - timeVec[0]) / totalPeriod, 2);
-            }
-            else {
-                // Cannot compute duty cycle without frequency for arbitrary waveforms
-                return 0.5;
-            }
+        }
+    }
+
+    // Anything with more vertices than a named shape — i.e. real imported or
+    // simulated data — gets MEASURED from the samples.
+    //
+    // This is where three unconditional `return 0.5` defaults used to sit (no
+    // frequency / degenerate period / "cannot compute duty cycle for arbitrary
+    // waveforms"), which is what showed a 21%-duty FlyBuck switch node as 50%
+    // (ABT #602). The old second-difference heuristic that followed them derived
+    // the duty from an index into `data` divided by numberPointsSampledWaveforms,
+    // a 128-vs-512 mismatch for imported waveforms, and thresholded at 5% of the
+    // maximum, which returns duty = 1 for any DC-biased signal.
+    return measure_duty_cycle_from_samples(waveform);
+}
+
+// Mean deviation from an ideal triangle of this waveform's own duty, over its
+// mean magnitude — the same ratio guess_sinusoidal_or_custom forms against a
+// reference sine, so the two shapes are judged on one scale.
+static double triangle_fit_error(const Waveform& waveform, double duty) {
+    const auto& data = waveform.get_data();
+    const size_t numberPoints = data.size();
+    double maximum = *max_element(data.begin(), data.end());
+    double minimum = *min_element(data.begin(), data.end());
+    double peakToPeak = maximum - minimum;
+    double offset = (maximum + minimum) / 2;
+    size_t troughIndex = std::distance(data.begin(), min_element(data.begin(), data.end()));
+
+    const auto timeOptional = waveform.get_time();
+    const bool useTime = timeOptional && timeOptional->size() == numberPoints && numberPoints > 1 &&
+                         (timeOptional->back() - timeOptional->front()) > 0;
+    double period = 0;
+    if (useTime) {
+        period = (timeOptional->back() - timeOptional->front()) * numberPoints / (numberPoints - 1.0);
+    }
+
+    double error = 0;
+    double area = 0;
+    for (size_t i = 0; i < numberPoints; ++i) {
+        // Position in the period measured FROM THE TROUGH, which is where the
+        // ideal triangle below starts its rise.
+        double position;
+        if (useTime) {
+            position = ((*timeOptional)[i] - (*timeOptional)[troughIndex]) / period;
         }
         else {
-            // Cannot sample without frequency, return default duty cycle
-            return 0.5;
+            position = double((i + numberPoints - troughIndex) % numberPoints) / numberPoints;
         }
+        position -= floor(position);
+        double shape = position < duty ? (position / duty) * 2 - 1
+                                       : 1 - ((position - duty) / (1 - duty)) * 2;
+        area += fabs(data[i]);
+        error += fabs((shape * peakToPeak / 2 + offset) - data[i]);
     }
-    else {
-        sampledWaveform = waveform;
+    error /= numberPoints;
+    area /= numberPoints;
+    if (area == 0) {
+        return DBL_MAX;
+    }
+    return error / area;
+}
+
+// Decide between a sine and an unrecognised shape by comparing the samples against
+// a reference sine of the same peak-to-peak, offset and period.
+//
+// This used to live in two copy-pasted copies, both carrying two defects (ABT #602):
+//   * `area` accumulated a SUM while `error` was averaged, so `error /= area`
+//     divided by N a second time. At N = 512 the 5% threshold became an effective
+//     2560% relative error, CUSTOM was unreachable, and every imported waveform —
+//     rectangles and triangles included — was labelled sinusoidal.
+//   * the reference sine took its period from the NOMINAL sample count instead of
+//     this waveform's, so it ran N/numberPointsSampledWaveforms cycles across the
+//     window it was being compared against.
+// Kept as one helper so the two call sites cannot drift apart again.
+static WaveformLabel guess_sinusoidal_or_custom(const Waveform& waveform) {
+    const auto& data = waveform.get_data();
+    const size_t numberPoints = data.size();
+    if (numberPoints == 0) {
+        throw std::invalid_argument("try_guess_waveform_label: waveform has no data");
     }
 
-    std::vector<double> data = sampledWaveform.get_data();
-    std::vector<double> diff_data;
-    std::vector<double> diff_diff_data;
+    double maximum = *max_element(data.begin(), data.end());
+    double minimum = *min_element(data.begin(), data.end());
+    double peakToPeak = maximum - minimum;
+    double offset = (maximum + minimum) / 2;
 
-    for (size_t i = 0; i < data.size() - 1; ++i) {
-        diff_data.push_back(roundFloat(data[i + 1] - data[i], 9));
-    }
-    for (size_t i = 0; i < diff_data.size() - 1; ++i) {
-        diff_diff_data.push_back(fabs(roundFloat(diff_data[i + 1] - diff_data[i], 9)));
+    // Build the reference sine on the waveform's OWN time axis when it has one.
+    // try_guess_waveform_label is normally handed a COMPRESSED waveform, whose
+    // points are not equally spaced, so an index-derived angle would compare the
+    // signal against a sine that is stretched wherever compression thinned the
+    // samples. Index-derived angle is only correct for uniform sampling, which is
+    // the no-time fallback below.
+    const auto timeOptional = waveform.get_time();
+    const bool useTime = timeOptional && timeOptional->size() == numberPoints && numberPoints > 1 &&
+                         (timeOptional->back() - timeOptional->front()) > 0;
+
+    double period = 0;
+    if (useTime) {
+        const auto& time = *timeOptional;
+        double span = time.back() - time.front();
+        // Two bases reach here and they do NOT span the period the same way.
+        //
+        // Raw uniform samples stop one step short of it, so the span is T - dt and
+        // has to be extended by the mean step. A COMPRESSED waveform does not:
+        // compress_waveform appends the wrapped copy of the first point at
+        // time.back() + dt before it starts, so its span is already a whole T and
+        // extending it again stretches the period by n/(n-1) — 3.6% at the 29
+        // points a measured triangle compresses to. That skew is what made an
+        // earlier attempt at phase estimation rotate the reference sine off every
+        // imported waveform.
+        //
+        // The wrapped copy is the tell, and it is exact: a compressed waveform
+        // ends on the very value it starts on.
+        const bool spansWholePeriod = data.back() == data.front();
+        period = spansWholePeriod ? span : span * numberPoints / (numberPoints - 1.0);
     }
 
-    double maximum = *max_element(diff_diff_data.begin(), diff_diff_data.end());
-    size_t maximum_index = 0;
-    size_t distanceToMiddle = numberPointsSampledWaveforms;
-    for (size_t i = 0; i < diff_diff_data.size(); ++i)
-    {
-        if (diff_diff_data[i] == maximum) {
-            if (fabs(double(numberPointsSampledWaveforms) / 2 - i) < distanceToMiddle) {
-                distanceToMiddle = fabs(double(numberPointsSampledWaveforms) / 2 - i);
-                maximum_index = i;
-            }
+    auto angleAt = [&](size_t i) {
+        return useTime ? 2 * kWaveformPi * ((*timeOptional)[i] - timeOptional->front()) / period
+                       : i * 2 * kWaveformPi / numberPoints;
+    };
+
+    // The projection below is a quadrature, and a compressed waveform is a
+    // brutally uneven mesh: consecutive points sit 10 ns apart where the signal
+    // curves and 1.5 us apart where it runs straight, so an unweighted sum leans
+    // wherever compression left the points dense.
+    //
+    // Weight each point by half the distance between its neighbours — the
+    // trapezoid rule on a periodic mesh. A one-sided (next - this) weight is NOT
+    // good enough here: on a mesh whose spacing varies by two orders of magnitude
+    // it biases the projection by a consistent 15 degrees, which is exactly how an
+    // earlier attempt at this rotated the reference sine off every imported
+    // waveform. Where the waveform wraps, the repeated final point is excluded
+    // rather than counted twice.
+    const size_t distinctPoints = (useTime && data.back() == data.front() && numberPoints > 1)
+                                      ? numberPoints - 1
+                                      : numberPoints;
+    auto weightAt = [&](size_t i) {
+        if (!useTime) {
+            return 1.0;
         }
+        const auto& time = *timeOptional;
+        double previous = (i == 0) ? time[distinctPoints - 1] - period : time[i - 1];
+        double next = (i + 1 >= distinctPoints) ? time[0] + period : time[i + 1];
+        return (next - previous) / 2;
+    };
+
+    // Find the fundamental's phase before comparing. One DFT bin gives it: for
+    // A·sin(θ + φ) the sin-projection goes as cos φ and the cos-projection as
+    // sin φ, so atan2(cosProjection, sinProjection) is φ. Each sample is weighted
+    // by its own time step, which is what makes this valid on the unevenly spaced
+    // compressed waveform as well as on raw samples — and on a compressed one the
+    // trailing wrapped point correctly weighs zero, since it repeats the first.
+    //
+    // A signal with no fundamental has no phase to find and keeps zero; it is not
+    // a sine either way, and the error test below is what says so.
+    double sinProjection = 0;
+    double cosProjection = 0;
+    for (size_t i = 0; i < distinctPoints; ++i) {
+        double centered = data[i] - offset;
+        sinProjection += weightAt(i) * centered * sin(angleAt(i));
+        cosProjection += weightAt(i) * centered * cos(angleAt(i));
     }
-    auto dutyCycle = roundFloat((maximum_index + 1.0) / numberPointsSampledWaveforms, 2);
+    double phase = (sinProjection == 0 && cosProjection == 0) ? 0 : atan2(cosProjection, sinProjection);
 
-    if (dutyCycle <= 0.03 || dutyCycle >= 0.97) {
+    double error = 0;
+    double area = 0;
+    for (size_t i = 0; i < numberPoints; ++i) {
+        double calculatedData = (sin(angleAt(i) + phase) * peakToPeak / 2) + offset;
+        area += fabs(data[i]);
+        error += fabs(calculatedData - data[i]);
+    }
+    error /= numberPoints;  // mean absolute deviation
+    area /= numberPoints;   // mean magnitude — both sides of the ratio are now means
 
-        double maximum = *max_element(data.begin(), data.end());
-        double threshold = maximum * 0.05;
+    if (area == 0) {
+        // Identically zero: there is no shape to recognise. Not a sine.
+        return WaveformLabel::CUSTOM;
+    }
+    error /= area;
 
-        double numberPointsOn = 0;
-        double numberPointsOff = 0;
-        for (size_t i = 0; i < data.size() - 1; ++i) {
-            if (data[i] < threshold) {
-                numberPointsOff++;
-            }
-            else {
-                numberPointsOn++;
-            }
-        }
-
-        dutyCycle = numberPointsOn / data.size();
+    // Measured data never survives the vertex tests above — a real triangle
+    // carries enough noise that compression leaves it 27 to 32 points, never the
+    // 3 those tests demand — so before this fell through to CUSTOM, SINUSOIDAL
+    // and CUSTOM were the only two labels an imported waveform could ever get.
+    // A quarter of the CoreDataX exchange is triangular and was reaching CUSTOM
+    // that way, taking its duty with it.
+    //
+    // The sine above is recognised by a TOLERANCE, not by exactness, which is why
+    // it survives noise. Hold a triangle to the same standard, on the same scale:
+    // fit one of the waveform's own measured duty and take whichever reference
+    // sits closer, provided it is inside the tolerance. On 200 real MagNet
+    // triangles this scores a median 2.5% and puts 195 of them under 5%.
+    double triangleDuty = triangle_duty_from_samples(waveform);
+    double triangleError = DBL_MAX;
+    if (triangleDuty > 0 && triangleDuty < 1) {
+        triangleError = triangle_fit_error(waveform, triangleDuty);
     }
 
-    return dutyCycle;
+    if (triangleError < error) {
+        return triangleError < 0.05 ? WaveformLabel::TRIANGULAR : WaveformLabel::CUSTOM;
+    }
+    if (error < 0.05) {
+        return WaveformLabel::SINUSOIDAL;
+    }
+    return WaveformLabel::CUSTOM;
 }
 
 WaveformLabel WaveformProcessor::try_guess_waveform_label(Waveform waveform, size_t numberPointsSampledWaveforms) {
@@ -418,6 +665,21 @@ WaveformLabel WaveformProcessor::try_guess_waveform_label(Waveform waveform, siz
             compressedWaveform.get_data()[2] == compressedWaveform.get_data()[3] &&
             compressedWaveform.get_data()[0] == compressedWaveform.get_data()[3]) {
                 return WaveformLabel::UNIPOLAR_TRIANGULAR;
+        }
+        else if (compressedWaveform.get_data().size() == 4 &&
+            is_close_enough(compressedWaveform.get_time().value()[1], compressedWaveform.get_time().value()[2], 1.5 * period / numberPointsSampledWaveforms) &&
+            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[3] &&
+            (compressedWaveform.get_data()[1] - compressedWaveform.get_data()[0]) *
+            (compressedWaveform.get_data()[2] - compressedWaveform.get_data()[0]) > 0) {
+                // A triangle whose apex falls BETWEEN two samples: compression
+                // cannot pick one vertex, so it emits both, and the 3-point test
+                // above misses a waveform that is a perfect triangle. The apex only
+                // lands on a sample when the duty divides the sample count, which
+                // is why an ideal 1024-point triangle was recognised at duty 0.5
+                // and called CUSTOM at 0.1, 0.2, 0.3, 0.7 and 0.8. The two extra
+                // points are adjacent samples on the same side of the trough;
+                // try_guess_duty_cycle already averages their times.
+                return WaveformLabel::TRIANGULAR;
         }
         else if (compressedWaveform.get_data().size() == 5 &&
             !is_close_enough((compressedWaveform.get_time().value()[2] - compressedWaveform.get_time().value()[0]) * compressedWaveform.get_data()[2] + (compressedWaveform.get_time().value()[4] - compressedWaveform.get_time().value()[2]) * compressedWaveform.get_data()[4], 0 , period) &&
@@ -493,53 +755,11 @@ WaveformLabel WaveformProcessor::try_guess_waveform_label(Waveform waveform, siz
                 return WaveformLabel::FLYBACK_SECONDARY;
         }
         else {
-            double error = 0;
-            double area = 0;
-            double maximum = *max_element(waveform.get_data().begin(), waveform.get_data().end());
-            double minimum = *min_element(waveform.get_data().begin(), waveform.get_data().end());
-
-            double peakToPeak = maximum - minimum;
-            double offset = (maximum + minimum) / 2; // FIXED: BUG-08
-
-            for (size_t i = 0; i < waveform.get_data().size(); ++i) {
-                double angle = i * 2 * kWaveformPi / numberPointsSampledWaveforms;
-                double calculated_data = (sin(angle) * peakToPeak / 2) + offset;
-                area += fabs(waveform.get_data()[i]);
-                error += fabs(calculated_data - waveform.get_data()[i]);
-            }
-            error /= waveform.get_data().size();
-            error /= area;
-            if (error < 0.05) {
-                return WaveformLabel::SINUSOIDAL;
-            }
-            else {
-                return WaveformLabel::CUSTOM;
-            }
+            return guess_sinusoidal_or_custom(waveform);
         }
     }
     else {
-        double error = 0;
-        double area = 0;
-        double maximum = *max_element(waveform.get_data().begin(), waveform.get_data().end());
-        double minimum = *min_element(waveform.get_data().begin(), waveform.get_data().end());
-
-        double peakToPeak = maximum - minimum;
-        double offset = (maximum + minimum) / 2; // FIXED: BUG-08
-
-        for (size_t i = 0; i < waveform.get_data().size(); ++i) {
-            double angle = i * 2 * kWaveformPi / numberPointsSampledWaveforms;
-            double calculated_data = (sin(angle) * peakToPeak / 2) + offset;
-            area += fabs(waveform.get_data()[i]);
-            error += fabs(calculated_data - waveform.get_data()[i]);
-        }
-        error /= waveform.get_data().size();
-        error /= area;
-        if (error < 0.05) {
-            return WaveformLabel::SINUSOIDAL;
-        }
-        else {
-            return WaveformLabel::CUSTOM;
-        }
+        return guess_sinusoidal_or_custom(waveform);
     }
 }
 
@@ -724,7 +944,7 @@ Waveform WaveformProcessor::create_waveform(WaveformLabel label, double peakToPe
     return waveform;
 }
 
-Waveform WaveformProcessor::calculate_sampled_waveform(Waveform waveform, double frequency, std::optional<size_t> numberPoints, size_t numberPointsSampledWaveforms) {
+Waveform WaveformProcessor::calculate_sampled_waveform(Waveform waveform, double frequency, std::optional<size_t> numberPoints, size_t numberPointsSampledWaveforms, std::optional<size_t> maximumNumberPoints) {
     std::vector<double> time;
     auto data = waveform.get_data();
 
@@ -775,21 +995,40 @@ Waveform WaveformProcessor::calculate_sampled_waveform(Waveform waveform, double
         else {
             numberPointsForSampling = round_up_size_to_power_of_2(data);
         }
+        // A waveform denser than requested is sampled at its own resolution, up to
+        // maximumNumberPoints when the caller sets one; never below what was requested.
+        if (maximumNumberPoints && numberPointsForSampling > maximumNumberPoints.value()) {
+            if ((maximumNumberPoints.value() & (maximumNumberPoints.value() - 1)) != 0) {
+                throw std::invalid_argument("maximumNumberPoints must be a power of 2, got " + std::to_string(maximumNumberPoints.value()));
+            }
+            numberPointsForSampling = std::max(numberPoints.value_or(numberPointsSampledWaveforms), maximumNumberPoints.value());
+        }
     }
 
     auto sampledTime = linear_spaced_array(0, 1. / roundFloat(frequency, 9), numberPointsForSampling + 1);
 
+    // The sampled instants increase, and on a time axis that never goes back the segment that
+    // holds instant i+1 is never before the one that held instant i: every earlier segment ended
+    // before instant i, so it ends before instant i+1 too. The search therefore resumes where the
+    // previous one stopped. Restarting it from segment 0 for every sample made this O(N*M) —
+    // an LTspice export with 400k points per switching period spent over two minutes here, and
+    // the web engine's watchdog killed the import. The result is identical: each instant still
+    // lands in the FIRST segment that contains it. A time axis that goes back keeps the full search.
+    const bool timeNeverDecreases = std::is_sorted(time.begin(), time.end());
     std::vector<double> sampledData;
+    sampledData.reserve(numberPointsForSampling);
+    size_t searchStart = 0;
 
     for (size_t i = 0; i < numberPointsForSampling; i++) {
         bool found = false;
-        for (size_t interpIndex = 0; interpIndex < data.size() - 1; interpIndex++) {
+        for (size_t interpIndex = timeNeverDecreases? searchStart : 0; interpIndex < data.size() - 1; interpIndex++) {
             // Skip zero-length segments (where time[i] == time[i+1])
             // These occur in waveforms like FLYBACK_PRIMARY: time = {0, 0, dc, dc, period}
             if (time[interpIndex + 1] == time[interpIndex]) {
                 // If sampled time is exactly at this zero-length segment, use the data value
                 if (sampledTime[i] == time[interpIndex]) {
                     sampledData.push_back(data[interpIndex]);
+                    searchStart = interpIndex;
                     found = true;
                     break;
                 }
@@ -803,6 +1042,7 @@ Waveform WaveformProcessor::calculate_sampled_waveform(Waveform waveform, double
                 double proportion = (sampledTime[i] - time[interpIndex]) / (time[interpIndex + 1] - time[interpIndex]);
                 double interpPoint = kWaveformLerp(data[interpIndex], data[interpIndex + 1], proportion);
                 sampledData.push_back(interpPoint);
+                searchStart = interpIndex;
                 found = true;
                 break;
             }
@@ -827,26 +1067,200 @@ Waveform WaveformProcessor::calculate_sampled_waveform(Waveform waveform, double
     return sampledWaveform;
 }
 
+std::vector<std::complex<double>> WaveformProcessor::calculate_exact_fourier_coefficients(const std::vector<double>& time,
+                                                                                         const std::vector<double>& data,
+                                                                                         size_t numberHarmonics) {
+    if (time.size() != data.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Exact Fourier coefficients: the waveform has " + std::to_string(time.size()) +
+                                    " time values but " + std::to_string(data.size()) + " data values");
+    }
+    if (data.size() < 2) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Exact Fourier coefficients: a piecewise-linear waveform needs at least 2 knots");
+    }
+    for (size_t i = 0; i < data.size(); ++i) {
+        if (!std::isfinite(time[i]) || !std::isfinite(data[i])) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "Exact Fourier coefficients: knot " + std::to_string(i) + " is not finite");
+        }
+        if (i > 0 && time[i] < time[i - 1]) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "Exact Fourier coefficients: time runs backwards at knot " + std::to_string(i) +
+                                        " (" + std::to_string(time[i - 1]) + " s -> " + std::to_string(time[i]) + " s)");
+        }
+    }
+    const double t0 = time.front();
+    const double period = time.back() - t0;
+    if (!(period > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Exact Fourier coefficients: the knots span no time, period = " + std::to_string(period));
+    }
+
+    // Every segment, including the closing one from the last knot back to the first value one
+    // period later (a step, as the last knot sits at t0 + period), as (dv, dt, t_mid - t0).
+    // Segments with dv = 0 add nothing to the derivative, so flat stretches and repeated
+    // samples drop out here.
+    struct Segment { double dv; double dt; double mid; };
+    std::vector<Segment> segments;
+    segments.reserve(data.size());
+    double integral = 0;
+    for (size_t i = 0; i + 1 < data.size(); ++i) {
+        double dt = time[i + 1] - time[i];
+        double dv = data[i + 1] - data[i];
+        integral += 0.5 * (data[i] + data[i + 1]) * dt;
+        if (dv != 0) {
+            segments.push_back({dv, dt, 0.5 * (time[i] + time[i + 1]) - t0});
+        }
+    }
+    if (data.front() != data.back()) {
+        segments.push_back({data.front() - data.back(), 0.0, period});
+    }
+
+    std::vector<std::complex<double>> coefficients(numberHarmonics + 1);
+    coefficients[0] = integral / period;
+    if (numberHarmonics == 0 || segments.empty()) {
+        return coefficients;
+    }
+
+    // c_k = 1/T int x e^{-j w t} dt = 1/(T j w) int e^{-j w t} dx (by parts, periodic x),
+    // and a linear segment gives int e^{-j w t} dx = dv e^{-j w t_mid} sinc(w dt / 2),
+    // which tends to the step's dv e^{-j w t} as dt -> 0. With w = 2 pi k / T,
+    // 1/(T j w) = -j / (2 pi k). The k-th powers of each segment's two phasors come from a
+    // running product, so the loop costs two complex products per segment and harmonic.
+    const double w1 = 2 * kWaveformPi / period;
+    std::vector<std::complex<double>> midPhasorStep(segments.size()), midPhasor(segments.size());
+    std::vector<std::complex<double>> halfWidthPhasorStep(segments.size()), halfWidthPhasor(segments.size());
+    for (size_t s = 0; s < segments.size(); ++s) {
+        midPhasorStep[s] = std::polar(1.0, -w1 * segments[s].mid);
+        midPhasor[s] = 1.0;
+        halfWidthPhasorStep[s] = std::polar(1.0, 0.5 * w1 * segments[s].dt);
+        halfWidthPhasor[s] = 1.0;
+    }
+    for (size_t k = 1; k <= numberHarmonics; ++k) {
+        const double kDouble = static_cast<double>(k);
+        std::complex<double> sum = 0;
+        for (size_t s = 0; s < segments.size(); ++s) {
+            midPhasor[s] *= midPhasorStep[s];
+            halfWidthPhasor[s] *= halfWidthPhasorStep[s];
+            double halfAngle = 0.5 * w1 * segments[s].dt * kDouble;
+            double sinc = (segments[s].dt == 0) ? 1.0 : halfWidthPhasor[s].imag() / halfAngle;
+            sum += segments[s].dv * sinc * midPhasor[s];
+        }
+        coefficients[k] = std::complex<double>(0, -1.0 / (2 * kWaveformPi * kDouble)) * sum;
+    }
+    return coefficients;
+}
+
+namespace {
+// True when the time axis steps uniformly (to 1e-6 of the mean step): the only waveforms that
+// can be read as uniform samples. N points on an uneven axis are knots, whatever their count.
+bool has_uniform_time_step(const std::vector<double>& time) {
+    if (time.size() < 2) {
+        return false;
+    }
+    const double step = (time.back() - time.front()) / static_cast<double>(time.size() - 1);
+    if (!(step > 0)) {
+        return false;
+    }
+    for (size_t i = 1; i < time.size(); ++i) {
+        if (std::fabs((time[i] - time[i - 1]) - step) > 1e-6 * step) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Exact Fourier coefficients c_0..c_{N/2} of the periodic linear interpolant of N uniform
+// samples: linear interpolation is the samples convolved with a one-sample triangle, whose
+// spectrum is sinc^2, so c_k = DFT_N[k] / N * sinc^2(pi k / N) (ABT #1460).
+std::vector<std::complex<double>> uniform_samples_exact_coefficients(const Waveform& sampledWaveform) {
+    const auto& values = sampledWaveform.get_data();
+    const size_t numberSamples = values.size();
+    if (numberSamples < 2 || (numberSamples & (numberSamples - 1)) != 0) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Sampled waveform size is not a power of 2: " + std::to_string(numberSamples));
+    }
+    if (sampledWaveform.get_time()) {
+        // The sinc^2 factor holds for uniform samples only; unevenly spaced "samples" could be
+        // knots or samples, and the two give different harmonics.
+        const std::vector<double> time = sampledWaveform.get_time().value();  // get_time() returns by value
+        if (time.size() != numberSamples) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "Sampled waveform has " + std::to_string(time.size()) + " time values for " + std::to_string(numberSamples) + " samples");
+        }
+        const double step = (time.back() - time.front()) / static_cast<double>(numberSamples - 1);
+        if (!(step > 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "Sampled waveform spans no time");
+        }
+        for (size_t i = 1; i < numberSamples; ++i) {
+            if (std::fabs((time[i] - time[i - 1]) - step) > 1e-6 * step) {
+                char detail[160];
+                std::snprintf(detail, sizeof(detail), " (%.6e s vs %.6e s; t0 = %.6e s, t_end = %.6e s)", time[i] - time[i - 1], step, time.front(), time.back());
+                throw InvalidInputException(ErrorCode::INVALID_INPUT, "A waveform of " + std::to_string(numberSamples) +
+                    " points is read as uniform samples, but its time step varies at point " + std::to_string(i) +
+                    detail + ": samples or knots is ambiguous");
+            }
+        }
+    }
+    std::vector<std::complex<double>> spectrum(values.begin(), values.end());
+    fft(spectrum);
+    const size_t numberHarmonics = numberSamples / 2;
+    std::vector<std::complex<double>> coefficients(numberHarmonics + 1);
+    const double numberSamplesDouble = static_cast<double>(numberSamples);
+    coefficients[0] = spectrum[0] / numberSamplesDouble;
+    for (size_t k = 1; k <= numberHarmonics; ++k) {
+        double x = kWaveformPi * static_cast<double>(k) / numberSamplesDouble;
+        double sinc = std::sin(x) / x;
+        coefficients[k] = spectrum[k] / numberSamplesDouble * (sinc * sinc);
+    }
+    return coefficients;
+}
+} // namespace
+
 Harmonics WaveformProcessor::calculate_harmonics_data(Waveform waveform, double frequency, bool trimHarmonics, double harmonicAmplitudeThreshold, size_t numberPointsSampledWaveforms) {
     bool isWaveformImported = is_waveform_imported(waveform, numberPointsSampledWaveforms);
     Harmonics harmonics;
 
-    std::vector<std::complex<double>> data;
-    for (std::size_t i = 0; i < waveform.get_data().size(); ++i) {
-        data.emplace_back(waveform.get_data()[i]);
-    }
+    if (!waveform.get_time()) {
+        // Data only: samples with no knots to be exact about, so this keeps the plain DFT of the
+        // samples, harmonics 0..N/2-1. Every MKF path that has knots or a time axis goes through
+        // the exact branches below (ABT #1460).
+        std::vector<std::complex<double>> data;
+        for (std::size_t i = 0; i < waveform.get_data().size(); ++i) {
+            data.emplace_back(waveform.get_data()[i]);
+        }
 
-    if (data.size() > 0 && ((data.size() & (data.size() - 1)) != 0)) {
-        throw std::invalid_argument("Data vector size is not a power of 2: " + std::to_string(data.size()));
-    }
-    fft(data);
+        if (data.size() > 0 && ((data.size() & (data.size() - 1)) != 0)) {
+            throw std::invalid_argument("Data vector size is not a power of 2: " + std::to_string(data.size()));
+        }
+        fft(data);
 
-    harmonics.get_mutable_amplitudes().push_back(abs(data[0] / static_cast<double>(data.size())));
-    for (size_t i = 1; i < data.size() / 2; ++i) {
-        harmonics.get_mutable_amplitudes().push_back(abs(2. * data[i] / static_cast<double>(data.size())));
+        harmonics.get_mutable_amplitudes().push_back(abs(data[0] / static_cast<double>(data.size())));
+        for (size_t i = 1; i < data.size() / 2; ++i) {
+            harmonics.get_mutable_amplitudes().push_back(abs(2. * data[i] / static_cast<double>(data.size())));
+        }
+        for (size_t i = 0; i < data.size() / 2; ++i) {
+            harmonics.get_mutable_frequencies().push_back(frequency * i);
+        }
     }
-    for (size_t i = 0; i < data.size() / 2; ++i) {
-        harmonics.get_mutable_frequencies().push_back(frequency * i);
+    else {
+        std::vector<std::complex<double>> coefficients;
+        // N points count as samples only on a uniform axis. The simulator's 128 samples, resampled
+        // over their own span and compressed, come back as 128 uneven knots (autocomplete's
+        // magnetizing current): those are knots, and their exact series is below.
+        if (is_waveform_sampled(waveform, numberPointsSampledWaveforms) && has_uniform_time_step(waveform.get_time().value())) {
+            coefficients = uniform_samples_exact_coefficients(waveform);
+        }
+        else if (waveform.get_data().size() > numberPointsSampledWaveforms) {
+            // Denser than the sampling grid (imports, 2N+1-sample converter models): the closed
+            // form would cost O(knots x harmonics) with thousands of both, so these are sampled
+            // at their own power-of-2 resolution and the samples' interpolant is used. It
+            // differs from the knots only where a knot falls between two samples.
+            coefficients = uniform_samples_exact_coefficients(calculate_sampled_waveform(waveform, frequency, std::nullopt, numberPointsSampledWaveforms));
+        }
+        else {
+            coefficients = calculate_exact_fourier_coefficients(waveform.get_time().value(), waveform.get_data(), numberPointsSampledWaveforms / 2);
+        }
+        harmonics.get_mutable_amplitudes().push_back(std::abs(coefficients[0]));
+        harmonics.get_mutable_frequencies().push_back(0);
+        for (size_t k = 1; k < coefficients.size(); ++k) {
+            harmonics.get_mutable_amplitudes().push_back(2 * std::abs(coefficients[k]));
+            harmonics.get_mutable_frequencies().push_back(frequency * static_cast<double>(k));
+        }
     }
 
 
@@ -898,7 +1312,18 @@ ProcessedWaveform WaveformProcessor::calculate_basic_processed_data(Waveform wav
 
     WaveformLabel label;
 
-    label = try_guess_waveform_label(compressedWaveform, numberPointsSampledWaveforms);
+    // Hand over the RAW waveform, not the compressed one. try_guess_waveform_label
+    // compresses internally for the vertex tests, so those are unaffected, but its
+    // fall-through tolerance tests — sine and triangle — need the full samples.
+    // Compression deletes points precisely where the signal runs straight, which
+    // is where a non-sine keeps its harmonic content, and leaves a mesh whose
+    // spacing varies by two orders of magnitude. On that mesh a phase estimate
+    // lands 15 degrees out and a distortion measure calls four waveforms in five a
+    // sine. On the raw samples both are accurate.
+    //
+    // Analytical waveforms are unaffected either way: they are not sampled, so
+    // compress_waveform returns them unchanged.
+    label = try_guess_waveform_label(waveform, numberPointsSampledWaveforms);
     processed.set_label(label);
 
     if (is_waveform_sampled(waveform, numberPointsSampledWaveforms)) {
@@ -930,7 +1355,12 @@ ProcessedWaveform WaveformProcessor::calculate_basic_processed_data(Waveform wav
     processed.set_positive_peak(positivePeak);
     processed.set_negative_peak(negativePeak);
 
-    processed.set_duty_cycle(try_guess_duty_cycle(compressedWaveform, label, 0, numberPointsSampledWaveforms));
+    // The analytical labels read vertex indices, so they need the COMPRESSED
+    // waveform; the measured CUSTOM path wants the raw uniform samples, which
+    // compression would thin out.
+    processed.set_duty_cycle(label == WaveformLabel::CUSTOM
+        ? try_guess_duty_cycle(waveform, label, 0, numberPointsSampledWaveforms)
+        : try_guess_duty_cycle(compressedWaveform, label, 0, numberPointsSampledWaveforms));
 
     return processed;
 }
@@ -956,7 +1386,8 @@ ProcessedWaveform WaveformProcessor::calculate_processed_data(Waveform waveform,
     if (!is_size_power_of_2(waveform.get_data())) {
         sampledWaveform = calculate_sampled_waveform(waveform, frequencyValue, std::nullopt, numberPointsSampledWaveforms);
     }
-    auto harmonics = calculate_harmonics_data(sampledWaveform, frequencyValue, trimHarmonics, harmonicAmplitudeThreshold, numberPointsSampledWaveforms);
+    // Harmonics from the knots themselves when there is a time axis: exact, no sampling (ABT #1460).
+    auto harmonics = calculate_harmonics_data(waveform.get_time() ? waveform : sampledWaveform, frequencyValue, trimHarmonics, harmonicAmplitudeThreshold, numberPointsSampledWaveforms);
     return calculate_processed_data(harmonics, waveform, includeAdvancedData, processed, numberPointsSampledWaveforms);
 }
 
@@ -1066,7 +1497,7 @@ OperatingPointExcitation WaveformProcessor::complete_excitation(Waveform current
     SignalDescriptor current;
     auto currentProcessed = calculate_processed_data(currentWaveform, switchingFrequency, true, std::nullopt, trimHarmonics, harmonicAmplitudeThreshold, numberPointsSampledWaveforms);
     auto sampledCurrentWaveform = calculate_sampled_waveform(currentWaveform, switchingFrequency, std::nullopt, numberPointsSampledWaveforms);
-    auto currentHarmonics = calculate_harmonics_data(sampledCurrentWaveform, switchingFrequency, trimHarmonics, harmonicAmplitudeThreshold, numberPointsSampledWaveforms);
+    auto currentHarmonics = calculate_harmonics_data(currentWaveform.get_time() ? currentWaveform : sampledCurrentWaveform, switchingFrequency, trimHarmonics, harmonicAmplitudeThreshold, numberPointsSampledWaveforms);
     // Store the resampled (power-of-2) waveform so downstream consumers
     // (MagnetizingInductance, harmonics derivation, FFT-based pipelines)
     // get the standardized waveform contract MKF expects. The raw
@@ -1081,7 +1512,7 @@ OperatingPointExcitation WaveformProcessor::complete_excitation(Waveform current
     SignalDescriptor voltage;
     auto voltageProcessed = calculate_processed_data(voltageWaveform, switchingFrequency, true, std::nullopt, trimHarmonics, harmonicAmplitudeThreshold, numberPointsSampledWaveforms);
     auto sampledVoltageWaveform = calculate_sampled_waveform(voltageWaveform, switchingFrequency, std::nullopt, numberPointsSampledWaveforms);
-    auto voltageHarmonics = calculate_harmonics_data(sampledVoltageWaveform, switchingFrequency, trimHarmonics, harmonicAmplitudeThreshold, numberPointsSampledWaveforms);
+    auto voltageHarmonics = calculate_harmonics_data(voltageWaveform.get_time() ? voltageWaveform : sampledVoltageWaveform, switchingFrequency, trimHarmonics, harmonicAmplitudeThreshold, numberPointsSampledWaveforms);
     voltage.set_waveform(sampledVoltageWaveform);
     voltage.set_processed(voltageProcessed);
     voltage.set_harmonics(voltageHarmonics);

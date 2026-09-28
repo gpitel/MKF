@@ -4,6 +4,9 @@
 #include "physical_models/WindingSkinEffectLosses.h"
 #include <cfloat>
 #include "support/Exceptions.h"
+#include <cmrc/cmrc.hpp>
+
+CMRC_DECLARE(dfmData);   // ABT #1269: the lead-sleeve overlap is rule data (src/data/dfm_rules.json)
 
 
 namespace OpenMagnetics {
@@ -55,76 +58,58 @@ bool InsulationCoordinator::can_fully_insulated_wire_be_used(Inputs& inputs) {
     return true;
 }
 
-size_t times_withstand_voltage_is_covered_by_wires(Wire leftWire, Wire rightWire, double withstandVoltage, bool canFullyInsulatedWireBeUsed) {
-    auto leftCoatingMaybe = leftWire.resolve_coating();
-    auto rightCoatingMaybe = rightWire.resolve_coating();
+// How many times one wire's own insulation covers the withstand voltage, or nullopt when its coating
+// states no breakdown voltage (nothing can then be credited to it). A LITZ wire whose served coating
+// states none is read through its strand's coating.
+std::optional<size_t> times_withstand_voltage_is_covered_by_wire(Wire wire, double withstandVoltage, bool canFullyInsulatedWireBeUsed) {
+    auto coatingMaybe = wire.resolve_coating();
+    if (!coatingMaybe) {
+        return size_t(0);
+    }
+    auto coating = coatingMaybe.value();
 
+    if (wire.get_type() == WireType::LITZ && !coating.get_breakdown_voltage()) {
+        auto strand = wire.resolve_strand();
+        coating = Wire::resolve_coating(strand).value();
+    }
+
+    if (!coating.get_breakdown_voltage()) {
+        return std::nullopt;
+    }
     size_t times = 0;
-    if (leftCoatingMaybe) {
-        auto coating = leftCoatingMaybe.value();
-
-        if (leftWire.get_type() == WireType::LITZ && !coating.get_breakdown_voltage()) {
-            auto strand = leftWire.resolve_strand();
-            coating = Wire::resolve_coating(strand).value();
+    if (coating.get_breakdown_voltage().value() > withstandVoltage) {
+        if (coating.get_number_layers()) {
+            times += coating.get_number_layers().value();
         }
-
-        if (!coating.get_breakdown_voltage()) {
-            return 0;
-            // throw std::runtime_error("Wire " + leftWire.get_name().value() + " is missing breakdown voltage");
-        }
-        if (coating.get_breakdown_voltage().value() > withstandVoltage) {
-            if (coating.get_number_layers()) {
-                times += coating.get_number_layers().value();
-            }
-            else if (coating.get_grade() && canFullyInsulatedWireBeUsed) {
-                if (coating.get_grade().value() > 3) {
-                    times += 3;
-                }
-                else {
-                    // A graded coating whose breakdown voltage covers the withstand
-                    // voltage counts at least once, same as an ungraded coating
-                    times++;
-                }
+        else if (coating.get_grade() && canFullyInsulatedWireBeUsed) {
+            if (coating.get_grade().value() > 3) {
+                times += 3;
             }
             else {
+                // A graded coating whose breakdown voltage covers the withstand
+                // voltage counts at least once, same as an ungraded coating
                 times++;
             }
         }
-    }
-    if (rightCoatingMaybe) {
-        auto coating = rightCoatingMaybe.value();
-
-        if (rightWire.get_type() == WireType::LITZ && !coating.get_breakdown_voltage()) {
-            auto strand = rightWire.resolve_strand();
-            coating = Wire::resolve_coating(strand).value();
-        }
-
-        if (!coating.get_breakdown_voltage()) {
-            return 0;
-            // throw std::runtime_error("Wire " + rightWire.get_name().value() + " is missing breakdown voltage");
-        }
-
-        if (coating.get_breakdown_voltage().value() > withstandVoltage) {
-            if (coating.get_number_layers()) {
-                times += coating.get_number_layers().value();
-            }
-            else if (coating.get_grade() && canFullyInsulatedWireBeUsed) {
-                if (coating.get_grade().value() > 3) {
-                    times += 3;
-                }
-                else {
-                    // A graded coating whose breakdown voltage covers the withstand
-                    // voltage counts at least once, same as an ungraded coating
-                    times++;
-                }
-            }
-            else {
-                times++;
-            }
+        else {
+            times++;
         }
     }
-
     return times;
+}
+
+size_t times_withstand_voltage_is_covered_by_wires(Wire leftWire, Wire rightWire, double withstandVoltage, bool canFullyInsulatedWireBeUsed) {
+    // A wire whose coating states no breakdown voltage voids the credit of the whole pair (the
+    // behaviour this function has always had).
+    auto left = times_withstand_voltage_is_covered_by_wire(leftWire, withstandVoltage, canFullyInsulatedWireBeUsed);
+    if (!left) {
+        return 0;
+    }
+    auto right = times_withstand_voltage_is_covered_by_wire(rightWire, withstandVoltage, canFullyInsulatedWireBeUsed);
+    if (!right) {
+        return 0;
+    }
+    return left.value() + right.value();
 }
 
 double insulation_distance_provided_by_wires(Wire leftWire, Wire rightWire, double withstandVoltage, bool canFullyInsulatedWireBeUsed) {
@@ -351,6 +336,188 @@ std::optional<CoilSectionInterface> InsulationCoordinator::calculate_coil_sectio
     coilSectionInterface.set_solid_insulation_thickness(tapeThickness * numberInsulationLayers);
     coilSectionInterface.set_total_margin_tape_distance(clearanceAndCreepageDistance);
     return coilSectionInterface;
+}
+
+double InsulationCoordinator::temperature_class_to_celsius(const TemperatureClassUnion& temperatureClass) {
+    if (std::holds_alternative<double>(temperatureClass)) {
+        return std::get<double>(temperatureClass);
+    }
+    switch (std::get<TemperatureClassEnum>(temperatureClass)) {
+        case TemperatureClassEnum::Y: return 90;
+        case TemperatureClassEnum::A: return 105;
+        case TemperatureClassEnum::E: return 120;
+        case TemperatureClassEnum::B: return 130;
+        case TemperatureClassEnum::F: return 155;
+        case TemperatureClassEnum::H: return 180;
+        case TemperatureClassEnum::N: return 200;
+        case TemperatureClassEnum::R: return 220;
+        case TemperatureClassEnum::THE_200: return 200;
+        case TemperatureClassEnum::THE_220: return 220;
+        case TemperatureClassEnum::THE_250: return 250;
+    }
+    throw InvalidInputException(ErrorCode::INVALID_INPUT, "Unknown IEC 60085 temperature class");
+}
+
+double InsulationCoordinator::lead_outer_diameter(Wire& wire) {
+    double outerWidth = wire.get_maximum_outer_width();
+    double outerHeight = wire.get_maximum_outer_height();
+    if (wire.get_type() == WireType::ROUND || wire.get_type() == WireType::LITZ) {
+        return std::max(outerWidth, outerHeight);
+    }
+    return std::hypot(outerWidth, outerHeight);
+}
+
+double InsulationCoordinator::lead_sleeve_required_temperature(Inputs& inputs, Wire& wire) {
+    bool anyTemperature = false;
+    double requiredTemperature = -DBL_MAX;
+    auto& designRequirements = inputs.get_design_requirements();
+    if (designRequirements.get_operating_temperature()) {
+        requiredTemperature = std::max(requiredTemperature,
+                                       resolve_dimensional_values(designRequirements.get_operating_temperature().value(), DimensionalValues::MAXIMUM));
+        anyTemperature = true;
+    }
+    for (auto& operatingPoint : inputs.get_operating_points()) {
+        requiredTemperature = std::max(requiredTemperature, operatingPoint.get_conditions().get_ambient_temperature());
+        anyTemperature = true;
+    }
+    auto coating = wire.resolve_coating();
+    if (coating && coating->get_temperature_rating()) {
+        requiredTemperature = std::max(requiredTemperature, coating->get_temperature_rating().value());
+        anyTemperature = true;
+    }
+    if (!anyTemperature) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "A lead sleeve must be rated for the part's temperature, but the inputs carry no operating temperature, no operating point and the wire" +
+            (wire.get_name() ? " '" + wire.get_name().value() + "'" : std::string()) + " states no coating temperature rating");
+    }
+    return requiredTemperature;
+}
+
+// ABT #1269: how far the sleeve reaches PAST the margin's inner face. Reaching the inner face is the
+// creepage requirement; going past it is mechanical retention, and what retains the end is the
+// winding lying over it -- so the overlap is the turn pitch the end is captured under, which for a
+// terminal lead is its own outer diameter. The number of capturing turns is rule data
+// (src/data/dfm_rules.json "leadSleeve"), and missing rule data throws: the flat 2 mm this replaced
+// was in no standard, and a length nobody can source is not a default to fall back on.
+double InsulationCoordinator::lead_sleeve_overlap_into_winding(Wire& wire) {
+    static const json rules = [] {
+        auto fs = cmrc::dfmData::get_filesystem();
+        auto data = fs.open("src/data/dfm_rules.json");
+        return json::parse(std::string(data.begin(), data.end()));
+    }();
+    auto number = [](const json& block, const std::string& key) {
+        if (!block.contains(key)) {
+            throw std::runtime_error("src/data/dfm_rules.json leadSleeve has no number '" + key + "'");
+        }
+        return block.at(key).get<double>();
+    };
+    if (!rules.contains("leadSleeve")) {
+        throw std::runtime_error("src/data/dfm_rules.json has no leadSleeve block; the sleeve's overlap "
+                                 "into the winding is rule data, not a constant (ABT #1269)");
+    }
+    const auto& block = rules.at("leadSleeve");
+    const double turns = number(block, "captureTurnsIntoWinding");
+    if (turns <= 0) {
+        throw std::runtime_error("src/data/dfm_rules.json leadSleeve: captureTurnsIntoWinding must be "
+                                 "positive; a sleeve end no turn lies over is not held down");
+    }
+    // The turns ride at the lead's own outer diameter, so that is the pitch its end is captured under.
+    return turns * lead_outer_diameter(wire);
+}
+
+std::optional<ConnectionSleeve> InsulationCoordinator::calculate_lead_sleeve_requirements(Inputs& inputs, Wire wire, bool crossesMargin) {
+    if (!inputs.get_design_requirements().get_insulation()) {
+        return std::nullopt;
+    }
+    auto insulationType = inputs.get_insulation_type();
+    size_t requiredCoverage = 0;
+    switch (insulationType) {
+        case IsolationClass::FUNCTIONAL:
+            return std::nullopt;   // not a safety boundary
+        case IsolationClass::BASIC:
+        case IsolationClass::SUPPLEMENTARY:
+            requiredCoverage = 2;   // calculate_coil_section_interface_layers drops the margin at 2
+            break;
+        case IsolationClass::DOUBLE:
+        case IsolationClass::REINFORCED:
+            requiredCoverage = 3;   // ... and at 3 for double / reinforced
+            break;
+    }
+    if (!crossesMargin) {
+        return std::nullopt;
+    }
+
+    double withstandVoltage = calculate_withstand_voltage(inputs);
+    bool canFullyInsulatedWireBeUsed = can_fully_insulated_wire_be_used(inputs);
+    if (canFullyInsulatedWireBeUsed) {
+        auto coverage = times_withstand_voltage_is_covered_by_wire(wire, withstandVoltage, canFullyInsulatedWireBeUsed);
+        if (coverage && coverage.value() >= requiredCoverage) {
+            return std::nullopt;   // the wire's own insulation is the lead's insulation (TIW practice)
+        }
+    }
+
+    // ABT #1269: the standards' distance through insulation IS the wall requirement (0.4 mm for
+    // supplementary/reinforced above the ES2 limit, none for basic); the withstand check below rejects
+    // a wall too thin to hold the voltage whatever the standard asks for thickness.
+    double requiredWall = calculate_distance_through_insulation(inputs);
+    double requiredTemperature = lead_sleeve_required_temperature(inputs, wire);
+
+    if (insulationMaterialDatabase.empty()) {
+        load_insulation_materials();
+    }
+
+    std::optional<std::string> chosenMaterial;
+    double chosenWall = DBL_MAX;
+    double chosenTemperature = DBL_MAX;
+    size_t sleeveMaterialsSeen = 0;
+    for (auto& [materialName, material] : insulationMaterialDatabase) {
+        if (!material.get_form() || material.get_form().value() != Form::SLEEVE) {
+            continue;
+        }
+        ++sleeveMaterialsSeen;
+        if (!material.get_temperature_class()) {
+            continue;   // an unrated sleeve cannot be shown to meet the temperature
+        }
+        double materialTemperature = temperature_class_to_celsius(material.get_temperature_class().value());
+        if (materialTemperature < requiredTemperature) {
+            continue;
+        }
+        for (auto& dielectricStrengthPoint : material.get_dielectric_strength()) {
+            if (!dielectricStrengthPoint.get_thickness()) {
+                continue;   // a strength with no wall says nothing about any wall on offer
+            }
+            double wall = dielectricStrengthPoint.get_thickness().value();
+            if (wall < requiredWall - 1e-12) {
+                continue;
+            }
+            if (dielectricStrengthPoint.get_value() * wall * double(leadSleeveNumberLayers) < withstandVoltage) {
+                continue;
+            }
+            if (wall < chosenWall - 1e-12 ||
+                (std::abs(wall - chosenWall) <= 1e-12 && materialTemperature < chosenTemperature)) {
+                chosenWall = wall;
+                chosenTemperature = materialTemperature;
+                chosenMaterial = materialName;
+            }
+        }
+    }
+
+    if (!chosenMaterial) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "The lead of wire" + (wire.get_name() ? " '" + wire.get_name().value() + "'" : std::string()) +
+            " crosses a margin and its own insulation does not cover the requirement, so it needs a sleeve with a wall of at least " +
+            std::to_string(requiredWall * 1e3) + " mm withstanding " + std::to_string(withstandVoltage) + " V, rated for at least " +
+            std::to_string(requiredTemperature) + " C; no insulation material with form 'sleeve' in the database offers one (" +
+            std::to_string(sleeveMaterialsSeen) + " sleeve materials checked)");
+    }
+
+    ConnectionSleeve sleeve;
+    sleeve.set_material(InsulationMaterialDataOrNameUnion(chosenMaterial.value()));
+    sleeve.set_wall_thickness(chosenWall);
+    sleeve.set_inner_diameter(lead_outer_diameter(wire) + leadSleeveInnerDiameterClearance);
+    sleeve.set_overlap_into_winding(lead_sleeve_overlap_into_winding(wire));
+    sleeve.set_number_layers(leadSleeveNumberLayers);
+    return sleeve;
 }
 
 double InsulationCoordinator::calculate_withstand_voltage(Inputs& inputs) {
@@ -682,7 +849,9 @@ double InsulationIEC60664Model::get_clearance_over_30kHz(double ratedVoltagePeak
 }
 
 double InsulationIEC60664Model::calculate_distance_through_insulation(Inputs& inputs) {
-    double maximumVoltageRms = inputs.get_maximum_voltage_rms();
+    // ABT #1269: the voltage across the barrier, mains included; the field-strength rule below is
+    // only as right as the voltage it is handed.
+    double maximumVoltageRms = working_voltage_across_barrier(inputs);
     double maximumFrequency = inputs.get_maximum_frequency();
     double distanceThroughInsulation = 0;
     if (maximumFrequency > iec60664Part1MaximumFrequency) {
@@ -1096,7 +1265,15 @@ double InsulationIEC62368Model::calculate_withstand_voltage(Inputs& inputs) {
 double InsulationIEC62368Model::calculate_distance_through_insulation(Inputs& inputs) {
     double maximumFrequency = inputs.get_maximum_frequency();
     double es2VoltageLimit = get_es2_voltage_limit(maximumFrequency);
-    double workingVoltageRms = get_working_voltage_rms(inputs);
+    // ABT #1269: THE VOLTAGE THIS INSULATION SEPARATES, not the winding's own excitation.
+    // get_working_voltage_rms returns the design's maximum winding voltage; for a MAINS-SUPPLIED
+    // part the safeguard being sized stands between the mains and the secondary, so the voltage
+    // across it is at least the mains supply. Comparing only the winding voltage let a mains
+    // flyback (250 V mains, 123.1 V rms windings at 85 kHz, ES2 limit 126.5 V there) read as an
+    // ES2 source and return NO distance through insulation for REINFORCED insulation, where
+    // 5.4.4.2 asks for 0,4 mm. The ES2 gate itself is right -- below ES2 there is no hazardous
+    // source to separate -- it was being handed the wrong voltage.
+    double workingVoltageRms = working_voltage_across_barrier(inputs);
     auto insulationType = inputs.get_insulation_type();
 
     if (workingVoltageRms <= es2VoltageLimit) {
@@ -1391,7 +1568,7 @@ double InsulationIEC61558Model::calculate_distance_through_insulation(Inputs& in
     if (mainSupplyVoltage > iec61558MaximumSupplyVoltage) {
         throw std::invalid_argument("Too much supply voltage for IEC 61558-1: " + std::to_string(mainSupplyVoltage));
     }
-    double workingVoltage = get_working_voltage_rms(inputs);
+    double workingVoltage = working_voltage_across_barrier(inputs);   // ABT #1269: mains included
     auto insulationType = inputs.get_insulation_type();
 
     if (insulationType == IsolationClass::FUNCTIONAL) {
@@ -1744,7 +1921,14 @@ double InsulationIEC60335Model::calculate_creepage_distance(Inputs& inputs, bool
     return roundFloat(creepageDistance, 5);
 }
 
-bool InsulationCoordinator::needs_margin(std::vector<WireSolidInsulationRequirements> combinationSolidInsulationRequirementsForWires, std::vector<size_t> pattern, size_t repetitions) {
+IsolationClass InsulationCoordinator::insulation_class_for_margin(Inputs& inputs) {
+    if (!inputs.get_design_requirements().get_insulation()) {
+        return IsolationClass::FUNCTIONAL;
+    }
+    return inputs.get_insulation_type();
+}
+
+bool InsulationCoordinator::needs_margin(std::vector<WireSolidInsulationRequirements> combinationSolidInsulationRequirementsForWires, std::vector<size_t> pattern, size_t repetitions, IsolationClass insulationClass) {
     for(size_t index = 0; index < pattern.size(); ++index) {
         size_t leftIndex = pattern[index];
         size_t rightIndex;
@@ -1774,9 +1958,30 @@ bool InsulationCoordinator::needs_margin(std::vector<WireSolidInsulationRequirem
             numberLayers += combinationSolidInsulationRequirementsForWires[rightIndex].get_minimum_number_layers().value();
         }
 
-        if (numberLayers < 3 && numberGrades < 4) {
-            return true;
+        if (numberLayers >= 3 || numberGrades >= 4) {
+            // Reinforced-level solid insulation between these two windings.
+            continue;
         }
+
+        // A wire whose requirement carries a breakdown voltage was asked to hold the withstand
+        // voltage in its own insulation (get_requirements_for_basic / _for_reinforced; the
+        // functional requirement asks for none). get_solid_insulation_requirements_for_wires
+        // builds, for BASIC and SUPPLEMENTARY insulation, one combination per isolation side in
+        // which only the OTHER side's wires carry it: that one rated wire IS the insulation,
+        // which is the point of those combinations. Judged only by the reinforced rule above,
+        // they always "needed" margin tape as well, so on a small bobbin (EQ 26/19/7 at 400 V
+        // mains, basic: 2.8 mm of margin at each end of a 5.65 mm window) every combination
+        // lost its whole section height and the coil adviser found no coil at all.
+        const bool leftRated = combinationSolidInsulationRequirementsForWires[leftIndex].get_minimum_breakdown_voltage() > 0;
+        const bool rightRated = combinationSolidInsulationRequirementsForWires[rightIndex].get_minimum_breakdown_voltage() > 0;
+        if ((insulationClass == IsolationClass::BASIC || insulationClass == IsolationClass::SUPPLEMENTARY) && (leftRated || rightRated)) {
+            continue;
+        }
+        // DOUBLE is basic plus supplementary: two rated wires, one of each part.
+        if (insulationClass == IsolationClass::DOUBLE && leftRated && rightRated) {
+            continue;
+        }
+        return true;
     }
     return false;
 }
@@ -1809,10 +2014,10 @@ WireSolidInsulationRequirements get_requirements_for_reinforced(double withstand
     return wireSolidInsulationRequirements;
 }
 
-std::vector<std::vector<WireSolidInsulationRequirements>> remove_combination_that_need_margin(std::vector<std::vector<WireSolidInsulationRequirements>> combinationsSolidInsulationRequirementsForWires, std::vector<size_t> pattern, size_t repetitions) {
+std::vector<std::vector<WireSolidInsulationRequirements>> remove_combination_that_need_margin(std::vector<std::vector<WireSolidInsulationRequirements>> combinationsSolidInsulationRequirementsForWires, std::vector<size_t> pattern, size_t repetitions, IsolationClass insulationClass) {
     std::vector<std::vector<WireSolidInsulationRequirements>> combinationsSolidInsulationRequirementsForWiresWithoutMargin;
     for (auto combinationSolidInsulationRequirementsForWires : combinationsSolidInsulationRequirementsForWires) {
-        bool needsMargin = InsulationCoordinator::needs_margin(combinationSolidInsulationRequirementsForWires, pattern, repetitions);
+        bool needsMargin = InsulationCoordinator::needs_margin(combinationSolidInsulationRequirementsForWires, pattern, repetitions, insulationClass);
         if (!needsMargin) {
             combinationsSolidInsulationRequirementsForWiresWithoutMargin.push_back(combinationSolidInsulationRequirementsForWires);
         }
@@ -1915,7 +2120,9 @@ std::vector<std::vector<WireSolidInsulationRequirements>> InsulationCoordinator:
         } 
 
         if (!allowMarginTape) {
-            combinationsSolidInsulationRequirementsForWires = remove_combination_that_need_margin(combinationsSolidInsulationRequirementsForWires, pattern, repetitions);
+            // insulationType here is the class the combinations were generated for (BASIC and
+            // SUPPLEMENTARY were raised to DOUBLE above when margin tape is not allowed).
+            combinationsSolidInsulationRequirementsForWires = remove_combination_that_need_margin(combinationsSolidInsulationRequirementsForWires, pattern, repetitions, insulationType);
         }
     }
 

@@ -152,31 +152,62 @@ std::pair<bool, double> MagneticFilterSaturation::evaluate_magnetic(Magnetic* ma
             magneticFluxDensityPeak = magneticFluxDensity.get_processed()->get_peak().value();
         }
 
+        // Common-mode chokes are classified as inductors (all windings on one
+        // isolation side) but their line current is DIFFERENTIAL: the flux of
+        // the line/neutral windings cancels in the core, so the raw line
+        // current does NOT saturate it. The only flux driver is the CM noise
+        // current, and that is NOT DERIVABLE from the design inputs: a
+        // symmetric operating point stores the line/ripple current identically
+        // on every winding (DM, cancels), and MAS has no CM-noise-current
+        // requirement to gate against. get_common_mode_choke_magnetizing_current
+        // models the ripple swing AS the CM current — an over-estimate by
+        // construction (the ripple returns on the other conductor and cancels
+        // too), which put multi-tesla fictional B on every EMI toroid and
+        // zeroed the default web CMC design (ABT #551/#236 archaeology: the
+        // gate rejected all 25 impedance survivors, so the test never passed
+        // with its committed fixture). BOTH saturation gates therefore skip
+        // tagged CMCs: saturation for a CMC is only checkable against an
+        // explicit CM-current spec, which does not exist in MAS today.
+        //
+        // CMC-ONLY, deliberately: a differential-mode choke ALSO has 2-4
+        // matching-current windings (can_be_common_mode_choke is true for it
+        // too), but a DMC's flux does NOT cancel — it carries the full line
+        // current additively and genuinely saturates — so a DMC must KEEP both
+        // gates. Distinguish by the CMC tag (topology or the web wizard's
+        // subApplication), then confirm current symmetry with
+        // can_be_common_mode_choke so a mis-tagged asymmetric design still
+        // gets checked.
+        // Shared with the MagneticAdviser's final gate (MagneticFilterInternal.h).
+        bool isCommonModeChoke = is_tagged_common_mode_choke(*inputs, operatingPoint);
+
         // Saturation scoring: dimensionless ratio of operating peak flux density to
         // material saturation. Smaller is better (more headroom). The previous
         // implementation used fabs(Bsat - Bpeak), which under min-max+invert
         // *rewards* candidates that operate close to saturation - the opposite of
         // engineering intent. Ratio Bpeak/Bsat preserves the "more headroom = higher
-        // normalized score" semantics correctly.
-        double bRatio = (magneticFluxDensitySaturation > 0)
-            ? (magneticFluxDensityPeak / magneticFluxDensitySaturation)
-            : 1.0;
-        scoring += bRatio;
-
-        // Multiplicative derating: reject if Bpeak·margin > Bsat (i.e. the
-        // core would saturate at `margin`× the actual operating excursion).
-        // margin == 1.0 (default) reproduces the historical bare comparison.
-        // Set via Settings::set_core_adviser_saturation_margin() — Maniktala
-        // Ch.5 recommends ≥1.2 for ferrite designs to leave headroom for
-        // tolerance, temperature, and DC-bias swing.
+        // normalized score" semantics correctly. For a CMC the B here is the
+        // fictional one described above, so neither score nor gate uses it.
         const double margin = Settings::GetInstance().get_core_adviser_saturation_margin();
-        bool isSaturated = magneticFluxDensityPeak * margin > magneticFluxDensitySaturation;
+        if (!isCommonModeChoke) {
+            double bRatio = (magneticFluxDensitySaturation > 0)
+                ? (magneticFluxDensityPeak / magneticFluxDensitySaturation)
+                : 1.0;
+            scoring += bRatio;
 
-        if (isSaturated) {
-            return {false, 0.0};
+            // Multiplicative derating: reject if Bpeak·margin > Bsat (i.e. the
+            // core would saturate at `margin`× the actual operating excursion).
+            // margin == 1.0 (default) reproduces the historical bare comparison.
+            // Set via Settings::set_core_adviser_saturation_margin() — Maniktala
+            // Ch.5 recommends ≥1.2 for ferrite designs to leave headroom for
+            // tolerance, temperature, and DC-bias swing.
+            bool isSaturated = magneticFluxDensityPeak * margin > magneticFluxDensitySaturation;
+
+            if (isSaturated) {
+                return {false, 0.0};
+            }
         }
 
-        if (!isTransformer) {
+        if (!isTransformer && !isCommonModeChoke) {
             // Authoritative saturation-current gate for energy-storing
             // inductors: require the gap-aware saturation current to clear the
             // peak current by the margin. The B-based check above evaluates B at

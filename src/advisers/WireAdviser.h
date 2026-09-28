@@ -3,6 +3,7 @@
 #include "constructive_models/Wire.h"
 #include "support/Utils.h"
 #include "support/LibraryContext.h"
+#include "support/Settings.h"
 #include <MAS.hpp>
 
 using namespace MAS;
@@ -114,6 +115,8 @@ class WireAdviser {
             auto defaults = Defaults();
             _maximumEffectiveCurrentDensity = defaults.maximumEffectiveCurrentDensity;
             _maximumNumberParallels = defaults.maximumNumberParallels;
+            // ABT #1110: the preferred standard from Settings; empty keeps every standard.
+            _commonWireStandard = Settings::GetInstance().get_preferred_wire_standard();
         }
         virtual ~WireAdviser() = default;
 
@@ -212,6 +215,14 @@ class WireAdviser {
         std::vector<std::pair<Winding, double>> filter_by_proximity_factor(std::vector<std::pair<Winding, double>>* unfilteredCoils,
                                                                                                  SignalDescriptor current,
                                                                                                  double temperature);
+
+        /**
+         * @brief ABT #1177 (WP8, DFM rule R1): penalise candidates landing on an odd layer count.
+         *
+         * Only applied when Settings::get_wire_adviser_penalize_odd_layer_count() is true
+         * (default off), so the adviser ranking is unchanged unless the caller opts in.
+         */
+        std::vector<std::pair<Winding, double>> filter_by_layer_parity(std::vector<std::pair<Winding, double>>* unfilteredCoils, Section section);
 
         std::vector<std::pair<Winding, double>> filter_by_solid_insulation_requirements(std::vector<std::pair<Winding, double>>* unfilteredCoils,
                                                                                                  WireSolidInsulationRequirements wireSolidInsulationRequirements);

@@ -31,6 +31,7 @@ namespace OpenMagnetics {
 
     Settings::Settings() {
         _inputsNumberPointsSampledWaveforms = constants.numberPointsSampledWaveforms;
+        _inputsMaximumNumberPointsSampledImportedWaveforms = constants.maximumNumberPointsSampledImportedWaveforms;
         _painterMirroringDimension = defaults.magneticFieldMirroringDimension;
         _magneticFieldMirroringDimension = defaults.magneticFieldMirroringDimension;
         _harmonicAmplitudeThreshold = defaults.harmonicAmplitudeThreshold;
@@ -79,6 +80,7 @@ namespace OpenMagnetics {
         _inputsTrimHarmonics = true;
 
         _inputsNumberPointsSampledWaveforms = Constants().numberPointsSampledWaveforms;
+        _inputsMaximumNumberPointsSampledImportedWaveforms = Constants().maximumNumberPointsSampledImportedWaveforms;
 
         _magnetizingInductanceIncludeAirInductance = false;
 
@@ -92,12 +94,23 @@ namespace OpenMagnetics {
         _coilEqualizeMargins = true;
         _coilOnlyOneTurnPerLayerInContiguousRectangular = false;
         _coilUseRealWindingGeometry = false;
+        _coilAllowCoatingSquish = false;
+        _coilAllowHorizontalOverflow = false;
+        _coilQuickBobbinGeneratePins = false;
+        _coilConnectLeadsToPins = false;
+        _coilQuickBobbinPinsOrientation = OrientationEnum::VERTICAL;
+        _toroidMounting = OrientationEnum::VERTICAL;
         _coilMaximumLayersPlanar = 32;
 
         _useOnlyCoresInStock = true;
         _usePowderCores = true;
         _corePerColumnWindingWindows = false;
         _coilAdviserAllowLateralPlacement = false;
+        _coilAdviserSizeMagneticShunts = false;
+        _coilAdviserMagneticShuntMaterial = "";
+        _coilAdviserMagneticShuntGapToInnerColumn = std::nullopt;
+        _coilAdviserMagneticShuntGapToOuterColumn = std::nullopt;
+        _wireAdviserPenalizeOddLayerCount = false;
         _gappingStrategy = GappingOptimizationStrategy::SIMPLE;
         _nanocrystallineStackingFactor = 0.80;
     _effectiveParameterStandard = EffectiveParameterStandard::IEC_60205;
@@ -126,10 +139,16 @@ namespace OpenMagnetics {
         _painterColorPFA = "0xedbe1c";
         _painterColorSilk = "0xe7e7e8";
         _painterColorSpacer = "0x3b3b3b";
+        _painterColorShunt = "0x6a5acd";
         _painterColorLines = "0x010000";
         _painterColorText = "0x000000";
         _painterColorCurrentDensity = "0x0892D0";
         _painterCciCoordinatesPath = std::nullopt;  // resolved at use time, see get_painter_cci_coordinates_path
+        // ABT #1172: these MUST be reset. They are consumer-declared geometry, and leaking one
+        // test's bend radius into the next silently moves every pin run that follows — the same
+        // leak this reset() was extended for before (adviser settings, ABT #842).
+        _coilLeadBendRadiusFactor = std::nullopt;
+        _coilLeadMinimumBendRadius = std::nullopt;
         _painterColorMagneticFieldMinimum = "0x2b35f5";
         _painterColorMagneticFieldMaximum = "0xe84922";
         _painterMagneticFieldStrengthModel = std::nullopt;
@@ -137,6 +156,7 @@ namespace OpenMagnetics {
         _magneticFieldNumberPointsX = 25;
         _magneticFieldNumberPointsY = 50;
         _magneticFieldMirroringDimension = Defaults().magneticFieldMirroringDimension;
+        _magneticFieldMirroringCompleteCells = false;
         _magneticFieldIncludeFringing = true;
 
         _coilMesherInsideTurnsFactor = 1.05;
@@ -160,15 +180,19 @@ namespace OpenMagnetics {
         _coreAdviserSaturationMargin = 1.2;
         _coreAdviserSaturationDeratingTemperature = 100.0;
 
+        _thermalNetworkStrictGeometry = true;
+
         _wireAdviserIncludePlanar = false;
         _wireAdviserIncludeFoil = false;
         _wireAdviserIncludeRectangular = true;
         _wireAdviserIncludeLitz = true;
         _wireAdviserIncludeRound = true;
         _wireAdviserAllowRectangularInToroidalCores = false;
+        _preferredWireStandard = std::nullopt;
 
         _harmonicAmplitudeThresholdQuickMode = true;
         _harmonicAmplitudeThreshold = Defaults().harmonicAmplitudeThreshold;
+        _magneticFieldTurnSumsCacheBytes = 64 * 1024 * 1024;
 
         _verbose = false;
 
@@ -254,6 +278,16 @@ namespace OpenMagnetics {
         _inputsNumberPointsSampledWaveforms = value;
     }
 
+    size_t Settings::get_inputs_maximum_number_points_sampled_imported_waveforms() const {
+        return _inputsMaximumNumberPointsSampledImportedWaveforms;
+    }
+    void Settings::set_inputs_maximum_number_points_sampled_imported_waveforms(size_t value) {
+        if (value < 2 || (value & (value - 1)) != 0) {
+            throw std::invalid_argument("The maximum number of samples per period of an imported waveform must be a power of 2 (the FFT needs one), got " + std::to_string(value));
+        }
+        _inputsMaximumNumberPointsSampledImportedWaveforms = value;
+    }
+
     bool Settings::get_magnetizing_inductance_include_air_inductance() const {
         return _magnetizingInductanceIncludeAirInductance;
     }
@@ -331,6 +365,46 @@ namespace OpenMagnetics {
         _coilUseRealWindingGeometry = value;
     }
 
+    bool Settings::get_coil_allow_coating_squish() const {
+        return _coilAllowCoatingSquish;
+    }
+    void Settings::set_coil_allow_coating_squish(bool value) {
+        _coilAllowCoatingSquish = value;
+    }
+
+    bool Settings::get_coil_allow_horizontal_overflow() const {
+        return _coilAllowHorizontalOverflow;
+    }
+    void Settings::set_coil_allow_horizontal_overflow(bool value) {
+        _coilAllowHorizontalOverflow = value;
+    }
+
+    bool Settings::get_coil_connect_leads_to_pins() const {
+        return _coilConnectLeadsToPins;
+    }
+    void Settings::set_coil_connect_leads_to_pins(bool value) {
+        _coilConnectLeadsToPins = value;
+    }
+
+    bool Settings::get_coil_quick_bobbin_generate_pins() const {
+        return _coilQuickBobbinGeneratePins;
+    }
+    void Settings::set_coil_quick_bobbin_generate_pins(bool value) {
+        _coilQuickBobbinGeneratePins = value;
+    }
+    OrientationEnum Settings::get_coil_quick_bobbin_pins_orientation() const {
+        return _coilQuickBobbinPinsOrientation;
+    }
+    void Settings::set_coil_quick_bobbin_pins_orientation(OrientationEnum value) {
+        _coilQuickBobbinPinsOrientation = value;
+    }
+    OrientationEnum Settings::get_toroid_mounting() const {
+        return _toroidMounting;
+    }
+    void Settings::set_toroid_mounting(OrientationEnum value) {
+        _toroidMounting = value;
+    }
+
     size_t Settings::get_coil_maximum_layers_planar() const {
         return _coilMaximumLayersPlanar;
     }
@@ -364,6 +438,38 @@ namespace OpenMagnetics {
     }
     void Settings::set_coil_adviser_allow_lateral_placement(bool value) {
         _coilAdviserAllowLateralPlacement = value;
+    }
+
+    bool Settings::get_coil_adviser_size_magnetic_shunts() const {
+        return _coilAdviserSizeMagneticShunts;
+    }
+    void Settings::set_coil_adviser_size_magnetic_shunts(bool value) {
+        _coilAdviserSizeMagneticShunts = value;
+    }
+    std::string Settings::get_coil_adviser_magnetic_shunt_material() const {
+        return _coilAdviserMagneticShuntMaterial;
+    }
+    void Settings::set_coil_adviser_magnetic_shunt_material(std::string value) {
+        _coilAdviserMagneticShuntMaterial = value;
+    }
+    std::optional<double> Settings::get_coil_adviser_magnetic_shunt_gap_to_inner_column() const {
+        return _coilAdviserMagneticShuntGapToInnerColumn;
+    }
+    void Settings::set_coil_adviser_magnetic_shunt_gap_to_inner_column(std::optional<double> value) {
+        _coilAdviserMagneticShuntGapToInnerColumn = value;
+    }
+    std::optional<double> Settings::get_coil_adviser_magnetic_shunt_gap_to_outer_column() const {
+        return _coilAdviserMagneticShuntGapToOuterColumn;
+    }
+    void Settings::set_coil_adviser_magnetic_shunt_gap_to_outer_column(std::optional<double> value) {
+        _coilAdviserMagneticShuntGapToOuterColumn = value;
+    }
+
+    bool Settings::get_wire_adviser_penalize_odd_layer_count() const {
+        return _wireAdviserPenalizeOddLayerCount;
+    }
+    void Settings::set_wire_adviser_penalize_odd_layer_count(bool value) {
+        _wireAdviserPenalizeOddLayerCount = value;
     }
 
     EffectiveParameterStandard Settings::get_effective_parameter_standard() const {
@@ -499,6 +605,13 @@ namespace OpenMagnetics {
         _painterColorSpacer = value;
     }
 
+    std::string Settings::get_painter_color_shunt() const {
+        return _painterColorShunt;
+    }
+    void Settings::set_painter_color_shunt(std::string value) {
+        _painterColorShunt = value;
+    }
+
     std::string Settings::get_painter_color_lines() const {
         return _painterColorLines;
     }
@@ -513,7 +626,7 @@ namespace OpenMagnetics {
         _painterColorText = value;
     }
 
-    std::string Settings::get_painter_cci_coordinates_path() const {
+    std::optional<std::string> Settings::try_get_painter_cci_coordinates_path() const {
         // Resolution order (first hit wins). Note the painter itself no longer
         // reads coordinate FILES for N <= 1000 strands — those are embedded at
         // build time (CciCoordinatesData) — so this path only matters to
@@ -557,13 +670,93 @@ namespace OpenMagnetics {
         if (std::filesystem::is_directory(cwdCandidate)) {
             return withTrailingSeparator(std::filesystem::absolute(cwdCandidate).string());
         }
-        // 5) Loudly refuse to guess.
-        throw std::runtime_error(
-            "CCI coordinates directory not found. Set it explicitly with "
-            "set_painter_cci_coordinates_path(), export MKF_CCI_COORDINATES_PATH, or run "
-            "from a directory containing cci_coords/coordinates/. (Strand counts up to "
-            "1000 use build-time embedded coordinates and do not need this path.)");
+        // 5) Nothing resolved. The caller decides whether that is fatal:
+        //    get_painter_cci_coordinates_path() throws, this one reports absence.
+        return std::nullopt;
     }
+
+    std::string Settings::get_painter_cci_coordinates_path() const {
+        auto path = try_get_painter_cci_coordinates_path();
+        if (!path) {
+            // Loudly refuse to guess — for consumers that genuinely need the catalog.
+            throw std::runtime_error(
+                "CCI coordinates directory not found. Set it explicitly with "
+                "set_painter_cci_coordinates_path(), export MKF_CCI_COORDINATES_PATH, or run "
+                "from a directory containing cci_coords/coordinates/. (Strand counts up to "
+                "1000 use build-time embedded coordinates and do not need this path.)");
+        }
+        return path.value();
+    }
+    std::optional<double> Settings::get_coil_lead_bend_radius_factor() const {
+        return _coilLeadBendRadiusFactor;
+    }
+    void Settings::set_coil_lead_bend_radius_factor(std::optional<double> value) {
+        if (value && !(value.value() >= 1.0)) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "The lead bend radius factor multiplies the wire's own coated radius, so it cannot be "
+                "below 1: a centreline bend tighter than the wire radius is not a bend a wire can take "
+                "(and OCC cannot sweep it -- it degenerates to a horn torus). Got " +
+                std::to_string(value.value()));
+        }
+        _coilLeadBendRadiusFactor = value;
+    }
+
+    std::optional<double> Settings::get_coil_lead_minimum_bend_radius() const {
+        return _coilLeadMinimumBendRadius;
+    }
+    void Settings::set_coil_lead_minimum_bend_radius(std::optional<double> value) {
+        if (value && !(value.value() > 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "The minimum lead bend radius is a length in metres and must be positive, got " +
+                std::to_string(value.value()));
+        }
+        _coilLeadMinimumBendRadius = value;
+    }
+
+    double Settings::resolve_lead_bend_radius(double coatedRadius) {
+        if (!(coatedRadius > 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA,
+                "A lead needs a positive coated radius to plan its bends, got " + std::to_string(coatedRadius));
+        }
+        auto& settings = Settings::GetInstance();
+        const auto factor = settings.get_coil_lead_bend_radius_factor();
+        const auto minimum = settings.get_coil_lead_minimum_bend_radius();
+        if (!factor && !minimum) {
+            // Nothing declared: plan SHARP corners, which is what MKF has always done. No invented
+            // default -- the route records this radius, so a consumer drawing a rounded corner sees
+            // that MKF did not plan for one and can refuse (ABT #1172).
+            return coatedRadius;
+        }
+        double radius = factor ? factor.value() * coatedRadius : coatedRadius;
+        if (minimum) {
+            radius = std::max(radius, minimum.value());
+        }
+        return radius;
+    }
+
+    double Settings::lead_leg_clearance(double sweptRadius, double bendRadius, double turnAngle) {
+        // ABT #1172. Two legs meet at an obstacle edge with the edge on the bisector. For a
+        // centreline bend of radius R with each leg a distance d from its face, the arc centre
+        // sits (R - d) / sin(theta/2) beyond the edge and the arc's closest approach to it is
+        //     R - (R - d) / sin(theta/2)
+        // so keeping the copper clear by its own radius requires
+        //     d >= R - (R - r) sin(theta/2)
+        // At theta = 90 degrees this is d >= R - (R - r)/sqrt(2), and at R = r it collapses to
+        // d >= r, the sharp-corner geometry. theta is the angle BETWEEN the legs. r is the radius
+        // the corner SWEEPS (the sleeve's when sleeved), R the lead's planned bend (ABT #1296,
+        // Coil::lead_bend_radius).
+        if (!(turnAngle > 0) || !(turnAngle < std::numbers::pi)) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "A lead corner turns through an angle strictly between 0 and pi, got " + std::to_string(turnAngle));
+        }
+        if (!(sweptRadius > 0) || !(bendRadius >= sweptRadius)) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "A lead corner's centreline bend radius cannot be below the radius it sweeps: bend " +
+                std::to_string(bendRadius) + " m, swept " + std::to_string(sweptRadius) + " m");
+        }
+        return bendRadius - (bendRadius - sweptRadius) * sin(turnAngle / 2);
+    }
+
     void Settings::set_painter_cci_coordinates_path(std::string value) {
         _painterCciCoordinatesPath = value;
     }
@@ -673,6 +866,13 @@ namespace OpenMagnetics {
     }
     void Settings::set_magnetic_field_mirroring_dimension(int value) {
         _magneticFieldMirroringDimension = value;
+    }
+
+    bool Settings::get_magnetic_field_mirroring_complete_cells() const {
+        return _magneticFieldMirroringCompleteCells;
+    }
+    void Settings::set_magnetic_field_mirroring_complete_cells(bool value) {
+        _magneticFieldMirroringCompleteCells = value;
     }
 
     bool Settings::get_magnetic_field_include_fringing() const {
@@ -789,6 +989,13 @@ namespace OpenMagnetics {
         _coreAdviserSaturationDeratingTemperature = value;
     }
 
+    bool Settings::get_thermal_network_strict_geometry() const {
+        return _thermalNetworkStrictGeometry;
+    }
+    void Settings::set_thermal_network_strict_geometry(bool value) {
+        _thermalNetworkStrictGeometry = value;
+    }
+
     GappingOptimizationStrategy Settings::get_gapping_strategy() const {
         return _gappingStrategy;
     }
@@ -838,11 +1045,25 @@ namespace OpenMagnetics {
         _wireAdviserAllowRectangularInToroidalCores = value;
     }
 
+    std::optional<WireStandard> Settings::get_preferred_wire_standard() const {
+        return _preferredWireStandard;
+    }
+    void Settings::set_preferred_wire_standard(std::optional<WireStandard> value) {
+        _preferredWireStandard = value;
+    }
+
     bool Settings::get_harmonic_amplitude_threshold_quick_mode() const {
         return _harmonicAmplitudeThresholdQuickMode;
     }
     void Settings::set_harmonic_amplitude_threshold_quick_mode(bool value) {
         _harmonicAmplitudeThresholdQuickMode = value;
+    }
+
+    size_t Settings::get_magnetic_field_turn_sums_cache_bytes() const {
+        return _magneticFieldTurnSumsCacheBytes;
+    }
+    void Settings::set_magnetic_field_turn_sums_cache_bytes(size_t value) {
+        _magneticFieldTurnSumsCacheBytes = value;
     }
 
     double Settings::get_harmonic_amplitude_threshold() const {

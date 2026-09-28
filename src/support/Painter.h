@@ -22,6 +22,23 @@ enum class ColorPalette {
     GRAYSCALE       // Black to white
 };
 
+// Which plane a whole-magnetic drawing projects (ABT #617, Alf 2026-08-10):
+//   XY - the classic winding-window cross-section (radial x, axial y), symmetric half.
+//   YZ - the CONNECTION-FACE view (depth z horizontal, axial y vertical), drawn WITHOUT
+//        symmetry: both +-z faces are painted (they genuinely differ - the dragback
+//        descents displace one face's crossings), and every dragback lane is drawn as a
+//        vertical copper run at its ride-displaced depth, mirroring the 3D realization.
+//   XZ - the TOP-DOWN view, looking along the column axis (ABT #685). The only projection that
+//        shows the winding as it is laid: rings around the column, each return occupying a lane
+//        through them, and every ring outside a lane BULGING over it. XY cannot show a lane (out
+//        of plane) and YZ flattens the rings, so a bump reads there as a depth offset instead of
+//        as the radial displacement it is. Drawn from Coil::get_connection_layout().
+enum class PainterProjection {
+    XY,
+    YZ,
+    XZ,
+};
+
 enum class ElectricFieldVisualizationModel {
     LEGACY,       // Original convex-hull area + band-proportion approach
     SDF_PHYSICS   // SDF Voronoi decomposition + bipolar/plate energy density
@@ -391,6 +408,9 @@ class Painter : public PainterInterface {
     }
     void paint_two_piece_set_core(Core core);
     void paint_toroidal_core(Core core);
+    // Drum-family + molded single-solid cross-sections (ABT #366/#362/#357): these have no
+    // mirrored halves, so the two-piece-set reconstruction draws them wrong.
+    void paint_drum_family_core(Core core);
     void paint_two_piece_set_bobbin(Magnetic magnetic);
     void paint_two_piece_set_coil_sections(Magnetic magnetic);
     void paint_toroidal_coil_sections(Magnetic magnetic);
@@ -398,6 +418,9 @@ class Painter : public PainterInterface {
     void paint_toroidal_coil_layers(Magnetic magnetic);
     void paint_two_piece_set_coil_turns(Magnetic magnetic, bool skipMarginAndLayers = false);
     void paint_toroidal_coil_turns(Magnetic magnetic, bool skipMarginAndLayers = false);
+    // ABT #685: the straight inner<->outer face crossings, split so the core can be drawn
+    // between the below-core returns and the over-core runs.
+    void paint_toroidal_turn_connections(Magnetic magnetic, bool below);
     void paint_two_piece_set_margin(Magnetic magnetic);
     void paint_toroidal_margin(Magnetic magnetic);
 
@@ -406,6 +429,8 @@ class Painter : public PainterInterface {
     // canvas height / layout family / toroid radius from the core when present,
     // and from the coil's bobbin winding window otherwise.
     bool prepare_coil_canvas(Magnetic& magnetic);
+    void paint_yz_projection(Magnetic magnetic);
+    void paint_xz_projection(Magnetic magnetic);
     double get_toroidal_initial_radius(Magnetic& magnetic);
 
     void set_image_size(Wire wire);
@@ -432,6 +457,7 @@ class Painter : public PainterInterface {
         _root.style(".margin").set_attr("fill", std::regex_replace(std::string(settings.get_painter_color_margin()), std::regex("0x"), "#"));
         _root.style(".margin_translucent").set_attr("fill", std::regex_replace(std::string(settings.get_painter_color_margin()), std::regex("0x"), "#")).set_attr("opacity", 0.5);
         _root.style(".spacer").set_attr("fill", std::regex_replace(std::string(settings.get_painter_color_spacer()), std::regex("0x"), "#"));
+        _root.style(".shunt").set_attr("fill", std::regex_replace(std::string(settings.get_painter_color_shunt()), std::regex("0x"), "#"));
         _root.style(".copper").set_attr("fill", std::regex_replace(std::string(settings.get_painter_color_copper()), std::regex("0x"), "#"));
         _root.style(".copper_translucent").set_attr("fill", std::regex_replace(std::string(settings.get_painter_color_copper()), std::regex("0x"), "#")).set_attr("opacity", 0.5);
         _root.style(".insulation").set_attr("fill", std::regex_replace(std::string(settings.get_painter_color_insulation()), std::regex("0x"), "#"));
@@ -458,8 +484,16 @@ class Painter : public PainterInterface {
     void export_png() {
         throw std::runtime_error("Not implemented in basic painter");
     }
+    // Draw the whole magnetic (core + bobbin + turns + connections) in one call, in the
+    // requested projection. XY is the classic recipe; YZ is the connection-face view (no
+    // symmetry, dragbacks as displaced lanes) - see PainterProjection.
+    void paint_magnetic(Magnetic magnetic, PainterProjection projection = PainterProjection::XY);
     void paint_core(Magnetic magnetic);
     void paint_bobbin(Magnetic magnetic);
+    // Magnetic shunts (MAS-RFC 0015): each sheet's rectangle in the 2D section, at its coordinates
+    // (x radial, y axial) with its width and height. Only the +x half is drawn, like the rest of the
+    // section. No-op when the magnetic has no shunts.
+    void paint_shunts(Magnetic magnetic);
     void paint_coil_sections(Magnetic magnetic);
     void paint_coil_layers(Magnetic magnetic);
     // Debug overlay: draws the space reserved by terminal/connection leads (from

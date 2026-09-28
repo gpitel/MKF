@@ -4,9 +4,13 @@
 #include "physical_models/Resistivity.h"
 #include "Defaults.h"
 
+#include <Eigen/Dense>
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <mutex>
+#include <limits>
+#include <map>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -18,6 +22,224 @@
 #include "support/Logger.h"
 
 namespace OpenMagnetics {
+
+// ABT #1188: the edge-crowding factor C(a, b) derived above — the surface integral for a
+// perfectly conducting ellipse of semi-axes a (wide/2) and b (thin/2) in a transverse field,
+// normalised by the wide dimension so it enters the loss expression where the fitted constant
+// used to sit. Integrated numerically with fixed-count Simpson over a quarter period (the
+// integrand is even and pi-periodic), which is deterministic and needs no elliptic-integral
+// special functions; 400 intervals converges to better than 1e-9 for every aspect ratio the
+// wire catalogue contains, and the result is a pure function of the two dimensions.
+// ============================================================================
+// ABT #1188: the EXCLUSION FACTOR of a conductor's own cross-section.
+//
+// A conductor thicker than a skin depth excludes the field: the eddy currents it induces cancel
+// the incident field inside the metal and crowd the remainder onto the surface, concentrated at
+// the edges. The loss is then the surface-resistance integral over the contour,
+//     P = 1/2 (rho/delta) * CONTOUR-INTEGRAL H_s^2 dl
+// and normalising by the wide dimension gives a dimensionless factor C that depends ONLY on the
+// conductor's aspect ratio (verified scale-invariant to 1e-9).
+//
+// THE CONTOUR IS THE STADIUM, which is the cross-section real rectangular magnet wire has -- a
+// rectangle with semicircular ends, the rounded-edge geometry the MAS wire table records as
+// edgeRadius. It is NOT the confocal ellipse: the ellipse has a closed form and was used first
+// for that reason, but its radius of curvature at the tip is thin^2/(2*wide), i.e. ASPECT times
+// sharper than the stadium's fixed thin/2 cap, so it over-crowds the edges by a margin that grows
+// as fast as the aspect ratio. Measured against 2D FEM (OMFEM, stadium mesh, uniform transverse
+// field): the ellipse form reads 1.00 of FEM at 2:1 but 1.31 at 96:1, while the stadium below
+// reads 1.03 to 0.92 over the same range. A planar trace is ~96:1, so the ellipse is not usable
+// there and this is not a refinement.
+//
+// The stadium has no closed form, so the exterior problem is solved directly: Hess-Smith
+// constant-strength source panels for the 2D exterior Neumann problem (H = -grad phi,
+// laplacian phi = 0 outside, dphi/dn = 0 on a perfect flux excluder), with the influence of each
+// panel integrated EXACTLY in panel-local coordinates. Validated against the two cases whose
+// answer is known independently: a circle returns 2*pi to four decimals, and an ellipse mesh
+// returns the closed-form ellipse integral to 3e-5 relative.
+//
+// NO CONSTANT HERE IS FITTED TO ANYTHING. This replaces a hard-coded 8.0 that had been
+// calibrated against a single FEM run on a single 20 x 0.209 mm planar trace; FEM is used to
+// CHECK this factor, never to set it.
+// ============================================================================
+namespace {
+
+// Panels graded two ways, because getting only one right diverges at high aspect:
+//  - the CAPS carry all the crowding and need a fixed panel count regardless of aspect (uniform
+//    arclength sampling starves them: a 96:1 stadium is 98% straight face);
+//  - the FLATS must transition SMOOTHLY into the cap panel size, or adjacent panels differ by
+//    ~100x at the junction and collocation loses conditioning exactly where the field turns.
+std::vector<std::pair<double, double>> stadium_contour(double aspect, size_t capPanels, double growth) {
+    const double r = 0.5;                    // unit thin dimension; C is scale-invariant
+    const double flat = aspect - 1.0;        // wide = aspect, so each face is (wide - thin)
+    const double capPanel = std::numbers::pi * r / double(capPanels);
+    std::vector<double> edges{0.0};
+    if (flat > 0) {
+        const double half = flat / 2;
+        std::vector<double> sizes;
+        double s = capPanel, total = 0;
+        while (total < half && sizes.size() < 4000) {
+            sizes.push_back(s); total += s; s *= growth;
+        }
+        double cum = 0;
+        const double scale = half / total;
+        for (double size : sizes) { cum += size * scale; edges.push_back(cum); }
+    }
+    std::vector<std::pair<double, double>> v;
+    const double half = flat / 2;
+    auto face = [&](double xStart, double direction, double y) {
+        for (size_t i = 0; i + 1 < edges.size(); ++i) {
+            v.emplace_back(xStart + direction * edges[i], y);
+        }
+        for (size_t i = edges.size() - 1; i > 0; --i) {
+            v.emplace_back(xStart + direction * (flat - edges[i]), y);
+        }
+    };
+    face(-half, +1, -r);
+    for (size_t i = 0; i < capPanels; ++i) {
+        const double a = -std::numbers::pi / 2 + double(i) / double(capPanels) * std::numbers::pi;
+        v.emplace_back(half + r * cos(a), r * sin(a));
+    }
+    face(+half, -1, +r);
+    for (size_t i = 0; i < capPanels; ++i) {
+        const double a = std::numbers::pi / 2 + double(i) / double(capPanels) * std::numbers::pi;
+        v.emplace_back(-half + r * cos(a), r * sin(a));
+    }
+    // Drop coincident vertices: a zero-length panel makes the whole solve NaN.
+    std::vector<std::pair<double, double>> out;
+    for (const auto& p : v) {
+        if (out.empty() || hypot(p.first - out.back().first, p.second - out.back().second) > 1e-12) {
+            out.push_back(p);
+        }
+    }
+    return out;
+}
+
+double solve_exclusion_factor(double aspect, bool fieldAlongWide, size_t capPanels = 200) {
+    const auto verts = stadium_contour(aspect, capPanels, 1.12);
+    const size_t n = verts.size();
+    if (n < 8) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "The stadium contour for aspect " + std::to_string(aspect) + " has too few panels");
+    }
+    Eigen::MatrixXd tangentX(n, 1), tangentY(n, 1), normalX(n, 1), normalY(n, 1), length(n, 1);
+    Eigen::MatrixXd midX(n, 1), midY(n, 1), startX(n, 1), startY(n, 1);
+    for (size_t i = 0; i < n; ++i) {
+        const auto& p1 = verts[i];
+        const auto& p2 = verts[(i + 1) % n];
+        const double dx = p2.first - p1.first, dy = p2.second - p1.second;
+        const double len = hypot(dx, dy);
+        length(i) = len;
+        tangentX(i) = dx / len; tangentY(i) = dy / len;
+        normalX(i) = tangentY(i); normalY(i) = -tangentX(i);     // outward for a CCW contour
+        midX(i) = 0.5 * (p1.first + p2.first); midY(i) = 0.5 * (p1.second + p2.second);
+        startX(i) = p1.first; startY(i) = p1.second;
+    }
+    const double ex = fieldAlongWide ? 1.0 : 0.0;
+    const double ey = fieldAlongWide ? 0.0 : 1.0;
+
+    Eigen::MatrixXd influence(n, n);
+    Eigen::MatrixXd tangentialInfluence(n, n);
+    Eigen::VectorXd rhs(n);
+    for (size_t i = 0; i < n; ++i) {
+        rhs(i) = -(normalX(i) * ex + normalY(i) * ey);
+        for (size_t j = 0; j < n; ++j) {
+            double gx, gy;
+            if (i == j) {
+                gx = 0.5 * normalX(j);          // self term: u_local = 0, v_local = 1/2
+                gy = 0.5 * normalY(j);
+            }
+            else {
+                const double dx = midX(i) - startX(j), dy = midY(i) - startY(j);
+                const double xl = dx * tangentX(j) + dy * tangentY(j);
+                const double yl = dx * normalX(j) + dy * normalY(j);
+                const double r1 = hypot(xl, yl);
+                const double r2 = hypot(xl - length(j), yl);
+                const double uLocal = log(r1 / r2) / (2 * std::numbers::pi);
+                const double vLocal = (atan2(yl, xl - length(j)) - atan2(yl, xl)) / (2 * std::numbers::pi);
+                gx = uLocal * tangentX(j) + vLocal * normalX(j);
+                gy = uLocal * tangentY(j) + vLocal * normalY(j);
+            }
+            influence(i, j) = gx * normalX(i) + gy * normalY(i);
+            tangentialInfluence(i, j) = gx * tangentX(i) + gy * tangentY(i);
+        }
+    }
+    const Eigen::VectorXd sigma = influence.partialPivLu().solve(rhs);
+    const Eigen::VectorXd induced = tangentialInfluence * sigma;
+    double integral = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const double tangential = (tangentX(i) * ex + tangentY(i) * ey) + induced(i);
+        integral += tangential * tangential * length(i);
+    }
+    return integral / aspect;               // normalised by the wide dimension (thin == 1)
+}
+
+
+// The factor depends ONLY on the aspect ratio (scale-invariant to 1e-9, verified), and is smooth
+// in log(aspect), so a 25-point table over 1..200 interpolates to +-0.05%. That keeps the per-call
+// cost a lookup rather than a 200x200 solve: the WireAdviser sweeps many wire sizes, each its own
+// aspect, and a solve per size would dominate the sweep. Aspects beyond the table solve directly.
+double stadium_exclusion_factor(double wideDimension, double thinDimension, bool fieldAlongWide) {
+    if (!(wideDimension > 0) || !(thinDimension > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA,
+            "The exclusion factor needs both conductor dimensions to be positive, got " +
+            std::to_string(wideDimension) + " x " + std::to_string(thinDimension) + " m");
+    }
+    // The two arguments are the conductor's dimensions IN THE CALLER'S ORIENTATION, not sorted by
+    // size: callers pass the dimension along the wide FACE first (height for a foil, width
+    // otherwise), and a tall-thin rectangular wire legitimately has that dimension the SMALLER of
+    // the two. The stadium's caps always sit on the ends of its LONG axis, so map the caller's
+    // orientation onto the geometry instead of assuming an ordering (97 tests threw on that
+    // assumption before it was fixed).
+    const double longDimension = std::max(wideDimension, thinDimension);
+    const double shortDimension = std::min(wideDimension, thinDimension);
+    const bool firstIsLong = wideDimension >= thinDimension;
+    const bool fieldAlongLong = firstIsLong ? fieldAlongWide : !fieldAlongWide;
+    const double aspect = longDimension / shortDimension;
+    // solve_exclusion_factor normalises the contour integral by the LONG dimension, while the
+    // caller multiplies the result back by the dimension it passed FIRST. Re-normalise so the
+    // product is the same integral either way.
+    const double renormalise = longDimension / wideDimension;
+    constexpr double kMinAspect = 1.0;
+    constexpr double kMaxAspect = 200.0;
+    constexpr size_t kPoints = 25;
+    if (aspect > kMaxAspect) {
+        return renormalise * solve_exclusion_factor(aspect, fieldAlongLong);
+    }
+    struct Table { std::vector<double> logAspect, perpendicular, parallel; };
+    static Table table;
+    static std::once_flag built;
+    std::call_once(built, [&]() {
+        for (size_t i = 0; i < kPoints; ++i) {
+            const double la = log(kMinAspect) + double(i) / double(kPoints - 1) * (log(kMaxAspect) - log(kMinAspect));
+            table.logAspect.push_back(la);
+            table.perpendicular.push_back(solve_exclusion_factor(exp(la), false));
+            table.parallel.push_back(solve_exclusion_factor(exp(la), true));
+        }
+    });
+    const auto& values = fieldAlongLong ? table.parallel : table.perpendicular;
+    const double la = log(aspect);
+    auto upper = std::upper_bound(table.logAspect.begin(), table.logAspect.end(), la);
+    if (upper == table.logAspect.begin()) { return renormalise * values.front(); }
+    if (upper == table.logAspect.end()) { return renormalise * values.back(); }
+    const size_t hi = size_t(upper - table.logAspect.begin());
+    const size_t lo = hi - 1;
+    const double t = (la - table.logAspect[lo]) / (table.logAspect[hi] - table.logAspect[lo]);
+    return renormalise * (values[lo] + t * (values[hi] - values[lo]));
+}
+
+}  // namespace
+
+
+static double fringing_edge_crowding_factor(double wideDimension, double thinDimension) {
+    // ABT #1188: the edge-crowding coefficient of the gap-fringing kernel IS the exclusion factor
+    // of the conductor's own cross-section, so it comes from the same stadium solve. It replaced a
+    // hard-coded 8.0 calibrated to one FEM run on one 20 x 0.209 mm planar trace -- a constant
+    // cannot be right here, because edge crowding depends on the aspect ratio: this returns 5.83
+    // for a 2:1 bar and 7.09 for that 96:1 trace. Against 2D OMFEM on the One_Turn_Planar fixture
+    // at 200 kHz it moves MKF from 1.78x FEM to 1.25x.
+    return stadium_exclusion_factor(wideDimension, thinDimension, false);
+}
+
 
 
 // PERF-003: Cached ResistivityModel to avoid repeated factory() calls
@@ -49,6 +271,12 @@ std::shared_ptr<WindingProximityEffectLossesModel>  WindingProximityEffectLosses
     else if (modelName == WindingProximityEffectLossesModels::LAMMERANER) {
         return std::make_shared<WindingProximityEffectLossesLammeranerModel>();
     }
+    else if (modelName == WindingProximityEffectLossesModels::MARTINEZ) {
+        return std::make_shared<WindingProximityEffectLossesMartinezModel>();
+    }
+    else if (modelName == WindingProximityEffectLossesModels::EWALD) {
+        return std::make_shared<WindingProximityEffectLossesEwaldModel>();
+    }
     else if (modelName == WindingProximityEffectLossesModels::DOWELL) {
         return std::make_shared<WindingProximityEffectLossesDowellModel>();
     }
@@ -67,8 +295,11 @@ std::shared_ptr<WindingProximityEffectLossesModel>  WindingProximityEffectLosses
     else if (modelName == WindingProximityEffectLossesModels::VANDELAC) {
         return std::make_shared<WindingProximityEffectLossesVandelacModel>();
     }
+    else if (modelName == WindingProximityEffectLossesModels::WANG_STACKED) {
+        return std::make_shared<WindingProximityEffectLossesWangStackedModel>();
+    }
     else
-        throw ModelNotAvailableException("Unknown wire proximity effect losses mode, available options are: {ROSSMANITH, WANG, FERREIRA, ALBACH, LAMMERANER, DOWELL, XI_NAN, WOJDA, SULLIVAN, BARTOLI, VANDELAC}");
+        throw ModelNotAvailableException("Unknown wire proximity effect losses mode, available options are: {ROSSMANITH, WANG, FERREIRA, ALBACH, LAMMERANER, DOWELL, XI_NAN, WOJDA, SULLIVAN, BARTOLI, VANDELAC, MARTINEZ, EWALD, WANG_STACKED}");
 }
 
 std::shared_ptr<WindingProximityEffectLossesModel> WindingProximityEffectLosses::get_model(WireType wireType, std::optional<WindingProximityEffectLossesModels> modelOverride) {
@@ -93,6 +324,19 @@ std::shared_ptr<WindingProximityEffectLossesModel> WindingProximityEffectLosses:
         case WireType::LITZ: {
             return WindingProximityEffectLossesModel::factory(WindingProximityEffectLossesModels::FERREIRA);
         }
+        // ABT #1188: these stay WANG, and the reason is worth recording because the single-
+        // conductor evidence pointed the other way. On 26 points against 2D FEM (ONE rectangular
+        // conductor in a uniform transverse field, aspect 2:1 to 96:1, both orientations, 100 kHz
+        // and 1 MHz) MARTINEZ was the only model inside +-10% everywhere:
+        //     MARTINEZ 0.903-1.064 (median 0.990)   WANG     0.468-1.026 (median 0.959)
+        //     DOWELL   0.517-1.586                  VANDELAC 0.276-0.848
+        //     FERREIRA 0.259-0.793                  ALBACH   0.255-0.783
+        // That does NOT transfer to wound geometry. On the 16-parallel planar fixture at 10 kHz,
+        // 2D OMFEM says 14.92 W; MARTINEZ says 10134 W and DOWELL 10122 W -- both 679x, because
+        // MKF hands them a ~16 kA/m field normal to the trace's wide face, which a 20 x 0.07 mm
+        // strip would indeed turn into ~900 W. WANG lands near the truth only because its c*h
+        // prefactor divides by h ~ 1e-4. The field is the bug (ABT #139); until it is fixed, the
+        // model that is accidentally right beats the models that are faithfully wrong.
         case WireType::PLANAR: {
             return WindingProximityEffectLossesModel::factory(WindingProximityEffectLossesModels::WANG);
         }
@@ -146,16 +390,45 @@ void WindingProximityEffectLossesModel::set_proximity_factor(Wire wire,  double 
 
 }
 
-std::pair<double, std::vector<std::pair<double, double>>> WindingProximityEffectLosses::calculate_proximity_effect_losses_per_meter(Wire wire, double temperature, std::vector<ComplexField> fields, std::optional<WindingProximityEffectLossesModels> modelOverride) {
+double WindingProximityEffectLossesModel::calculate_turn_losses_from_phasors(Wire wire, double frequency, std::vector<ComplexFieldPoint> inPhaseData, std::vector<ComplexFieldPoint> quadratureData, double temperature) {
+    if (inPhaseData.size() != quadratureData.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Proximity losses: " + std::to_string(inPhaseData.size()) + " in-phase field points but " +
+                                    std::to_string(quadratureData.size()) + " quadrature field points");
+    }
+    // Quadratic form of the field: the time-averaged loss of Re[(Hi + j Hq) e^{jwt}] is
+    // loss(Hi) + loss(Hq). An identically zero quadrature field adds exactly nothing.
+    double turnLosses = calculate_turn_losses(wire, frequency, inPhaseData, temperature);
+    bool quadratureIsZero = std::all_of(quadratureData.begin(), quadratureData.end(),
+        [](const ComplexFieldPoint& point) { return point.get_real() == 0 && point.get_imaginary() == 0; });
+    if (!quadratureIsZero) {
+        turnLosses += calculate_turn_losses(wire, frequency, quadratureData, temperature);
+    }
+    return turnLosses;
+}
+
+std::pair<double, std::vector<std::pair<double, double>>> WindingProximityEffectLosses::calculate_proximity_effect_losses_per_meter(Wire wire, double temperature, std::vector<ComplexField> fields, std::optional<WindingProximityEffectLossesModels> modelOverride, std::optional<std::vector<ComplexField>> quadratureFields, std::optional<double> perpendicularOutlineFactor) {
     auto model = get_model(wire.get_type(), modelOverride);
+    if (auto stackedModel = std::dynamic_pointer_cast<WindingProximityEffectLossesWangStackedModel>(model)) {
+        if (!perpendicularOutlineFactor) {
+            throw InvalidInputException(ErrorCode::MISSING_DATA,
+                "WANG_STACKED needs the turn's stack-outline factor, which only the coil geometry gives: evaluate it through calculate_proximity_effect_losses");
+        }
+        stackedModel->set_perpendicular_outline_factor(perpendicularOutlineFactor.value());
+    }
     if (!wire.get_number_conductors()) {
         wire.set_number_conductors(1);
+    }
+    if (quadratureFields && quadratureFields->size() != fields.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Proximity losses: " + std::to_string(fields.size()) + " in-phase harmonic fields but " +
+                                    std::to_string(quadratureFields->size()) + " quadrature harmonic fields");
     }
 
     double totalProximityEffectLossesPerMeter = 0;
     std::vector<std::pair<double, double>> lossesPerHarmonic;
 
-    for (auto& complexField : fields) {
+    auto isWidthSample = [](const ComplexFieldPoint& point) { return point.get_label() && point.get_label().value() == "widthsample"; };
+    for (size_t fieldIndex = 0; fieldIndex < fields.size(); ++fieldIndex) {
+        auto& complexField = fields[fieldIndex];
         auto frequency = complexField.get_frequency();
         auto dataForThisTurn = complexField.get_data();
 
@@ -163,12 +436,27 @@ std::pair<double, std::vector<std::pair<double, double>>> WindingProximityEffect
             // Width-resolved samples are only consumed by the Wang flat-conductor
             // model; models that average over the lumped surface points must not
             // see them, or their point-average would be silently skewed.
-            dataForThisTurn.erase(std::remove_if(dataForThisTurn.begin(), dataForThisTurn.end(),
-                [](const ComplexFieldPoint& point) { return point.get_label() && point.get_label().value() == "widthsample"; }),
+            dataForThisTurn.erase(std::remove_if(dataForThisTurn.begin(), dataForThisTurn.end(), isWidthSample),
                 dataForThisTurn.end());
         }
 
-        auto turnLosses = model->calculate_turn_losses(wire, frequency, dataForThisTurn, temperature);
+        double turnLosses;
+        if (quadratureFields) {
+            auto& quadratureField = quadratureFields.value()[fieldIndex];
+            if (quadratureField.get_frequency() != frequency) {
+                throw InvalidInputException(ErrorCode::INVALID_INPUT, "Proximity losses: quadrature field at " + std::to_string(quadratureField.get_frequency()) +
+                                            " Hz paired with an in-phase field at " + std::to_string(frequency) + " Hz");
+            }
+            auto quadratureDataForThisTurn = quadratureField.get_data();
+            if (!model->consumes_width_samples()) {
+                quadratureDataForThisTurn.erase(std::remove_if(quadratureDataForThisTurn.begin(), quadratureDataForThisTurn.end(), isWidthSample),
+                    quadratureDataForThisTurn.end());
+            }
+            turnLosses = model->calculate_turn_losses_from_phasors(wire, frequency, dataForThisTurn, quadratureDataForThisTurn, temperature);
+        }
+        else {
+            turnLosses = model->calculate_turn_losses(wire, frequency, dataForThisTurn, temperature);
+        }
 
         if (std::isnan(turnLosses)) {
             throw NaNResultException("NaN found in proximity effect losses per meter");
@@ -180,11 +468,34 @@ std::pair<double, std::vector<std::pair<double, double>>> WindingProximityEffect
     return {totalProximityEffectLossesPerMeter, lossesPerHarmonic};
 }
 
+WindingLossesOutput WindingProximityEffectLosses::calculate_proximity_effect_losses(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, WindingWindowMagneticStrengthFieldPhasorOutput windingWindowMagneticStrengthFieldOutput, std::optional<WindingProximityEffectLossesModels> modelOverride) {
+    return calculate_proximity_effect_losses_impl(coil, temperature, windingLossesOutput, windingWindowMagneticStrengthFieldOutput.get_field_per_frequency(),
+                                                  windingWindowMagneticStrengthFieldOutput.get_quadrature_field_per_frequency(), modelOverride);
+}
+
 WindingLossesOutput WindingProximityEffectLosses::calculate_proximity_effect_losses(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, WindingWindowMagneticStrengthFieldOutput windingWindowMagneticStrengthFieldOutput, std::optional<WindingProximityEffectLossesModels> modelOverride) {
+    return calculate_proximity_effect_losses_impl(coil, temperature, windingLossesOutput, windingWindowMagneticStrengthFieldOutput.get_field_per_frequency(),
+                                                  std::nullopt, modelOverride);
+}
+
+WindingLossesOutput WindingProximityEffectLosses::calculate_proximity_effect_losses_impl(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, const std::vector<ComplexField>& fieldPerFrequency, const std::optional<std::vector<ComplexField>>& quadratureFieldPerFrequency, std::optional<WindingProximityEffectLossesModels> modelOverride) {
+    if (quadratureFieldPerFrequency && quadratureFieldPerFrequency->size() != fieldPerFrequency.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Proximity losses: " + std::to_string(fieldPerFrequency.size()) + " in-phase harmonic fields but " +
+                                    std::to_string(quadratureFieldPerFrequency->size()) + " quadrature harmonic fields");
+    }
     if (!coil.get_turns_description()) {
         throw CoilNotProcessedException("Winding does not have turns description");
     }
     auto turns = coil.get_turns_description().value();
+
+    // WANG_STACKED reads each turn's place in its stack from the coil geometry, once.
+    std::optional<std::vector<double>> perpendicularOutlineFactorPerTurn;
+    for (size_t windingIndex = 0; windingIndex < coil.get_functional_description().size(); ++windingIndex) {
+        if (std::dynamic_pointer_cast<WindingProximityEffectLossesWangStackedModel>(get_model(coil.get_wire_type(windingIndex), modelOverride))) {
+            perpendicularOutlineFactorPerTurn = WindingProximityEffectLossesWangStackedModel::calculate_perpendicular_outline_factors(coil);
+            break;
+        }
+    }
 
     auto windingLossesPerTurn = windingLossesOutput.get_winding_losses_per_turn().value();
 
@@ -197,26 +508,136 @@ WindingLossesOutput WindingProximityEffectLosses::calculate_proximity_effect_los
         auto wire = coil.resolve_wire(windingIndex);
         double wireLength = turn.get_length();
 
-        std::vector<ComplexField> fields;
-        for (auto& fieldPerHarmonic : windingWindowMagneticStrengthFieldOutput.get_field_per_frequency()) {
-            std::vector<ComplexFieldPoint> data;
-            for (auto& fieldPoint : fieldPerHarmonic.get_data()) {
+        // ABT #227.2: a turn with a genuine second plane crossing (CoilMesher samples the
+        // field at BOTH crossings for these -- see CoilMesherCenterModel::generate_mesh_
+        // induced_turn) sits in a materially different proximity environment at each: the
+        // in-window half and the out-of-core/other-window half of a lateral multi-column
+        // turn. Classify each solved field point by which crossing coordinate it matches
+        // -- NOT by label or turn_length, since not every MagneticFieldStrengthModel
+        // implementation propagates those onto its ComplexFieldPoint output, while every
+        // one of them propagates `point` (the field's own location, load-bearing for the
+        // model itself) -- and weight each crossing's per-meter loss by its own length
+        // share instead of billing the whole loop length at one crossing's density. If no
+        // point actually matches the secondary coordinate (single-crossing turns, and any
+        // wire/model combination that does not emit a second sample), every point stays
+        // "primary" and primaryLength stays the full wireLength: byte-identical to the
+        // pre-fix behavior.
+        // Bind once: the MAS getter returns the nested vectors BY VALUE (repo memory:
+        // never chain .value() calls off it), and it used to be called four times here.
+        const auto additionalCoordinatesOpt = turn.get_additional_coordinates();
+        bool turnHasSecondCrossing = additionalCoordinatesOpt.has_value() &&
+            !additionalCoordinatesOpt->empty() &&
+            (*additionalCoordinatesOpt)[0].size() >= 2;
+        std::vector<double> secondaryCoordinates;
+        if (turnHasSecondCrossing) {
+            secondaryCoordinates = (*additionalCoordinatesOpt)[0];
+        }
+
+        std::vector<ComplexField> primaryFields;
+        std::vector<ComplexField> secondaryFields;
+        std::vector<ComplexField> primaryQuadratureFields;
+        std::vector<ComplexField> secondaryQuadratureFields;
+        bool hasSecondaryCrossing = false;
+
+        for (size_t fieldIndex = 0; fieldIndex < fieldPerFrequency.size(); ++fieldIndex) {
+            auto& fieldPerHarmonic = fieldPerFrequency[fieldIndex];
+            const std::vector<ComplexFieldPoint>* quadratureHarmonicData = nullptr;
+            if (quadratureFieldPerFrequency) {
+                quadratureHarmonicData = &quadratureFieldPerFrequency.value()[fieldIndex].get_data();
+                if (quadratureHarmonicData->size() != fieldPerHarmonic.get_data().size()) {
+                    throw InvalidInputException(ErrorCode::INVALID_INPUT, "Proximity losses: the quadrature field has " + std::to_string(quadratureHarmonicData->size()) +
+                                                " points where the in-phase field has " + std::to_string(fieldPerHarmonic.get_data().size()));
+                }
+            }
+            std::vector<ComplexFieldPoint> primaryData;
+            std::vector<ComplexFieldPoint> secondaryData;
+            std::vector<ComplexFieldPoint> primaryQuadratureData;
+            std::vector<ComplexFieldPoint> secondaryQuadratureData;
+            for (size_t pointIndex = 0; pointIndex < fieldPerHarmonic.get_data().size(); ++pointIndex) {
+                auto& fieldPoint = fieldPerHarmonic.get_data()[pointIndex];
                 if (!fieldPoint.get_turn_index()) {
                     throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION, "Missing turn index in field point");
                 }
-                if (fieldPoint.get_turn_index().value() == int(turnIndex)) {
-                    data.push_back(fieldPoint);
+                if (fieldPoint.get_turn_index().value() != int(turnIndex)) {
+                    continue;
+                }
+                // Nearest-crossing classification. The CenterModel emits the secondary
+                // sample exactly AT the secondary coordinate, but the WangModel (ABT
+                // #227.2 parity) emits a whole surface cluster OFFSET around each
+                // crossing, so an exact-match test would file its secondary points under
+                // the primary crossing. Comparing the distance to each crossing centre
+                // classifies both models' points correctly and is byte-identical for the
+                // exact-match case (distance 0 beats anything).
+                bool isSecondaryPoint = turnHasSecondCrossing && fieldPoint.get_point().size() >= 2 &&
+                    std::hypot(fieldPoint.get_point()[0] - secondaryCoordinates[0],
+                               fieldPoint.get_point()[1] - secondaryCoordinates[1]) <
+                    std::hypot(fieldPoint.get_point()[0] - turn.get_coordinates()[0],
+                               fieldPoint.get_point()[1] - turn.get_coordinates()[1]);
+                if (isSecondaryPoint) {
+                    secondaryData.push_back(fieldPoint);
+                    if (quadratureHarmonicData) {
+                        secondaryQuadratureData.push_back((*quadratureHarmonicData)[pointIndex]);
+                    }
+                    hasSecondaryCrossing = true;
+                }
+                else {
+                    primaryData.push_back(fieldPoint);
+                    if (quadratureHarmonicData) {
+                        primaryQuadratureData.push_back((*quadratureHarmonicData)[pointIndex]);
+                    }
                 }
             }
-            
-            ComplexField complexField;
-            complexField.set_data(data);
-            complexField.set_frequency(fieldPerHarmonic.get_frequency());
-            fields.push_back(complexField);
+
+            ComplexField primaryComplexField;
+            primaryComplexField.set_data(primaryData);
+            primaryComplexField.set_frequency(fieldPerHarmonic.get_frequency());
+            primaryFields.push_back(primaryComplexField);
+            if (quadratureHarmonicData) {
+                ComplexField primaryQuadratureComplexField;
+                primaryQuadratureComplexField.set_data(primaryQuadratureData);
+                primaryQuadratureComplexField.set_frequency(fieldPerHarmonic.get_frequency());
+                primaryQuadratureFields.push_back(primaryQuadratureComplexField);
+            }
+
+            // Only assembled when this turn can actually have secondary points — the
+            // common single-crossing case used to build an empty ComplexField per
+            // harmonic for nothing.
+            if (turnHasSecondCrossing) {
+                ComplexField secondaryComplexField;
+                secondaryComplexField.set_data(secondaryData);
+                secondaryComplexField.set_frequency(fieldPerHarmonic.get_frequency());
+                secondaryFields.push_back(secondaryComplexField);
+                if (quadratureHarmonicData) {
+                    ComplexField secondaryQuadratureComplexField;
+                    secondaryQuadratureComplexField.set_data(secondaryQuadratureData);
+                    secondaryQuadratureComplexField.set_frequency(fieldPerHarmonic.get_frequency());
+                    secondaryQuadratureFields.push_back(secondaryQuadratureComplexField);
+                }
+            }
+        }
+        std::optional<std::vector<ComplexField>> primaryQuadrature;
+        std::optional<std::vector<ComplexField>> secondaryQuadrature;
+        if (quadratureFieldPerFrequency) {
+            primaryQuadrature = primaryQuadratureFields;
+            secondaryQuadrature = secondaryQuadratureFields;
         }
 
-        auto lossesPerHarmonicThisTurn = calculate_proximity_effect_losses_per_meter(wire, temperature, fields, modelOverride).second;
+        double primaryLength = hasSecondaryCrossing ? wireLength / 2 : wireLength;
+        double secondaryLength = hasSecondaryCrossing ? wireLength / 2 : 0;
 
+        std::optional<double> perpendicularOutlineFactor;
+        if (perpendicularOutlineFactorPerTurn) {
+            perpendicularOutlineFactor = perpendicularOutlineFactorPerTurn.value()[turnIndex];
+        }
+        auto primaryLossesPerHarmonic = calculate_proximity_effect_losses_per_meter(wire, temperature, primaryFields, modelOverride, primaryQuadrature, perpendicularOutlineFactor).second;
+        std::vector<std::pair<double, double>> secondaryLossesPerHarmonic;
+        if (hasSecondaryCrossing) {
+            secondaryLossesPerHarmonic = calculate_proximity_effect_losses_per_meter(wire, temperature, secondaryFields, modelOverride, secondaryQuadrature, perpendicularOutlineFactor).second;
+            if (secondaryLossesPerHarmonic.size() != primaryLossesPerHarmonic.size()) {
+                throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                    "Primary and secondary crossing harmonics do not match for turn " + std::to_string(turnIndex));
+            }
+        }
 
         LossElementPerHarmonic proximityEffectLossesThisTurn;
         auto model = get_model(coil.get_wire_type(windingIndex), modelOverride);
@@ -225,15 +646,24 @@ WindingLossesOutput WindingProximityEffectLosses::calculate_proximity_effect_los
         proximityEffectLossesThisTurn.get_mutable_harmonic_frequencies().push_back(0);
         proximityEffectLossesThisTurn.get_mutable_losses_per_harmonic().push_back(0);
 
-        for (auto& lossesThisHarmonic : lossesPerHarmonicThisTurn) {
-            if (std::isnan(lossesThisHarmonic.first)) {
+        for (size_t harmonicIndex = 0; harmonicIndex < primaryLossesPerHarmonic.size(); ++harmonicIndex) {
+            auto& primaryThisHarmonic = primaryLossesPerHarmonic[harmonicIndex];
+            if (std::isnan(primaryThisHarmonic.first)) {
                 throw NaNResultException("NaN found in proximity effect losses");
             }
-            proximityEffectLossesThisTurn.get_mutable_harmonic_frequencies().push_back(lossesThisHarmonic.second);
-            proximityEffectLossesThisTurn.get_mutable_losses_per_harmonic().push_back(lossesThisHarmonic.first * wireLength);
+            double lossThisHarmonic = primaryThisHarmonic.first * primaryLength;
+            if (hasSecondaryCrossing) {
+                auto& secondaryThisHarmonic = secondaryLossesPerHarmonic[harmonicIndex];
+                if (std::isnan(secondaryThisHarmonic.first)) {
+                    throw NaNResultException("NaN found in proximity effect losses");
+                }
+                lossThisHarmonic += secondaryThisHarmonic.first * secondaryLength;
+            }
 
-            totalProximityEffectLosses += lossesThisHarmonic.first * wireLength;
+            proximityEffectLossesThisTurn.get_mutable_harmonic_frequencies().push_back(primaryThisHarmonic.second);
+            proximityEffectLossesThisTurn.get_mutable_losses_per_harmonic().push_back(lossThisHarmonic);
 
+            totalProximityEffectLosses += lossThisHarmonic;
         }
 
         windingLossesPerTurn[turnIndex].set_proximity_effect_losses(proximityEffectLossesThisTurn);
@@ -285,9 +715,24 @@ double WindingProximityEffectLossesRossmanithModel::calculate_proximity_factor(W
         double wireWidth = resolve_dimensional_values(wire.get_conducting_width().value());
         double wireHeight = resolve_dimensional_values(wire.get_conducting_height().value());
 
-        // FEM-validated height*width/delta prefactor — do NOT rewrite to
-        // 2*height/delta (June 2026 planar/foil over-prediction regression, reverted).
-        factor = wireHeight * wireWidth / skinDepth * (sinh(wireWidth / skinDepth) - sin(wireWidth / skinDepth)) / (cosh(wireWidth / skinDepth) + cos(wireWidth / skinDepth));
+        if (wire.get_type() == WireType::PLANAR) {
+            // PLANAR keeps the legacy form: it is entangled with the C=8 FEM-calibrated width
+            // integral in the Wang model and needs the OMFEM planar suite to untangle (ABT #139).
+            factor = wireHeight * wireWidth / skinDepth * (sinh(wireWidth / skinDepth) - sin(wireWidth / skinDepth)) / (cosh(wireWidth / skinDepth) + cos(wireWidth / skinDepth));
+        }
+        else {
+            // RECTANGULAR / FOIL. ABT #837, two errors in one expression:
+            //  1. height*width is a CROSS-SECTION prefactor; the slab form takes the BREADTH
+            //     alone (same defect class as ABT #182 for foil and ABT #832 for rectangular).
+            //  2. the kernel was evaluated at width/delta — the WIDE dimension — when the field
+            //     penetrates the THIN one. For a 4 x 0.9 mm conductor that is the difference
+            //     between G(19) = 1 (saturated) and G(4.3).
+            // The June 2026 revert this comment used to cite (de156755) backed out a fix that
+            // was itself wrong (it carried a spurious factor 2 and broke PLANAR); the correct
+            // slab form has since been FEM-arbitrated twice.
+            const double penetrated = std::min(wireHeight, wireWidth) / skinDepth;
+            factor = wireWidth / skinDepth * (sinh(penetrated) - sin(penetrated)) / (cosh(penetrated) + cos(penetrated));
+        }
     }
     else if (wire.get_type() == WireType::ROUND ) {
         double wireRadius;
@@ -371,6 +816,22 @@ double WindingProximityEffectLossesRossmanithModel::calculate_turn_losses(Wire w
  * @return Proximity effect losses for this turn [W]
  */
 double WindingProximityEffectLossesWangModel::calculate_turn_losses(Wire wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature) {
+    return calculate_turn_losses_impl(wire, frequency, data, nullptr, temperature);
+}
+
+double WindingProximityEffectLossesWangModel::calculate_turn_losses_from_phasors(Wire wire, double frequency, std::vector<ComplexFieldPoint> inPhaseData, std::vector<ComplexFieldPoint> quadratureData, double temperature) {
+    if (inPhaseData.size() != quadratureData.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Wang proximity losses: " + std::to_string(inPhaseData.size()) + " in-phase field points but " +
+                                    std::to_string(quadratureData.size()) + " quadrature field points");
+    }
+    return calculate_turn_losses_impl(wire, frequency, inPhaseData, &quadratureData, temperature);
+}
+
+// Every term below is a quadratic form of the field, so the phasor loss adds the in-phase and
+// the quadrature forms (|H|^2 = Re^2 + Im^2); the width-sample term bridges the SUMMED low- and
+// high-frequency integrals. Without quadrature data every quadrature sum is exactly 0 and the
+// result is bit-identical to the single-field model.
+double WindingProximityEffectLossesWangModel::calculate_turn_losses_impl(Wire& wire, double frequency, const std::vector<ComplexFieldPoint>& data, const std::vector<ComplexFieldPoint>* quadratureData, double temperature) {
     auto& resistivityModel = get_cached_resistivity_model(); // PERF-003: cached
     auto resistivity = (*resistivityModel).get_resistivity(wire.resolve_material(), temperature);
     double skinDepth = WindingSkinEffectLosses::calculate_skin_depth(wire, frequency, temperature);
@@ -396,6 +857,36 @@ double WindingProximityEffectLossesWangModel::calculate_turn_losses(Wire wire, d
     double nonPlanarHe = 0;
     size_t lumpedPointCount = 0;
     std::vector<double> widthSamplesHPerpendicular;
+    // Quadrature counterparts (all zero without quadrature data).
+    double quadratureHx1 = 0, quadratureHx2 = 0, quadratureHy1 = 0, quadratureHy2 = 0;
+    double quadratureNonPlanarHe = 0;
+    std::vector<double> quadratureWidthSamplesHPerpendicular;
+    if (quadratureData) {
+        for (auto& datum : *quadratureData) {
+            if (!datum.get_label()) {
+                throw InvalidInputException(ErrorCode::MISSING_DATA, "Missing label in induced point");
+            }
+            else if (datum.get_label().value() == "top") {
+                quadratureNonPlanarHe += datum.get_imaginary();
+                quadratureHx2 += datum.get_real();
+            }
+            else if (datum.get_label().value() == "bottom") {
+                quadratureNonPlanarHe += datum.get_imaginary();
+                quadratureHx1 += datum.get_real();
+            }
+            else if (datum.get_label().value() == "right") {
+                quadratureNonPlanarHe += datum.get_real();
+                quadratureHy2 += datum.get_imaginary();
+            }
+            else if (datum.get_label().value() == "left") {
+                quadratureNonPlanarHe += datum.get_real();
+                quadratureHy1 += datum.get_imaginary();
+            }
+            else if (datum.get_label().value() == "widthsample") {
+                quadratureWidthSamplesHPerpendicular.push_back(wire.get_type() == WireType::FOIL ? datum.get_real() : datum.get_imaginary());
+            }
+        }
+    }
     for (auto& datum : data) {
         if (!datum.get_label()) {
             throw InvalidInputException(ErrorCode::MISSING_DATA, "Missing label in induced point");
@@ -452,7 +943,7 @@ double WindingProximityEffectLossesWangModel::calculate_turn_losses(Wire wire, d
         // part within 15% (numerically arbitrated against F_R(Delta=1.2, m=2)=1.81).
 
         // Parallel field: Hy at the left/right faces, penetrating the thickness c.
-        turnLosses += h * resistivity / skinDepth * pow((Hy2 + Hy1) / 2, 2) * (sinh(cTerm) - sin(cTerm)) / (cosh(cTerm) + cos(cTerm));
+        turnLosses += h * resistivity / skinDepth * (pow((Hy2 + Hy1) / 2, 2) + pow((quadratureHy2 + quadratureHy1) / 2, 2)) * (sinh(cTerm) - sin(cTerm)) / (cosh(cTerm) + cos(cTerm));
 
         // Perpendicular field (Hx, normal to the wide face): rotated-slab end
         // term from the top/bottom points — always applied, so losses do not
@@ -461,19 +952,41 @@ double WindingProximityEffectLossesWangModel::calculate_turn_losses(Wire wire, d
         // see). Mean of squares, not square of the mean — the two foil ends
         // dissipate independently and their Hx carry opposite signs in a
         // symmetric window (a signed average silently cancels them).
-        turnLosses += c * resistivity / skinDepth * (pow(Hx1, 2) + pow(Hx2, 2)) / 2 * (sinh(hTerm) - sin(hTerm)) / (cosh(hTerm) + cos(hTerm));
+        turnLosses += c * resistivity / skinDepth * (pow(Hx1, 2) + pow(Hx2, 2) + pow(quadratureHx1, 2) + pow(quadratureHx2, 2)) / 2 * (sinh(hTerm) - sin(hTerm)) / (cosh(hTerm) + cos(hTerm));
+    }
+    else if (wire.get_type() == WireType::RECTANGULAR) {
+        // RECTANGULAR (wide dimension c across x, thin dimension h along y).
+        // Same literature slab form as the FOIL branch (Dowell 1966; Lammeraner &
+        // Stafl 1966; ABT #182 arbitration): per-unit-length proximity of a slab in
+        // a tangential field is  P/l = breadth * rho / delta * Ha^2 * G(Delta) --
+        // NO cross-section prefactor. The former c*h prefactor under-predicted by
+        // 1/h resp. 1/c (a 4 x 0.9 mm conductor read ~1000x low: proximity 2e-6 W
+        // against 6e-4 W of skin where OMFEM put R_ac/R_dc at 6.0 vs MKF's 2.3 —
+        // ABT #832, FEM-arbitrated 2026-08-20).
+
+        // Parallel field (Hx along the wide face, from the top/bottom points),
+        // penetrating the thin dimension h.
+        turnLosses += c * resistivity / skinDepth * (pow((Hx2 + Hx1) / 2, 2) + pow((quadratureHx2 + quadratureHx1) / 2, 2)) * (sinh(hTerm) - sin(hTerm)) / (cosh(hTerm) + cos(hTerm));
+        if (widthSamplesHPerpendicular.empty()) {
+            // Perpendicular field (Hy, normal to the wide face): rotated-slab form
+            // from the left/right edge points, penetrating the wide dimension c.
+            // Mean of squares, not square of the mean — the two edges dissipate
+            // independently and their Hy carry opposite signs in a symmetric
+            // window (same rule as the FOIL end term).
+            turnLosses += h * resistivity / skinDepth * (pow(Hy1, 2) + pow(Hy2, 2) + pow(quadratureHy1, 2) + pow(quadratureHy2, 2)) / 2 * (sinh(cTerm) - sin(cTerm)) / (cosh(cTerm) + cos(cTerm));
+        }
     }
     else {
-    // Wang 1D slab proximity per turn (PLANAR/RECTANGULAR). NOTE: the c*h
+    // Wang 1D slab proximity per turn (PLANAR). NOTE: the c*h
     // prefactor here is dimensionally inconsistent with the slab literature (see
-    // the FOIL branch above and ABT #182) but is entangled with the C=8
+    // the FOIL and RECTANGULAR branches above and ABT #182) but is entangled with the C=8
     // FEM-calibrated width integral below (single-turn planar benchmark, June
     // 2026); correcting it requires re-running the OMFEM planar suite — ABT #139.
-    turnLosses += c * h * resistivity / skinDepth * pow((Hx2 + Hx1) / 2, 2) * (sinh(hTerm) - sin(hTerm)) / (cosh(hTerm) + cos(hTerm));
+    turnLosses += c * h * resistivity / skinDepth * (pow((Hx2 + Hx1) / 2, 2) + pow((quadratureHx2 + quadratureHx1) / 2, 2)) * (sinh(hTerm) - sin(hTerm)) / (cosh(hTerm) + cos(hTerm));
     if (widthSamplesHPerpendicular.empty()) {
         // Legacy lumped path (no width samples meshed, e.g. fringing disabled):
         // perpendicular-field loss from the average of the two edge points.
-        turnLosses += h * c * resistivity / skinDepth * pow((Hy2 + Hy1) / 2, 2) * (sinh(cTerm) - sin(cTerm)) / (cosh(cTerm) + cos(cTerm));
+        turnLosses += h * c * resistivity / skinDepth * (pow((Hy2 + Hy1) / 2, 2) + pow((quadratureHy2 + quadratureHy1) / 2, 2)) * (sinh(cTerm) - sin(cTerm)) / (cosh(cTerm) + cos(cTerm));
     }
     }
     if (!widthSamplesHPerpendicular.empty()) {
@@ -498,31 +1011,69 @@ double WindingProximityEffectLossesWangModel::calculate_turn_losses(Wire wire, d
         // and -33% at 20 kHz for the canonical 3 mm gap; sub-mm gaps under-predict
         // 2-3.3x because the analytical fringing field decays faster with distance
         // than the FEM field (image/core-guidance effects) — field-level follow-up.
-        constexpr double fringingLossCalibration = 8.0;
+        // ABT #1188: C IS DERIVED, NOT FITTED (it used to be a bare 8.0 obtained by fitting one
+        // planar trace, 20 x 0.209 mm, against one FEM run — and a constant cannot be right,
+        // because edge crowding depends on the conductor's ASPECT RATIO).
+        //
+        // At strong skin effect the conductor EXCLUDES the perpendicular field, so the exterior
+        // problem is a perfectly conducting cross-section in a transverse field. Taking that
+        // cross-section as the ellipse with the conductor's own semi-axes a = wide/2, b = thin/2
+        // (the strip's edge-singularity-free equivalent: a true rectangle's surface current
+        // diverges at the corners, an ellipse's does not), the surface field is
+        //     H_s(v) = H0 (a + b) |cos v| / sqrt(a^2 sin^2 v + b^2 cos^2 v)
+        // — zero at the middle of the wide faces, peaking at the edges with the classical
+        // (1 + a/b) enhancement. The loss per unit length is the surface integral
+        //     P = 1/2 (rho/delta) * H0^2 (a + b)^2 * INTEGRAL_0^2pi cos^2 v dv / sqrt(...)
+        // and dividing by the wide dimension puts it in the same form as the expression below,
+        // so C is that integral rather than a number:
+        //     C(a, b) = (a + b)^2 / wide * INTEGRAL_0^2pi cos^2 v dv / sqrt(a^2 sin^2 v + b^2 cos^2 v)
+        //
+        // What it gives: 10.10 for the 20 x 0.209 mm trace C was fitted on (the fit was 8.0, so
+        // the derivation reproduces the one case it was tuned to within 26%), 6.04 for a
+        // 3.0 x 0.5 mm rectangular wire, 5.82 for 4.0 x 0.9, 11.48 for 20 x 0.1 foil, and 35.94
+        // for a 0.1 x 1.6 mm tall strip — a factor of 4.5 above the constant, which is the size
+        // of the error a fitted C carries onto a geometry it was never fitted for.
         double wideDimension = (wire.get_type() == WireType::FOIL) ? h : c;
         double thinDimension = (wire.get_type() == WireType::FOIL) ? c : h;
+        const double fringingLossCalibration = fringing_edge_crowding_factor(wideDimension, thinDimension);
         size_t numberSamples = widthSamplesHPerpendicular.size();
         double sampleStep = wideDimension / double(numberSamples);
         double vacuumPermeability = Constants().vacuumPermeability;
         double angularFrequency = 2 * std::numbers::pi * frequency;
 
+        // Both integrals are quadratic forms of the profile: evaluate each for the in-phase
+        // and (when present) the quadrature profile and add, THEN bridge.
+        auto integrateProfile = [&](const std::vector<double>& profile, double& integralSquared, double& integralFluxSquared) {
+            std::vector<double> fluxFunction(numberSamples);
+            double cumulativeFlux = 0;
+            for (size_t sampleIndex = 0; sampleIndex < numberSamples; ++sampleIndex) {
+                double HPerpendicular = profile[sampleIndex];
+                integralSquared += HPerpendicular * HPerpendicular * sampleStep;
+                cumulativeFlux += -vacuumPermeability * HPerpendicular * sampleStep;
+                fluxFunction[sampleIndex] = cumulativeFlux;
+            }
+            double fluxFunctionMean = std::accumulate(fluxFunction.begin(), fluxFunction.end(), 0.0) / double(numberSamples);
+            for (size_t sampleIndex = 0; sampleIndex < numberSamples; ++sampleIndex) {
+                integralFluxSquared += pow(fluxFunction[sampleIndex] - fluxFunctionMean, 2) * sampleStep;
+            }
+        };
         double integralHPerpendicularSquared = 0;
-        std::vector<double> fluxFunction(numberSamples);
-        double cumulativeFlux = 0;
-        for (size_t sampleIndex = 0; sampleIndex < numberSamples; ++sampleIndex) {
-            double HPerpendicular = widthSamplesHPerpendicular[sampleIndex];
-            integralHPerpendicularSquared += HPerpendicular * HPerpendicular * sampleStep;
-            cumulativeFlux += -vacuumPermeability * HPerpendicular * sampleStep;
-            fluxFunction[sampleIndex] = cumulativeFlux;
-        }
-        double fluxFunctionMean = std::accumulate(fluxFunction.begin(), fluxFunction.end(), 0.0) / double(numberSamples);
         double integralFluxFunctionSquared = 0;
-        for (size_t sampleIndex = 0; sampleIndex < numberSamples; ++sampleIndex) {
-            integralFluxFunctionSquared += pow(fluxFunction[sampleIndex] - fluxFunctionMean, 2) * sampleStep;
+        integrateProfile(widthSamplesHPerpendicular, integralHPerpendicularSquared, integralFluxFunctionSquared);
+        if (quadratureData) {
+            if (quadratureWidthSamplesHPerpendicular.size() != numberSamples) {
+                throw InvalidInputException(ErrorCode::INVALID_INPUT, "Wang proximity losses: " + std::to_string(numberSamples) + " in-phase width samples but " +
+                                            std::to_string(quadratureWidthSamplesHPerpendicular.size()) + " quadrature width samples");
+            }
+            double quadratureIntegralHPerpendicularSquared = 0;
+            double quadratureIntegralFluxFunctionSquared = 0;
+            integrateProfile(quadratureWidthSamplesHPerpendicular, quadratureIntegralHPerpendicularSquared, quadratureIntegralFluxFunctionSquared);
+            integralHPerpendicularSquared += quadratureIntegralHPerpendicularSquared;
+            integralFluxFunctionSquared += quadratureIntegralFluxFunctionSquared;
         }
 
         double lossLowFrequency = 0.5 * pow(angularFrequency, 2) * thinDimension / (2 * resistivity) * integralFluxFunctionSquared;
-        double lossHighFrequency = 0.5 * fringingLossCalibration * resistivity / skinDepth * integralHPerpendicularSquared;
+        double lossHighFrequency = 0.5 * fringingLossCalibration * resistivity / skinDepth * integralHPerpendicularSquared * perpendicular_high_frequency_factor();
         if (lossLowFrequency > 0 && lossHighFrequency > 0) {
             turnLosses += 1.0 / (1.0 / lossLowFrequency + 1.0 / lossHighFrequency);
         }
@@ -530,13 +1081,21 @@ double WindingProximityEffectLossesWangModel::calculate_turn_losses(Wire wire, d
 
     // BUG-003 FIX: Normalize nonPlanarHe by the lumped surface-point count
     // (width samples do not contribute to it and must not dilute the average)
-    // FOIL is excluded: its cross components (Hy at the ends, Hx at the faces)
-    // are already covered by the parallel/perpendicular slab terms above
-    // (ABT #182), so routing them through the Ferreira factor double-counts.
-    if (wire.get_type() != WireType::FOIL && nonPlanarHe != 0 && lumpedPointCount > 0) {
+    // FOIL and RECTANGULAR are excluded: their cross components (Hy at the ends,
+    // Hx at the faces) are already covered by the parallel/perpendicular slab terms
+    // above, so routing them through the Ferreira factor double-counts. FOIL got
+    // those two terms in ABT #182; RECTANGULAR got the identical pair in ABT #832,
+    // so the same exclusion now applies to it — it was only harmless before because
+    // the Ferreira rectangular factor was ~1000x too small (see below) and the term
+    // it contributed was indistinguishable from zero. PLANAR still routes through
+    // here: its slab branch keeps the legacy c*h prefactor and the C=8 width
+    // integral, and untangling that needs the OMFEM planar suite (ABT #139).
+    if (wire.get_type() != WireType::FOIL && wire.get_type() != WireType::RECTANGULAR &&
+        (nonPlanarHe != 0 || quadratureNonPlanarHe != 0) && lumpedPointCount > 0) {
         nonPlanarHe /= lumpedPointCount;
+        quadratureNonPlanarHe /= lumpedPointCount;
         double proximityFactor = WindingProximityEffectLossesFerreiraModel::calculate_proximity_factor(wire, frequency, temperature);
-        turnLosses += proximityFactor * pow(nonPlanarHe, 2);
+        turnLosses += proximityFactor * (pow(nonPlanarHe, 2) + pow(quadratureNonPlanarHe, 2));
     }
 
     turnLosses *= wire.get_number_conductors().value();
@@ -589,11 +1148,28 @@ double WindingProximityEffectLossesFerreiraModel::calculate_proximity_factor(Wir
         double h = resolve_dimensional_values(wire.get_conducting_height().value());
 
         double xi = std::min(h, w) / skinDepth;
+        double slabKernel = (sinh(xi) - sin(xi)) / (cosh(xi) + cos(xi));
 
-        // FEM-validated planar/foil/rectangular proximity factor (w*xi form).
-        // Do NOT rewrite to 2*max(h,w)/delta: that over-predicts planar/foil
-        // proximity by 1-2 orders of magnitude (June 2026 regression, reverted).
-        factor = w * xi * resistivity * (sinh(xi) - sin(xi)) / (cosh(xi) + cos(xi));
+        if (wire.get_type() == WireType::PLANAR) {
+            // PLANAR keeps the legacy w*xi form. It is dimensionally wrong in the same
+            // way as the branch below, but it is entangled with the C=8 FEM-calibrated
+            // width integral in the Wang model, and correcting it needs the OMFEM planar
+            // suite re-run — ABT #139. Do NOT "fix" this in isolation: the June 2026
+            // attempt (de156755) reverted precisely because the planar case blew up.
+            factor = w * xi * resistivity * slabKernel;
+        }
+        else {
+            // RECTANGULAR / FOIL. ABT #837: the w*xi form carries a CROSS-SECTION
+            // prefactor -- w * (min(h,w)/delta) * rho has units of Ohm*m^2, so multiplied
+            // by H^2 [A^2/m^2] it yields W, not the W/m every caller then multiplies by a
+            // length. The literature slab form (Dowell 1966; Lammeraner & Stafl 1966; the
+            // same arbitration as ABT #182 for foil and ABT #832 for rectangular) is
+            //     P/l = breadth * rho/delta * H^2 * G(t/delta)
+            // i.e. exactly this expression with 1/delta in place of xi. The difference is
+            // a factor min(h,w) -- 0.9 mm on a 4x0.9 mm conductor, so the old factor was
+            // ~1100x LOW and the term it produced read as zero.
+            factor = w * resistivity / skinDepth * slabKernel;
+        }
         if (std::isnan(factor)) {
             throw NaNResultException("NaN found in Ferreira's proximity factor");
         }
@@ -608,10 +1184,32 @@ double WindingProximityEffectLossesFerreiraModel::calculate_proximity_factor(Wir
             wireDiameter = resolve_dimensional_values(strand.get_conducting_diameter());
         }
         double gamma = wireDiameter / (skinDepth * sqrt(2));
-        // Eq. A8: G = -2*PI*gamma * [...] — the pi was missing, underestimating
-        // round/litz proximity losses by exactly pi (numerically verified against
-        // the modified-Bessel form 2*pi*rho*Re[alpha*I1(alpha)/I0(alpha)])
-        factor = - 2 * std::numbers::pi * gamma * resistivity * (kelvin_function_real(2, gamma) * derivative_kelvin_function_real(0, gamma) + kelvin_function_imaginary(2, gamma) * derivative_kelvin_function_imaginary(0, gamma)) / (pow(kelvin_function_real(0, gamma), 2) + pow(kelvin_function_imaginary(0, gamma), 2));
+        // ABT #1127: Eq. A8 is a ratio of Kelvin functions, and ber/bei grow like
+        // exp(gamma/sqrt(2)) while the power series that evaluates them has terms as
+        // large as exp(gamma). Above gamma ~ 20 the ratio is a difference of huge
+        // nearly-cancelling numbers and no double-precision series survives it: the
+        // proximity factor first overshoots, then crosses ZERO and goes negative
+        // (a negative loss), which is what put the vertical notch in the
+        // resistance-over-frequency sweep. The strong-skin-effect limit of Eq. A8 is
+        // the exact closed form
+        //     G -> pi * rho * (sqrt(2) * gamma - 1)
+        // which is already within 1.3e-3 of the exact value at gamma = 10, 3e-4 at
+        // gamma = 20 and improves as 1/gamma (verified against 60-digit ber/bei).
+        // Same treatment, and the same threshold, as modified_bessel_ratio_I1_I0 uses
+        // for the Albach skin factor.
+        constexpr double gammaAsymptoticThreshold = 20.0;
+        if (gamma >= gammaAsymptoticThreshold) {
+            factor = std::numbers::pi * resistivity * (sqrt(2) * gamma - 1);
+        }
+        else {
+            // Eq. A8: G = -2*PI*gamma * [...] — the pi was missing, underestimating
+            // round/litz proximity losses by exactly pi (numerically verified against
+            // the modified-Bessel form 2*pi*rho*Re[alpha*I1(alpha)/I0(alpha)])
+            factor = - 2 * std::numbers::pi * gamma * resistivity * (kelvin_function_real(2, gamma) * derivative_kelvin_function_real(0, gamma) + kelvin_function_imaginary(2, gamma) * derivative_kelvin_function_imaginary(0, gamma)) / (pow(kelvin_function_real(0, gamma), 2) + pow(kelvin_function_imaginary(0, gamma), 2));
+        }
+        if (std::isnan(factor)) {
+            throw NaNResultException("NaN found in Ferreira's round/litz proximity factor");
+        }
 
 
     }
@@ -702,6 +1300,7 @@ double WindingProximityEffectLossesFerreiraModel::calculate_turn_losses(Wire wir
  * @param temperature Operating temperature [K]
  * @return Proximity effect losses for this turn [W]
  */
+
 double WindingProximityEffectLossesAlbachModel::calculate_turn_losses(Wire wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature) {
     auto& resistivityModel = get_cached_resistivity_model(); // PERF-003: cached
     auto resistivity = (*resistivityModel).get_resistivity(wire.resolve_material(), temperature);
@@ -743,9 +1342,16 @@ double WindingProximityEffectLossesAlbachModel::calculate_turn_losses(Wire wire,
         He2_sum += pow(datum.get_real(), 2) + pow(datum.get_imaginary(), 2);
     }
     double He2_rms = He2_sum / data.size();
-    // FEM-validated form with the cross-section factor d — do NOT drop d
-    // (June 2026 planar/foil over-prediction regression, reverted).
-    double turnLosses = c * resistivity * He2_rms * (alpha * d * tanh(alpha * d / 2.0)).real();
+    // ABT #837: the leading `c` is a second length that does not belong. Every other model
+    // here returns W/m — the aggregator multiplies by the turn length — but c * rho * H^2 *
+    // Re[...] has units of W, so this model was under by a factor of one conductor dimension
+    // (~1e-3 for a sub-millimetre wire), i.e. it reported essentially zero for every wire
+    // type INCLUDING round. Without it the low-frequency limit is rho*d^4/(6*delta^4), which
+    // is 1.70x the exact cylinder result pi*rho*d^4/(32*delta^4) — the model's own plate
+    // approximation applied to a round wire, and a documented over-estimate rather than a
+    // silent zero. (The June 2026 revert cited here backed out a fix that also broke PLANAR
+    // for an unrelated reason; see the Rossmanith note above.)
+    double turnLosses = resistivity * He2_rms * (alpha * d * tanh(alpha * d / 2.0)).real();
 
     // Solid round/foil/rect wires carry no explicit number_conductors — default to 1
     // (was an unguarded .value()); litz supplies its strand count.
@@ -826,9 +1432,318 @@ double WindingProximityEffectLossesLammeranerModel::calculate_proximity_factor(W
             ". Use a different proximity model (e.g., WANG or FERREIRA) for high frequencies.");
     }
 
-    factor = 2.0 * std::numbers::pi * resistivity * pow((wireConductingDimension / 2) / skinDepth, 4) / 4;
+    // ABT #837: wireConductingDimension is ALREADY the half-dimension for round/litz (the
+    // radius, set above as diameter/2), so dividing by 2 again here halved it twice and the
+    // fourth power turned that into a factor 1/16 — the model read 16x LOW everywhere inside
+    // its own validity window. With the stray /2 gone this is
+    //     2*pi*rho*(r/delta)^4/4 = pi*rho*d^4/(32*delta^4)
+    // which is EXACTLY the low-frequency limit of the Kelvin-function proximity factor that
+    // Ferreira/Rossmanith evaluate (verified against an independent radial-mode solve).
+    factor = 2.0 * std::numbers::pi * resistivity * pow(wireConductingDimension / skinDepth, 4) / 4;
 
     return factor;
+}
+
+
+// ============================================================================================
+// MARTINEZ MODEL (ABT #1188) — proximity loss with field exclusion. See the header for the
+// derivation; the short version is that a conductor thicker than a skin depth excludes the
+// field rather than letting it through, and the loss is then a surface integral over the
+// excluded (edge-crowded) field instead of a volume integral over a field that is not there.
+// ============================================================================================
+
+
+// ============================================================================================
+// EWALD & BIELA (EPE'23) — the published analytical 2D model for rectangular conductors.
+// Implemented from the paper's equation (7), external term only (the internal term is the inner
+// skin effect, which MKF accounts for in WindingSkinEffectLosses).
+// ============================================================================================
+double WindingProximityEffectLossesEwaldModel::calculate_turn_losses(Wire wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature) {
+    if (data.empty()) {
+        return 0;
+    }
+    if (wire.get_type() != WireType::RECTANGULAR && wire.get_type() != WireType::PLANAR &&
+        wire.get_type() != WireType::FOIL) {
+        throw ModelNotAvailableException(
+            "The Ewald model is derived for conductors of rectangular cross-section only.");
+    }
+    auto& resistivityModel = get_cached_resistivity_model();
+    const double resistivity = resistivityModel->get_resistivity(wire.resolve_material(), temperature);
+    const double skinDepth = sqrt(resistivity / (std::numbers::pi * frequency * Constants().vacuumPermeability));
+    if (!(skinDepth > 0)) {
+        return 0;
+    }
+    // The paper's w is the conductor width (x) and h its height (y), figure 3.
+    const double width = wire.get_maximum_conducting_width();
+    const double height = wire.get_maximum_conducting_height();
+    if (!(width > 0) || !(height > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA,
+            "The Ewald model needs both conducting dimensions of the rectangular wire");
+    }
+
+    // Mean external field on the conductor, by component. get_real() is Hx, get_imaginary() is Hy.
+    // Width samples are skipped: this model takes ONE homogeneous field per surface by
+    // construction (section II-C), which is exactly the assumption under test.
+    double sumFieldX = 0;
+    double sumFieldY = 0;
+    size_t count = 0;
+    for (const auto& point : data) {
+        if (point.get_label() && point.get_label().value() == "widthsample") {
+            continue;
+        }
+        sumFieldX += point.get_real();
+        sumFieldY += point.get_imaginary();
+        ++count;
+    }
+    if (count == 0) {
+        return 0;
+    }
+    const double fieldX = sumFieldX / double(count);
+    const double fieldY = sumFieldY / double(count);
+
+    const std::complex<double> gamma = std::complex<double>(1.0, 1.0) / skinDepth;
+    const std::complex<double> psiX = gamma * width * std::tanh(gamma * height / 2.0);
+    const std::complex<double> psiY = gamma * height * std::tanh(gamma * width / 2.0);
+    // Equation (7), external term. MKF's field points are PEAK harmonic amplitudes and its other
+    // models take the 1/2 for the time average explicitly; the paper's (7) already carries the
+    // 1/2 of Poynting's theorem (its low-frequency limit (8) reproduces the classical result for
+    // peak amplitudes without a further factor), so none is applied here.
+    const double losses = resistivity * std::real(psiX * fieldX * fieldX + psiY * fieldY * fieldY);
+    return std::max(0.0, losses);
+}
+
+double WindingProximityEffectLossesMartinezModel::calculate_exclusion_factor(double wideDimension, double thinDimension, bool fieldAlongWide) {
+    return stadium_exclusion_factor(wideDimension, thinDimension, fieldAlongWide);
+}
+
+double WindingProximityEffectLossesMartinezModel::calculate_edge_crowding_factor(double wideDimension, double thinDimension) {
+    return calculate_exclusion_factor(wideDimension, thinDimension, false);
+}
+
+
+
+double WindingProximityEffectLossesMartinezModel::calculate_turn_losses(Wire wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature) {
+    return calculate_turn_losses_impl(wire, frequency, data, nullptr, temperature);
+}
+
+double WindingProximityEffectLossesMartinezModel::calculate_turn_losses_from_phasors(Wire wire, double frequency, std::vector<ComplexFieldPoint> inPhaseData, std::vector<ComplexFieldPoint> quadratureData, double temperature) {
+    if (inPhaseData.size() != quadratureData.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Martinez proximity losses: " + std::to_string(inPhaseData.size()) + " in-phase field points but " +
+                                    std::to_string(quadratureData.size()) + " quadrature field points");
+    }
+    return calculate_turn_losses_impl(wire, frequency, inPhaseData, &quadratureData, temperature);
+}
+
+// Phasor field: every squared-field sum takes the in-phase plus the quadrature component
+// (|H|^2 = Re^2 + Im^2), and each low/high-frequency bridge acts on the SUMMED forms. Without
+// quadrature data every quadrature sum is exactly 0: bit-identical to the single-field model.
+double WindingProximityEffectLossesMartinezModel::calculate_turn_losses_impl(Wire& wire, double frequency, const std::vector<ComplexFieldPoint>& data, const std::vector<ComplexFieldPoint>* quadratureData, double temperature) {
+    if (data.empty()) {
+        return 0;
+    }
+    auto& resistivityModel = get_cached_resistivity_model();
+    const double resistivity = resistivityModel->get_resistivity(wire.resolve_material(), temperature);
+    const double skinDepth = sqrt(resistivity / (std::numbers::pi * frequency * Constants().vacuumPermeability));
+    if (!(skinDepth > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "Martinez model: non-positive skin depth at " + std::to_string(frequency) + " Hz");
+    }
+
+    // RECTANGULAR-SECTION WIRES ONLY (Alf, 2026-09-19). A round conductor is not this model's
+    // to claim: Ferreira 1994 is the EXACT Bessel solution for an isolated cylinder in a
+    // transverse AC field, so it already carries the field exclusion this model derives and it
+    // is exact at every frequency rather than bridged between two asymptotes. Round and litz
+    // wire keep Ferreira; sending them here would be a step backwards, so it throws instead of
+    // silently giving a worse answer.
+    if (wire.get_type() != WireType::RECTANGULAR && wire.get_type() != WireType::PLANAR &&
+        wire.get_type() != WireType::FOIL) {
+        throw ModelNotAvailableException(
+            "The Martinez proximity model is for rectangular-section wires (rectangular, planar, "
+            "foil); round and litz conductors are served exactly by Ferreira's Bessel solution.");
+    }
+
+    double wideDimension;
+    double thinDimension;
+    if (wire.get_type() == WireType::FOIL) {
+        wideDimension = wire.get_maximum_conducting_height();
+        thinDimension = wire.get_maximum_conducting_width();
+    }
+    else {
+        wideDimension = wire.get_maximum_conducting_width();
+        thinDimension = wire.get_maximum_conducting_height();
+    }
+    if (!(wideDimension > 0) || !(thinDimension > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA,
+            "Martinez model: the wire carries no usable conducting dimensions");
+    }
+
+    // DECOMPOSE THE FIELD. This is the heart of the model and the thing a magnitude-only
+    // treatment gets wrong: the two field components are excluded by the conductor in completely
+    // different geometries.
+    //
+    //   PARALLEL to the wide face (Hx on a rectangular wire): the field runs along the face. It
+    //   is not excluded sideways and there is no edge crowding — the conductor simply presents
+    //   two wide faces to it, each dissipating the surface-resistance loss 1/2 (rho/delta) H^2.
+    //   Two faces, so the coefficient is 2, and it is geometry-independent.
+    //
+    //   PERPENDICULAR to the wide face (Hy): the field is driven INTO the face and the conductor
+    //   excludes it, so the induced surface current has to run round the section and crowds at
+    //   the edges. That is where the ellipse solution and its aspect-ratio factor belong.
+    //
+    // In a winding window the parallel component usually dominates; near a gap the perpendicular
+    // one does. Charging the perpendicular treatment to the total magnitude over-predicts the
+    // ordinary window field by the ratio of the two coefficients — measured at 2.6x on the
+    // ABT #832 rectangular fixtures before this decomposition was put in.
+    const bool wideAlongY = (wire.get_type() == WireType::FOIL);
+    std::vector<double> perpendicularProfile;
+    double parallelFieldSquaredSum = 0;
+    size_t parallelCount = 0;
+    double edgeFieldSquaredSum = 0;
+    size_t edgeCount = 0;
+    std::vector<double> quadraturePerpendicularProfile;
+    if (quadratureData) {
+        // Squared sums only (the counts come from the in-phase pass over the same points).
+        for (const auto& point : *quadratureData) {
+            if (!point.get_label()) {
+                continue;
+            }
+            const auto label = point.get_label().value();
+            const double fieldX = point.get_real();
+            const double fieldY = point.get_imaginary();
+            if (label == "widthsample") {
+                quadraturePerpendicularProfile.push_back(wideAlongY ? fieldX : fieldY);
+            }
+            else if (label == "top" || label == "bottom") {
+                parallelFieldSquaredSum += (wideAlongY ? fieldY : fieldX) * (wideAlongY ? fieldY : fieldX);
+            }
+            else if (label == "left" || label == "right") {
+                if (wideAlongY) {
+                    parallelFieldSquaredSum += fieldY * fieldY;
+                }
+                else {
+                    edgeFieldSquaredSum += fieldY * fieldY;
+                }
+            }
+        }
+    }
+    for (const auto& point : data) {
+        if (!point.get_label()) {
+            continue;
+        }
+        const auto label = point.get_label().value();
+        // get_real() is Hx and get_imaginary() is Hy: these are field components, not a phasor.
+        const double fieldX = point.get_real();
+        const double fieldY = point.get_imaginary();
+        if (label == "widthsample") {
+            perpendicularProfile.push_back(wideAlongY ? fieldX : fieldY);
+        }
+        else if (label == "top" || label == "bottom") {
+            // The wide faces of a rectangular wire; the flat faces of a foil are left/right.
+            parallelFieldSquaredSum += (wideAlongY ? fieldY : fieldX) * (wideAlongY ? fieldY : fieldX);
+            ++parallelCount;
+        }
+        else if (label == "left" || label == "right") {
+            if (wideAlongY) {
+                // A foil's wide faces ARE left/right, so these carry its parallel field.
+                parallelFieldSquaredSum += fieldY * fieldY;
+                ++parallelCount;
+            }
+            else {
+                // The short ends of a rectangular wire. They carry the PERPENDICULAR component,
+                // and they are the only source of it when no width samples were meshed (fringing
+                // disabled). Dropping them made the model return exactly zero for a field normal
+                // to the wide face — caught against Ewald & Biela's benchmark, where a purely
+                // perpendicular 250 A/m field gave 0 W/m.
+                edgeFieldSquaredSum += fieldY * fieldY;
+                ++edgeCount;
+            }
+        }
+    }
+
+    // INTEGRAL Hperp^2 dx along the wide face, resolved where width samples exist.
+    double integralPerpendicularSquared = 0;
+    std::vector<double> profile = perpendicularProfile;
+    if (profile.empty() && edgeCount > 0) {
+        // No width-resolved samples: take the perpendicular field as uniform across the face, at
+        // the level the short ends report. (edgeFieldSquaredSum already holds the quadrature
+        // squares, so this one uniform profile carries |H|^2 and no quadrature profile is used.)
+        profile.assign(8, sqrt(edgeFieldSquaredSum / double(edgeCount)));
+        quadraturePerpendicularProfile.clear();
+    }
+    if (!quadraturePerpendicularProfile.empty() && quadraturePerpendicularProfile.size() != profile.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Martinez proximity losses: " + std::to_string(profile.size()) + " in-phase width samples but " +
+                                    std::to_string(quadraturePerpendicularProfile.size()) + " quadrature width samples");
+    }
+    if (!profile.empty()) {
+        const double sampleStep = wideDimension / double(profile.size());
+        for (double fieldValue : profile) {
+            integralPerpendicularSquared += fieldValue * fieldValue * sampleStep;
+        }
+        for (double fieldValue : quadraturePerpendicularProfile) {
+            integralPerpendicularSquared += fieldValue * fieldValue * sampleStep;
+        }
+    }
+
+    // EACH COMPONENT GETS ITS OWN LOW/HIGH-FREQUENCY BRIDGE, and the two are summed. Bridging the
+    // COMBINED loss is wrong: a turn in a purely parallel field has no perpendicular asymptote at
+    // all, and a single bridge then collapses the whole result to zero. (Both zero cases showed up
+    // on Ewald & Biela's benchmark — first perpendicular, then parallel after a partial fix.)
+    const double surfaceResistance = resistivity / skinDepth;
+    const double angularFrequency = 2 * std::numbers::pi * frequency;
+    const double vacuumPermeability = Constants().vacuumPermeability;
+    const double meanParallelSquared = parallelCount > 0 ? parallelFieldSquaredSum / double(parallelCount) : 0.0;
+
+    // ---- parallel to the wide face: excluded too, and crowded by the inverse aspect ratio ----
+    // HF: the surface-resistance loss on each of the two wide faces.
+    // LF: the classical slab limit, sigma omega^2 mu0^2 H^2 t^3 w / 24, which is exactly the
+    //     x-term of Ewald & Biela's equation (8).
+    // ABT #1188: the field ALONG the wide face is excluded too, so its coefficient is the ellipse
+    // solution for that axis (4.03 on a 2:1 wire), not the 2.0 of "two flat faces". 2D FEM on the
+    // real conductor measured the difference as 2.016x, and the derived factor closes it.
+    const double parallelExclusionFactor = calculate_exclusion_factor(wideDimension, thinDimension, true);
+    const double highFrequencyParallel = 0.5 * parallelExclusionFactor * surfaceResistance *
+                                         meanParallelSquared * wideDimension;
+    const double lowFrequencyParallel = pow(angularFrequency, 2) * pow(vacuumPermeability, 2) *
+                                        meanParallelSquared * pow(thinDimension, 3) * wideDimension /
+                                        (24 * resistivity);
+    double lossParallel = 0;
+    if (lowFrequencyParallel > 0 && highFrequencyParallel > 0) {
+        lossParallel = 1.0 / (1.0 / lowFrequencyParallel + 1.0 / highFrequencyParallel);
+    }
+
+    // ---- perpendicular to the wide face: excluded, and edge-crowded by the aspect ratio ----
+    double lossPerpendicular = 0;
+    if (!profile.empty()) {
+        const double edgeCrowdingFactor = calculate_edge_crowding_factor(wideDimension, thinDimension);
+        const double highFrequencyPerpendicular = 0.5 * edgeCrowdingFactor * surfaceResistance * integralPerpendicularSquared;
+        // LF: the vector-potential variance across the face (omega^2), which for a uniform field
+        // reduces to the y-term of the same equation (8).
+        const double sampleStep = wideDimension / double(profile.size());
+        double integralFluxVariance = 0;
+        auto accumulateFluxVariance = [&](const std::vector<double>& fieldProfile) {
+            std::vector<double> fluxFunction(fieldProfile.size());
+            double cumulativeFlux = 0;
+            for (size_t i = 0; i < fieldProfile.size(); ++i) {
+                cumulativeFlux += -vacuumPermeability * fieldProfile[i] * sampleStep;
+                fluxFunction[i] = cumulativeFlux;
+            }
+            const double fluxMean = std::accumulate(fluxFunction.begin(), fluxFunction.end(), 0.0) / double(fluxFunction.size());
+            for (double flux : fluxFunction) {
+                integralFluxVariance += pow(flux - fluxMean, 2) * sampleStep;
+            }
+        };
+        accumulateFluxVariance(profile);
+        if (!quadraturePerpendicularProfile.empty()) {
+            accumulateFluxVariance(quadraturePerpendicularProfile);
+        }
+        const double lowFrequencyPerpendicular = pow(angularFrequency, 2) * thinDimension /
+                                                 (2 * resistivity) * integralFluxVariance;
+        if (lowFrequencyPerpendicular > 0 && highFrequencyPerpendicular > 0) {
+            lossPerpendicular = 1.0 / (1.0 / lowFrequencyPerpendicular + 1.0 / highFrequencyPerpendicular);
+        }
+    }
+
+    return lossParallel + lossPerpendicular;
 }
 
 double WindingProximityEffectLossesLammeranerModel::calculate_turn_losses(Wire wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature) {
@@ -1089,30 +2004,56 @@ double WindingProximityEffectLossesWojdaModel::calculate_proximity_factor(Wire w
         // R_pe/l = ηh²·μ₀²·ω²·h / (12·ρ·b)  where ηh = h/p ≈ 1 for dense foil
         double h = resolve_dimensional_values(wire.get_conducting_height().value());
         double bw = resolve_dimensional_values(wire.get_conducting_width().value());
-        // Eq. 42 lamination form (b in the DENOMINATOR, per the comment above).
-        // Do NOT move bw to the numerator (June 2026 planar/foil regression, reverted).
-        factor = std::pow(mu0, 2) * std::pow(omega, 2) * std::pow(h, 3)
-               / (12.0 * resistivity * bw);
+        // ABT #837: the breadth belongs in the NUMERATOR and the constant is 24, not 12.
+        // Dimensions settle it: mu0^2*omega^2*h^3/(rho*bw) is Ohm/m, so multiplied by H^2 it
+        // gives W/m^3 where the aggregator needs W/m — the factor was out by 1/bw^2. The
+        // standard thin-slab low-frequency eddy result, with the PEAK-amplitude convention
+        // MKF uses throughout, is
+        //     P/l = bw * h^3 * mu0^2 * omega^2 * H^2 / (24 * rho)
+        // For a 4 x 0.9 mm conductor the old expression read ~2.7e5x HIGH.
+        factor = std::pow(mu0, 2) * std::pow(omega, 2) * std::pow(h, 3) * bw
+               / (24.0 * resistivity);
     }
     else if (wt == WireType::RECTANGULAR) {
-        // Same form as foil (Eq. 42/45):
+        // Same form as foil (Eq. 42/45), same ABT #837 correction:
         double h  = resolve_dimensional_values(wire.get_conducting_height().value());
         double bw = resolve_dimensional_values(wire.get_conducting_width().value());
-        factor = std::pow(mu0, 2) * std::pow(omega, 2) * std::pow(h, 3)
-               / (12.0 * resistivity * bw);
+        factor = std::pow(mu0, 2) * std::pow(omega, 2) * std::pow(h, 3) * bw
+               / (24.0 * resistivity);
     }
-    else if (wt == WireType::ROUND) {
+    else if (wt == WireType::ROUND || wt == WireType::LITZ) {
         // Eq. 70: R_pe = ηb²·π²·μ₀²·ω²·Nl²·lT·d² / (576·ρ)
         // Per-conductor per-metre, single layer (Nl=1):
         //   factor = π·μ₀²·ω²·d⁴ / (128·ρ)  (consistent with Sullivan SFD at low
         //   freq, which matches the exact LF cylinder result — π² was π too high)
-        double d = resolve_dimensional_values(wire.get_conducting_diameter().value());
-        factor = std::numbers::pi * std::pow(mu0, 2) * std::pow(omega, 2) * std::pow(d, 4)
-               / (128.0 * resistivity);
+        double d;
+        if (wt == WireType::ROUND) {
+            d = resolve_dimensional_values(wire.get_conducting_diameter().value());
+        }
+        else {
+            auto strand = wire.resolve_strand();
+            d = resolve_dimensional_values(strand.get_conducting_diameter());
+        }
+
+    // ABT #837: the SFD form is a LOW-FREQUENCY asymptote — it grows as omega^2 forever, while
+    // true proximity loss saturates towards sqrt(f) once the field stops penetrating. Outside
+    // d << delta the over-prediction runs away as (r/delta)^3: ~25% at r/delta = 1, but 119x by
+    // r/delta ~ 7.6 (d = 1 mm at 1 MHz), which the model used to report silently. Refuse beyond
+    // the same r/delta <= 1 bound the Lammeraner proximity model uses, and say "only valid for"
+    // so the model sweeps record it as a declined combination rather than a crash
+    // (TestWindingLosses.cpp, ABT #376/#116).
+    {
+        const double skinDepthForBound = WindingSkinEffectLosses::calculate_skin_depth(wire, frequency, temperature);
+        const double normalisedRadius = (d / 2) / skinDepthForBound;
+        if (normalisedRadius > 1.0) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "Wojda proximity model is only valid for low frequencies where the conductor is "
+                "small against the skin depth (radius/skin_depth <= 1); here it is " +
+                std::to_string(normalisedRadius) + ", where this squared-field-derivative form "
+                "over-predicts by roughly (radius/skin_depth)^3. Use FERREIRA or ROSSMANITH, which "
+                "evaluate the exact Kelvin-function factor at any frequency.");
+        }
     }
-    else if (wt == WireType::LITZ) {
-        auto strand = wire.resolve_strand();
-        double d = resolve_dimensional_values(strand.get_conducting_diameter());
         factor = std::numbers::pi * std::pow(mu0, 2) * std::pow(omega, 2) * std::pow(d, 4)
                / (128.0 * resistivity);
     }
@@ -1171,6 +2112,26 @@ double WindingProximityEffectLossesSullivanModel::calculate_proximity_factor(Wir
             "Sullivan SFD model only supports ROUND and LITZ wire");
     }
 
+
+    // ABT #837: the SFD form is a LOW-FREQUENCY asymptote — it grows as omega^2 forever, while
+    // true proximity loss saturates towards sqrt(f) once the field stops penetrating. Outside
+    // d << delta the over-prediction runs away as (r/delta)^3: ~25% at r/delta = 1, but 119x by
+    // r/delta ~ 7.6 (d = 1 mm at 1 MHz), which the model used to report silently. Refuse beyond
+    // the same r/delta <= 1 bound the Lammeraner proximity model uses, and say "only valid for"
+    // so the model sweeps record it as a declined combination rather than a crash
+    // (TestWindingLosses.cpp, ABT #376/#116).
+    {
+        const double skinDepthForBound = WindingSkinEffectLosses::calculate_skin_depth(wire, frequency, temperature);
+        const double normalisedRadius = (d / 2) / skinDepthForBound;
+        if (normalisedRadius > 1.0) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "Sullivan SFD proximity model is only valid for low frequencies where the conductor is "
+                "small against the skin depth (radius/skin_depth <= 1); here it is " +
+                std::to_string(normalisedRadius) + ", where this squared-field-derivative form "
+                "over-predicts by roughly (radius/skin_depth)^3. Use FERREIRA or ROSSMANITH, which "
+                "evaluate the exact Kelvin-function factor at any frequency.");
+        }
+    }
     // Appendix A, Eq. (1): P_inst/l = (π·d⁴)/(128·ρ) · |dB/dt|²
     // For sinusoidal B=μ₀·H·sin(ωt): <|dB/dt|²> = μ₀²·ω²·H²_rms
     // → factor [Ω·m] = π·μ₀²·ω²·d⁴ / (128·ρ)
@@ -1404,6 +2365,166 @@ double WindingProximityEffectLossesVandelacModel::calculate_turn_losses(Wire wir
     return turnLosses;
 }
 
+// ============================================================================
+// WANG_STACKED (ABT #1409)
+// ============================================================================
+
+double WindingProximityEffectLossesWangStackedModel::perpendicular_high_frequency_factor() const {
+    if (!_perpendicularOutlineFactor) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "WANG_STACKED: no stack-outline factor was set for this turn");
+    }
+    return _perpendicularOutlineFactor.value();
+}
+
+double WindingProximityEffectLossesWangStackedModel::outline_integral(double A, double B, double v1, double v2) {
+    // 64-point Gauss-Legendre. For a wide, flat outline (A > B) the integrand peaks within B/A of
+    // v = 0; u = sin v, u = (B / sqrt(A^2 - B^2)) sinh t turns it into sqrt(1 - u^2) / sqrt(A^2 - B^2),
+    // smooth in t. Checked against a 2e6-point trapezoid: within 4e-6 up to A/B = 100.
+    static const std::pair<std::vector<double>, std::vector<double>> nodesAndWeights = []() {
+        constexpr size_t n = 64;
+        std::vector<double> nodes(n), weights(n);
+        for (size_t i = 0; i < n; ++i) {
+            double x = std::cos(std::numbers::pi * (static_cast<double>(i) + 0.75) / (static_cast<double>(n) + 0.5));
+            double derivative = 0;
+            for (int newton = 0; newton < 100; ++newton) {
+                double p0 = 1, p1 = x;
+                for (size_t k = 2; k <= n; ++k) {
+                    double p2 = ((2.0 * static_cast<double>(k) - 1) * x * p1 - (static_cast<double>(k) - 1.0) * p0) / static_cast<double>(k);
+                    p0 = p1;
+                    p1 = p2;
+                }
+                derivative = static_cast<double>(n) * (x * p1 - p0) / (x * x - 1);
+                double step = p1 / derivative;
+                x -= step;
+                if (std::abs(step) < 1e-15) {
+                    break;
+                }
+            }
+            nodes[i] = x;
+            weights[i] = 2 / ((1 - x * x) * derivative * derivative);
+        }
+        return std::pair<std::vector<double>, std::vector<double>>{nodes, weights};
+    }();
+    const auto& nodes = nodesAndWeights.first;
+    const auto& weights = nodesAndWeights.second;
+    double total = 0;
+    if (A > B) {
+        double c = std::sqrt(A * A - B * B);
+        double t1 = std::asinh(std::sin(v1) * c / B);
+        double t2 = std::asinh(std::sin(v2) * c / B);
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            double t = 0.5 * (t2 - t1) * nodes[i] + 0.5 * (t2 + t1);
+            double u = B / c * std::sinh(t);
+            total += weights[i] * std::sqrt(std::max(0.0, 1 - u * u)) / c;
+        }
+        return total * 0.5 * (t2 - t1);
+    }
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        double v = 0.5 * (v2 - v1) * nodes[i] + 0.5 * (v2 + v1);
+        double sine = std::sin(v), cosine = std::cos(v);
+        total += weights[i] * cosine * cosine / std::sqrt(A * A * sine * sine + B * B * cosine * cosine);
+    }
+    return total * 0.5 * (v2 - v1);
+}
+
+std::vector<double> WindingProximityEffectLossesWangStackedModel::calculate_perpendicular_outline_factors(Coil coil) {
+    if (!coil.get_turns_description()) {
+        throw CoilNotProcessedException("WANG_STACKED: the coil has no turns description");
+    }
+    const auto turns = coil.get_turns_description().value();
+    size_t numberTurns = turns.size();
+    std::vector<double> factors(numberTurns, 1.0);
+
+    // Each flat turn in its own (wide, stacking) frame, as the CoilMesher places its width samples.
+    struct FlatTurn { bool flat; bool wideAlongY; double wide; double thin; double alongWide; double alongStack; };
+    std::vector<FlatTurn> flatTurns(numberTurns);
+    for (size_t turnIndex = 0; turnIndex < numberTurns; ++turnIndex) {
+        const auto& turn = turns[turnIndex];
+        auto wire = coil.resolve_wire(coil.get_winding_index_by_name(turn.get_winding()));
+        FlatTurn flatTurn{false, false, 0, 0, 0, 0};
+        if (wire.get_type() == WireType::RECTANGULAR || wire.get_type() == WireType::PLANAR || wire.get_type() == WireType::FOIL) {
+            flatTurn.flat = true;
+            flatTurn.wideAlongY = (wire.get_type() == WireType::FOIL);
+            double width = wire.get_maximum_conducting_width();
+            double height = wire.get_maximum_conducting_height();
+            flatTurn.wide = flatTurn.wideAlongY ? height : width;
+            flatTurn.thin = flatTurn.wideAlongY ? width : height;
+            flatTurn.alongWide = flatTurn.wideAlongY ? turn.get_coordinates()[1] : turn.get_coordinates()[0];
+            flatTurn.alongStack = flatTurn.wideAlongY ? turn.get_coordinates()[0] : turn.get_coordinates()[1];
+        }
+        flatTurns[turnIndex] = flatTurn;
+    }
+
+    std::vector<size_t> parent(numberTurns);
+    for (size_t i = 0; i < numberTurns; ++i) {
+        parent[i] = i;
+    }
+    auto root = [&](size_t i) {
+        while (parent[i] != i) {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        return i;
+    };
+    for (size_t i = 0; i < numberTurns; ++i) {
+        const auto& a = flatTurns[i];
+        if (!a.flat) {
+            continue;
+        }
+        for (size_t j = i + 1; j < numberTurns; ++j) {
+            const auto& b = flatTurns[j];
+            if (!b.flat || b.wideAlongY != a.wideAlongY) {
+                continue;
+            }
+            double tolerance = 1e-9 * std::max(a.wide, b.wide);
+            if (std::abs(a.wide - b.wide) > tolerance || std::abs(a.thin - b.thin) > tolerance) {
+                continue;
+            }
+            if (std::abs(a.alongWide - b.alongWide) >= a.wide / 2) {
+                continue;
+            }
+            double slit = std::abs(a.alongStack - b.alongStack) - a.thin;
+            if (slit >= 0 && slit < a.wide / 2) {
+                parent[root(i)] = root(j);
+            }
+        }
+    }
+    std::map<size_t, std::vector<size_t>> stacks;
+    for (size_t i = 0; i < numberTurns; ++i) {
+        if (flatTurns[i].flat) {
+            stacks[root(i)].push_back(i);
+        }
+    }
+    for (auto& [stackRoot, members] : stacks) {
+        if (members.size() < 2) {
+            continue;  // an isolated conductor keeps Wang's own ellipse: factor 1
+        }
+        std::sort(members.begin(), members.end(), [&](size_t i, size_t j) { return flatTurns[i].alongStack < flatTurns[j].alongStack; });
+        double wide = flatTurns[members[0]].wide;
+        double thin = flatTurns[members[0]].thin;
+        double minimumAlongWide = std::numeric_limits<double>::max();
+        double maximumAlongWide = std::numeric_limits<double>::lowest();
+        for (auto i : members) {
+            minimumAlongWide = std::min(minimumAlongWide, flatTurns[i].alongWide);
+            maximumAlongWide = std::max(maximumAlongWide, flatTurns[i].alongWide);
+        }
+        double A = (maximumAlongWide - minimumAlongWide + wide) / 2;
+        double stackBottom = flatTurns[members.front()].alongStack - thin / 2;
+        double stackTop = flatTurns[members.back()].alongStack + thin / 2;
+        double B = (stackTop - stackBottom) / 2;
+        double stackCentre = (stackTop + stackBottom) / 2;
+        double a = wide / 2;
+        double b = thin / 2;
+        double isolated = (a + b) * (a + b) * outline_integral(a, b, -std::numbers::pi / 2, std::numbers::pi / 2);
+        auto angleAt = [&](double position) { return std::asin(std::clamp((position - stackCentre) / B, -1.0, 1.0)); };
+        for (size_t k = 0; k < members.size(); ++k) {
+            size_t i = members[k];
+            double lower = (k == 0) ? stackBottom : (flatTurns[members[k - 1]].alongStack + flatTurns[i].alongStack) / 2;
+            double upper = (k + 1 == members.size()) ? stackTop : (flatTurns[members[k + 1]].alongStack + flatTurns[i].alongStack) / 2;
+            factors[i] = (A + B) * (A + B) * outline_integral(A, B, angleAt(lower), angleAt(upper)) / isolated;
+        }
+    }
+    return factors;
+}
 
 } // namespace OpenMagnetics
-

@@ -1,0 +1,239 @@
+// Validation for the 2026-07 shape families added to CorePiece::factory
+// (ABT #263-#272). Each new family is modelled as inheriting an existing piece's
+// geometry; this test confirms (a) the factory recognises the family without
+// throwing, (b) effective parameters compute, and (c) for identical A-F dimensions
+// the child family yields the SAME Ae/Le as its parent piece (i.e. the inheritance
+// is wired correctly).
+#include "constructive_models/Core.h"
+#include "TestingUtils.h"
+#include "json.hpp"
+#include <numbers>
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
+
+using namespace MAS;
+using namespace OpenMagnetics;
+
+static std::pair<double, double> ae_le(CoreShape shape, CoreShapeFamily family) {
+    shape.set_family(family);
+    auto piece = CorePiece::factory(shape, true);
+    auto ep = piece->get_partial_effective_parameters();
+    return {ep.get_effective_area(), ep.get_effective_length()};
+}
+
+TEST_CASE("New shape families inherit parent geometry", "[corepiece][newfamilies]") {
+    // {parent shape name, parent family, child family}
+    struct Case { std::string shapeName; CoreShapeFamily parent; CoreShapeFamily child; };
+    std::vector<Case> cases = {
+        {"EP 13",        CoreShapeFamily::EP,  CoreShapeFamily::EPQ},
+        {"EP 13",        CoreShapeFamily::EP,  CoreShapeFamily::EPW},
+        {"EP 13",        CoreShapeFamily::EP,  CoreShapeFamily::EPT},
+        {"EP 13",        CoreShapeFamily::EP,  CoreShapeFamily::LEP},
+        {"ETD 29/16/10", CoreShapeFamily::ETD, CoreShapeFamily::EER},
+        {"E 20/10/6",    CoreShapeFamily::E,   CoreShapeFamily::EF},
+    };
+    for (auto& c : cases) {
+        auto shape = find_core_shape_by_name(c.shapeName);
+        auto [aeP, leP] = ae_le(shape, c.parent);
+        auto [aeC, leC] = ae_le(shape, c.child);
+        INFO("shape=" << c.shapeName << " Ae parent=" << aeP << " child=" << aeC
+                      << " Le parent=" << leP << " child=" << leC);
+        REQUIRE(aeC > 0.0);
+        REQUIRE(leC > 0.0);
+        REQUIRE_THAT(aeC, Catch::Matchers::WithinRel(aeP, 1e-9));
+        REQUIRE_THAT(leC, Catch::Matchers::WithinRel(leP, 1e-9));
+    }
+}
+
+// ABT #270: EPC no longer inherits EP. It has its own piece (CorePieceEpc: an E-core walk
+// around a stadium pole), so it left the inheritance list above and is checked here against
+// TDK's PUBLISHED effective parameters instead of against another MKF result.
+//
+// Sources: TDK "EPC series" catalogues, 2026-04 ferrite_mz_rf-power_epc_en.pdf (EPC13, EPC17)
+// and 2014-03 ferrite_mz_sw_epc_en.pdf (EPC25). The MAS records carry those drawings'
+// dimensions.
+//
+// The bands are the model's ACCEPTED error, not tuning slack. The owner accepted an
+// approximate EPC model (ABT #270, 2026-09-23); the reasons are in the CorePieceEpc comment.
+// Measured errors: EPC13 le -7.4 % / Ae +0.4 % / Ve -7.0 %; EPC17 le -5.3 % / Ae -6.7 % /
+// Ve -11.6 %; EPC25 le -1.3 % / Ae +2.8 % / Ve +1.3 %. Each band is set about 1.5 points
+// outside its measured error, so the test does not flap on rounding but still fails if the
+// model drifts or the records change.
+TEST_CASE("Test_Epc_Effective_Parameters_Against_Tdk_Catalogue", "[core][shape-families][epc]") {
+    settings.reset();
+    clear_databases();
+
+    struct Reference {
+        std::string shapeName;
+        double effectiveAreaSquareMillimetres;
+        double effectiveLengthMillimetres;
+        double effectiveVolumeCubicMillimetres;
+        double areaBand;
+        double lengthBand;
+        double volumeBand;
+    };
+    std::vector<Reference> references = {
+        {"EPC 13", 12.5, 30.6,  382, 0.02, 0.09, 0.085},
+        {"EPC 17", 22.8, 40.2,  917, 0.08, 0.07, 0.13},
+        {"EPC 25", 40.4, 56.3, 2280, 0.045, 0.03, 0.03},
+    };
+
+    for (const auto& reference : references) {
+        auto core = OpenMagneticsTesting::get_quick_core(reference.shapeName, json::array(), 1, "3C97");
+        REQUIRE(core.get_shape_family() == CoreShapeFamily::EPC);
+        auto effectiveParameters = core.get_processed_description()->get_effective_parameters();
+        double effectiveArea = effectiveParameters.get_effective_area() * 1e6;
+        double effectiveLength = effectiveParameters.get_effective_length() * 1e3;
+        double effectiveVolume = effectiveParameters.get_effective_volume() * 1e9;
+        UNSCOPED_INFO(reference.shapeName << ": Ae " << effectiveArea << " mm2 (TDK "
+                      << reference.effectiveAreaSquareMillimetres << "), le " << effectiveLength
+                      << " mm (TDK " << reference.effectiveLengthMillimetres << "), Ve "
+                      << effectiveVolume << " mm3 (TDK " << reference.effectiveVolumeCubicMillimetres << ")");
+        CHECK_THAT(effectiveArea, Catch::Matchers::WithinRel(reference.effectiveAreaSquareMillimetres, reference.areaBand));
+        CHECK_THAT(effectiveLength, Catch::Matchers::WithinRel(reference.effectiveLengthMillimetres, reference.lengthBand));
+        CHECK_THAT(effectiveVolume, Catch::Matchers::WithinRel(reference.effectiveVolumeCubicMillimetres, reference.volumeBand));
+
+        // The pole is the stadium, which reproduces TDK's published centre-pole area Acp.
+        auto centralColumn = core.get_processed_description()->get_columns()[0];
+        REQUIRE(centralColumn.get_corner_radius());
+        CHECK_THAT(centralColumn.get_corner_radius().value(),
+                   Catch::Matchers::WithinRel(centralColumn.get_depth() / 2, 1e-6));
+    }
+
+    // Acp from the same catalogues: EPC13 10.6, EPC17 19.9, EPC25 42.6 mm2.
+    std::vector<std::pair<std::string, double>> poleAreas = {{"EPC 13", 10.6}, {"EPC 17", 19.9}, {"EPC 25", 42.6}};
+    for (const auto& [shapeName, poleArea] : poleAreas) {
+        auto core = OpenMagneticsTesting::get_quick_core(shapeName, json::array(), 1, "3C97");
+        double area = core.get_processed_description()->get_columns()[0].get_area() * 1e6;
+        INFO(shapeName << " pole area " << area << " mm2, TDK Acp " << poleArea);
+        CHECK_THAT(area, Catch::Matchers::WithinRel(poleArea, 0.01));
+    }
+    settings.reset();
+}
+
+// The EPC pole is a stadium long along A, carried as a RECTANGULAR column whose corner radius is
+// half its short side (see CorePieceEpc for why it is not OBLONG). Under real winding geometry a
+// turn around it must be the stadium turn: straights 4 (w - d) plus a circle of radius d + standoff,
+// where w and d are the bobbin bore's half-extents. An OBLONG column would have charged
+// 2 pi r + 4 (d - w), about 19 % short.
+TEST_CASE("Test_Epc_Real_Winding_Turn_Is_The_Stadium", "[core][shape-families][epc]") {
+    settings.reset();
+    clear_databases();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto coil = OpenMagneticsTesting::get_quick_coil({10}, {1}, "EPC 13");
+    auto bobbin = coil.resolve_bobbin();
+    auto processed = bobbin.get_processed_description().value();
+    REQUIRE(processed.get_column_shape() == ColumnShape::RECTANGULAR);
+    double halfWidth = processed.get_column_width().value();
+    double halfDepth = processed.get_column_depth();
+    REQUIRE(processed.get_column_corner_radius());
+    CHECK_THAT(processed.get_column_corner_radius().value(), Catch::Matchers::WithinRel(halfDepth, 1e-6));
+
+    auto turns = coil.get_turns_description().value();
+    size_t checked = 0;
+    for (const auto& turn : turns) {
+        if (turn.get_length() <= 0) {
+            continue;  // real winding's zero-length station entry, as on any E core
+        }
+        double standoff = turn.get_coordinates()[0] - halfWidth;
+        double stadium = 4 * (halfWidth - halfDepth) + 2 * std::numbers::pi * (halfDepth + standoff);
+        INFO(turn.get_name() << ": length " << turn.get_length() << " m, stadium " << stadium << " m");
+        CHECK_THAT(turn.get_length(), Catch::Matchers::WithinRel(stadium, 1e-6));
+        checked++;
+    }
+    CHECK(checked >= 10);
+    settings.reset();
+}
+
+// A pole that is thicker than it is long is not an EPC. The walk would silently model it wrong,
+// so the piece refuses it.
+TEST_CASE("Test_Epc_Refuses_A_Pole_Thicker_Than_Long", "[core][shape-families][epc]") {
+    settings.reset();
+    clear_databases();
+    auto shape = find_core_shape_by_name("EPC 13");
+    auto dimensions = shape.get_dimensions().value();
+    std::swap(dimensions["F"], dimensions["F2"]);
+    shape.set_dimensions(dimensions);
+    REQUIRE_THROWS(CorePiece::factory(shape, true));
+    settings.reset();
+}
+
+// ABT #274 / #264: validate the piece-and-plate effective parameters against PUBLISHED vendor
+// values rather than against another MKF result.
+//
+// Source: Magnetics 2022 Ferrite Catalog, "U, I Cores", printed pages 38-39
+// (https://www.mag-inc.com/Media/Magnetics/File-Library/Product%20Literature/Ferrite%20Literature/Magnetics-2022-Ferrite-Catalog.pdf).
+// An I bar has no closed magnetic path of its own, so the le/Ae printed on an I-core row are those
+// of the U+I COMBINATION it is used in -- which is exactly what a UI shape models. Those rows are
+// the reference below.
+//
+// IEC 60205:2016 has no clause for a piece closed by a plate (every 5.x clause is "Pair of
+// X-cores"), so CorePieceUi applies the standard's general method -- C1 = sum(l/A), C2 =
+// sum(l/A^2), le = C1^2/C2, Ae = C1/C2, corners per clause 4.6. This test is what keeps that
+// derivation honest.
+TEST_CASE("Test_Ui_Effective_Parameters_Match_Vendor_Catalogue", "[core][shape-families][ui]") {
+    settings.reset();
+    clear_databases();
+
+    struct Reference {
+        std::string shapeName;
+        double effectiveLengthMillimetres;   // catalogue le, from the I-core row
+        double effectiveAreaSquareMillimetres;
+    };
+    // UI 93/76/16 pairs with plate I 93/28/16: catalogue le 257 mm, Ae 450 mm^2.
+    // PQI 16/7.8 from TDK's planar series: published Ae 41.8 mm^2 and Ve 815 mm^3, so the
+    // published le is Ve/Ae = 19.50 mm. (IEC 60205 clause 5.12 covers the PQ + PLT(plate)
+    // combination; the geometry keeps the PQ's logarithmic radial-spreading yoke.)
+    std::vector<Reference> references = {
+        {"UI 93/76/16", 257.0, 450.0},
+        {"PQI 16/7.8",   19.50,  41.8},
+    };
+
+    for (const auto& reference : references) {
+        auto shape = find_core_shape_by_name(reference.shapeName);
+        auto piece = CorePiece::factory(shape, true);
+        REQUIRE(piece != nullptr);
+        auto effectiveParameters = piece->get_partial_effective_parameters();
+
+        double effectiveLength = effectiveParameters.get_effective_length() * 1000;
+        double effectiveArea = effectiveParameters.get_effective_area() * 1e6;
+        UNSCOPED_INFO(reference.shapeName << ": le = " << effectiveLength << " mm (catalogue "
+                      << reference.effectiveLengthMillimetres << "), Ae = " << effectiveArea
+                      << " mm2 (catalogue " << reference.effectiveAreaSquareMillimetres << ")");
+        // 5% covers the catalogue's three-significant-figure rounding and the dimensional
+        // tolerances; the derivation itself lands well inside 1% on these parts.
+        CHECK_THAT(effectiveLength, Catch::Matchers::WithinRel(reference.effectiveLengthMillimetres, 0.05));
+        CHECK_THAT(effectiveArea, Catch::Matchers::WithinRel(reference.effectiveAreaSquareMillimetres, 0.05));
+    }
+    settings.reset();
+}
+
+// ABT #264: the PIECE_AND_PLATE branch of the geometrical-description switch used to be an empty
+// `break`, so a piece-and-plate core produced NO geometry for CAD/3D consumers to draw. It must
+// emit the shaped half plus the closing plate, using MAS's own PLATE element type rather than a
+// second mirrored HALF_SET.
+TEST_CASE("Test_Piece_And_Plate_Emits_Piece_And_Plate_Geometry", "[core][shape-families][ui]") {
+    settings.reset();
+    clear_databases();
+
+    auto core = OpenMagneticsTesting::get_quick_core("UI 93/76/16", json::array(), 1, "3C97");
+    REQUIRE(core.get_functional_description().get_type() == CoreType::PIECE_AND_PLATE);
+
+    auto geometricalDescription = core.get_geometrical_description();
+    REQUIRE(geometricalDescription);
+
+    size_t halfSets = 0;
+    size_t plates = 0;
+    for (const auto& element : geometricalDescription.value()) {
+        if (element.get_type() == CoreGeometricalDescriptionElementType::HALF_SET) {
+            halfSets++;
+        }
+        else if (element.get_type() == CoreGeometricalDescriptionElementType::PLATE) {
+            plates++;
+        }
+    }
+    // Exactly one shaped half and one closing plate -- not two mirrored halves.
+    CHECK(halfSets == 1);
+    CHECK(plates == 1);
+    settings.reset();
+}

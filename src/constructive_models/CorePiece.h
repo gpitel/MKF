@@ -4,11 +4,13 @@
 
 #include <MAS.hpp>
 
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <numbers>
+#include <optional>
 #include <streambuf>
 #include <vector>
 
@@ -56,6 +58,31 @@ class CorePiece {
     virtual void process_winding_window() = 0;
     virtual void process_extra_data() = 0;
 
+    // ABT #362: pieces whose magnetic circuit crosses TWO materials (e.g. a ferrite drum
+    // closed by a magnetic-epoxy shell) expose their IEC shape constants split per material:
+    // {c1_core, c2_core, c1_shell, c2_shell}. c1 alone drives the per-section reluctance
+    // (mu applied section by section); c1 and c2 together give each material's own effective
+    // parameters — le = c1^2/c2, Ae = c1/c2, Ve = c1^3/c2^2 — which the core-loss split needs
+    // to price each material over ITS volume at ITS flux density. Single-material pieces
+    // return nullopt (default).
+    virtual std::optional<std::array<double, 4>> get_mixed_material_constants() { return std::nullopt; }
+
+    // ABT #1002: a compression-moulded body can be pressed from up to THREE powders -- the post
+    // the coil sits on, the cover moulded over the coil, and the base plate under it (the WE lists
+    // of parts name them COR / COV / SUB, or Inner / Outer when base and cover are one pressing).
+    // Pieces built that way expose their IEC 60205 sections grouped per REGION, in the order
+    // functionalDescription.material lists the grades, so the inductance model can apply each
+    // region's own permeability and the loss model can price each region's own volume. c1 and c2
+    // are the same sums get_shape_constants() makes: adding the regions reproduces the piece.
+    // Single-region pieces return nullopt (default).
+    struct RegionShapeConstants {
+        std::string name;
+        double c1;
+        double c2;
+        double minimumArea;
+    };
+    virtual std::optional<std::vector<RegionShapeConstants>> get_region_shape_constants() { return std::nullopt; }
+
     virtual ~CorePiece() = default;
 
     /**
@@ -101,6 +128,16 @@ class CorePiece {
     }
 
     static std::shared_ptr<CorePiece> factory(CoreShape shape, bool process=true);
+
+    /**
+     * @brief Whether factory() can build a piece for this shape family.
+     *
+     * ABT #307: MAS ships shape records for families whose geometry class does not
+     * exist yet (UI, PQI, ...). The catalog loader uses this to leave those shapes
+     * out instead of letting one unbuildable record abort an entire adviser sweep.
+     * Single source of truth for factory()'s dispatch — keep the two in step.
+     */
+    static bool is_family_supported(CoreShapeFamily family);
 
     void process();
     
@@ -223,6 +260,45 @@ class CorePiece {
      */
     CoreLossFractions calculate_core_loss_fractions();
 };
+
+/**
+ * The shape families CorePiece::factory can actually construct.
+ *
+ * This is the ENGINE's capability, and it is deliberately not the same question as
+ * get_core_shape_families() in Utils.h, which reports the families that happen to
+ * appear in the loaded shape database. A family with no catalogue shape is still
+ * fully buildable from a custom shape, so a UI that offers families must ask this
+ * one; asking the database instead silently hides every family nobody has published
+ * a part for yet.
+ *
+ * @return the supported families, in declaration order
+ */
+std::vector<CoreShapeFamily> get_supported_core_shape_families();
+
+/**
+ * The dimensions a family's geometry reads and REQUIRES, from the CorePiece subclass that
+ * reads them — not from whichever shapes are published, which answers nothing for a family
+ * with no catalogue record (ABT #1007). Optional, guarded dimensions are deliberately absent;
+ * get_shape_family_dimensions adds whatever the catalogue additionally carries.
+ *
+ * @throws std::runtime_error if the family has no declaration.
+ */
+std::vector<std::string> get_core_shape_family_required_dimensions(CoreShapeFamily family);
+
+/**
+ * The family the engine models a shape as. Differs from the declared family only for pure
+ * aliases, whose geometry AND magnetic circuit are those of another family:
+ *   H -> DRUM (ABT #277): "H" is the Asian-vendor name for the H/I-shaped drum bobbin core.
+ *
+ * An alias cannot be handled in CorePiece::factory alone: the core TYPE (open shape vs
+ * two-piece set), the open-core inductance model and the painter all branch on the family,
+ * so an H routed only through the factory would get a drum's geometry but be MIRRORED as a
+ * two-piece set (twice the path length) and skip the drum's air-return model. Shapes are
+ * therefore canonicalised where they enter (Core construction and shape resolution, the
+ * catalogue loader), the same way an ELP name resolves to its planarE record (ABT #273).
+ */
+CoreShapeFamily canonical_core_shape_family(CoreShapeFamily family);
+CoreShape canonicalize_core_shape_family(CoreShape shape);
 
 void from_json(const json& j, OpenMagnetics::CorePiece& x);
 void to_json(json& j, const OpenMagnetics::CorePiece& x);

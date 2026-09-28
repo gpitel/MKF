@@ -32,15 +32,39 @@ namespace OpenMagnetics {
 // per-stage timing investigations (e.g. finding the bottleneck in slow
 // converter wizards). Off by default — production callers and the
 // WebFrontend WASM build see only the existing log entries.
-inline void log_stage(const std::string& stage, size_t count) {
-    logEntry("After " + stage + ": " + std::to_string(count), "CoreAdviser");
+// Shared cursor for the CORE_ADVISER_PROFILE stream, so that log_stage and
+// log_probe below report deltas against the same previous mark rather than two
+// independent ones (otherwise a probe between two stages would leave the stage
+// delta double-counting the probe's own span).
+inline std::chrono::steady_clock::time_point& profile_cursor() {
+    thread_local auto prev = std::chrono::steady_clock::now();
+    return prev;
+}
+
+inline void profile_mark(const std::string& label, size_t count) {
     if (const char* dbg = std::getenv("CORE_ADVISER_PROFILE"); dbg && dbg[0] == '1') {
-        thread_local auto prev = std::chrono::steady_clock::now();
+        auto& prev = profile_cursor();
         auto now = std::chrono::steady_clock::now();
         auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - prev).count();
-        std::cerr << "[CA-PROFILE] " << stage << ": " << dt_ms << " ms (count=" << count << ")\n";
+        std::cerr << "[CA-PROFILE] " << label << ": " << dt_ms << " ms (count=" << count << ")\n";
         prev = now;
     }
+}
+
+inline void log_stage(const std::string& stage, size_t count) {
+    logEntry("After " + stage + ": " + std::to_string(count), "CoreAdviser");
+    profile_mark(stage, count);
+}
+
+// Profile-only probe for stretches that emit no stage log at all. ABT #859: the
+// DMC run spends minutes both BEFORE the first logged stage (dataset build,
+// input pre-processing) and AFTER the last one (per-candidate winding in
+// post_process_and_cut), and neither span was visible to CORE_ADVISER_PROFILE
+// because that stream is driven exclusively by log_stage. Unlike log_stage this
+// writes nothing at all unless CORE_ADVISER_PROFILE=1, so it can sit on a hot
+// path without changing what production logging emits.
+inline void log_probe(const std::string& label, size_t count = 0) {
+    profile_mark(label, count);
 }
 inline void log_pruned(const std::string& stage, size_t count) {
     logEntry("Pruned to " + std::to_string(count) + " before " + stage, "CoreAdviser");
@@ -76,7 +100,11 @@ inline CoreLossesModelPair make_default_core_losses_model_pair() {
 // Forward declarations for free helpers that still live in CoreAdviser.cpp
 // but are called from sibling TUs (CoreAdviserPipeline.cpp, CoreAdviserFilters.cpp).
 void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>>* magneticsWithScoring, const Inputs& inputs);
-void add_alternative_materials(std::vector<std::pair<Magnetic, double>>* magneticsWithScoring, Inputs inputs);
+// alternativesCache (optional): alternatives already looked up in this pass, keyed by the full
+// reference material and the temperature. The lookup depends on nothing else, so a caller that
+// annotates many candidates sharing a material (post_process_and_cut) passes one map for all.
+void add_alternative_materials(std::vector<std::pair<Magnetic, double>>* magneticsWithScoring, Inputs inputs,
+                               std::map<std::string, std::vector<std::string>>* alternativesCache = nullptr);
 std::vector<double> normalize_scoring(std::vector<std::pair<Magnetic, double>>* magneticsWithScoring, std::vector<double> newScoring, double weight, std::map<std::string, bool> filterConfiguration);
 void sort_magnetics_by_scoring(std::vector<std::pair<Magnetic, double>>* magneticsWithScoring);
 

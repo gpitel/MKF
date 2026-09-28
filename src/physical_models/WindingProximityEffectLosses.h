@@ -27,6 +27,15 @@ class WindingProximityEffectLossesModel {
   public:
     std::string methodName = "Default";
     virtual double calculate_turn_losses(Wire wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature) = 0;
+    // Turn losses of a PHASOR field (MAS excitation convention, 2026-09-24): inPhaseData and
+    // quadratureData are the in-phase and quadrature (Hx, Hy) at the same points, in the same
+    // order (see WindingWindowMagneticStrengthFieldPhasorOutput); the loss must be that of
+    // |H|^2 = Hx_i^2 + Hy_i^2 + Hx_q^2 + Hy_q^2. For a model whose loss is a quadratic form of
+    // the field (every model that sums |H|^2 or squared component averages with fixed
+    // coefficients) that is exactly loss(inPhase) + loss(quadrature), which is this default.
+    // A model that bridges two DIFFERENT quadratic forms (a low/high-frequency harmonic mean)
+    // is not additive and must override it and bridge the summed forms.
+    virtual double calculate_turn_losses_from_phasors(Wire wire, double frequency, std::vector<ComplexFieldPoint> inPhaseData, std::vector<ComplexFieldPoint> quadratureData, double temperature);
     // Whether the model consumes the "widthsample" mesh points (width-resolved
     // perpendicular-field samples for flat conductors). Models that average over
     // the lumped surface points must not see them, so the dispatcher strips them
@@ -43,8 +52,15 @@ class WindingProximityEffectLosses {
   protected:
   public:
     static std::shared_ptr<WindingProximityEffectLossesModel> get_model(WireType wireType, std::optional<WindingProximityEffectLossesModels> modelOverride = std::nullopt);
+    // Phasor field (MagneticField::calculate_magnetic_field_strength_field): the loss of every
+    // harmonic is that of the in-phase plus the quadrature field.
+    static WindingLossesOutput calculate_proximity_effect_losses(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, WindingWindowMagneticStrengthFieldPhasorOutput windingWindowMagneticStrengthFieldOutput, std::optional<WindingProximityEffectLossesModels> modelOverride = std::nullopt);
+    // A plain (real, single-phase) field: there is no quadrature component.
     static WindingLossesOutput calculate_proximity_effect_losses(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, WindingWindowMagneticStrengthFieldOutput windingWindowMagneticStrengthFieldOutput, std::optional<WindingProximityEffectLossesModels> modelOverride = std::nullopt);
-    static std::pair<double, std::vector<std::pair<double, double>>> calculate_proximity_effect_losses_per_meter(Wire wire, double temperature, std::vector<ComplexField> fields, std::optional<WindingProximityEffectLossesModels> modelOverride = std::nullopt);
+    // quadratureFields, when given, must match fields harmonic by harmonic and point by point.
+    static std::pair<double, std::vector<std::pair<double, double>>> calculate_proximity_effect_losses_per_meter(Wire wire, double temperature, std::vector<ComplexField> fields, std::optional<WindingProximityEffectLossesModels> modelOverride = std::nullopt, std::optional<std::vector<ComplexField>> quadratureFields = std::nullopt, std::optional<double> perpendicularOutlineFactor = std::nullopt);
+  private:
+    static WindingLossesOutput calculate_proximity_effect_losses_impl(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, const std::vector<ComplexField>& fieldPerFrequency, const std::optional<std::vector<ComplexField>>& quadratureFieldPerFrequency, std::optional<WindingProximityEffectLossesModels> modelOverride);
 
 };
 
@@ -64,7 +80,56 @@ class WindingProximityEffectLossesWangModel : public WindingProximityEffectLosse
   public:
     std::string methodName = "Wang";
     double calculate_turn_losses(Wire wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
+    // Its width-sample term bridges two different quadratic forms, so it is not additive.
+    double calculate_turn_losses_from_phasors(Wire wire, double frequency, std::vector<ComplexFieldPoint> inPhaseData, std::vector<ComplexFieldPoint> quadratureData, double temperature) override;
     bool consumes_width_samples() const override { return true; }
+  protected:
+    // Multiplies the high-frequency (skin-limited) branch of the width-resolved perpendicular
+    // term. 1 for an isolated conductor; WANG_STACKED supplies the stack-outline share.
+    virtual double perpendicular_high_frequency_factor() const { return 1.0; }
+  private:
+    double calculate_turn_losses_impl(Wire& wire, double frequency, const std::vector<ComplexFieldPoint>& data, const std::vector<ComplexFieldPoint>* quadratureData, double temperature);
+};
+
+// ABT #1409: WANG for flat conductors that screen each other.
+//
+// Wang's width-resolved perpendicular term puts the edge crowding of an ISOLATED conductor on
+// every flat turn: at strong skin effect the conductor excludes the field normal to its wide
+// faces, and the exterior problem is a field-excluding ellipse with the conductor's own
+// semi-axes (fringing_edge_crowding_factor). Flat conductors stacked with slits much narrower
+// than their width do not each exclude the field: the stack does, as one body, and the
+// excluded field crowds at the STACK's edges. Against 2D FEM, with the true applied field, the
+// isolated form read the gap-plane turns of a 22-turn flat stack beside spacer gaps 3x high,
+// and 16 stacked parallel planar traces 30x high.
+//
+// Grouping (geometry only): two flat conductors of the same section and orientation belong to
+// one stack when they overlap over more than half their width along the wide direction and
+// the slit between their facing wide faces is narrower than half that width -- the slit then
+// offers the perpendicular flux a path (w/2)/(mu0 s) longer than the free path around the
+// body, so the flux goes around the stack.
+//
+// Each member's high-frequency perpendicular loss becomes its share of the stack outline's:
+// the ellipse surface-field integral over the arc of the outline the member occupies (bounded
+// half-way across the slits) instead of its own full ellipse, with the incident field still
+// the member's own width-averaged perpendicular field. The factor is geometry only:
+//     (A + B)^2 J(A, B; v1, v2) / ((a + b)^2 J(a, b; -pi/2, pi/2)),
+//     J = integral cos^2 v / sqrt(A^2 sin^2 v + B^2 cos^2 v) dv,
+// A, B the stack's semi-axes along the wide and stacking directions, a, b the conductor's.
+// A stack of one gives exactly 1. The parallel-field term, the low-frequency branch and the
+// skin effect are Wang's, unchanged: current redistribution among stacked parallels is NOT
+// modelled (the field arrives as one sum, so the stack's own current cannot be separated).
+class WindingProximityEffectLossesWangStackedModel : public WindingProximityEffectLossesWangModel {
+  public:
+    std::string methodName = "WangStacked";
+    void set_perpendicular_outline_factor(double factor) { _perpendicularOutlineFactor = factor; }
+    // One factor per turn of the coil, in turns-description order (1 for unstacked or round turns).
+    static std::vector<double> calculate_perpendicular_outline_factors(Coil coil);
+    // integral_{v1}^{v2} cos^2 v / sqrt(A^2 sin^2 v + B^2 cos^2 v) dv, fixed 64-point quadrature.
+    static double outline_integral(double A, double B, double v1, double v2);
+  protected:
+    double perpendicular_high_frequency_factor() const override;
+  private:
+    std::optional<double> _perpendicularOutlineFactor;
 };
 
 // Based on A New Approach to Analyse Conduction Losses in High Frequency Magnetic Components by J.A. Ferreira
@@ -83,6 +148,104 @@ class WindingProximityEffectLossesAlbachModel : public WindingProximityEffectLos
   public:
     std::string methodName = "Albach";
     double calculate_turn_losses(Wire wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
+};
+
+// Based on "Eddy currents in rectangular conductors: Analytical 2D loss model in the context of
+// magnetic component design", Thomas Ewald and Jürgen Biela, ETH Zurich, EPE'23 ECCE Europe.
+// https://doi.org/10.23919/epe23ecceeurope58414.2023.10264392
+//
+// Solves the Helmholtz equation INSIDE the rectangular conductor with a separable formulation
+// whose four tangential surface fields H1..H4 are matched by hyperbolic profiles, takes the
+// electric field from Ampere's law and the loss from Poynting's theorem. The result is the
+// closed-form complex power of the paper's equation (7); the external (proximity) half of it is
+// what this model returns:
+//
+//     P_ext = rho * Re[ psi_x * H_ext,x^2 + psi_y * H_ext,y^2 ]
+//     psi_x = gamma * w * tanh(gamma * h / 2)      psi_y = gamma * h * tanh(gamma * w / 2)
+//     gamma = (1 + i) / delta
+//
+// ITS STATED SIMPLIFICATION, which is the reason MKF carries it as a comparison rather than as
+// the answer: section II-C assumes "the field on the conductor's surface is spatially
+// homogeneous". That removes edge crowding by construction, and the paper's own Table I records
+// the consequence — the model reads -12 % at 1 MHz on a square conductor and -19 % / -23 % at
+// 100 kHz / 1 MHz on a mixed-field case, with the authors noting it "underestimates the losses,
+// which might be problematic in terms of optimizations".
+class WindingProximityEffectLossesEwaldModel : public WindingProximityEffectLossesModel {
+  public:
+    std::string methodName = "Ewald";
+    double calculate_turn_losses(Wire wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
+};
+
+// MARTINEZ MODEL (ABT #1188) - proximity loss with FIELD EXCLUSION.
+//
+// Every other proximity model in this file computes the loss a conductor dissipates in a field
+// that passes through it unchanged. A real conductor thicker than about a skin depth does not
+// let the field through: the eddy currents it induces produce their own field, which cancels the
+// incident one inside the metal and crowds the remainder onto the surface, concentrated at the
+// edges. That exclusion is the whole of this model.
+//
+// RECTANGULAR-SECTION WIRES ONLY. The functional below would evaluate for any cross-section, but
+// round and litz wire keep Ferreira, which is the EXACT Bessel solution for an isolated cylinder
+// and therefore already carries this exclusion without bridging between two asymptotes.
+// calculate_turn_losses throws for them rather than silently give the worse answer.
+//
+// The geometry enters through the conductor's own cross-section, not a per-wire-type formula:
+//
+//   HIGH FREQUENCY (delta << thickness): the conductor excludes the field, so the exterior
+//   problem is a perfectly conducting cross-section in a transverse field. Taking that section
+//   as the ellipse of the conductor's semi-axes (the strip's edge-singularity-free equivalent -
+//   a rectangle's surface current diverges at the corners, an ellipse's does not), the surface
+//   field is H_s(v) = H0 (a + b) |cos v| / sqrt(a^2 sin^2 v + b^2 cos^2 v): zero at the middle of
+//   the wide faces, peaking at the edges with the classical (1 + a/b) enhancement that the
+//   standard demagnetising factor N = a/(a + b) also gives. The loss is then the surface-
+//   resistance integral P = 1/2 (rho/delta) * CONTOUR-INTEGRAL H_s^2 dl, which is exact for a
+//   circle (it returns 2*pi, the known perfectly-conducting-cylinder result) and grows like
+//   ln(wide/thin) for a strip.
+//
+//   LOW FREQUENCY (delta >> thickness): the field penetrates fully, the induced currents are
+//   resistance-limited, and the loss is the vector-potential integral over the section, growing
+//   as omega^2.
+//
+//   The two are joined by the same harmonic-mean bridge the fringing kernel uses, applied to
+//   EACH field component separately and then summed - NOT to the field magnitude, which
+//   over-predicts (158 % on a representative winding) because the two components have different
+//   exclusion factors, different characteristic dimensions and so different corner frequencies.
+//
+// The driving field is the TOTAL local field - the gap-fringing field (Roshen / Albach) and the
+// transport-current field of every other turn, cross term included - sampled across the
+// conductor's wide face where those samples exist.
+//
+// VALIDATION (ABT #1188): against 2D FEM on the stadium cross-section that real rectangular wire
+// actually has, at 2:1 aspect and both field orientations, this model reads 0.94-1.08 of FEM
+// (median 0.99) at 10 kHz, 100 kHz and 1 MHz. The Ewald model above reads 0.17-1.15 (median
+// 0.44) over the same six points.
+//
+// WHAT IT DOES NOT YET DO, stated so nobody assumes otherwise: the MUTUAL reaction. Each
+// conductor excludes the field from its own volume, but the field its induced currents throw
+// back at its neighbours is not fed round a second time. That is a coupled solve over the
+// induced dipole moments, and it is the natural next step; without it, closely packed turns are
+// still charged more field than they really see.
+class WindingProximityEffectLossesMartinezModel : public WindingProximityEffectLossesModel {
+  public:
+    std::string methodName = "Martinez";
+    // The exclusion factor C for a field along one of the conductor's axes. A conductor excludes
+    // BOTH field components, not only the one normal to its wide face: the same ellipse solution
+    // serves each, with the roles of the two axes swapped.
+    //   fieldAlongWide = false -> field normal to the wide face. The surface current runs round the
+    //     section and crowds at the edges with the classical (1 + a/b) peak. 5.67 for a 2:1 wire.
+    //   fieldAlongWide = true  -> field along the wide face. The conductor still excludes it, and
+    //     the peak is (1 + b/a). 4.03 for the same wire -- NOT the 2.0 that "two flat faces, no
+    //     crowding" would give, which is where this model was a factor 2.016 low until 2D FEM
+    //     measured it (ABT #1188).
+    static double calculate_exclusion_factor(double wideDimension, double thinDimension, bool fieldAlongWide);
+    // Named alias for the perpendicular case, which is what "edge crowding" means at the call site.
+    static double calculate_edge_crowding_factor(double wideDimension, double thinDimension);
+    double calculate_turn_losses(Wire wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
+    // Its perpendicular term bridges two different quadratic forms, so it is not additive.
+    double calculate_turn_losses_from_phasors(Wire wire, double frequency, std::vector<ComplexFieldPoint> inPhaseData, std::vector<ComplexFieldPoint> quadratureData, double temperature) override;
+    bool consumes_width_samples() const override { return true; }
+  private:
+    double calculate_turn_losses_impl(Wire& wire, double frequency, const std::vector<ComplexFieldPoint>& data, const std::vector<ComplexFieldPoint>* quadratureData, double temperature);
 };
 
 // Based on Eddy currents by Jiří Lammeraner

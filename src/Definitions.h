@@ -66,7 +66,8 @@ enum class CoreCrossReferencerFilters : int {
     SATURATION, 
     WINDING_WINDOW_AREA, 
     ENVELOPING_VOLUME, 
-    EFFECTIVE_AREA
+    EFFECTIVE_AREA,
+    IMPEDANCE
 };
 
 void from_json(const json & j, CoreCrossReferencerFilters & x);
@@ -79,6 +80,7 @@ inline void from_json(const json & j, CoreCrossReferencerFilters & x) {
     else if (j == "WindingWindowArea" || j == "windingwindowarea" || j == "WINDINGWINDOWAREA") x = CoreCrossReferencerFilters::WINDING_WINDOW_AREA;
     else if (j == "EnvelopingVolume" || j == "envelopingvolume" || j == "ENVELOPINGVOLUME") x = CoreCrossReferencerFilters::ENVELOPING_VOLUME;
     else if (j == "EffectiveArea" || j == "effectivearea" || j == "EFFECTIVEAREA") x = CoreCrossReferencerFilters::EFFECTIVE_AREA;
+    else if (j == "Impedance" || j == "impedance" || j == "IMPEDANCE") x = CoreCrossReferencerFilters::IMPEDANCE;
     else { throw std::runtime_error("Input JSON does not conform to CoreCrossReferencerFilters schema: " + to_string(j)); }
 }
 
@@ -90,6 +92,7 @@ inline void to_json(json & j, const CoreCrossReferencerFilters & x) {
         case CoreCrossReferencerFilters::WINDING_WINDOW_AREA: j = "WindingWindowArea"; break;
         case CoreCrossReferencerFilters::ENVELOPING_VOLUME: j = "EnvelopingVolume"; break;
         case CoreCrossReferencerFilters::EFFECTIVE_AREA: j = "EffectiveArea"; break;
+        case CoreCrossReferencerFilters::IMPEDANCE: j = "Impedance"; break;
         default: throw std::runtime_error("Unexpected value in enumeration \"CoreCrossReferencerFilters\": " + std::to_string(static_cast<int>(x)));
     }
 }
@@ -219,16 +222,18 @@ inline void to_json(json & j, const MagneticFieldStrengthModels & x) {
         case MagneticFieldStrengthModels::DOWELL: j = "Dowell"; break;
         case MagneticFieldStrengthModels::WANG: j = "Wang"; break;
         case MagneticFieldStrengthModels::ALBACH: j = "Albach"; break;
+        case MagneticFieldStrengthModels::IMAGED_MMF_SHEETS: j = "ImagedMmfSheets"; break;
         default: throw std::runtime_error("Unexpected value in enumeration \"MagneticFieldStrengthModels\": " + std::to_string(static_cast<int>(x)));
     }
 }
 
 inline void from_json(const json & j, MagneticFieldStrengthModels & x) {
-    if (j == "BinnsLawrenson" || j == "binnslawrenson" || j == "BINNSLAWRENSON") x = MagneticFieldStrengthModels::BINNS_LAWRENSON;
+    if (j == "BinnsLawrenson" || j == "binnslawrenson" || j == "BINNSLAWRENSON" || j == "BINNS_LAWRENSON") x = MagneticFieldStrengthModels::BINNS_LAWRENSON;
     else if (j == "Lammeraner" || j == "lammeraner" || j == "LAMMERANER") x = MagneticFieldStrengthModels::LAMMERANER;
     else if (j == "Dowell" || j == "dowell" || j == "DOWELL") x = MagneticFieldStrengthModels::DOWELL;
     else if (j == "Wang" || j == "wang" || j == "WANG") x = MagneticFieldStrengthModels::WANG;
     else if (j == "Albach" || j == "albach" || j == "ALBACH" || j == "Albach2D" || j == "albach2d" || j == "ALBACH_2D") x = MagneticFieldStrengthModels::ALBACH;
+    else if (j == "ImagedMmfSheets" || j == "imagedMmfSheets" || j == "IMAGED_MMF_SHEETS") x = MagneticFieldStrengthModels::IMAGED_MMF_SHEETS;
     else { throw std::runtime_error("Input JSON does not conform to MagneticFieldStrengthModels schema: " + to_string(j)); }
 }
 
@@ -409,6 +414,9 @@ inline void from_json(const json & j, WindingProximityEffectLossesModels & x) {
     else if (j == "Sullivan"   || j == "SULLIVAN")   x = WindingProximityEffectLossesModels::SULLIVAN;
     else if (j == "Bartoli"    || j == "BARTOLI")    x = WindingProximityEffectLossesModels::BARTOLI;
     else if (j == "Vandelac"   || j == "VANDELAC")   x = WindingProximityEffectLossesModels::VANDELAC;
+    else if (j == "Martinez"   || j == "MARTINEZ")   x = WindingProximityEffectLossesModels::MARTINEZ;
+    else if (j == "Ewald"      || j == "EWALD")      x = WindingProximityEffectLossesModels::EWALD;
+    else if (j == "WangStacked" || j == "WANG_STACKED") x = WindingProximityEffectLossesModels::WANG_STACKED;
     else { throw std::runtime_error("Input JSON does not conform to WindingProximityEffectLossesModels schema: " + to_string(j)); }
 }
 
@@ -425,6 +433,9 @@ inline void to_json(json & j, const WindingProximityEffectLossesModels & x) {
     case WindingProximityEffectLossesModels::SULLIVAN:   j = "Sullivan";   break;
     case WindingProximityEffectLossesModels::BARTOLI:    j = "Bartoli";    break;
     case WindingProximityEffectLossesModels::VANDELAC:   j = "Vandelac";   break;
+    case WindingProximityEffectLossesModels::MARTINEZ:   j = "Martinez";   break;
+    case WindingProximityEffectLossesModels::EWALD:      j = "Ewald";      break;
+    case WindingProximityEffectLossesModels::WANG_STACKED: j = "WangStacked"; break;
     default: throw std::runtime_error("Unexpected value in enumeration \"WindingProximityEffectLossesModels\": " + std::to_string(static_cast<int>(x)));
     }
 }
@@ -530,7 +541,9 @@ enum class MagneticFilters : int {
     LEAKAGE_INDUCTANCE,  // For CMC optimization - minimize leakage for tight coupling
     TEMPERATURE,         // Node-network core temperature (Temperature.cpp, coreOnly mode)
     TURN_COUNT,       // Total turns across all windings — fewer turns preferred (CMC/DMC ranking)
-    DATASHEET_LIMITS  // Gate catalogue parts by their own datasheet electrical limits; no-op when datasheetInfo absent (ABT #19)
+    DATASHEET_LIMITS,  // Gate catalogue parts by their own datasheet electrical limits, scoring utilisation; does not apply to parts publishing none (ABT #19)
+    WINDABILITY,      // Can each wire actually be bent around the former it is wound on? IEC 60317 bend radius (ABT #959)
+    LEAKAGE_INDUCTANCE_TARGET  // Distance of the leakage inductance to designRequirements.leakageInductance (ABT #1176)
 };
 
 class MagneticFilterOperation {
@@ -613,6 +626,8 @@ inline void from_json(const json & j, MagneticFilters & x) {
     else if (j == "Temperature") x = MagneticFilters::TEMPERATURE;
     else if (j == "Turn Count") x = MagneticFilters::TURN_COUNT;
     else if (j == "Datasheet Limits") x = MagneticFilters::DATASHEET_LIMITS;
+    else if (j == "Windability") x = MagneticFilters::WINDABILITY;
+    else if (j == "Leakage Inductance Target") x = MagneticFilters::LEAKAGE_INDUCTANCE_TARGET;
     else { throw std::runtime_error("Input JSON does not conform to MagneticFilters schema!"); }
 }
 
@@ -656,6 +671,8 @@ inline void to_json(json & j, const MagneticFilters & x) {
         case MagneticFilters::TEMPERATURE: j = "Temperature"; break;
         case MagneticFilters::TURN_COUNT: j = "Turn Count"; break;
         case MagneticFilters::DATASHEET_LIMITS: j = "Datasheet Limits"; break;
+        case MagneticFilters::WINDABILITY: j = "Windability"; break;
+        case MagneticFilters::LEAKAGE_INDUCTANCE_TARGET: j = "Leakage Inductance Target"; break;
         default: throw std::runtime_error("Unexpected value in enumeration \"MagneticFilters\": " + std::to_string(static_cast<int>(x)));
     }
 }

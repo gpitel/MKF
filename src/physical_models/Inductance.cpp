@@ -65,6 +65,25 @@ double Inductance::calculate_leakage_inductance(
     return leakageOutput.get_leakage_inductance_per_winding()[0].get_nominal().value();
 }
 
+// ABT #396: see the declaration in Inductance.h for the full rationale. On a 3-column
+// E 42 with the primary on the centre leg and the secondary on an outer leg,
+// calculate_coupling_coefficient said 0.999 where the matrix said 0.624 before this was
+// unified; the latter is the real flux divider, since the secondary only links the share
+// of primary flux that returns through ITS leg.
+std::optional<std::vector<std::vector<double>>> Inductance::magnetizing_coupling_matrix(
+    Magnetic& magnetic,
+    const MagnetizingInductanceOutput& magnetizingOutput) {
+
+    if (!ReluctanceNetwork::has_non_main_placement(magnetic)) {
+        return std::nullopt;
+    }
+    ReluctanceNetwork magneticCircuit(
+        magnetic.get_core(),
+        magnetizingOutput.get_ungapped_core_reluctance().value(),
+        magnetizingOutput.get_reluctance_per_gap().value_or(std::vector<AirGapReluctanceOutput>{}));
+    return magneticCircuit.calculate_magnetizing_inductance_matrix(magnetic);
+}
+
 double Inductance::calculate_mutual_inductance(
     Magnetic magnetic,
     size_t sourceIndex,
@@ -75,16 +94,21 @@ double Inductance::calculate_mutual_inductance(
         // Self inductance, not mutual
         throw std::invalid_argument("Cannot calculate mutual inductance between a winding and itself");
     }
-    
-    // Mutual inductance M = k * sqrt(Lm1 * Lm2)
-    // For ideal transformer with k ≈ 1:
-    // M = Lm_primary * (N_dest / N_source) = sqrt(Lm_source * Lm_dest)
-    
+
+    // Leg-separated windings do not couple ideally: ask the reluctance network, the same
+    // source calculate_inductance_matrix uses (ABT #396). The sign is meaningful and is
+    // kept — the network returns a negative mutual in the common branch orientation, where
+    // flux up one leg comes down the other.
+    auto magnetizingOutput = calculate_magnetizing_inductance(magnetic, operatingPoint);
+    if (auto networkMatrix = magnetizing_coupling_matrix(magnetic, magnetizingOutput)) {
+        return (*networkMatrix)[sourceIndex][destinationIndex];
+    }
+
+    // All windings share the main column, so the closed form is exact: with a single
+    // magnetizing flux linking every winding, M = sqrt(Lm_source * Lm_dest), equivalently
+    // Lm_primary * (N_dest / N_source) for a two-winding transformer.
     double Lm_source = calculate_magnetizing_inductance_referred_to_winding(magnetic, sourceIndex, operatingPoint);
     double Lm_dest = calculate_magnetizing_inductance_referred_to_winding(magnetic, destinationIndex, operatingPoint);
-    
-    // For ideal coupling (k = 1), M = sqrt(Lm1 * Lm2)
-    // This is equivalent to Lm_primary * (N2/N1) for a two-winding transformer
     return std::sqrt(Lm_source * Lm_dest);
 }
 
@@ -97,7 +121,20 @@ double Inductance::calculate_self_inductance(
     // Self inductance L_ii = Lm_i + Ll_i
     // Where Ll_i is the total leakage inductance as seen from winding i
     
-    double Lm_i = calculate_magnetizing_inductance_referred_to_winding(magnetic, windingIndex, operatingPoint);
+    // ABT #396: the magnetizing part of L_ii has to come from the same place the mutual
+    // does, or the coupling coefficient built from them is a ratio of two different
+    // models. For leg-separated windings the driving-point magnetizing inductance of
+    // winding i is the network's diagonal — its own column in series with the parallel
+    // combination of the others — not the rank-1 value referred from the primary, which
+    // assumes every winding sees the main column's flux path.
+    auto magnetizingOutput = calculate_magnetizing_inductance(magnetic, operatingPoint);
+    double Lm_i;
+    if (auto networkMatrix = magnetizing_coupling_matrix(magnetic, magnetizingOutput)) {
+        Lm_i = (*networkMatrix)[windingIndex][windingIndex];
+    }
+    else {
+        Lm_i = calculate_magnetizing_inductance_referred_to_winding(magnetic, windingIndex, operatingPoint);
+    }
 
     // Self-leakage of winding i is the diagonal of the energy-method leakage
     // matrix (Λ_ii = 4·W(e_i)), the single source of leakage shared with
@@ -139,9 +176,24 @@ double Inductance::calculate_coupling_coefficient(
     }
     
     double k = M / denominator;
-    
-    // Clamp to valid range [0, 1]
-    return std::min(1.0, std::max(0.0, k));
+
+    // ABT #396: the clamp that used to sit here, min(1, max(0, k)), silently destroyed two
+    // different things. It turned the legitimately NEGATIVE coupling of leg-separated
+    // windings — flux up one leg comes down the other, which the reluctance network reports
+    // with a sign — into a flat 0, i.e. "these windings do not couple at all". And it
+    // capped |k| > 1, which is not a value to be tidied away but a contradiction: a mutual
+    // inductance exceeding sqrt(L11*L22) violates the energy bound, so it means one of the
+    // three inputs is wrong. Report the sign, and refuse the impossible.
+    constexpr double couplingBoundTolerance = 1e-6;
+    if (std::abs(k) > 1 + couplingBoundTolerance) {
+        throw InvalidInputException(ErrorCode::CALCULATION_INVALID_RESULT,
+            "Coupling coefficient between windings " + std::to_string(sourceIndex) + " and " +
+            std::to_string(destinationIndex) + " is " + std::to_string(k) +
+            ", which exceeds the energy bound |k| <= 1: the mutual inductance " +
+            std::to_string(M) + " H is larger than sqrt(L11*L22) = " + std::to_string(denominator) +
+            " H (L11 = " + std::to_string(L11) + " H, L22 = " + std::to_string(L22) + " H)");
+    }
+    return k;
 }
 
 ScalarMatrixAtFrequency Inductance::calculate_leakage_inductance_matrix(
@@ -253,13 +305,12 @@ ScalarMatrixAtFrequency Inductance::calculate_inductance_matrix(
     // window leakage is only meaningful between windings sharing a column;
     // cross-column pairs take their coupling from the network alone until the window
     // field solvers become window-aware.
-    bool multiColumnPlacement = ReluctanceNetwork::has_non_main_placement(magnetic);
+    auto networkMatrixIfPlaced = magnetizing_coupling_matrix(magnetic, magnetizingOutput);
+    bool multiColumnPlacement = networkMatrixIfPlaced.has_value();
     std::vector<std::vector<double>> networkMatrix;
     std::vector<size_t> columnIndexPerWinding;
     if (multiColumnPlacement) {
-        ReluctanceNetwork magneticCircuit(magnetic.get_core(), magnetizingOutput.get_ungapped_core_reluctance().value(),
-                                        magnetizingOutput.get_reluctance_per_gap().value_or(std::vector<AirGapReluctanceOutput>{}));
-        networkMatrix = magneticCircuit.calculate_magnetizing_inductance_matrix(magnetic);
+        networkMatrix = networkMatrixIfPlaced.value();
         columnIndexPerWinding = ReluctanceNetwork::resolve_winding_column_indexes(magnetic);
     }
 

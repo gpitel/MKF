@@ -127,12 +127,34 @@ inline bool windings_on_single_isolation_side(const std::optional<std::vector<Is
 // turns LOWER B, so they must not. Every one of those sites — plus the
 // saturation filter and the CoreAdviser turn seeder — must use THIS predicate,
 // or they disagree on which candidates to saturation-check. Detection tiers
-// (most reliable first): (1) all windings on one isolation side ⇒ inductor;
-// (2) topology, if specified; (3) legacy heuristic — a minimum-only inductance
-// spec ("at least L") is a transformer's magnetizing inductance, anything with
-// a nominal or maximum is a specific energy-storage target ⇒ inductor.
+// (most reliable first): (0) a single winding ⇒ inductor; (1) all windings on
+// one isolation side ⇒ inductor; (2) topology, if specified; (3) legacy
+// heuristic — a minimum-only inductance spec ("at least L") is a transformer's
+// magnetizing inductance, anything with a nominal or maximum is a specific
+// energy-storage target ⇒ inductor.
+//
+// Tier 0 comes before the topology: designRequirements.topology names the
+// CONVERTER, not the component. The resonant inductor of an LLC/CLLC carries
+// the converter's topology but has one winding; classified as a transformer it
+// was seeded with volt-seconds turns at B_max and left ungapped, missing its
+// inductance band by 3-6x (ABT #1411).
+inline bool is_single_winding_design(const Inputs& inputs) {
+    if (!inputs.get_design_requirements().get_turns_ratios().empty()) {
+        return false;
+    }
+    for (const auto& operatingPoint : inputs.get_operating_points()) {
+        if (operatingPoint.get_excitations_per_winding().size() > 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline bool is_inductor(const Inputs& inputs) {
     const auto& designRequirements = inputs.get_design_requirements();
+    if (is_single_winding_design(inputs)) {
+        return true;
+    }
     if (windings_on_single_isolation_side(designRequirements.get_isolation_sides())) {
         return true;
     }
@@ -145,6 +167,34 @@ inline bool is_inductor(const Inputs& inputs) {
                        && !magnetizingInductance.get_nominal().has_value()
                        && !magnetizingInductance.get_maximum().has_value();
     return !minimumOnly;
+}
+
+// Single source of truth for "is this operating point a common-mode choke's",
+// shared by the saturation FILTER (seed stage) and the MagneticAdviser's final
+// saturation GATE so the two cannot disagree (ABT #1369: the gate lacked the
+// exemption and dropped every wound CMC the filter had let through).
+//
+// A CMC is an inductor to is_inductor (every winding on the line side) but its
+// line current is DIFFERENTIAL: the flux of the line/neutral windings cancels
+// in the core, so neither the raw line current nor the ripple swing that
+// get_common_mode_choke_magnetizing_current models as "the CM current" is a
+// saturation criterion — MAS carries no CM-noise-current requirement to gate
+// against, and the ripple estimate puts multi-tesla fictional B on every EMI
+// toroid. The impedance filter is the authoritative gate for a CMC. CMC-ONLY,
+// deliberately: a differential-mode choke also has 2-4 matching-current
+// windings (can_be_common_mode_choke is true for it too) but carries the full
+// line current additively and genuinely saturates, so it keeps both gates.
+// Distinguish by the CMC tag (topology, or the web wizard's subApplication —
+// the wizards do not set designRequirements.topology), then confirm current
+// symmetry with can_be_common_mode_choke so a mis-tagged asymmetric design is
+// still checked.
+inline bool is_tagged_common_mode_choke(const Inputs& inputs, const OperatingPoint& operatingPoint) {
+    auto topology = inputs.get_design_requirements().get_topology();
+    auto subApplication = inputs.get_design_requirements().get_sub_application();
+    bool taggedCommonMode =
+        (topology.has_value() && topology.value() == MAS::Topology::COMMON_MODE_CHOKE) ||
+        (subApplication.has_value() && subApplication.value() == "commonModeNoiseFiltering");
+    return taggedCommonMode && Inputs::can_be_common_mode_choke(operatingPoint);
 }
 
 // Single source of truth for the saturation-safe "maximum allowed peak flux
@@ -200,6 +250,38 @@ inline std::map<std::string, std::string> default_loss_filter_models() {
     return models;
 }
 
+// ABT #825: the area filter and the loss-budget threshold both need the time-averaged |v*i| of
+// the primary excitation, so they both need a voltage AND a current. Each dereferenced both
+// optionals unconditionally, so an operating point carrying only a current -- an ordinary way to
+// describe an inductor's winding, and what several catalogue callers actually send -- died on an
+// empty optional. The message was "bad optional access": no operating point, no winding, no field,
+// no hint that a voltage was what was missing. Core sizing genuinely cannot proceed without one,
+// so this still fails -- it just says what it needed.
+inline void require_voltage_and_current_for_power(const OperatingPointExcitation& excitation,
+                                                  size_t operatingPointIndex,
+                                                  const OperatingPoint& operatingPoint,
+                                                  const std::string& consumer) {
+    std::string label = "operating point " + std::to_string(operatingPointIndex) +
+        (operatingPoint.get_name() ? " ('" + operatingPoint.get_name().value() + "')" : "");
+
+    std::string missing;
+    if (!excitation.get_voltage() || !excitation.get_voltage()->get_waveform()) {
+        missing = "a voltage";
+    }
+    if (!excitation.get_current() || !excitation.get_current()->get_waveform()) {
+        missing = missing.empty() ? "a current" : missing + " and a current";
+    }
+    if (missing.empty()) {
+        return;
+    }
+
+    throw std::invalid_argument(
+        label + ", primary winding: " + consumer + " needs the time-averaged |v*i| of the"
+        " excitation, and this one has no " + missing + " waveform. Give the primary winding both a"
+        " voltage and a current excitation.");
+}
+
+
 // Compute the max-over-operating-points of the time-averaged |v·i|
 // "power mean" used to scale the loss-budget threshold. If any
 // operating point has a waveform longer than 2× the configured sampled
@@ -213,6 +295,8 @@ inline double compute_maximum_power_mean_and_maybe_force_steinmetz(
     std::vector<double> powerMeans(operatingPoints.size(), 0);
     for (size_t opi = 0; opi < operatingPoints.size(); ++opi) {
         auto excitation = Inputs::get_primary_excitation(operatingPoints[opi]);
+        require_voltage_and_current_for_power(excitation, opi, operatingPoints[opi],
+                                             "the core-losses budget threshold");
         auto voltageWaveform = excitation.get_voltage().value().get_waveform().value();
         auto currentWaveform = excitation.get_current().value().get_waveform().value();
         double frequency = excitation.get_frequency();

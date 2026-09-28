@@ -64,6 +64,10 @@ CoreAdviser::GappingConstraints CoreAdviser::calculate_gapping_constraints(Input
 
     // 1. Calculate minimum gap: energy storage requirement
     double maxAllowedB = maximum_allowed_magnetic_flux_density(realisticBsat);
+    if (core.get_gapping().empty()) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "calculate_gapping_constraints: core '" + core.get_name().value_or("?") + "' has no gap position to size");
+    }
     double minGap = magneticEnergy.calculate_gap_length_by_magnetic_energy(
         core.get_gapping()[0], maxAllowedB, requiredMagneticEnergy);
     constraints.minGap = minGap;
@@ -143,21 +147,10 @@ double CoreAdviser::calculate_gap_for_fringing_factor(double targetFringingFacto
 double CoreAdviser::get_peak_current(Inputs inputs) {
     double peakCurrent = 0.0;
 
-    // For transformer topologies (forward converters), core saturation is driven by
+    // For transformers (forward converters), core saturation is driven by
     // magnetizing current only. The reflected secondary current is balanced and does
     // not contribute to net flux. Using actual current would oversize the core.
-    // When topology is unset, fall back to inductance-based heuristic:
-    // minimum-only inductance = transformer; nominal/max inductance = inductor.
-    auto topology = inputs.get_design_requirements().get_topology();
-    bool isTransformerTopology;
-    if (topology.has_value()) {
-        isTransformerTopology = !is_energy_storing_topology(topology);
-    } else {
-        auto& inductanceReq = inputs.get_design_requirements().get_magnetizing_inductance();
-        isTransformerTopology = inductanceReq.get_minimum() &&
-                                !inductanceReq.get_nominal() &&
-                                !inductanceReq.get_maximum();
-    }
+    bool isTransformerTopology = !is_inductor(inputs);
 
     for (auto& op : inputs.get_operating_points()) {
         auto excitation = Inputs::get_primary_excitation(op);
@@ -196,7 +189,13 @@ double CoreAdviser::calculate_core_losses_for_gap(double gap, Inputs inputs, Cor
     // falls back to the SIMPLE gap strategy with an explicit logEntry on
     // failure (named fallback, not a hidden default).
     core.set_ground_gapping(gap);
-    core.process_gap();
+    if (!core.process_gap()) {
+        // ABT #774: an unprocessable gap must not flow into the losses model as if it were
+        // real. Throwing routes it through the optimizer's documented failure contract —
+        // the caller catches and falls back to the SIMPLE gap strategy.
+        throw GapException(core.get_last_gap_processing_failure().value_or(
+            "gap does not fit the winding column"));
+    }
 
     auto coreLossesModel = CoreLossesModel::factory(
         std::map<std::string, std::string>({{"coreLosses", "Steinmetz"}}));
@@ -267,9 +266,6 @@ void CoreAdviser::add_gapping_standard_cores(std::vector<std::pair<Magnetic, dou
     //   (e.g., LLC resonant converter needs controlled magnetizing inductance)
     // - Transformer with minimum-only inductance: NO gap needed (want maximum L)
     //
-    auto topology = inputs.get_design_requirements().get_topology();
-    bool isEnergyStoring = is_energy_storing_topology(topology);
-    
     auto inductanceReq = inputs.get_design_requirements().get_magnetizing_inductance();
     bool hasNominalInductance = inductanceReq.get_nominal().has_value();
     bool hasMaxInductance = inductanceReq.get_maximum().has_value();
@@ -281,8 +277,9 @@ void CoreAdviser::add_gapping_standard_cores(std::vector<std::pair<Magnetic, dou
     // - The gap is computed directly: gap = (N² / Lm - R_core) × μ₀ × Ae,
     //   where N comes from the same volt-seconds estimate as add_initial_turns_by_inductance.
     // When only a minimum inductance is specified (want high Lm), no gap is needed.
-    bool isTransformer = topology.has_value() ? !isEnergyStoring :
-        (inductanceReq.get_minimum() && !hasNominalInductance && !hasMaxInductance);
+    // is_inductor, not the topology alone: the resonant inductor of an LLC carries the
+    // converter's topology but is one winding, and must be gapped as an inductor (ABT #1411).
+    bool isTransformer = !is_inductor(inputs);
 
     bool skipGapping = isTransformer && !hasNominalInductance && !hasMaxInductance;
 
@@ -311,6 +308,7 @@ void CoreAdviser::add_gapping_standard_cores(std::vector<std::pair<Magnetic, dou
         return;
     }
 
+    std::vector<size_t> gapInfeasibleIndexes;
     for (size_t i = 0; i < magneticsWithScoring->size(); ++i) {
         Core core = (*magneticsWithScoring)[i].first.get_core();
 
@@ -326,8 +324,33 @@ void CoreAdviser::add_gapping_standard_cores(std::vector<std::pair<Magnetic, dou
             core.process_data();
         }
 
-        // Calculate gapping constraints
-        auto constraints = calculate_gapping_constraints(inputs, core);
+        // A drum / piece-and-plate core (e.g. DRS 5/3.7/...) carries no gap position at all:
+        // like a toroid, its reluctance is set by its geometry, not by a ground gap. It used
+        // to reach calculate_gapping_constraints, which read get_gapping()[0] of an empty
+        // vector (undefined behaviour: a segfault natively, whatever it happened to read in
+        // the browser engine) and killed the whole advise of the isolated buck at 750 kHz.
+        if (core.get_gapping().empty()) {
+            core.set_name(core.get_name().value_or("unnamed") + " ungapped");
+            (*magneticsWithScoring)[i].first.set_core(core);
+            continue;
+        }
+
+        // Calculate gapping constraints. ABT #774: the sizing itself can already prove the
+        // candidate infeasible — calculate_gap_from_saturation_constraint processes the
+        // solved gap and throws GapException when it cannot fit the column (a 0.44 m gap on
+        // a 9 mm column, for a tiny core asked to store flyback energy). That is a verdict
+        // on THIS candidate, not an engine error: reject it and keep sweeping.
+        GappingConstraints constraints;
+        try {
+            constraints = calculate_gapping_constraints(inputs, core);
+        }
+        catch (const GapException& e) {
+            logEntry("Rejecting core '" + core.get_name().value_or("?")
+                     + "': gap-infeasible while sizing: " + std::string(e.what()),
+                     "CoreAdviser", 2);
+            gapInfeasibleIndexes.push_back(i);
+            continue;
+        }
 
         logEntry("Gap: core=" + core.get_name().value_or("?")
                  + " minGap=" + std::to_string(constraints.minGap)
@@ -338,7 +361,18 @@ void CoreAdviser::add_gapping_standard_cores(std::vector<std::pair<Magnetic, dou
 
         // Apply the optimal gap
         core.set_ground_gapping(constraints.optimalGap);
-        core.process_gap();
+        // ABT #774: a candidate whose required gap does not fit its own column is simply
+        // INFEASIBLE — reject it here with the rest of the filter stage instead of leaving
+        // an unprocessed gap on the candidate for a downstream calculation to trip over
+        // (process_gap_or_throw escaping from the inductance filter aborted whole Heaviside
+        // design sweeps: one bad candidate cost every good one behind it).
+        if (!core.process_gap()) {
+            logEntry("Rejecting core '" + core.get_name().value_or("?") + "': "
+                     + core.get_last_gap_processing_failure().value_or("gap does not fit the winding column"),
+                     "CoreAdviser", 2);
+            gapInfeasibleIndexes.push_back(i);
+            continue;
+        }
 
         // Update name with gap info (avoid duplicates)
         std::stringstream ss;
@@ -360,6 +394,10 @@ void CoreAdviser::add_gapping_standard_cores(std::vector<std::pair<Magnetic, dou
         }
 
         (*magneticsWithScoring)[i].first.set_core(core);
+    }
+    // ABT #774: drop the gap-infeasible candidates (reverse order keeps indexes valid).
+    for (auto it = gapInfeasibleIndexes.rbegin(); it != gapInfeasibleIndexes.rend(); ++it) {
+        magneticsWithScoring->erase(magneticsWithScoring->begin() + *it);
     }
 }
 
@@ -431,6 +469,47 @@ void CoreAdviser::reject_winding_killing_gaps(std::vector<std::pair<Magnetic, do
                  "CoreAdviser");
     }
     *magneticsWithScoring = std::move(kept);
+}
+
+void CoreAdviser::select_inductor_turns_and_gap_by_losses(std::vector<std::pair<Magnetic, double>>* magneticsWithScoring,
+                                                          Inputs inputs) {
+    // ABT #1426: the seeded (N, gap) of an inductor is its saturation floor; move each
+    // candidate to the (N, gap) that minimises the estimated core + copper loss at or above
+    // that floor. The per-candidate work is MagneticFilterInductorTurnsAndGapByLosses'; this
+    // only runs it over the pool. It is a design move, not a gate: a candidate it cannot
+    // improve keeps its seeded design, and the gates and ranking that follow judge it.
+    if (magneticsWithScoring->empty() || !MagneticFilterInductorTurnsAndGapByLosses::applies_to_design(inputs)) {
+        return;
+    }
+    MagneticFilterInductorTurnsAndGapByLosses filter(inputs, _models);
+    size_t moved = 0;
+    std::vector<size_t> failedIndexes;
+    for (size_t index = 0; index < magneticsWithScoring->size(); ++index) {
+        auto& magnetic = (*magneticsWithScoring)[index].first;
+        auto seededNumberTurns = magnetic.get_coil().get_functional_description()[0].get_number_turns();
+        // A candidate whose (N, gap) cannot be evaluated (a loss estimate that is not finite,
+        // a waveform the loss models reject) is dropped with an ERROR, as evaluate_and_cull
+        // drops a candidate whose filter evaluation throws: it would otherwise reach the
+        // ranking on a seed nobody checked, and one bad candidate must not abort the others.
+        try {
+            filter.evaluate_magnetic(&magnetic, &inputs);
+        }
+        catch (const OpenMagneticsException& exception) {
+            logEntry("Loss-optimal inductor turns: dropping candidate " + magnetic.get_core().get_name().value_or("?") +
+                     ": " + exception.what(), "CoreAdviser", 0);
+            failedIndexes.push_back(index);
+            continue;
+        }
+        if (magnetic.get_coil().get_functional_description()[0].get_number_turns() != seededNumberTurns) {
+            moved++;
+        }
+    }
+    logEntry("Loss-optimal inductor turns: " + std::to_string(moved) + " of " +
+             std::to_string(magneticsWithScoring->size()) + " candidates moved above their saturation-floor turns, " +
+             std::to_string(failedIndexes.size()) + " dropped", "CoreAdviser");
+    for (auto it = failedIndexes.rbegin(); it != failedIndexes.rend(); ++it) {
+        magneticsWithScoring->erase(magneticsWithScoring->begin() + static_cast<std::ptrdiff_t>(*it));
+    }
 }
 
 // ============================================================================

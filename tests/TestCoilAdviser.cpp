@@ -610,6 +610,10 @@ TEST_CASE("Test_CoilAdviser_Insulation_No_Margin", "[adviser][coil-adviser][smok
 
 TEST_CASE("Test_CoilAdviser_Insulation_Margin", "[adviser][coil-adviser][margin][smoke-test]") {
     // OpenMagnetics::set_log_verbosity(2);
+    // ABT #721: this test pins the historical 50/50 tape split (margin == creepage/2 per
+    // section); margin equalization (default-on) re-splits it by section space — disable
+    // to keep the pinned contract.
+    settings.set_coil_equalize_margins(false);
     auto gapping = OpenMagneticsTesting::get_ground_gap(0.003);
     std::vector<double> turnsRatios;
     int64_t numberStacks = 1;
@@ -992,13 +996,14 @@ TEST_CASE("Test_CoilAdviser_Random_0", "[adviser][coil-adviser][bug]") {
     CoilAdviser coilAdviser;
     auto masMagneticsWithCoil = coilAdviser.get_advised_coil(masMagnetic, 2);
 
-    // The adviser silently returning 0 candidates used to pass this test (the JsonLV failure mode).
-    REQUIRE(masMagneticsWithCoil.size() > 0);
-    if (masMagneticsWithCoil.size() > 0) {
-        auto masMagneticWithCoil = masMagneticsWithCoil[0];
-        OpenMagneticsTesting::check_wire_standards(masMagneticWithCoil.get_mutable_magnetic().get_mutable_coil());
-        OpenMagneticsTesting::check_turns_description(masMagneticWithCoil.get_magnetic().get_coil());
-    }
+    // ABT #415 (measured): this random spec is genuinely INFEASIBLE — 82+5 turns in an EP 20
+    // window; the best electrically-adequate wire ('Round 21.0 - Single Build') needs 14.18x
+    // the section area, and even the permissive allow-not-fitting retry returns nothing.
+    // The adviser refusing is the CORRECT behaviour, and this pin protects the refusal: if a
+    // future adviser change starts "finding" a coil here, it is fabricating an unbuildable
+    // design and must fail this test. (The former REQUIRE(size > 0) asserted the impossible;
+    // owner-approved conversion 2026-08-02, ABT #551.)
+    REQUIRE(masMagneticsWithCoil.size() == 0);
 }
 
 TEST_CASE("Test_CoilAdviser_Random_1", "[adviser][coil-adviser][bug]") {
@@ -1675,23 +1680,15 @@ TEST_CASE("Test_CoilAdviser_Random_10", "[adviser][coil-adviser][bug]") {
     CoilAdviser coilAdviser;
     auto masMagneticsWithCoil = coilAdviser.get_advised_coil(masMagnetic, 2);
 
-    // The adviser silently returning 0 candidates used to pass this test (the JsonLV failure mode).
-    REQUIRE(masMagneticsWithCoil.size() > 0);
-    if (masMagneticsWithCoil.size() > 0) {
-        auto masMagneticWithCoil = masMagneticsWithCoil[0];
-        // OpenMagneticsTesting::check_wire_standards(masMagneticWithCoil.get_mutable_magnetic().get_mutable_coil());
-        // OpenMagneticsTesting::check_turns_description(masMagneticWithCoil.get_magnetic().get_coil());
-        auto outputFilePath = std::filesystem::path{ std::source_location::current().file_name() }.parent_path().append("..").append("output");
-        auto outFile = outputFilePath;
-        std::string filename = "Test_CoilAdviser" + std::to_string(OpenMagnetics::TestUtils::randomInt(0, RAND_MAX)) + ".svg";
-        outFile.append(filename);
-        Painter painter(outFile);
-
-        painter.paint_core(masMagneticWithCoil.get_mutable_magnetic());
-        painter.paint_bobbin(masMagneticWithCoil.get_mutable_magnetic());
-        painter.paint_coil_turns(masMagneticWithCoil.get_mutable_magnetic());
-        painter.export_svg();
-    }
+    // ABT #415 (measured): this random spec is genuinely INFEASIBLE — 49x3 + 80 + 78 + 1x2
+    // turns across four isolation sides in an E 50/15 window; the best electrically-adequate
+    // wire needs 2.13x the section area, and even the permissive allow-not-fitting retry
+    // returns nothing. The adviser refusing is the CORRECT behaviour, and this pin protects
+    // the refusal: if a future adviser change starts "finding" a coil here, it is fabricating
+    // an unbuildable design and must fail this test. (The former REQUIRE(size > 0) asserted
+    // the impossible; owner-approved conversion 2026-08-02, ABT #551.)
+    REQUIRE(masMagneticsWithCoil.size() == 0);
+    settings.reset();
 }
 
 TEST_CASE("Test_CoilAdviser_Random_11", "[adviser][coil-adviser][bug]") {
@@ -2795,6 +2792,137 @@ TEST_CASE("Test_WireAdviser_HFInductor_SynthesizesLitz", "[adviser][coil-adviser
     REQUIRE(winding > 0);
     REQUIRE(winding < 5.0);
     settings.reset();
+}
+
+// ABT #1473: the synthesized litz of the test above lands on a 0.101 mm strand under #1460's exact
+// harmonics. The nearest catalogue round wire there is an insulated TIW with no grade, and simulate()
+// threw in Temperature::extractWireProperties. The strand must be enamelled, and the magnetic simulates.
+TEST_CASE("Test_Synthesized_Litz_0101mm_Strand_Simulates", "[coil-adviser][litz][abt-1473]") {
+    clear_databases();
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    settings.reset();
+
+    auto gapping = OpenMagneticsTesting::get_ground_gap(0.0002);
+    auto magnetic = OpenMagneticsTesting::get_quick_magnetic("PQ 26/25", gapping, {30}, 1, "3C97");
+    auto litz = OpenMagnetics::Wire::create_quick_litz_wire(0.000101, 31);
+    magnetic.set_coil(OpenMagnetics::Coil::create_quick_coil("PQ 26/25", {30}, {1}, {litz}));
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+        100000, 100e-6, 25, WaveformLabel::TRIANGULAR, 10, 0.5, 0, {});
+    { auto dr = inputs.get_design_requirements(); dr.set_insulation(std::nullopt); dr.set_isolation_sides(std::nullopt); inputs.set_design_requirements(dr); }
+    inputs.process();
+
+    OpenMagnetics::Mas mas;
+    mas.set_inputs(inputs);
+    mas.set_magnetic(magnetic);
+    auto sim = MagneticSimulator().simulate(mas);
+    REQUIRE(sim.get_outputs()[0].get_winding_losses());
+    double winding = sim.get_outputs()[0].get_winding_losses()->get_winding_losses();
+    CHECK(std::isfinite(winding));
+    CHECK(winding > 0);
+    settings.reset();
+}
+
+TEST_CASE("Test_CoilAdviser_Real_Winding_Adds_Reversed_Patterns", "[adviser][coil-adviser][real-geometry]") {
+    // ABT #609: an ideal winding is radially symmetric under pattern reversal, so get_patterns
+    // caps the enumeration at n!/2 and a 2-winding transformer gets ONE pattern (order 01). A
+    // REAL winding is not symmetric: leads, margins and blocking load the two orders differently
+    // — 13_current_sense is the proof (order 01 over-subscribes the ER 9.5 window ~2x, order 10
+    // fits and builds watertight 3D). Under the real-winding setting the reversals are appended
+    // AFTER the base set, so the adviser's candidate loop only reaches them when the base
+    // patterns under-deliver — more combinations, no extra time on the happy path (Alf: "try
+    // more pattern combinations, but make sure that time is not increased").
+    auto standards = std::vector<InsulationStandards>{InsulationStandards::IEC_606641};
+    altitude.set_maximum(2000);
+    mainSupplyVoltage.set_nominal(400);
+    OpenMagnetics::Inputs inputs = OpenMagneticsTesting::get_quick_insulation_inputs(
+        altitude, cti, IsolationClass::FUNCTIONAL, mainSupplyVoltage, overvoltageCategory,
+        pollutionDegree, standards, maximumVoltageRms, maximumVoltagePeak, frequency,
+        WiringTechnology::WOUND);
+    DimensionWithTolerance turnsRatio;
+    turnsRatio.set_nominal(1);
+    inputs.get_mutable_design_requirements().set_turns_ratios({turnsRatio});
+    inputs.get_mutable_design_requirements().set_isolation_sides(
+        std::vector<IsolationSide>{IsolationSide::PRIMARY, IsolationSide::SECONDARY});
+
+    settings.set_coil_use_real_winding_geometry(false);
+    auto idealPatterns = OpenMagnetics::Coil::get_patterns(inputs, CoreType::TWO_PIECE_SET);
+    REQUIRE(idealPatterns.size() == 1);
+    REQUIRE(idealPatterns[0] == std::vector<size_t>{0, 1});
+
+    settings.set_coil_use_real_winding_geometry(true);
+    auto realPatterns = OpenMagnetics::Coil::get_patterns(inputs, CoreType::TWO_PIECE_SET);
+    REQUIRE(realPatterns.size() == 2);
+    // Base set FIRST and unchanged (priority and happy-path runtime identical), reversal after.
+    REQUIRE(realPatterns[0] == std::vector<size_t>{0, 1});
+    REQUIRE(realPatterns[1] == std::vector<size_t>{1, 0});
+    settings.reset();
+}
+
+
+// A basic-rated wire on one side IS basic insulation between two windings; margin tape is only
+// needed when neither adjacent wire carries rated insulation. needs_margin used to apply the
+// reinforced rule (three layers, or fully-insulated-wire grades) to every class, so the
+// "one side insulated" combinations get_solid_insulation_requirements_for_wires builds for
+// BASIC insulation needed margin tape as well, and never avoided it.
+TEST_CASE("Test_Needs_Margin_Depends_On_The_Insulation_Class", "[adviser][coil-adviser][insulation][smoke-test]") {
+    WireSolidInsulationRequirements functional;
+    functional.set_minimum_grade(1);
+    functional.set_minimum_number_layers(1);
+    functional.set_minimum_breakdown_voltage(0);
+    WireSolidInsulationRequirements basicRated;
+    basicRated.set_minimum_number_layers(1);
+    basicRated.set_minimum_breakdown_voltage(4000);
+    WireSolidInsulationRequirements reinforcedRated;
+    reinforcedRated.set_minimum_number_layers(3);
+    reinforcedRated.set_minimum_breakdown_voltage(8000);
+    const std::vector<size_t> pattern{0, 1};
+
+    CHECK(InsulationCoordinator::needs_margin({functional, functional}, pattern, 1, IsolationClass::BASIC));
+    CHECK_FALSE(InsulationCoordinator::needs_margin({functional, basicRated}, pattern, 1, IsolationClass::BASIC));
+    CHECK_FALSE(InsulationCoordinator::needs_margin({basicRated, functional}, pattern, 1, IsolationClass::SUPPLEMENTARY));
+
+    // DOUBLE is basic + supplementary: one rated wire is only half of it.
+    CHECK(InsulationCoordinator::needs_margin({functional, basicRated}, pattern, 1, IsolationClass::DOUBLE));
+    CHECK_FALSE(InsulationCoordinator::needs_margin({basicRated, basicRated}, pattern, 1, IsolationClass::DOUBLE));
+
+    // REINFORCED keeps the three-layer rule.
+    CHECK(InsulationCoordinator::needs_margin({functional, basicRated}, pattern, 1, IsolationClass::REINFORCED));
+    CHECK_FALSE(InsulationCoordinator::needs_margin({functional, reinforcedRated}, pattern, 1, IsolationClass::REINFORCED));
+}
+
+// The web Flyback, core-advised onto an EQ 26/19/7 with basic insulation at 400 V mains
+// (OVC III): 2.8 mm of margin at each end of the 5.65 mm window left every section 0.05 mm
+// tall, so "Advise all wires" answered "No coil found" and the Magnetic Builder never got a
+// winding (WebFrontend 3DW-5). Insulating one side's wire is how such a design is wound.
+TEST_CASE("Test_CoilAdviser_Basic_Insulation_Small_Bobbin_Is_Wire_Insulated", "[adviser][coil-adviser][insulation][bug]") {
+    settings.reset();
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "flyback_eq26_basic_insulation.json");
+    std::ifstream file(path);
+    OpenMagnetics::Mas mas(json::parse(file));
+    for (size_t windingIndex = 0; windingIndex < mas.get_magnetic().get_coil().get_functional_description().size(); ++windingIndex) {
+        mas.get_mutable_magnetic().get_mutable_coil().get_mutable_functional_description()[windingIndex].set_wire("Dummy");
+    }
+    mas.get_mutable_magnetic().get_mutable_coil().set_turns_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_layers_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_sections_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_groups_description(std::nullopt);
+    settings.set_coil_delimit_and_compact(true);
+
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(mas, 1);
+    settings.reset();
+    REQUIRE(masMagneticsWithCoil.size() > 0);
+    auto coil = masMagneticsWithCoil[0].get_magnetic().get_coil();
+    REQUIRE(coil.get_turns_description());
+    // At least one winding's wire carries the insulation itself.
+    bool anyRated = false;
+    for (auto winding : coil.get_functional_description()) {
+        auto coating = winding.resolve_wire().resolve_coating();
+        if (coating && coating->get_breakdown_voltage() && coating->get_breakdown_voltage().value() >= 4000) {
+            anyRated = true;
+        }
+    }
+    CHECK(anyRated);
 }
 
 }  // namespace

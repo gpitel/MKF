@@ -5,6 +5,8 @@
 #include "constructive_models/Mas.h"
 #include "support/Utils.h"
 #include <MAS.hpp>
+#include <limits>
+#include <optional>
 
 using namespace MAS;
 
@@ -106,18 +108,52 @@ class CoilAdviser : public WireAdviser {
         std::map<MagneticFilters, std::shared_ptr<MagneticFilter>> _filters;
         std::vector<MagneticFilterOperation> _loadedFilterFlow;
         OpenMagnetics::WireAdviser _wireAdviser;
-        std::optional<WireStandard> _commonWireStandard = defaults.commonWireStandard;
+        // ABT #1110: Settings' preferred wire standard wins; with no preference the coil
+        // adviser keeps its built-in one (Defaults::commonWireStandard, a preference that
+        // falls back to every standard when the catalog has none of it, see get_advised_coil).
+        std::optional<WireStandard> _commonWireStandard = Settings::GetInstance().get_preferred_wire_standard().has_value()
+            ? Settings::GetInstance().get_preferred_wire_standard()
+            : std::optional<WireStandard>(defaults.commonWireStandard);
         std::vector<MagneticFilterOperation> _defaultCustomMagneticFilterFlow{
             MagneticFilterOperation(MagneticFilters::EFFECTIVE_RESISTANCE, true, true, 1.0),
             MagneticFilterOperation(MagneticFilters::EFFECTIVE_CURRENT_DENSITY, true, true, true, 1.0),  // Strictly required - designs exceeding current density are invalid
             MagneticFilterOperation(MagneticFilters::MAGNETOMOTIVE_FORCE, true, true, 1.0),
         };
 
+        // ABT #415: zero-result diagnosis, accumulated across every pattern/insulation attempt of
+        // one get_advised_coil call and composed into _lastNoResultsReason when the call returns an
+        // empty vector. Every count is honest bookkeeping of what actually ran — no fabricated
+        // results, only the explanation the caller could never reach before (each diagnosis in the
+        // ticket needed the winder instrumented by hand).
+        size_t _diagnosisWireCandidates = 0;   // wires that survived electrical filtering, all windings
+        size_t _diagnosisWindAttempts = 0;     // wire combinations handed to wind()
+        size_t _diagnosisGuardSkips = 0;       // combinations rejected by the packability guard pre-wind
+        bool _diagnosisNoWiresSurvived = false;
+        std::string _diagnosisNoWiresDetail;
+        double _diagnosisBestOverfill = std::numeric_limits<double>::max();
+        std::string _diagnosisBestFailure;     // failing constraint of the closest losing candidate
+        std::optional<std::string> _lastNoResultsReason;
+
     public:
 
+        // ABT #415: when get_advised_coil returns an EMPTY vector, this explains why — at minimum
+        // distinguishing "no wire survived electrical filtering" from "wires survived but none
+        // could be wound", with the counts and the failing constraint of the best (closest-to-
+        // winding) candidate. std::nullopt whenever the last call returned results. Empty results
+        // stay an empty vector (MagneticAdviser iterates cores and legitimately sees empties), but
+        // never a silent one: the same text is logged at WARNING level.
+        std::optional<std::string> get_last_no_results_reason() const {
+            return _lastNoResultsReason;
+        }
+
         std::vector<Mas> get_advised_coil(Mas mas, size_t maximumNumberResults=1);
+    // ABT #1176, behind Settings::get_coil_adviser_size_magnetic_shunts().
+    void add_magnetic_shunts_for_leakage_target(std::vector<Mas>& candidates);
         std::vector<Mas> get_advised_coil(std::vector<Wire>* wires, Mas mas, size_t maximumNumberResults=1);
-        std::vector<Section> get_advised_sections(Mas mas, std::vector<size_t> pattern, size_t repetitions);
+        // withMarginTape=false builds the sections of a combination whose wires carry the
+        // insulation themselves (InsulationCoordinator::needs_margin false): no creepage margin
+        // is reserved, and the inter-section tape is the no-margin build.
+        std::vector<Section> get_advised_sections(Mas mas, std::vector<size_t> pattern, size_t repetitions, bool withMarginTape = true);
         std::vector<Section> get_advised_planar_sections(Mas mas, std::vector<size_t> pattern, size_t repetitions);
         std::vector<Mas> get_advised_coil_for_pattern(std::vector<Wire>* wires, Mas mas, std::vector<size_t> pattern, size_t repetitions, std::vector<WireSolidInsulationRequirements> solidInsulationRequirementsForWires, size_t maximumNumberResults, std::string reference);
         std::vector<Mas> get_advised_planar_coil_for_pattern(std::vector<Wire>* wires, Mas mas, std::vector<size_t> pattern, size_t repetitions, size_t maximumNumberResults, std::string reference);

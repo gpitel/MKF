@@ -31,15 +31,28 @@ class InitialPermeability {
                                         std::optional<double> temperature = std::nullopt,
                                         std::optional<double> magneticFieldDcBias = std::nullopt,
                                         std::optional<double> frequency = std::nullopt,
-                                        std::optional<double> magneticFluxDensity = std::nullopt);
+                                        std::optional<double> magneticFluxDensity = std::nullopt,
+                                        std::optional<CoreShapeFamily> shapeFamily = std::nullopt);
 
         static double get_initial_permeability(CoreMaterial coreMaterial,
                                         std::optional<double> temperature = std::nullopt,
                                         std::optional<double> magneticFieldDcBias = std::nullopt,
                                         std::optional<double> frequency = std::nullopt,
-                                        std::optional<double> magneticFluxDensity = std::nullopt);
-        static double get_initial_permeability(CoreMaterial coreMaterial, OperatingPoint operatingPoint);
-        static double get_initial_permeability(std::string coreMaterialName, OperatingPoint operatingPoint);
+                                        std::optional<double> magneticFluxDensity = std::nullopt,
+                                        std::optional<CoreShapeFamily> shapeFamily = std::nullopt);
+        static double get_initial_permeability(CoreMaterial coreMaterial, OperatingPoint operatingPoint,
+                                        std::optional<CoreShapeFamily> shapeFamily = std::nullopt);
+        static double get_initial_permeability(std::string coreMaterialName, OperatingPoint operatingPoint,
+                                        std::optional<CoreShapeFamily> shapeFamily = std::nullopt);
+
+        // ABT #358: vendors publish per-shape-family DC-bias fits under modifier keys like
+        // "E", "EQ", "PQ", "E/ER/U", "EQ/LP" (a slash lists the families sharing one fit).
+        // Those entries are PARTIAL — typically only the DC-bias factor — so the resolved
+        // modifier is "default" with every factor the family entry provides overlaid on top.
+        // Matching is exact per slash-separated token, never substring (a substring test would
+        // make "E" hit "EQ/LP", the ABT #359 class of bug).
+        static InitialPermeabilitModifier resolve_modifier(const PermeabilityPoint& permeabilityPoint,
+                                        std::optional<CoreShapeFamily> shapeFamily = std::nullopt);
 
         static double has_temperature_dependency(CoreMaterial coreMaterial);
         static double has_frequency_dependency(CoreMaterial coreMaterial);
@@ -47,6 +60,16 @@ class InitialPermeability {
         static double get_initial_permeability_temperature_dependent(CoreMaterial coreMaterial, double temperature);
         static double get_initial_permeability_frequency_dependent(CoreMaterial coreMaterial, double frequency);
         static double get_initial_permeability_magnetic_field_dc_bias_dependent(CoreMaterial coreMaterial, double magneticFieldDcBias);
+        // ABT #1093: the field strength H_dc that carries a given DC flux density in the material.
+        // The datasheet bias curve is the REVERSIBLE (incremental) permeability, dB/dH along the
+        // magnetisation curve, so B(H) = µ0·∫0^H µ_rev(h)·dh must be integrated and inverted; the
+        // secant B = µ0·µ_rev(H)·H is wrong past the knee, and the fixed point µ ← µ_rev(B/(µ0·µ))
+        // diverges there. Throws when biasFluxDensity exceeds the material saturation at that
+        // temperature: no field strength holds that flux, the design is infeasible.
+        static double get_magnetic_field_dc_bias_for_flux_density(CoreMaterial coreMaterial,
+                                        double biasFluxDensity,
+                                        double temperature,
+                                        std::optional<double> frequency = std::nullopt);
         static std::vector<PermeabilityPoint> sample_initial_permeability_by_frequency_modifier(PermeabilityPoint permeabilityPoint);
         static double calculate_frequency_for_initial_permeability_drop(CoreMaterial coreMaterial, double percentageDrop, double maximumError = 0.01);
         static std::vector<size_t> get_only_temperature_dependent_indexes(CoreMaterial coreMaterial);
@@ -63,7 +86,8 @@ class InitialPermeability {
                                                        std::optional<double> temperature,
                                                        std::optional<double> magneticFieldDcBias,
                                                        std::optional<double> frequency,
-                                                       std::optional<double> magneticFluxDensity);
+                                                       std::optional<double> magneticFluxDensity,
+                                        std::optional<CoreShapeFamily> shapeFamily);
 };
 
 } // namespace OpenMagnetics

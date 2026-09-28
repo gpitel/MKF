@@ -23,6 +23,7 @@ class Inputs : public MAS::Inputs {
   public:
     Inputs(json j, bool processWaveform = true, std::optional<std::variant<double, std::vector<double>>> magnetizingInductance = std::nullopt) {
         OpenMagnetics::compat::migrate_pre_1_0(j);
+        throw_if_json_lacks_required_fields(j);
         from_json(j, *this);
         auto check_passed = check_integrity();
         if (!check_passed.first) {
@@ -46,6 +47,16 @@ class Inputs : public MAS::Inputs {
     Inputs() = default;
     virtual ~Inputs() = default;
 
+    // ABT #1329: MAS requires inputs.designRequirements and inputs.operatingPoints. Without this
+    // check a missing one surfaced as a raw "[json.exception.out_of_range.403] key
+    // 'designRequirements' not found" from the generated parser, naming no MAS field.
+    static void throw_if_json_lacks_required_fields(const json& inputsJson);
+    // ABT #1329: insulation coordination (clearance, creepage, distance through insulation, lead
+    // sleeves) is defined by the standards the design names. designRequirements.insulation.standards
+    // is optional in MAS, so an insulation block without it is valid and simply names no standard
+    // to coordinate by: true only when the insulation block carries a standards list. (An EMPTY
+    // list, which MKF's own quick inputs build, keeps its previous meaning: coordinate by no table.)
+    bool has_insulation_coordination_requirements() const;
     std::pair<bool, std::string> check_integrity();
     void process(std::optional<std::variant<double, std::vector<double>>> magnetizingInductance = std::nullopt);
     static OperatingPoint process_operating_point(OperatingPoint operatingPoint, double magnetizingInductance, std::optional<std::vector<double>> turnsRatios = std::nullopt, bool isDmcTopology = false);
@@ -56,11 +67,15 @@ class Inputs : public MAS::Inputs {
     static bool can_be_common_mode_choke(OperatingPoint operatingPoint);
     static bool can_be_differential_mode_choke(OperatingPoint operatingPoint, bool isDmcTopology = false);
 
-    static Waveform calculate_sampled_waveform(Waveform waveform, double frequency=0, std::optional<size_t> numberPoints=std::nullopt);
+    static Waveform calculate_sampled_waveform(Waveform waveform, double frequency=0, std::optional<size_t> numberPoints=std::nullopt, std::optional<size_t> maximumNumberPoints=std::nullopt);
     static ProcessedWaveform calculate_processed_data(Waveform waveform, std::optional<double> frequency=std::nullopt, bool includeAdvancedData=true, std::optional<ProcessedWaveform> processed=std::nullopt);
     static ProcessedWaveform calculate_processed_data(SignalDescriptor excitation, Waveform sampledWaveform, bool includeAdvancedData=true, std::optional<ProcessedWaveform> processed=std::nullopt);
     static ProcessedWaveform calculate_processed_data(Harmonics harmonics, Waveform waveform, bool includeAdvancedData=true, std::optional<ProcessedWaveform> processed=std::nullopt);
     static Harmonics calculate_harmonics_data(Waveform waveform, double frequency);
+    // Harmonics of `waveform` from its own knots when it has a time axis (the exact series, no
+    // sampling), else of `sampledWaveform`, its uniform resample: a data-only waveform has no
+    // knots to be exact about (ABT #1460).
+    static Harmonics calculate_harmonics_data(const Waveform& waveform, const Waveform& sampledWaveform, double frequency);
     static OperatingPointExcitation prune_harmonics(OperatingPointExcitation excitation, double windingLossesHarmonicAmplitudeThreshold, std::optional<size_t> mainHarmonicIndex=std::nullopt);
     static SignalDescriptor prune_harmonics(SignalDescriptor signalDescriptor, double windingLossesHarmonicAmplitudeThreshold, std::optional<size_t> mainHarmonicIndex=std::nullopt);
     static OperatingPoint prune_harmonics(OperatingPoint operatingPoint, double windingLossesHarmonicAmplitudeThreshold, std::optional<size_t> mainHarmonicIndex=std::nullopt);
@@ -102,15 +117,37 @@ class Inputs : public MAS::Inputs {
     static double calculate_max_volt_seconds(const OperatingPointExcitation& excitation);
     static double calculate_max_volt_seconds(const OperatingPoint& operatingPoint);
     static bool include_dc_offset_into_magnetizing_current(OperatingPoint operatingPoint, std::vector<double> turnsRatios);
+    // addOffset: anchor the magnetizing current's DC level to the winding current
+    // (see include_dc_offset_into_magnetizing_current). alternatingConduction: true
+    // when the operating point has several windings conducting alternately (flyback
+    // style); the winding current then contains commutation steps, so the DC anchor
+    // is peak-based on the volt-second integral instead of the measured midpoint
+    // (ABT #907). Pass excitations_per_winding().size() > 1 at the call site.
+    // The ampere-turn current of an operating point: i_m(t) = sum_k c_k (N_k/N_ref) i_k(t), the
+    // single current that, in the reference winding, drives the same core flux as all windings
+    // together. Built from the winding current WAVEFORMS on one common period grid, so phase and
+    // dot direction count: c_k = +1 for a primary-side winding, -1 otherwise (MAS's excitation
+    // sign convention: primary-side currents passive, the others source), N_k/N_ref from the
+    // design's turnsRatios (Np/Nk against winding 0, re-referred to the reference) or 1:1 when
+    // none are given; the reference is the first primary-side winding. Its processed values come
+    // from the summed waveform (offset = signed DC, peak = magnitude peak). Throws when a winding
+    // has no current waveform (processed values alone carry no phase), when the windings'
+    // frequencies differ, or when the isolation sides are not given for every winding.
+    static SignalDescriptor calculate_ampere_turn_current(const OperatingPoint& operatingPoint,
+                                                          const std::vector<double>& turnsRatios,
+                                                          const std::vector<IsolationSide>& isolationSides);
+
     static SignalDescriptor calculate_magnetizing_current(OperatingPointExcitation& excitation,
                                                             double magnetizingInductance,
                                                             bool compress,
-                                                            bool addOffset);
+                                                            bool addOffset,
+                                                            bool alternatingConduction);
     static SignalDescriptor calculate_magnetizing_current(OperatingPointExcitation& excitation,
                                                             Waveform voltageSampledWaveform,
                                                             double magnetizingInductance,
                                                             bool compress,
-                                                            bool addOffset);
+                                                            bool addOffset,
+                                                            bool alternatingConduction);
     static SignalDescriptor calculate_magnetizing_current(OperatingPointExcitation& excitation,
                                                             double magnetizingInductance,
                                                             bool compress,
@@ -160,6 +197,12 @@ class Inputs : public MAS::Inputs {
                                                                               double currentOffset = 0);
 
     static WaveformLabel try_guess_waveform_label(Waveform waveform);
+    // ABT #1330: whether a processed description defines a waveform on its own. A signal given only
+    // by its processed parameters (label, peakToPeak, offset, dutyCycle...) is rebuilt with
+    // create_waveform, which reads the duty cycle for every non-sinusoidal label and the dead time
+    // for the *_WITH_DEADTIME ones; CUSTOM and RECTANGULAR_DCM have no parametric form at all.
+    // Throws naming what is missing (`what` says which signal), never assumes a value.
+    static void throw_if_processed_cannot_define_waveform(const ProcessedWaveform& processed, const std::string& what);
     static Waveform create_waveform(ProcessedWaveform processed, double frequency);
     // phase: radians, applied to SINUSOIDAL waveforms only (positive phase
     // advances the waveform — e.g. phase=pi/2 turns sin(wt) into sin(wt+pi/2)=cos(wt),

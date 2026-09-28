@@ -1,5 +1,6 @@
 #include <source_location>
 #include "Constants.h"
+#include "constructive_models/CorePiece.h"
 #include "physical_models/CoreLosses.h"
 #include "support/Painter.h"
 #include "support/Settings.h"
@@ -7,6 +8,7 @@
 #include "physical_models/MagnetizingInductance.h"
 #include "processors/CircuitSimulatorInterface.h"
 #include "physical_models/Reluctance.h"
+#include "support/MaterialValidator.h"
 #include "TestingUtils.h"
 #include "Fixtures.h"
 #include <magic_enum.hpp>
@@ -1918,7 +1920,15 @@ TEST_CASE("Test_Ki_3C95_Steinmetz", "[physical-model][core-losses][igse-core-los
     auto coreLossesIGSEModel = CoreLossesIGSEModel();
 
     auto ki = coreLossesIGSEModel.get_ki(steinmetzDatum);
-    double expectedKi = 0.0635;
+    // ABT #648: was 0.0635. get_ki reads k and ignores ct, so this pin tracks 3C95's k alone —
+    // and MAS 4b9a743 rescaled k WITHOUT changing any prediction. That refit normalised the
+    // temperature polynomial to ct(25 C) = 1 and folded the old ct(25 C) = 1.38437 into k
+    // (1.3984475 -> 1.9359667, alpha and beta untouched). Checked against MAS's 60 measured 3C95
+    // points: old and new agree to 5 significant figures (100 kHz/100 mT/25 C: 65066.9 vs
+    // 65065.3 W/m3). So 0.0635 * 1.38437 = 0.0879, purely a change of parameterisation.
+    // End-to-end iGSE is unaffected — get_core_volumetric_losses applies the ct on top, and the
+    // 1.384 cancels.
+    double expectedKi = 0.0879;
 
     REQUIRE_THAT(ki, Catch::Matchers::WithinAbs(expectedKi, expectedKi * 0.1));
 }
@@ -1988,6 +1998,55 @@ TEST_CASE("Test_IGSE_composite_waveform_low_excitation_frequency", "[physical-mo
     // (within 10x), not 100x-1000x higher as the bug caused
     REQUIRE(volumetricLosses < refVolumetricLosses * 10);
     REQUIRE(volumetricLosses > 0);
+}
+
+// ABT #1426 follow-up: the dB/dt core-loss models integrate over the segments of a
+// piecewise-linear flux density waveform, and MAS marks an instant with two samples at the same
+// time. A repeated sample (dt = 0, dB = 0) evaluated (0/0)^alpha * 0 = NaN, and a flux step
+// (dt = 0, dB != 0) inf * 0 = NaN; the NaN passed every `< 0` guard and silently turned the
+// loss-optimal turn search off for a whole flyback pool. A repeated sample adds nothing to the
+// integral; a flux step needs infinite volts per turn, and the model must say so.
+TEST_CASE("Core losses of a flux waveform with zero-length segments", "[physical-model][core-losses][smoke-test]") {
+    settings.reset();
+    clear_databases();
+    Core core = OpenMagneticsTesting::get_quick_core("PQ 20/20", json::array(), 1, "3C95");
+    double frequency = 100000;
+    double temperature = 25;
+    double peak = 0.1;
+
+    auto makeExcitation = [&](std::vector<double> time, std::vector<double> data) {
+        json excitationJson;
+        excitationJson["frequency"] = frequency;
+        excitationJson["magneticFluxDensity"]["waveform"]["time"] = time;
+        excitationJson["magneticFluxDensity"]["waveform"]["data"] = data;
+        excitationJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::CUSTOM;
+        excitationJson["magneticFluxDensity"]["processed"]["offset"] = 0;
+        excitationJson["magneticFluxDensity"]["processed"]["peak"] = peak;
+        excitationJson["magneticFluxDensity"]["processed"]["peakToPeak"] = 2 * peak;
+        excitationJson["magneticFluxDensity"]["processed"]["dutyCycle"] = 0.5;
+        return OperatingPointExcitation(excitationJson);
+    };
+    double period = 1 / frequency;
+    // Symmetric triangle, and the same triangle with every sample repeated at its instant.
+    auto triangle = makeExcitation({0, period / 2, period}, {-peak, peak, -peak});
+    auto triangleWithRepeatedSamples = makeExcitation({0, 0, period / 2, period / 2, period, period},
+                                                      {-peak, -peak, peak, peak, -peak, -peak});
+    // Sawtooth: ramps up over the whole period and steps back down in zero time.
+    auto sawtoothWithFluxStep = makeExcitation({0, period, period}, {-peak, peak, -peak});
+
+    for (auto modelName : {CoreLossesModels::IGSE, CoreLossesModels::MSE, CoreLossesModels::ALBACH,
+                           CoreLossesModels::NSE, CoreLossesModels::ROSHEN}) {
+        INFO("Model: " << magic_enum::enum_name(modelName));
+        auto model = CoreLossesModel::factory(modelName);
+        double reference = model->get_core_losses(core, triangle, temperature).get_core_losses();
+        double repeated = model->get_core_losses(core, triangleWithRepeatedSamples, temperature).get_core_losses();
+        REQUIRE(std::isfinite(reference));
+        REQUIRE(reference > 0);
+        REQUIRE(std::isfinite(repeated));
+        CHECK_THAT(repeated, Catch::Matchers::WithinRel(reference, 1e-9));
+        CHECK_THROWS_AS(model->get_core_losses(core, sawtoothWithFluxStep, temperature), InvalidInputException);
+    }
+    settings.reset();
 }
 
 TEST_CASE("Voltage_And_Current", "[physical-model][core-losses][smoke-test]") {
@@ -2567,7 +2626,17 @@ TEST_CASE("Test_Core_Losses_Rosano_Forward", "[physical-model][core-losses][smok
     auto coreLossesModel = CoreLossesModel::factory(models);
     auto coreLosses = coreLossesModel->get_core_losses(core, excitation, temperature);
     auto calculatedCoreLosses = coreLosses.get_core_losses();
-    double expectedLosses = 0.51;
+    // ABT #648: was 0.51 W, which encoded MAS's OLD 3F3 Steinmetz fit. That fit was badly wrong —
+    // against MAS's 82 measured 3F3 points it ran 56.3 % mean |rel err| (median 20.5 %) and
+    // returned 223 kW/m3 at the datasheet's own 100 kHz/100 mT/100 C point, where the Ferroxcube
+    // 3F3 MDS specifies <= 80. The refit (MAS 23d5d2c, 200 kHz range k 1.028 -> 2.030,
+    // beta 2.40 -> 2.6242) scores 7.6 % / 4.1 % and returns 76.6 kW/m3 there, plus 139 against the
+    // MDS's second point (<= 150 at 400 kHz/50 mT/100 C). At THIS test's condition the measured
+    // curve reads 92595 W/m3 at 71.6 mT and 210851 at 98.2 mT, i.e. ~121900 log-interpolated to
+    // the fixture's B = 79.58 mT; the new model gives 118800 sinusoidal (-2.6 %), the old ~141600.
+    // NOTE the +/-10 % band below is tighter than what the fixture actually controls: the B
+    // assertion allows +/-10 % and Pv goes as B^2.62, i.e. +/-27 %.
+    double expectedLosses = 0.438;
     auto maximumError = 0.1;
 
     // Updated for 617dc492: magnetizing current is now bipolar-centered for AC
@@ -2837,7 +2906,7 @@ TEST_CASE("Test_Core_Losses_Web_2", "[physical-model][core-losses][bug]") {
     REQUIRE_THAT(expectedLosses, Catch::Matchers::WithinAbs(calculatedCoreLosses, expectedLosses * maximumError));
 }
 
-TEST_CASE("Test_Core_Losses_DMEGC_DMR51W", "[physical-model][core-losses][bug][smoke-test]") {
+TEST_CASE("Test_Core_Losses_DMEGC_DMR51W", "[physical-model][core-losses][bug][smoke-test][!mayfail]") {
     auto models = json::parse("{\"coreLosses\": \"STEINMETZ\", \"gapReluctance\": \"BALAKRISHNAN\"}");
     auto core = Core(json::parse(R"({"distributorsInfo": [], "functionalDescription": {"coating": null, "gapping": [{"area": 0.000078, "coordinates": [0, 0.0003, 0 ], "distanceClosestNormalSurface": 0.00865, "distanceClosestParallelSurface": 0.005325, "length": 0.0006, "sectionDimensions": [0.00725, 0.01075 ], "shape": "rectangular", "type": "subtractive" }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" } ], "material": "DMR51W", "numberStacks": 1, "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "twoPieceSet", "magneticCircuit": "open" }, "geometricalDescription": [{"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": [{"coordinates": [0, 0.0003, 0 ], "length": 0.0006 } ], "material": "DMR51W", "rotation": [3.141592653589793, 3.141592653589793, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" }, {"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": null, "material": "DMR51W", "rotation": [0, 0, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" } ], "manufacturerInfo": null, "name": "custom", "processedDescription": {"columns": [{"area": 0.000078, "coordinates": [0, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "central", "width": 0.00725 }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 } ], "depth": 0.01075, "effectiveParameters": {"effectiveArea": 0.00007739519022938956, "effectiveLength": 0.05775787070464925, "effectiveVolume": 0.000004470181390430815, "minimumArea": 0.00007686249999999999 }, "height": 0.0251, "width": 0.02505, "windingWindows": [{"angle": null, "area": 0.00009531749999999999, "coordinates": [0.0036249999999999998, 0 ], "height": 0.0179, "radialHeight": null, "sectionsAlignment": null, "sectionsOrientation": null, "shape": null, "width": 0.005325 } ] } })"));
     auto coil = OpenMagnetics::Coil(OpenMagneticsTesting::fixtures::get_json("coil-e25-13-11-32-turn-round"));
@@ -2859,6 +2928,21 @@ TEST_CASE("Test_Core_Losses_DMEGC_DMR51W", "[physical-model][core-losses][bug][s
 
     auto coreLossesModel = CoreLossesModel::factory(models);
     auto calculatedCoreLosses = coreLossesModel->get_core_losses(core, excitation, temperature).get_core_losses();
+    // ABT #648 / #786 — THIS PIN IS CORRECT AND THIS TEST IS EXPECTED TO FAIL. DO NOT RE-PIN IT.
+    //
+    // Tagged [!mayfail] 2026-08-21 (owner-approved) so the expected red reports as "failed as
+    // expected" instead of as a suite failure. NOTHING about the pin or the physics changed: the
+    // 0.3 below is still the manufacturer's measurement, the test still RUNS and still compares
+    // against it, and it flips back to a HARD failure the moment MKF starts matching — which is
+    // the signal ABT #786 exists to produce. The tag was added only so that a genuinely NEW
+    // regression in this file cannot hide behind an already-red test.
+    // DMEGC published a measured point at exactly this condition (700 kHz, 50 mT, 25 C):
+    // Pv = 61679.9 W/m3, which over this fixture's Ve = 4.470181e-6 m3 is 0.2757 W. The 0.3 below
+    // is +8.8 % off that measured truth, i.e. very nearly ground truth. MKF currently returns
+    // 0.2182 W — 21 % BELOW the manufacturer's own measurement — because MAS's single
+    // 500 kHz–5 MHz DMR51W Steinmetz range cannot follow the material: measured beta runs ~2.98
+    // at 13–26 mT and ~3.36 at 74–99 mT against a fitted 2.79, and ct is ~2x too weak (measured
+    // Pv triples 25 C -> 100 C; ct(100) = 1.64). Filed as ABT #786 to MAS. The red is the signal.
     double expectedLosses = 0.3;
     auto maximumError = 0.15;
     REQUIRE_THAT(expectedLosses, Catch::Matchers::WithinAbs(calculatedCoreLosses, expectedLosses * maximumError));
@@ -3661,10 +3745,655 @@ TEST_CASE("Test_Core_Losses_All_Models_Comparison_Table",
             bestModel = name;
         }
     }
-    std::cout << "Best model: " << bestModel << " with " 
+    std::cout << "Best model: " << bestModel << " with "
               << (bestAvg * 100) << "% average error" << std::endl;
-    
+
     REQUIRE(bestAvg < 0.5); // At least one model under 50% avg error
     settings.reset();
 }
 
+// ABT #362: semi-shielded drum core losses must be split PER MATERIAL. The single-material
+// path prices the drum ferrite's loss density over the core's whole effective volume — glue
+// shell included — which overcounts. The split prices each material over its own volume at its
+// own flux density (flux continuity: a smaller-area section sees a larger B).
+//
+// Shell losses are ZERO unless the shell material carries volumetricLosses — a deliberate,
+// user-approved choice for a real data gap (no public magnetic-epoxy compound publishes loss
+// data, ABT #364), reported in the method name so it can never be mistaken for a priced result.
+TEST_CASE("Test_Core_Losses_Drum_Semishielded_Per_Material_Split", "[physical-model][core-losses][drum-semishielded]") {
+    settings.reset();
+    clear_databases();
+    auto buildCore = [](const std::string& shellMaterialName) {
+        json shapeJson = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "drumSemishielded"},
+            {"aliases", json::array()}, {"name", "LQS-like 4018"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0038}}}, {"B", {{"nominal", 0.0018}}}, {"C", {{"nominal", 0.0015}}},
+                {"D", {{"nominal", 0.0004}}}, {"E", {{"nominal", 0.0010}}}, {"F", {{"nominal", 0.0004}}},
+                {"J", {{"nominal", 0.0040}}}, {"K", {{"nominal", 0.0040}}}, {"L", {{"nominal", 0.0018}}}}}
+        };
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", "pieceAndPlate"}, {"material", "3C90"}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1},
+            {"coating", {{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", shellMaterialName}}}};
+        Core core(coreJson);
+        core.process_data();
+        core.process_gap();
+        return core;
+    };
+
+    json excitationJson = json();
+    excitationJson["frequency"] = 500000;
+    excitationJson["magneticFluxDensity"]["processed"]["dutyCycle"] = 0.5;
+    excitationJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+    excitationJson["magneticFluxDensity"]["processed"]["offset"] = 0;
+    excitationJson["magneticFluxDensity"]["processed"]["peak"] = 0.05;
+    excitationJson["magneticFluxDensity"]["processed"]["peakToPeak"] = 0.1;
+    excitationJson["magneticFieldStrength"]["processed"]["offset"] = 0;
+    excitationJson["magneticFieldStrength"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+    excitationJson["magneticFieldStrength"]["processed"]["peakToPeak"] = 0;
+    OperatingPointExcitation excitation(excitationJson);
+
+    // "Kool Mu 26" is a powder grade WITH loss data, so the shell is priced; the drum ferrite
+    // is 3C90. Both materials therefore contribute over their own volumes.
+    auto pricedShellCore = buildCore("Kool Mµ 26");
+    auto pricedShellLosses = CoreLosses().calculate_core_losses(pricedShellCore, excitation, 25);
+    CHECK(std::isfinite(pricedShellLosses.get_core_losses()));
+    CHECK(pricedShellLosses.get_core_losses() > 0);
+    CHECK(pricedShellLosses.get_method_used() == "SemiShieldedPerMaterialSplit");
+
+    // THE INVARIANT THAT MATTERS: the ferrite's loss density must not be charged to the SHELL
+    // volume. Compare like with like — same ferrite density, only the volume differs — so this
+    // isolates the overcount the split exists to remove.
+    auto corePiece = CorePiece::factory(pricedShellCore.resolve_shape());
+    auto mixedConstants = corePiece->get_mixed_material_constants();
+    REQUIRE(mixedConstants.has_value());
+    double ferriteC1 = (*mixedConstants)[0];
+    double ferriteC2 = (*mixedConstants)[1];
+    double shellC1 = (*mixedConstants)[2];
+    double shellC2 = (*mixedConstants)[3];
+    double ferriteVolume = pow(ferriteC1, 3) / pow(ferriteC2, 2);
+    double shellVolume = pow(shellC1, 3) / pow(shellC2, 2);
+    REQUIRE(shellVolume > 0);
+
+    // Shell material without loss data: its contribution is zero AND the method name says so,
+    // so a zero-shell result can never be mistaken for a priced one.
+    auto unpricedShellCore = buildCore("Nanoperm 4000");
+    auto unpricedShellLosses = CoreLosses().calculate_core_losses(unpricedShellCore, excitation, 25);
+    CHECK(unpricedShellLosses.get_method_used() == "SemiShieldedPerMaterialSplit(shellLossesAssumedZero)");
+    CHECK(unpricedShellLosses.get_core_losses() > 0);
+
+    // With the shell contributing nothing, the total is the FERRITE sections alone. Charging the
+    // ferrite's own density over ferrite+shell volume — the old single-material behaviour, at the
+    // same flux density — must be strictly larger, in the ratio of the volumes.
+    double ferriteOnlyLosses = unpricedShellLosses.get_core_losses();
+    double ferriteDensityChargedEverywhere = ferriteOnlyLosses * (ferriteVolume + shellVolume) / ferriteVolume;
+    UNSCOPED_INFO("ferrite-only " << ferriteOnlyLosses * 1e3 << " mW vs ferrite-density-over-whole-volume "
+                  << ferriteDensityChargedEverywhere * 1e3 << " mW (shell is "
+                  << shellVolume / (ferriteVolume + shellVolume) * 100 << "% of the volume)");
+    CHECK(ferriteOnlyLosses < ferriteDensityChargedEverywhere);
+
+    // Pricing a lossy shell adds to the ferrite-only total (it cannot subtract).
+    CHECK(pricedShellLosses.get_core_losses() > ferriteOnlyLosses);
+
+    // NOTE on magnitudes: the split can exceed the legacy single-material number even though it
+    // removes the shell overcount, because each section is now evaluated at ITS OWN flux density
+    // rather than one average B. Loss density is convex in B (Steinmetz beta > 1), so resolving a
+    // non-uniform circuit raises the total — the small-area ferrite post sees a much higher B
+    // than the volume-average. That is the physics, not a regression.
+    settings.reset();
+}
+
+// ABT #366: shielded drum (drumRing). The loss models consume the assembly's effective
+// parameters (post + flanges + ring, IEC 60205 general method) — this pins that the whole
+// pipeline yields finite, positive, sane volumetric losses for the new family. The effective
+// volume must also sit between the drum alone and the full envelope cylinder, or the sectioned
+// circuit produced nonsense.
+TEST_CASE("Test_Core_Losses_Drum_Ring_Smoke", "[physical-model][core-losses][drum-ring]") {
+    settings.reset();
+    clear_databases();
+    Core core = OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "3C90");
+
+    auto effectiveParameters = core.get_processed_description().value().get_effective_parameters();
+    double effectiveVolume = effectiveParameters.get_effective_volume();
+    // Envelope cylinder: pi/4 J^2 * max(B, L); the ferrite path volume must be below it and
+    // above zero (le and Ae both from the sectioned assembly).
+    double envelopeVolume = std::numbers::pi / 4 * pow(0.003, 2) * 0.00105;
+    CHECK(effectiveVolume > 0);
+    CHECK(effectiveVolume < envelopeVolume);
+
+    auto coreLossesModel = CoreLossesModel::factory(CoreLossesModels::STEINMETZ);
+    json excitationJson = json();
+    excitationJson["frequency"] = 100000;
+    excitationJson["magneticFluxDensity"]["processed"]["dutyCycle"] = 0.5;
+    excitationJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+    excitationJson["magneticFluxDensity"]["processed"]["offset"] = 0;
+    excitationJson["magneticFluxDensity"]["processed"]["peak"] = 0.1;
+    excitationJson["magneticFluxDensity"]["processed"]["peakToPeak"] = 0.2;
+    excitationJson["magneticFieldStrength"]["processed"]["offset"] = 0;
+    excitationJson["magneticFieldStrength"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+    excitationJson["magneticFieldStrength"]["processed"]["peakToPeak"] = 0;
+    OperatingPointExcitation excitation(excitationJson);
+
+    auto coreLosses = coreLossesModel->get_core_losses(core, excitation, 25);
+    CHECK(std::isfinite(coreLosses.get_core_losses()));
+    CHECK(coreLosses.get_core_losses() > 0);
+    CHECK(std::isfinite(coreLosses.get_volumetric_losses().value()));
+    CHECK(coreLosses.get_volumetric_losses().value() > 0);
+    settings.reset();
+}
+
+
+// ABT #388: export_magnetic_as_subcircuit refused every lossFactor material with
+// "[MATERIAL_DATA_MISSING] No proprietary volumetric losses method", blocking 101 of 118
+// shielded-drum models built on the two datasheet-sourced NiZn grades (TAK DL5, SDE N5D).
+// Loss factor (tan_delta/mu_i vs frequency) is how NiZn makers publish loss — Steinmetz curves
+// are usually not published for these grades — so refusing it rejects vendor data, not bad data.
+TEST_CASE("Test_Subcircuit_Export_Accepts_LossFactor_Materials", "[processor][circuit-simulator][loss-factor]") {
+    settings.reset();
+    clear_databases();
+    auto core = OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "DL5");
+    json coilJson;
+    coilJson["bobbin"] = "Dummy";
+    coilJson["functionalDescription"] = json::array({{
+        {"name", "winding 0"}, {"numberTurns", 8}, {"numberParallels", 1},
+        {"isolationSide", "primary"}, {"wire", "Round 0.1 - Grade 1"}}});
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
+    auto completed = OpenMagnetics::magnetic_autocomplete(magnetic);
+
+    // Both exporter flavours: the ngspice one is what the Kirchhoff/Heaviside path consumes.
+    OpenMagnetics::CircuitSimulatorExporter ngspiceExporter(OpenMagnetics::CircuitSimulatorExporterModels::NGSPICE);
+    std::string ngspiceSubcircuit;
+    REQUIRE_NOTHROW(ngspiceSubcircuit = ngspiceExporter.export_magnetic_as_subcircuit(completed, 100000, 25, std::nullopt, std::nullopt));
+    CHECK(ngspiceSubcircuit.find(".subckt") != std::string::npos);
+
+    OpenMagnetics::CircuitSimulatorExporter simbaExporter;
+    std::string simbaSubcircuit;
+    REQUIRE_NOTHROW(simbaSubcircuit = simbaExporter.export_magnetic_as_subcircuit(completed, 100000, 25, std::nullopt, std::nullopt));
+    CHECK(simbaSubcircuit.size() > 50);
+    settings.reset();
+}
+
+// ABT #1002: a moulded body pressed from more than one powder prices each region with its own
+// grade over its own volume. One grade listed everywhere must reproduce the single-grade loss
+// exactly, and an unpriced or non-magnetic region is disclosed, never silently zeroed.
+TEST_CASE("Test_Core_Losses_Molded_Per_Region_Split", "[physical-model][core-losses][molded][abt-1002]") {
+    settings.reset();
+    clear_databases();
+    auto buildCore = [](json material) {
+        json shapeJson = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+            {"aliases", json::array()}, {"name", "MAPI-like 4020"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0041}}}, {"B", {{"nominal", 0.0021}}}, {"C", {{"nominal", 0.0041}}},
+                {"D", {{"nominal", 0.0014}}}, {"E", {{"nominal", 0.0030}}}, {"F", {{"nominal", 0.0012}}}}}
+        };
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", "closedShape"}, {"material", material}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1}};
+        Core core(coreJson);
+        core.process_data();
+        core.process_gap();
+        return core;
+    };
+
+    json excitationJson = json();
+    excitationJson["frequency"] = 500000;
+    excitationJson["magneticFluxDensity"]["processed"]["dutyCycle"] = 0.5;
+    excitationJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+    excitationJson["magneticFluxDensity"]["processed"]["offset"] = 0;
+    excitationJson["magneticFluxDensity"]["processed"]["peak"] = 0.05;
+    excitationJson["magneticFluxDensity"]["processed"]["peakToPeak"] = 0.1;
+    excitationJson["magneticFieldStrength"]["processed"]["offset"] = 0;
+    excitationJson["magneticFieldStrength"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+    excitationJson["magneticFieldStrength"]["processed"]["peakToPeak"] = 0;
+    OperatingPointExcitation excitation(excitationJson);
+
+    auto bare = CoreLosses().calculate_core_losses(buildCore("Kool Mµ 26"), excitation, 25);
+    auto listed = CoreLosses().calculate_core_losses(buildCore(json::array({"Kool Mµ 26", "Kool Mµ 26", "Kool Mµ 26"})), excitation, 25);
+    REQUIRE(std::isfinite(bare.get_core_losses()));
+    REQUIRE(bare.get_core_losses() > 0);
+    CHECK(listed.get_method_used() == "MoldedPerRegionSplit");
+    UNSCOPED_INFO("bare " << bare.get_core_losses() * 1e3 << " mW, listed x3 " << listed.get_core_losses() * 1e3 << " mW");
+    CHECK_THAT(listed.get_core_losses(), Catch::Matchers::WithinRel(bare.get_core_losses(), 0.02));
+
+    // A plastic-bobbin post dissipates nothing, so the body loses less than the all-powder one.
+    auto bobbinPost = CoreLosses().calculate_core_losses(buildCore(json::array({"air", "Kool Mµ 26", "Kool Mµ 26"})), excitation, 25);
+    CHECK(bobbinPost.get_method_used() == "MoldedPerRegionSplit");
+    CHECK(bobbinPost.get_core_losses() > 0);
+    CHECK(bobbinPost.get_core_losses() < listed.get_core_losses());
+
+    // A grade without a published loss model is disclosed in the method name.
+    auto unpricedBase = CoreLosses().calculate_core_losses(buildCore(json::array({"Kool Mµ 26", "Kool Mµ 26", "Nanoperm 4000"})), excitation, 25);
+    CHECK(unpricedBase.get_method_used() == "MoldedPerRegionSplit(lossesAssumedZero:base=Nanoperm 4000)");
+    CHECK(unpricedBase.get_core_losses() < listed.get_core_losses());
+
+    // Nothing priceable at all is an error, not a zero.
+    CHECK_THROWS(CoreLosses().calculate_core_losses(buildCore(json::array({"air", "Nanoperm 4000", "Nanoperm 4000"})), excitation, 25));
+    settings.reset();
+}
+
+// ABT #1379: an excitation whose magnetizing current has an RMS value (enough to pass
+// get_core_losses's own guard) but no peak used to reach a bare .value() on an empty
+// std::optional inside calculate_magnetizing_inductance_from_excitation and crash with
+// bad_optional_access. It must throw a named InvalidInputException instead.
+//
+// Calls CoreLossesLossFactorModel directly rather than going through
+// CoreLosses::calculate_core_losses: DL5 publishes both a steinmetz and a
+// lossFactor volumetric-losses method, and the top-level dispatcher's material
+// lookup prefers steinmetz (which never touches magnetizing current), so it
+// would never exercise the function under test.
+TEST_CASE("Test_Loss_Factor_Model_Throws_On_Missing_Peak_Instead_Of_Crashing", "[physical-model][core-losses][loss-factor][abt-1379]") {
+    settings.reset();
+    clear_databases();
+    auto core = OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "DL5");
+
+    json baseExcitationJson;
+    baseExcitationJson["frequency"] = 100000;
+    baseExcitationJson["magneticFluxDensity"]["processed"]["dutyCycle"] = 0.5;
+    baseExcitationJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+    baseExcitationJson["magneticFluxDensity"]["processed"]["offset"] = 0;
+    baseExcitationJson["magneticFluxDensity"]["processed"]["peak"] = 0.05;
+    baseExcitationJson["magneticFluxDensity"]["processed"]["peakToPeak"] = 0.1;
+
+    // Magnetizing current has an RMS but no peak: passes get_core_losses's own
+    // get_magnetizing_current()/get_processed() guards, then used to crash inside
+    // calculate_magnetizing_inductance_from_excitation instead of throwing.
+    json noPeakExcitationJson = baseExcitationJson;
+    noPeakExcitationJson["magnetizingCurrent"]["processed"]["dutyCycle"] = 0.5;
+    noPeakExcitationJson["magnetizingCurrent"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+    noPeakExcitationJson["magnetizingCurrent"]["processed"]["offset"] = 0;
+    noPeakExcitationJson["magnetizingCurrent"]["processed"]["rms"] = 0.1;
+    OperatingPointExcitation noPeakExcitation(noPeakExcitationJson);
+    REQUIRE_THROWS_WITH(CoreLossesLossFactorModel().get_core_losses(core, noPeakExcitation, 25),
+        Catch::Matchers::ContainsSubstring("magnetizing current's processed data has no peak"));
+
+    // Magnetic flux density itself missing a peak must also throw, not crash.
+    json noBPeakExcitationJson;
+    noBPeakExcitationJson["frequency"] = 100000;
+    noBPeakExcitationJson["magneticFluxDensity"]["processed"]["dutyCycle"] = 0.5;
+    noBPeakExcitationJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+    noBPeakExcitationJson["magneticFluxDensity"]["processed"]["offset"] = 0;
+    noBPeakExcitationJson["magneticFluxDensity"]["processed"]["peakToPeak"] = 0.1;
+    noBPeakExcitationJson["magnetizingCurrent"]["processed"]["dutyCycle"] = 0.5;
+    noBPeakExcitationJson["magnetizingCurrent"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+    noBPeakExcitationJson["magnetizingCurrent"]["processed"]["offset"] = 0;
+    noBPeakExcitationJson["magnetizingCurrent"]["processed"]["rms"] = 0.1;
+    noBPeakExcitationJson["magnetizingCurrent"]["processed"]["peak"] = 0.2;
+    OperatingPointExcitation noBPeakExcitation(noBPeakExcitationJson);
+    REQUIRE_THROWS_WITH(CoreLossesLossFactorModel().get_core_losses(core, noBPeakExcitation, 25),
+        Catch::Matchers::ContainsSubstring("magnetic flux density's processed data has no peak"));
+
+    settings.reset();
+}
+
+// ABT #1344: the Roshen classical eddy current term used the core's own bulk
+// cross-section unconditionally, which is the right length scale for a
+// sintered/solid material (ferrite, powder) but wrong by 2-3 orders of
+// magnitude for a tape-wound material (nanocrystalline, amorphous, electrical
+// steel), whose eddy-current-limiting dimension is the ribbon thickness. These
+// tests pin the ferrite path to its closed-form (unchanged) formula and the new
+// laminated path to the textbook laminated-eddy formula (TI SLUP124).
+namespace {
+OperatingPointExcitation build_sinusoidal_flux_excitation(double frequency, double peak) {
+    size_t numberPoints = 10000;
+    std::vector<double> bData(numberPoints);
+    for (size_t i = 0; i < numberPoints; ++i) {
+        double t = static_cast<double>(i) / (numberPoints - 1) / frequency;
+        bData[i] = peak * sin(2 * std::numbers::pi * frequency * t);
+    }
+
+    json excitationJson;
+    excitationJson["frequency"] = frequency;
+    excitationJson["magneticFluxDensity"]["waveform"]["data"] = bData;
+    excitationJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+    excitationJson["magneticFluxDensity"]["processed"]["offset"] = 0;
+    excitationJson["magneticFluxDensity"]["processed"]["peak"] = peak;
+    excitationJson["magneticFluxDensity"]["processed"]["peakToPeak"] = 2 * peak;
+    excitationJson["magneticFluxDensity"]["processed"]["dutyCycle"] = 0.5;
+    excitationJson["magneticFluxDensity"]["harmonics"]["amplitudes"] = {0, peak};
+    excitationJson["magneticFluxDensity"]["harmonics"]["frequencies"] = {0, frequency};
+
+    return OperatingPointExcitation(excitationJson);
+}
+}  // namespace
+
+TEST_CASE("Test_Roshen_Eddy_Current_Ferrite_Uses_Bulk_Cross_Section", "[physical-model][core-losses][roshen-core-losses-model][abt-1344]") {
+    settings.reset();
+    clear_databases();
+
+    double frequency = 100000;
+    double peak = 0.05;
+    double resistivity = 4;  // PC47 @ 20C, MAS/data/core_materials.ndjson
+
+    Core core = OpenMagneticsTesting::get_quick_core("PQ 20/20", json::array(), 1, "PC47");
+    double centralColumnArea = core.get_processed_description().value().get_columns()[0].get_area();
+
+    auto excitation = build_sinusoidal_flux_excitation(frequency, peak);
+
+    double eddyLosses = CoreLossesRoshenModel().get_eddy_current_losses_density(core, excitation, resistivity);
+
+    // Closed form for a sinusoid, from Roshen Eq. (5): Pe = pi * A * Bpk^2 * f^2 / (4 * rho)
+    double expected = std::numbers::pi * centralColumnArea * pow(peak, 2) * pow(frequency, 2) / (4 * resistivity);
+    CHECK_THAT(eddyLosses, Catch::Matchers::WithinRel(expected, 0.02));
+    settings.reset();
+}
+
+TEST_CASE("Test_Roshen_Eddy_Current_Laminated_Uses_Ribbon_Thickness", "[physical-model][core-losses][roshen-core-losses-model][abt-1344]") {
+    settings.reset();
+    clear_databases();
+
+    double frequency = 100000;
+    double peak = 0.05;
+    double resistivity = 1.15e-6;  // Nanoperm 80000 @ 25C, MAS/data/core_materials.ndjson
+    double laminationThickness = 20e-6;  // illustrative ribbon thickness for this unit test only
+
+    Core core = OpenMagneticsTesting::get_quick_core("T 63/50/30", json::array(), 1, "Nanoperm 80000");
+    auto material = find_core_material_by_name("Nanoperm 80000");
+    REQUIRE(material.get_material() == MAS::MaterialType::NANOCRYSTALLINE);
+    DimensionWithTolerance laminationThicknessDimension;
+    laminationThicknessDimension.set_nominal(laminationThickness);
+    material.set_lamination_thickness(laminationThicknessDimension);
+    core.get_mutable_functional_description().set_material(material);
+
+    auto excitation = build_sinusoidal_flux_excitation(frequency, peak);
+
+    double eddyLosses = CoreLossesRoshenModel().get_eddy_current_losses_density(core, excitation, resistivity);
+
+    // Closed form for a sinusoid, TI SLUP124: Pe = pi^2 * D^2 * f^2 * Bpk^2 / (6 * rho)
+    double expected = pow(std::numbers::pi, 2) * pow(laminationThickness, 2) * pow(frequency, 2) * pow(peak, 2) / (6 * resistivity);
+    CHECK_THAT(eddyLosses, Catch::Matchers::WithinRel(expected, 0.02));
+
+    // The branch must actually be engaged: using the core's bulk cross-section instead of the
+    // ribbon thickness would be many orders of magnitude larger for a real tape-wound geometry.
+    double centralColumnArea = core.get_processed_description().value().get_columns()[0].get_area();
+    double bulkAreaFormulaResult = std::numbers::pi * centralColumnArea * pow(peak, 2) * pow(frequency, 2) / (4 * resistivity);
+    CHECK(eddyLosses < bulkAreaFormulaResult / 100);
+    settings.reset();
+}
+
+TEST_CASE("Test_Roshen_Eddy_Current_Laminated_Without_Thickness_Throws", "[physical-model][core-losses][roshen-core-losses-model][abt-1344]") {
+    settings.reset();
+    clear_databases();
+
+    Core core = OpenMagneticsTesting::get_quick_core("T 63/50/30", json::array(), 1, "Nanoperm 80000");
+    auto material = find_core_material_by_name("Nanoperm 80000");
+    REQUIRE(material.get_material() == MAS::MaterialType::NANOCRYSTALLINE);
+    REQUIRE_FALSE(material.get_lamination_thickness());
+    core.get_mutable_functional_description().set_material(material);
+
+    auto excitation = build_sinusoidal_flux_excitation(100000, 0.05);
+
+    CHECK_THROWS(CoreLossesRoshenModel().get_eddy_current_losses_density(core, excitation, 1.15e-6));
+    settings.reset();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Magnetic Blade Runner: physics validation of MAS core-material records (MaterialValidator).
+// Each must-fire case is proven by the revert harness: running it with
+// MKF_MATERIAL_VALIDATOR_SUPPRESS=<CODE> must turn it red.
+namespace {
+json material_record(const std::string& name) {
+    auto path = std::filesystem::path{__FILE__}.parent_path().parent_path() / "MAS" / "data" / "core_materials.ndjson";
+    std::ifstream in(path);
+    REQUIRE(in.good());
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.find("\"" + name + "\"") == std::string::npos) continue;
+        json record = json::parse(line);
+        if (record["name"] == name) return record;
+    }
+    FAIL("material " << name << " not in " << path);
+    return json();
+}
+
+size_t count_findings(const MaterialVerdict& verdict, const std::string& code, std::optional<MaterialFindingSeverity> severity = std::nullopt) {
+    size_t n = 0;
+    for (const auto& f : verdict.findings) {
+        if (f.code == code && (!severity || f.severity == *severity)) ++n;
+    }
+    return n;
+}
+
+bool has_skip(const MaterialVerdict& verdict, const std::string& prefix) {
+    for (const auto& s : verdict.skipped) {
+        if (s.rfind(prefix, 0) == 0) return true;
+    }
+    return false;
+}
+
+std::string describe(const MaterialVerdict& verdict) {
+    json j = verdict;
+    return j.dump(1);
+}
+} // namespace
+
+TEST_CASE("Test_Material_Validator_Real_Power_Ferrites_Are_Clean", "[material-validator]") {
+    settings.reset();
+    MaterialValidator validator;
+    for (std::string name : {"3C95", "N87", "3F36"}) {
+        auto verdict = validator.validate(material_record(name));
+        INFO(describe(verdict));
+        CHECK(verdict.valid);
+        CHECK(verdict.findings.empty());
+        CHECK(verdict.materialClass == "MnZn power ferrite");
+    }
+}
+
+TEST_CASE("Test_Material_Validator_Abt1456_Out_Of_Range_Grades", "[material-validator]") {
+    // TP5H / DMR52 / DMR51W / P61: Steinmetz fits span 0.5..5 MHz only, so the class point
+    // 100 kHz / 200 mT / 100 C is an extrapolation.
+    settings.reset();
+    MaterialValidator validator;
+    for (std::string name : {"TP5H", "DMR52", "DMR51W", "P61"}) {
+        auto verdict = validator.validate(material_record(name));
+        INFO(name << "\n" << describe(verdict));
+        CHECK(count_findings(verdict, "MAT_LOSS_OUT_OF_RANGE", MaterialFindingSeverity::SUSPICIOUS) == 1);
+    }
+}
+
+TEST_CASE("Test_Material_Validator_Abt1456_P63_Below_Envelope", "[material-validator]") {
+    // P63's first range claims 1 kHz..1 MHz; at 100 kHz / 200 mT / 100 C it gives far less than
+    // the best published MnZn power grade (PC47 250 kW/m3).
+    settings.reset();
+    auto verdict = MaterialValidator().validate(material_record("P63"));
+    INFO(describe(verdict));
+    CHECK(count_findings(verdict, "MAT_LOSS_ENVELOPE", MaterialFindingSeverity::SUSPICIOUS) >= 1);
+}
+
+TEST_CASE("Test_Material_Validator_Abt1456_Temperature_Coefficients_Missing", "[material-validator]") {
+    // KL11F / KL7F / KL9F carry ct0/ct1 but no ct2: MKF drops the temperature dependence.
+    settings.reset();
+    MaterialValidator validator;
+    for (std::string name : {"KL11F", "KL7F", "KL9F"}) {
+        auto verdict = validator.validate(material_record(name));
+        INFO(name << "\n" << describe(verdict));
+        CHECK(count_findings(verdict, "MAT_LOSS_TEMPERATURE", MaterialFindingSeverity::SUSPICIOUS) == 1);
+    }
+}
+
+TEST_CASE("Test_Material_Validator_Hysteresis_Bound_P63_Points", "[material-validator]") {
+    // The advanced P63 points at 1 kHz carry the 1 MHz value (80 kW/m3 at 50 mT): 80 J/m3 per cycle
+    // against 4*Hc*B = 4 * 50.28 * 0.05 = 10 J/m3.
+    settings.reset();
+    std::vector<MaterialLossPoint> points = {{1e3, 0.05, 25, 80e3, "manufacturer"}};
+    auto verdict = MaterialValidator().validate(material_record("P63"), points);
+    INFO(describe(verdict));
+    CHECK(count_findings(verdict, "MAT_LOSS_HYSTERESIS_BOUND", MaterialFindingSeverity::IMPOSSIBLE) == 1);
+    CHECK_FALSE(verdict.valid);
+
+    // A believable 1 kHz point (a fraction of the bound) stays quiet.
+    std::vector<MaterialLossPoint> fine = {{1e3, 0.05, 25, 5.0, "manufacturer"}};
+    auto quiet = MaterialValidator().validate(material_record("P63"), fine);
+    CHECK(count_findings(quiet, "MAT_LOSS_HYSTERESIS_BOUND") == 0);
+}
+
+TEST_CASE("Test_Material_Validator_Points_Inconsistent", "[material-validator]") {
+    // DMR51W's 100 C B-sweep at 1 MHz reaches 1.32 MW/m3 at 58 mT, while its temperature-sweep
+    // points at 1 MHz / 50 mT / ~100 C say ~90 kW/m3.
+    settings.reset();
+    std::vector<MaterialLossPoint> points = {{1e6, 0.030, 100, 300e3, "manufacturer"},
+                                             {1e6, 0.058, 100, 1.32e6, "manufacturer"},
+                                             {1e6, 0.050, 99, 90e3, "manufacturer"}};
+    auto verdict = MaterialValidator().validate(material_record("DMR51W"), points);
+    INFO(describe(verdict));
+    CHECK(count_findings(verdict, "MAT_LOSS_POINTS_INCONSISTENT", MaterialFindingSeverity::IMPOSSIBLE) >= 1);
+
+    std::vector<MaterialLossPoint> consistent = {{1e6, 0.030, 100, 300e3, "manufacturer"},
+                                                 {1e6, 0.058, 100, 1.32e6, "manufacturer"},
+                                                 {1e6, 0.050, 99, 950e3, "manufacturer"}};
+    auto quiet = MaterialValidator().validate(material_record("DMR51W"), consistent);
+    CHECK(count_findings(quiet, "MAT_LOSS_POINTS_INCONSISTENT") == 0);
+}
+
+TEST_CASE("Test_Material_Validator_Synthetic_Loss_Times_1000_Is_Impossible", "[material-validator]") {
+    settings.reset();
+    auto record = material_record("N87");
+    for (auto& method : record["volumetricLosses"]["default"]) {
+        if (method.is_object() && method["method"] == "steinmetz") {
+            for (auto& range : method["ranges"]) range["k"] = range["k"].get<double>() * 1000;
+        }
+    }
+    record["name"] = "N87 k x1000";
+    auto verdict = MaterialValidator().validate(record);
+    INFO(describe(verdict));
+    CHECK(count_findings(verdict, "MAT_LOSS_ENVELOPE", MaterialFindingSeverity::IMPOSSIBLE) >= 1);
+    CHECK_FALSE(verdict.valid);
+}
+
+TEST_CASE("Test_Material_Validator_Monotonic_Frequency", "[material-validator]") {
+    // A negative alpha makes the loss FALL with frequency.
+    settings.reset();
+    auto record = material_record("N87");
+    for (auto& method : record["volumetricLosses"]["default"]) {
+        if (method.is_object() && method["method"] == "steinmetz") {
+            for (auto& range : method["ranges"]) range["alpha"] = -0.5;
+        }
+    }
+    record["name"] = "N87 alpha -0.5";
+    auto verdict = MaterialValidator().validate(record);
+    INFO(describe(verdict));
+    CHECK(count_findings(verdict, "MAT_LOSS_MONOTONIC", MaterialFindingSeverity::IMPOSSIBLE) == 1);
+}
+
+TEST_CASE("Test_Material_Validator_Saturation_Above_Iron_Is_Impossible", "[material-validator]") {
+    settings.reset();
+    auto record = material_record("N87");
+    record["saturation"][0]["magneticFluxDensity"] = 3.0;
+    record["name"] = "N87 Bs 3 T";
+    auto verdict = MaterialValidator().validate(record);
+    INFO(describe(verdict));
+    CHECK(count_findings(verdict, "MAT_BSAT_CEILING", MaterialFindingSeverity::IMPOSSIBLE) == 1);
+    CHECK(count_findings(verdict, "MAT_BSAT_CLASS", MaterialFindingSeverity::SUSPICIOUS) == 1);
+    CHECK_FALSE(verdict.valid);
+}
+
+TEST_CASE("Test_Material_Validator_Curie_And_Permeability", "[material-validator]") {
+    settings.reset();
+    auto record = material_record("N87");
+    record["curieTemperature"] = 60;  // below the class minimum AND below its own 100 C saturation point
+    record["name"] = "N87 Tc 60";
+    auto verdict = MaterialValidator().validate(record);
+    INFO(describe(verdict));
+    CHECK(count_findings(verdict, "MAT_CURIE", MaterialFindingSeverity::SUSPICIOUS) == 1);
+    CHECK(count_findings(verdict, "MAT_CURIE_SATURATION", MaterialFindingSeverity::IMPOSSIBLE) == 1);
+
+    auto lowPermeability = material_record("N87");
+    lowPermeability["permeability"]["initial"] = json::array({json{{"temperature", 25}, {"value", 0.5}}});
+    lowPermeability["name"] = "N87 mu 0.5";
+    auto low = MaterialValidator().validate(lowPermeability);
+    INFO(describe(low));
+    CHECK(count_findings(low, "MAT_PERM", MaterialFindingSeverity::IMPOSSIBLE) == 1);
+
+    auto highPermeability = material_record("N87");
+    highPermeability["permeability"]["initial"] = json::array({json{{"temperature", 25}, {"value", 100000}}});
+    highPermeability["name"] = "N87 mu 100000";
+    auto high = MaterialValidator().validate(highPermeability);
+    INFO(describe(high));
+    CHECK(count_findings(high, "MAT_PERM", MaterialFindingSeverity::SUSPICIOUS) == 1);
+}
+
+TEST_CASE("Test_Material_Validator_Loss_Factor_And_Parse", "[material-validator]") {
+    settings.reset();
+    json broken = json{{"name", "not a material"}, {"type", "commercial"}};
+    MaterialVerdict verdict;
+    REQUIRE_NOTHROW(verdict = MaterialValidator().validate(broken));
+    CHECK(count_findings(verdict, "MAT_PARSE", MaterialFindingSeverity::IMPOSSIBLE) == 1);
+    CHECK_FALSE(verdict.valid);
+
+    auto record = material_record("N87");
+    record["volumetricLosses"]["default"].push_back(json{{"method", "lossFactor"}, {"factors", json::array({json{{"frequency", 1e6}, {"value", -0.01}}})}});
+    record["name"] = "N87 negative loss factor";
+    auto negative = MaterialValidator().validate(record);
+    INFO(describe(negative));
+    CHECK(count_findings(negative, "MAT_LOSS_FACTOR", MaterialFindingSeverity::IMPOSSIBLE) == 1);
+}
+
+TEST_CASE("Test_Material_Validator_Skips_Are_Reported", "[material-validator]") {
+    settings.reset();
+    // A powder of unstated composition cannot be classed: every class-dependent check says so.
+    auto record = material_record("N87");
+    record["material"] = "powder";
+    record["materialComposition"] = "proprietary";
+    record["name"] = "unclassed powder";
+    auto verdict = MaterialValidator().validate(record);
+    INFO(describe(verdict));
+    CHECK(verdict.materialClass.empty());
+    CHECK(has_skip(verdict, "MAT_LOSS_ENVELOPE: unclassified"));
+    CHECK(has_skip(verdict, "MAT_PERM: unclassified"));
+    CHECK(has_skip(verdict, "MAT_BSAT_CLASS: unclassified"));
+    CHECK(has_skip(verdict, "MAT_CURIE: unclassified"));
+
+    // No loss model at all: the loss rules report themselves skipped, not passed.
+    auto noModel = material_record("N87");
+    noModel["volumetricLosses"] = json{{"default", json::array()}};
+    noModel["name"] = "N87 without losses";
+    auto quiet = MaterialValidator().validate(noModel);
+    INFO(describe(quiet));
+    CHECK(has_skip(quiet, "MAT_LOSS_EVAL:"));
+    CHECK(has_skip(quiet, "MAT_LOSS_ENVELOPE:"));
+    CHECK(has_skip(quiet, "MAT_LOSS_MONOTONIC:"));
+}
+
+TEST_CASE("Test_Material_Validator_Provenance_Summary", "[material-validator]") {
+    settings.reset();
+    auto n87 = material_record("N87");
+    auto c95 = material_record("3C95");
+    MaterialValidator validator;
+
+    // Today the schema has no provenance field: one summary line, no per-record warnings.
+    auto verdicts = validator.validate_catalogue_text(n87.dump() + "\n" + c95.dump() + "\n");
+    REQUIRE(verdicts.size() == 2);
+    for (const auto& v : verdicts) CHECK(count_findings(v, "MAT_PROVENANCE") == 0);
+    auto summary = summarize_material_verdicts(verdicts);
+    CHECK(summary["provenance"] == "2/2 materials without provenance; schema has no field, RFC 0011");
+
+    // Once a record carries provenance, the others get a per-record WARNING.
+    json withProvenance = c95;
+    withProvenance["provenance"] = json{{"source", "Ferroxcube 3C95 MDS 2015-10-02"}};
+    auto adopted = validator.validate_catalogue_text(n87.dump() + "\n" + withProvenance.dump() + "\n");
+    REQUIRE(adopted.size() == 2);
+    CHECK(count_findings(adopted[0], "MAT_PROVENANCE", MaterialFindingSeverity::WARNING) == 1);
+    CHECK(count_findings(adopted[1], "MAT_PROVENANCE") == 0);
+    CHECK(adopted[0].valid);
+}
+
+TEST_CASE("Test_Material_Validator_Loss_Not_Positive_Inside_Span", "[material-validator]") {
+    // k = 0 in every range: MKF returns 0 W/m3 inside the fitted span.
+    settings.reset();
+    auto record = material_record("N87");
+    for (auto& method : record["volumetricLosses"]["default"]) {
+        if (method.is_object() && method["method"] == "steinmetz") {
+            for (auto& range : method["ranges"]) range["k"] = 0;
+        }
+    }
+    record["name"] = "N87 k 0";
+    auto verdict = MaterialValidator().validate(record);
+    INFO(describe(verdict));
+    CHECK(count_findings(verdict, "MAT_LOSS_EVAL", MaterialFindingSeverity::IMPOSSIBLE) >= 1);
+    CHECK_FALSE(verdict.valid);
+}

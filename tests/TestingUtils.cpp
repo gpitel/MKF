@@ -238,9 +238,25 @@ Core get_quick_core(std::string shapeName,
                                           std::string materialName) {
     auto coreJson = json();
 
+    // NOTE: this picks the core type from the shape NAME, which is a heuristic the production
+    // path does not use — Core/create_quick_core dispatch on CoreShapeFamily. Kept because the
+    // helper builds its core from raw json without resolving the shape first, but it has to be
+    // taught each new type: UI/PQI are piece-and-plate (a shaped half closed by a flat I plate),
+    // not two mirrored halves (ABT #264/#274/#275).
     std::string coreType;
     if (shapeName[0] == 'T' || (shapeName[0] == 'R' && shapeName[1] == ' ')) {
         coreType = "toroidal";
+    }
+    else if (shapeName.rfind("UI ", 0) == 0 || shapeName.rfind("PQI ", 0) == 0) {
+        coreType = "pieceAndPlate";
+    }
+    else if (shapeName.rfind("DRH", 0) == 0 || shapeName.rfind("Bobbin ", 0) == 0) {
+        // Drum cores (ABT #331): open magnetic circuit, single piece.
+        coreType = "openShape";
+    }
+    else if (shapeName.rfind("DR ", 0) == 0) {
+        // drumRing records ("DR 2.3 + SRI 3.0", ABT #366): drum closed by its shield ring.
+        coreType = "pieceAndPlate";
     }
     else {
         coreType = "twoPieceSet";
@@ -870,7 +886,16 @@ OpenMagnetics::Mas mas_loader(const std::filesystem::path& path) {
         //     several tests downstream.
         try {
             MagnetizingInductance magnetizingInductanceModel;
-            double magnetizingInductance = magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(magnetic.get_core(), magnetic.get_coil()).get_magnetizing_inductance().get_nominal().value();
+            // ABT #278: slim MAS files carry the core functionally (shape/material possibly by
+            // name, no processed description) and the physics models take Core BY VALUE, so heal a
+            // THROWAWAY copy here — the returned MAS keeps the file's raw (unprocessed) core, which
+            // Test_Expand_Magnetic documents as the loader contract (autocomplete does the rest).
+            auto coreForInductance = magnetic.get_core();
+            if (!coreForInductance.get_processed_description()) {
+                coreForInductance.process_data();
+                coreForInductance.process_gap();
+            }
+            double magnetizingInductance = magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(coreForInductance, magnetic.get_coil()).get_magnetizing_inductance().get_nominal().value();
             inputs = OpenMagnetics::Inputs(inputsJson, true, magnetizingInductance);
         }
         catch (const std::exception& e)

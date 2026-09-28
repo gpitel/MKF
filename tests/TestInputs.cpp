@@ -8,6 +8,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -130,7 +131,8 @@ TEST_CASE("Test_One_Operating_Point_One_Winding_Equidistant_Rectangular", "[proc
     auto excitation = inputs.get_operating_points()[0].get_excitations_per_winding()[0];
     REQUIRE_THAT(excitation.get_voltage().value().get_processed().value().get_rms().value(), Catch::Matchers::WithinAbs(4.28, max_error * 4.28));
     REQUIRE_THAT(excitation.get_voltage().value().get_processed().value().get_thd().value(), Catch::Matchers::WithinAbs(0.95, max_error * 0.95));
-    REQUIRE_THAT(excitation.get_voltage().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(692290, max_error * 692290));
+    // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128).
+    REQUIRE_THAT(excitation.get_voltage().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(590582.20189317234, max_error * 590582.20189317234));
     REQUIRE_THAT(excitation.get_voltage().value().get_processed().value().get_peak_to_peak().value(), Catch::Matchers::WithinAbs(10, max_error * 10));
     REQUIRE_THAT(excitation.get_voltage().value().get_processed().value().get_offset(), Catch::Matchers::WithinAbs(0, max_error));
 
@@ -208,7 +210,8 @@ TEST_CASE("Test_One_Operating_Point_One_Winding_Rectangular_Processed", "[proces
     auto excitation = inputs.get_operating_points()[0].get_excitations_per_winding()[0];
     REQUIRE_THAT(excitation.get_current().value().get_processed().value().get_rms().value(), Catch::Matchers::WithinAbs(7.93, max_error * 7.93));
     REQUIRE_THAT(excitation.get_current().value().get_processed().value().get_thd().value(), Catch::Matchers::WithinAbs(1.15, max_error * 1.15));
-    REQUIRE_THAT(excitation.get_current().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(746020, max_error * 746020));
+    // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128).
+    REQUIRE_THAT(excitation.get_current().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(644721.39218268555, max_error * 644721.39218268555));
     REQUIRE_THAT(excitation.get_current().value().get_processed().value().get_peak_to_peak().value(), Catch::Matchers::WithinAbs(20, max_error * 20));
     REQUIRE_THAT(excitation.get_current().value().get_processed().value().get_offset(), Catch::Matchers::WithinAbs(0, max_error));
 
@@ -285,7 +288,8 @@ TEST_CASE("Test_One_Operating_Point_One_Winding_Bipolar_Rectangular_Processed", 
     auto excitation = inputs.get_operating_points()[0].get_excitations_per_winding()[0];
     REQUIRE_THAT(excitation.get_current().value().get_processed().value().get_rms().value(), Catch::Matchers::WithinAbs(5.92, max_error * 5.92));
     REQUIRE_THAT(excitation.get_current().value().get_processed().value().get_thd().value(), Catch::Matchers::WithinAbs(0.315, max_error * 0.315));
-    REQUIRE_THAT(excitation.get_current().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(465000, max_error * 465000));
+    // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128).
+    REQUIRE_THAT(excitation.get_current().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(398003.45508438692, max_error * 398003.45508438692));
     REQUIRE_THAT(excitation.get_current().value().get_processed().value().get_peak_to_peak().value(), Catch::Matchers::WithinAbs(13, max_error * 13));
     REQUIRE_THAT(excitation.get_current().value().get_processed().value().get_offset(), Catch::Matchers::WithinAbs(0, max_error));
 
@@ -368,7 +372,8 @@ TEST_CASE("Test_One_Operating_Point_Two_Generated_Windings_Turns_Ratios", "[proc
 
         REQUIRE_THAT(excitation_primary.get_current().value().get_processed().value().get_rms().value(), Catch::Matchers::WithinAbs(2.9, max_error * 2.9));
         REQUIRE_THAT(excitation_primary.get_current().value().get_processed().value().get_thd().value(), Catch::Matchers::WithinAbs(0.382, max_error * 0.382));
-        REQUIRE_THAT(excitation_primary.get_current().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(129700, max_error * 129700));
+        // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128).
+        REQUIRE_THAT(excitation_primary.get_current().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(126785.46967026753, max_error * 126785.46967026753));
         REQUIRE_THAT(excitation_primary.get_current().value().get_processed().value().get_peak_to_peak().value(), Catch::Matchers::WithinAbs(10, max_error * 10));
         REQUIRE_THAT(excitation_primary.get_current().value().get_processed().value().get_offset(), Catch::Matchers::WithinAbs(0, max_error));
 
@@ -378,13 +383,17 @@ TEST_CASE("Test_One_Operating_Point_Two_Generated_Windings_Turns_Ratios", "[proc
         REQUIRE_THAT(excitation_primary.get_current().value().get_harmonics().value().get_frequencies()[1], Catch::Matchers::WithinAbs(100000, max_error * 100000));
 
         REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_rms().value(), Catch::Matchers::WithinAbs(0.5, max_error * 0.5));
-        REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_thd().value(), Catch::Matchers::WithinAbs(0.95, max_error * 0.92));
-        REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(640900, max_error * 640900));
+        // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128).
+        REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_thd().value(), Catch::Matchers::WithinAbs(0.91374449406562508, max_error * 0.92));
+        // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128).
+        REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(546440.67624448077, max_error * 546440.67624448077));
         REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_peak_to_peak().value(), Catch::Matchers::WithinAbs(1, max_error * 1));
         REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_offset(), Catch::Matchers::WithinAbs(0, max_error * 0.25));
 
-        REQUIRE_THAT(excitation_primary.get_voltage().value().get_harmonics().value().get_amplitudes()[0], Catch::Matchers::WithinAbs(0.2421, max_error * 0.25));
-        REQUIRE_THAT(excitation_primary.get_voltage().value().get_harmonics().value().get_amplitudes()[1], Catch::Matchers::WithinAbs(0.439, max_error * 0.451));
+        // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128). The DC of the D=0.25 square is exactly 0.25 (was 31/128).
+        REQUIRE_THAT(excitation_primary.get_voltage().value().get_harmonics().value().get_amplitudes()[0], Catch::Matchers::WithinAbs(0.25, max_error * 0.25));
+        // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128). Fundamental = (2/pi) sin(pi/4).
+        REQUIRE_THAT(excitation_primary.get_voltage().value().get_harmonics().value().get_amplitudes()[1], Catch::Matchers::WithinAbs(0.45015815807855303, max_error * 0.451));
         REQUIRE_THAT(excitation_primary.get_voltage().value().get_harmonics().value().get_frequencies()[0], Catch::Matchers::WithinAbs(0, max_error));
         REQUIRE_THAT(excitation_primary.get_voltage().value().get_harmonics().value().get_frequencies()[1], Catch::Matchers::WithinAbs(100000, max_error * 100000));
 
@@ -1069,8 +1078,10 @@ TEST_CASE("Test_Quick_Operating_Point_No_Dc", "[processor][inputs][smoke-test]")
     auto excitation = inputs.get_operating_points()[0].get_excitations_per_winding()[0];
     REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_rms().value(), Catch::Matchers::WithinAbs(0.541, max_error * 0.541));
     REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_thd().value(), Catch::Matchers::WithinAbs(0.3765, max_error * 0.3765));
-    REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(129000, max_error * 129000));
-    REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_ac_effective_frequency().value(), Catch::Matchers::WithinAbs(129000, max_error * 129000));
+    // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128).
+    REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(126360.81756912007, max_error * 126360.81756912007));
+    // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128).
+    REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_ac_effective_frequency().value(), Catch::Matchers::WithinAbs(126365.89373250987, max_error * 126365.89373250987));
     REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_peak_to_peak().value(), Catch::Matchers::WithinAbs(1.855, max_error * 1.855));
     REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_offset(), Catch::Matchers::WithinAbs(0, max_error));
 
@@ -1096,8 +1107,10 @@ TEST_CASE("Test_Quick_Operating_Point", "[processor][inputs][smoke-test]") {
     auto excitation = inputs.get_operating_points()[0].get_excitations_per_winding()[0];
     REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_rms().value(), Catch::Matchers::WithinAbs(10.0146, max_error * 10.0146));
     REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_thd().value(), Catch::Matchers::WithinAbs(0.3765, max_error * 0.3765));
-    REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(9777, max_error * 9777));
-    REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_ac_effective_frequency().value(), Catch::Matchers::WithinAbs(129000, max_error * 129000));
+    // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128).
+    REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(9633.2324487888418, max_error * 9633.2324487888418));
+    // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128).
+    REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_ac_effective_frequency().value(), Catch::Matchers::WithinAbs(126365.89373250984, max_error * 126365.89373250984));
     REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_peak_to_peak().value(), Catch::Matchers::WithinAbs(1.855, max_error * 1.855));
     REQUIRE_THAT(excitation.get_magnetizing_current().value().get_processed().value().get_offset(), Catch::Matchers::WithinAbs(0, max_error));
 
@@ -1652,6 +1665,47 @@ TEST_CASE("Test_Reflect_Flyback_Primary_Web", "[processor][inputs][smoke-test]")
     REQUIRE(processed.get_label() == WaveformLabel::FLYBACK_SECONDARY);
 }
 
+TEST_CASE("Test_Imported_Rectangle_Is_Custom_Not_Sinusoidal_Via_Inputs", "[processor][inputs][mas-migration][bug]") {
+    // ABT #602: Inputs::calculate_basic_processed_data / try_guess_waveform_label /
+    // try_guess_duty_cycle used to be a verbatim, independently-bugged twin of
+    // WaveformProcessor's classifier (fixed in 6be9b794 but deliberately left
+    // untouched here at the time). Every real entry point — every PyOM/WASM
+    // binding — reaches THIS Inputs-facing copy, not WaveformProcessor's
+    // directly, so the user-reported symptom (a 300 kHz FlyBuck switch-node
+    // waveform, true duty ~20.7%, read back as label=sinusoidal, dutyCycle=0.5)
+    // is only actually closed once this copy is fixed too. Reproduces the
+    // reported file's shape: a two-level rectangle with finite edges and
+    // plateau ripple, which compress_waveform does NOT collapse to an exact
+    // 5-point analytical shape (real SPICE data never does).
+    const size_t numberPoints = 512;
+    const double dutyCycle = 0.207;
+    const double high = 15.086;
+    const double low = -3.92;
+    const double period = 1.0 / 300000;
+    const double ripple = 0.25;
+    size_t pointsHigh = static_cast<size_t>(numberPoints * dutyCycle);
+
+    std::vector<double> data;
+    std::vector<double> time;
+    for (size_t i = 0; i < numberPoints; ++i) {
+        double value = (i < pointsHigh) ? high : low;
+        if (i == pointsHigh || i == pointsHigh + 1) {
+            value = high + (low - high) * (i - pointsHigh + 1) / 3.0;
+        }
+        value += ripple * sin(2 * M_PI * i * 7 / numberPoints);
+        data.push_back(value);
+        time.push_back(period * i / numberPoints);
+    }
+    Waveform waveform;
+    waveform.set_data(data);
+    waveform.set_time(time);
+
+    auto processed = OpenMagnetics::Inputs::calculate_basic_processed_data(waveform);
+    REQUIRE(processed.get_label() == WaveformLabel::CUSTOM);
+    // Measured, not assumed: the duty must track the real high time, not be 0.5.
+    REQUIRE_THAT(processed.get_duty_cycle().value(), Catch::Matchers::WithinAbs(dutyCycle, 0.01));
+}
+
 TEST_CASE("Test_Flyback_Json", "[processor][inputs][smoke-test]") {
     json masJson = OpenMagneticsTesting::fixtures::get_json("mas-flyback-3-winding-lv");
 
@@ -1767,7 +1821,9 @@ TEST_CASE("Test_Simplify_PFC_Json", "[processor][inputs]") {
         REQUIRE_THAT(processed.get_peak_to_peak().value(), Catch::Matchers::WithinAbs(reconstructedProcessed.get_peak_to_peak().value(), max_error * processed.get_peak_to_peak().value()));
         REQUIRE_THAT(processed.get_rms().value(), Catch::Matchers::WithinAbs(reconstructedProcessed.get_rms().value(), max_error * processed.get_rms().value()));
         REQUIRE(29847U == voltage.get_waveform()->get_data().size());
-        REQUIRE(16384U == excitation.get_current()->get_harmonics().value().get_frequencies().size());
+        // ABT #1460: harmonics 0..N/2 of the exact piecewise-linear series (previously the FFT bins
+        // 0..N/2-1), so the Nyquist bin is now included.
+        REQUIRE(16385U == excitation.get_current()->get_harmonics().value().get_frequencies().size());
     }
     {
         settings.set_inputs_trim_harmonics(true);
@@ -1839,3 +1895,208 @@ TEST_CASE("Test_Standardize_Signal_Descriptor_Non_Multiple_Harmonics", "[process
     REQUIRE(processed.get_rms().value() > 0);
 }
 }  // namespace
+
+// ABT #375/#190: check_integrity resolved designRequirements.magnetizingInductance eagerly, at the
+// top of the function, although exactly one branch needs it — deriving a magnetizing current for an
+// excitation that carries a voltage but no current. Inputs that never reach that branch were
+// rejected for a requirement nothing had asked for, with a message naming neither the field nor the
+// caller: "resolve_dimensional_values: DimensionWithTolerance has neither nominal, minimum nor
+// maximum set". The visible casualties were a MAS file carrying only a magnetic — from_file
+// explicitly supports that, computing the inductance from the geometry and handing it to this
+// constructor, but the eager resolve rejected the file before that value was ever applied — and
+// Test_Flyback_Simulation.
+//
+// The distinction being pinned: an inputs object with NO operating points needs no inductance,
+// because there is no waveform to derive anything for. One WITH an operating point does need it
+// (the induced voltage of a current-driven excitation, and the magnetizing current of a
+// voltage-driven one, are both proportional to L), and a missing value must still be refused there
+// rather than defaulted. So this is not a relaxation — it moves the requirement to where it is real.
+TEST_CASE("Test_Inputs_Magnetizing_Inductance_Resolved_Only_Where_Needed", "[processor][inputs][smoke-test]") {
+    json inputsJson;
+    inputsJson["operatingPoints"] = json::array();
+    inputsJson["designRequirements"] = json();
+    inputsJson["designRequirements"]["magnetizingInductance"] = json::object();
+    inputsJson["designRequirements"]["turnsRatios"] = json::array();
+
+    // Nothing to process, so the absent inductance is nobody's problem.
+    REQUIRE_NOTHROW(OpenMagnetics::Inputs(inputsJson));
+
+    // Add an operating point and the inductance becomes genuinely required: it sets the induced
+    // voltage across the magnetizing branch. Still absent, so this must be refused, loudly.
+    json inputsWithOperatingPointJson = inputsJson;
+    json operatingPoint = json();
+    operatingPoint["name"] = "Nominal";
+    operatingPoint["conditions"]["ambientTemperature"] = 42;
+    json excitation = json();
+    excitation["frequency"] = 100000;
+    excitation["current"]["waveform"]["data"] = {-5, 5, -5};
+    excitation["current"]["waveform"]["time"] = {0, 0.0000025, 0.00001};
+    operatingPoint["excitationsPerWinding"] = json::array({excitation});
+    inputsWithOperatingPointJson["operatingPoints"].push_back(operatingPoint);
+    REQUIRE_THROWS(OpenMagnetics::Inputs(inputsWithOperatingPointJson));
+
+    // Supply it and the same input processes.
+    json satisfiedInputsJson = inputsWithOperatingPointJson;
+    satisfiedInputsJson["designRequirements"]["magnetizingInductance"]["nominal"] = 100e-6;
+    OpenMagnetics::Inputs satisfiedInputs(satisfiedInputsJson);
+    REQUIRE(satisfiedInputs.get_operating_points().size() == 1);
+    auto processedExcitation = satisfiedInputs.get_operating_points()[0].get_excitations_per_winding()[0];
+    CHECK(processedExcitation.get_voltage());  // derived from the current and the inductance
+}
+
+TEST_CASE("Test_Reflected_Secondary_Reflects_Only_What_The_Primary_Has", "[processor][inputs]") {
+    // ABT #825: with one turns ratio the design has two windings, so a lone excitation means the
+    // secondary is reflected from the primary. That reflection dereferenced the primary's voltage
+    // AND current unconditionally, so an operating point giving a current and no voltage — an
+    // ordinary way to describe an inductor's winding — died with a bare "bad optional access"
+    // naming neither the operating point, the winding, nor the field.
+    json inputsJson = json();
+    inputsJson["designRequirements"]["magnetizingInductance"]["nominal"] = 100e-6;
+    inputsJson["designRequirements"]["turnsRatios"] = json::array({json{{"nominal", 0.5}}});
+
+    json excitation = json();
+    excitation["frequency"] = 100000;
+    excitation["current"]["processed"]["dutyCycle"] = 0.5;
+    excitation["current"]["processed"]["label"] = "Triangular";
+    excitation["current"]["processed"]["offset"] = 0;
+    excitation["current"]["processed"]["peakToPeak"] = 10;
+
+    json operatingPoint = json();
+    operatingPoint["name"] = "Nominal";
+    operatingPoint["conditions"]["ambientTemperature"] = 25;
+    operatingPoint["excitationsPerWinding"] = json::array({excitation});
+    inputsJson["operatingPoints"] = json::array({operatingPoint});
+
+    // Current only: the secondary is reflected from the current alone rather than throwing.
+    OpenMagnetics::Inputs inputs(inputsJson);
+    auto excitations = inputs.get_operating_points()[0].get_excitations_per_winding();
+    REQUIRE(excitations.size() == 2);
+    CHECK(excitations[1].get_current());
+
+    // Nothing to reflect at all: still refused, but the message must name the operating point and
+    // say what is missing, never "bad optional access".
+    json emptyExcitationJson = inputsJson;
+    emptyExcitationJson["operatingPoints"][0]["excitationsPerWinding"][0].erase("current");
+    try {
+        OpenMagnetics::Inputs refused(emptyExcitationJson);
+        FAIL("an excitation with neither voltage nor current must be refused");
+    }
+    catch (const std::exception& e) {
+        std::string message(e.what());
+        CHECK(message.find("Nominal") != std::string::npos);
+        CHECK(message != "bad optional access");
+    }
+}
+
+TEST_CASE("Test_Missing_Required_Field_Names_The_Object", "[processor][inputs]") {
+    // ABT #829: a missing required field escaped as nlohmann's own
+    // "[json.exception.out_of_range.403] key 'bobbin' not found", which names the key but not the
+    // object — and "name" is ambiguous across the magnetic, the core, the shape, the bobbin,
+    // manufacturerInfo and every winding. The field IS required (coil.json's anyOf requires it in
+    // every branch); the message simply has to say whose it is.
+    json coilJson = json();
+    coilJson["functionalDescription"] = json::array({json{
+        {"name", "primary"},
+        {"numberTurns", 10},
+        {"numberParallels", 1},
+        {"isolationSide", "primary"},
+        {"wire", "Round 0.5 - Grade 1"}}});
+
+    try {
+        auto coil = coilJson.get<OpenMagnetics::Coil>();
+        FAIL("a coil without a bobbin must be refused");
+    }
+    catch (const std::exception& e) {
+        std::string message(e.what());
+        CHECK(message.find("coil") != std::string::npos);
+        CHECK(message.find("bobbin") != std::string::npos);
+        CHECK(message.find("out_of_range") == std::string::npos);
+    }
+
+    json windingMissingWireJson = coilJson;
+    windingMissingWireJson["bobbin"] = "Dummy";
+    windingMissingWireJson["functionalDescription"][0].erase("wire");
+    try {
+        auto coil = windingMissingWireJson.get<OpenMagnetics::Coil>();
+        FAIL("a winding without a wire must be refused");
+    }
+    catch (const std::exception& e) {
+        std::string message(e.what());
+        CHECK(message.find("winding") != std::string::npos);
+        CHECK(message.find("wire") != std::string::npos);
+    }
+}
+
+// ABT #1330: a signal given only by processed parameters is rebuilt with create_waveform, which
+// needs the duty cycle for every non-sinusoidal label and the dead time for the *_WITH_DEADTIME
+// ones. When they are absent the reconstruction must refuse by name, never assume a value.
+TEST_CASE("Test_Processed_Only_Signal_Defines_A_Waveform_Or_Says_What_Is_Missing", "[processor][inputs][abt-1330]") {
+    ProcessedWaveform triangular;
+    triangular.set_label(WaveformLabel::TRIANGULAR);
+    triangular.set_peak_to_peak(1.5);
+    triangular.set_offset(2.0);
+    REQUIRE_THROWS_AS(OpenMagnetics::Inputs::throw_if_processed_cannot_define_waveform(triangular, "current"), InvalidInputException);
+    REQUIRE_THROWS_WITH(OpenMagnetics::Inputs::throw_if_processed_cannot_define_waveform(triangular, "current"), Catch::Matchers::ContainsSubstring("dutyCycle"));
+    triangular.set_duty_cycle(0.4);
+    CHECK_NOTHROW(OpenMagnetics::Inputs::throw_if_processed_cannot_define_waveform(triangular, "current"));
+
+    ProcessedWaveform withDeadTime = triangular;
+    withDeadTime.set_label(WaveformLabel::RECTANGULAR_WITH_DEADTIME);
+    REQUIRE_THROWS_WITH(OpenMagnetics::Inputs::throw_if_processed_cannot_define_waveform(withDeadTime, "voltage"), Catch::Matchers::ContainsSubstring("deadTime"));
+
+    ProcessedWaveform sinusoidal;
+    sinusoidal.set_label(WaveformLabel::SINUSOIDAL);
+    sinusoidal.set_peak_to_peak(10);
+    sinusoidal.set_offset(0);
+    CHECK_NOTHROW(OpenMagnetics::Inputs::throw_if_processed_cannot_define_waveform(sinusoidal, "voltage"));
+    sinusoidal.set_peak_to_peak(std::nullopt);
+    REQUIRE_THROWS_WITH(OpenMagnetics::Inputs::throw_if_processed_cannot_define_waveform(sinusoidal, "voltage"), Catch::Matchers::ContainsSubstring("peakToPeak"));
+
+    ProcessedWaveform custom = triangular;
+    custom.set_label(WaveformLabel::CUSTOM);
+    REQUIRE_THROWS_WITH(OpenMagnetics::Inputs::throw_if_processed_cannot_define_waveform(custom, "voltage"), Catch::Matchers::ContainsSubstring("sampled waveform"));
+
+    // The voltage reconstruction refuses too, instead of letting create_waveform default the duty
+    // cycle to 0.5: a rectangular voltage with no dutyCycle has no defined peak.
+    ProcessedWaveform noDuty;
+    noDuty.set_label(WaveformLabel::RECTANGULAR);
+    noDuty.set_peak_to_peak(96);
+    noDuty.set_offset(0);
+    SignalDescriptor voltage;
+    voltage.set_processed(noDuty);
+    OperatingPointExcitation excitation;
+    excitation.set_frequency(120000);
+    excitation.set_voltage(voltage);
+    OperatingPoint operatingPoint;
+    operatingPoint.set_excitations_per_winding({excitation});
+    OpenMagnetics::Inputs inputs;
+    inputs.set_operating_points({operatingPoint});
+    REQUIRE_THROWS_AS(inputs.get_maximum_voltage_peak(), InvalidInputException);
+    REQUIRE_THROWS_WITH(inputs.get_maximum_voltage_peak(), Catch::Matchers::ContainsSubstring("dutyCycle"));
+}
+
+TEST_CASE("Test_Excitation_With_Proportional_Voltage_And_Current_Recalculates_Processed", "[processor][inputs][smoke-test]") {
+    // The processed peak, peak to peak and offset scale with the waveform, they are not kept from the original one
+    OpenMagnetics::Inputs inputs = OpenMagnetics::Inputs::create_quick_operating_point(
+        100000, 100e-6, 25, WaveformLabel::RECTANGULAR, 10, 0.5, 0);
+    auto excitation = inputs.get_operating_points()[0].get_excitations_per_winding()[0];
+    auto originalVoltage = excitation.get_voltage()->get_processed().value();
+    auto originalCurrent = excitation.get_current()->get_processed().value();
+
+    auto scaled = OpenMagnetics::Inputs::get_excitation_with_proportional_voltage(excitation, 3);
+    scaled = OpenMagnetics::Inputs::get_excitation_with_proportional_current(scaled, 2);
+    auto scaledVoltage = scaled.get_voltage()->get_processed().value();
+    auto scaledCurrent = scaled.get_current()->get_processed().value();
+    REQUIRE_THAT(scaledVoltage.get_peak().value(), Catch::Matchers::WithinRel(3 * originalVoltage.get_peak().value(), 0.01));
+    REQUIRE_THAT(scaledVoltage.get_peak_to_peak().value(), Catch::Matchers::WithinRel(3 * originalVoltage.get_peak_to_peak().value(), 0.01));
+    REQUIRE_THAT(scaledVoltage.get_rms().value(), Catch::Matchers::WithinRel(3 * originalVoltage.get_rms().value(), 0.01));
+    REQUIRE(scaledVoltage.get_label() == originalVoltage.get_label());
+    REQUIRE_THAT(scaledCurrent.get_peak().value(), Catch::Matchers::WithinRel(2 * originalCurrent.get_peak().value(), 0.01));
+    REQUIRE_THAT(scaledCurrent.get_peak_to_peak().value(), Catch::Matchers::WithinRel(2 * originalCurrent.get_peak_to_peak().value(), 0.01));
+    REQUIRE(scaledCurrent.get_label() == originalCurrent.get_label());
+
+    // A winding without load: no current at all
+    auto unloaded = OpenMagnetics::Inputs::get_excitation_with_proportional_current(excitation, 0);
+    REQUIRE_THAT(unloaded.get_current()->get_processed()->get_peak().value(), Catch::Matchers::WithinAbs(0, 1e-12));
+    REQUIRE_THAT(unloaded.get_current()->get_processed()->get_rms().value(), Catch::Matchers::WithinAbs(0, 1e-12));
+}

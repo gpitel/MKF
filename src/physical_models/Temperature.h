@@ -236,6 +236,14 @@ struct TemperatureConfig {
     // Thermal model configuration
     double convergenceTolerance = 0.1;  // Temperature convergence criterion (°C)
     size_t maxIterations = 100;         // Maximum solver iterations
+    // ABT #837: a solve that did not converge returns whatever the last relaxed iterate
+    // happened to be, which is not an estimate of anything — so by default the solver now
+    // REFUSES rather than handing a diverged number to callers that publish it (datasheet
+    // temperature rise, rated currents, the adviser's temperature gate). Set this false ONLY
+    // when you are not asking for a temperature at all: the schematic exporters cap
+    // maxIterations to build the resistance network and draw it, and legitimately never
+    // intend to solve it.
+    bool requireConvergence = true;
     double coreThermalConductivity = 4.0;  // Ferrite thermal conductivity (W/m·K)
     
     // Inter-turn insulation (electrical insulation tape between turns)
@@ -276,6 +284,17 @@ struct TemperatureConfig {
     // Factory method to create config from MAS inputs
     static TemperatureConfig fromMasOperatingConditions(
         const MAS::OperatingConditions& conditions);
+
+    // THE one way to configure a full-network solve from a simulated operating
+    // point (ABT #906): ambient + cooling from the operating point's conditions,
+    // core losses and the per-turn winding-loss distribution from the simulated
+    // output, no schematic side effect. MagneticSimulator (outputs[].temperature,
+    // datasheet thermal block) and the temperature-field plot wrappers (WASM,
+    // PyOM) must all build their config through here, so the exported MAS and
+    // the UI temperature map can never disagree again.
+    static TemperatureConfig fromSimulatedOutput(
+        const MAS::OperatingPoint& operatingPoint,
+        const MAS::Outputs& output);
 };
 
 /**
@@ -323,8 +342,15 @@ private:
         bool isRoundWire = false;
         bool isPlanar = false;
         std::optional<InsulationWireCoating> wireCoating;
+        // The winding's resolved wire, kept so the film on its outer surface can be read from
+        // MAS where a face actually touches something (surfaceFilm, ABT #1454).
+        std::optional<Wire> wire;
     };
     std::map<size_t, WindingWireProperties> _perWindingWireProps;
+    // The film on a conductor's OUTER surface, the one that rests on a bobbin, core or wrap:
+    // {thickness, thermal conductivity}; thickness 0 means bare metal. For litz it is the
+    // serving when there is one and the outer strands' own enamel when there is not (ABT #1454).
+    static std::pair<double, double> surfaceFilm(const WindingWireProperties& properties, const std::string& nodeName);
     
     double getMinimumDistanceForConduction() const {
         // Threshold for conduction: accounts for actual gap between surfaces
@@ -376,6 +402,18 @@ public:
      * @brief Get the list of thermal resistances
      */
     const std::vector<ThermalResistanceElement>& getResistances() const { return _resistances; }
+
+    /**
+     * @brief Nodes with no path over the resistances to any of `roots` (ambient, cold plates).
+     *
+     * CONNECTIVITY, not degree: a node whose only edges lead to other stranded nodes has a
+     * non-zero conductance diagonal and passed the old G(i,i) test, yet the whole island floats
+     * and the solve is singular. Static and public so the rule is testable on a bare graph.
+     * Returns the stranded node indices in index order.
+     */
+    static std::vector<size_t> nodesWithoutPathToRoots(size_t nodeCount,
+                                                       const std::vector<ThermalResistanceElement>& resistances,
+                                                       const std::vector<size_t>& roots);
     
     /**
      * @brief Get configuration
@@ -587,6 +625,50 @@ private:
      * Creates connections when turns are close to bobbin walls
      */
     void createTurnToBobbinConnections();
+
+    /**
+     * @brief ABT #1454: conduction from a wound (concentric, non-planar) winding to what encloses
+     * it: the bobbin column and flanges, or -- without a bobbin -- the core column.
+     *
+     * Sort-and-sweep (O(N log N)) over turn and insulation-layer nodes finds, for each item, the
+     * share of its column-facing face (and, with a bobbin, of its top/bottom face) that no other
+     * item shadows. That share conducts across the real gap to the enclosure surface: an air
+     * wedge plus enamel for round wire, flat conduction for rectangular wire and film, plus the
+     * plastic wall in series. Throws on overlapping geometry and on a bare round wire in line
+     * contact (the wedge conductance diverges).
+     */
+    void createWindingToEnclosureConnections();
+
+    /**
+     * @brief ABT #1454: winding faces that the convection builder left exposed and that face the
+     * core across the window (outer faces -> lateral column; top/bottom faces -> yokes when there
+     * is no bobbin) conduct their in-window share across the air gap (Rayleigh ~ 1-100 in a
+     * millimetre gap: conduction regime); the rest keeps its convection.
+     */
+    void createWindingToCoreAcrossWindowConnections(size_t ambientIdx);
+
+    /**
+     * @brief Resistance (K/W) from an item's face to a flat parallel surface a gap g away.
+     * Round turns: air wedge + enamel; rectangular turns: flat air + enamel; insulation film:
+     * flat air + half the film. @p shareOfFace is the unshadowed share of the face.
+     */
+    double faceToSurfaceResistance(size_t nodeIdx, ThermalNodeFace face, double gap, double shareOfFace) const;
+
+    /// Air thermal conductivity for enclosed gaps, at the convection model's initial film temperature.
+    double gapAirThermalConductivity() const;
+
+    /// Share of a concentric wrap that lies inside the core windows: column depth / (width + depth).
+    double inWindowFraction() const;
+
+    /// ABT #1459: exposed (room-facing) outer surface of a concentric core, from its real geometry.
+    struct CoreExteriorAreas {
+        double plateFace = 0;             // top piece's outer plate face (drum: first flange)
+        double plateSideBand = 0;         // top piece's side band: plate perimeter x yoke thickness
+        double secondPlateFace = 0;       // bottom piece's outer plate face
+        double secondPlateSideBand = 0;   // bottom piece's side band
+        double lateralLegs = 0;           // room-facing faces over the window height (legs, skirt, ends)
+    };
+    CoreExteriorAreas calculateConcentricCoreExteriorAreas() const;
 
     /**
      * @brief Get set of quadrants that are already connected by conduction

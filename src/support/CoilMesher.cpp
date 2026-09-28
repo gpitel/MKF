@@ -1,8 +1,10 @@
 #include "support/CoilMesher.h"
 #include "physical_models/WindingOhmicLosses.h"
+#include "processors/Inputs.h"
 #include "constructive_models/Coil.h"
 #include "support/Utils.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <complex>
@@ -54,6 +56,10 @@ std::vector<size_t> CoilMesher::get_common_harmonic_indexes(OperatingPoint opera
         }
         return commonHarmonicIndexes;
     }
+    if (!operatingPoint.get_excitations_per_winding()[0].get_current() ||
+        !operatingPoint.get_excitations_per_winding()[0].get_current()->get_harmonics()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Primary excitation current is missing harmonics in Coil Mesher");
+    }
     if (commonHarmonicIndexes.size() > operatingPoint.get_excitations_per_winding()[0].get_current()->get_harmonics().value().get_amplitudes().size() * _quickModeForManyHarmonicsThreshold) {
         return get_common_harmonic_indexes(operatingPoint, windingLossesHarmonicAmplitudeThreshold * 3);
     }
@@ -86,8 +92,8 @@ bool is_point_inside_turn(const Turn& turn, double pointX, double pointY, double
     return false;
 }
 
-bool is_inside_turns(std::vector<Turn> turns, double pointX, double pointY) {
-    for (auto turn : turns) {
+bool is_inside_turns(const std::vector<Turn>& turns, double pointX, double pointY) {
+    for (const auto& turn : turns) {
         // Check main coordinates
         if (is_point_inside_turn(turn, pointX, pointY, settings.get_coil_mesher_inside_turns_factor())) {
             return true;
@@ -109,8 +115,8 @@ bool is_inside_turns(std::vector<Turn> turns, double pointX, double pointY) {
     return false;
 }
 
-bool is_far_from_turns(std::vector<Turn> turns, double pointX, double pointY) {
-    for (auto turn : turns) {
+bool is_far_from_turns(const std::vector<Turn>& turns, double pointX, double pointY) {
+    for (const auto& turn : turns) {
         // Check distance to main coordinates
         double distanceX = fabs(turn.get_coordinates()[0] - pointX);
         double distanceY = fabs(turn.get_coordinates()[1] - pointY);
@@ -136,21 +142,21 @@ bool is_far_from_turns(std::vector<Turn> turns, double pointX, double pointY) {
     return true;
 }
 
-bool is_passed_from_all_turns(std::vector<Turn> turns, double pointX, double pointY) {
-    for (auto turn : turns) {
+bool is_passed_from_all_turns(const std::vector<Turn>& turns, double pointX, double pointY) {
+    for (const auto& turn : turns) {
         if (pointX < turn.get_coordinates()[0]) {
             return false;
         }
     }
     bool noTurnsAbove = true;
-    for (auto turn : turns) {
+    for (const auto& turn : turns) {
         if (pointY < turn.get_coordinates()[1]) {
             noTurnsAbove = false;
         }
     }
 
     bool noTurnsBelow = true;
-    for (auto turn : turns) {
+    for (const auto& turn : turns) {
         if (pointY > turn.get_coordinates()[1]) {
             noTurnsBelow = false;
         }
@@ -292,7 +298,168 @@ std::pair<Field, double> CoilMesher::generate_mesh_induced_grid(Magnetic magneti
 }
 
 
+std::pair<Field, double> CoilMesher::generate_mesh_core_winding_window_grid(Magnetic magnetic, double frequency, size_t numberPointsX, size_t numberPointsY) {
+    if (numberPointsX == 0 || numberPointsY == 0) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Core winding window grid needs at least one point per axis");
+    }
+    auto core = magnetic.get_core();
+    if (!core.get_processed_description()) {
+        throw CoreNotProcessedException("Core winding window grid: the core has no processed description");
+    }
+    if (core.get_shape_family() == CoreShapeFamily::T) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Core winding window grid: toroidal windows are not rectangular");
+    }
+    auto windingWindows = core.get_processed_description()->get_winding_windows();
+    if (windingWindows.size() != 1) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Core winding window grid: expected a single winding window, the core has " + std::to_string(windingWindows.size()));
+    }
+    if (!windingWindows[0].get_width() || !windingWindows[0].get_height()) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Core winding window grid: the winding window has no width or height");
+    }
+    // Same frame as CoilMesherCenterModel's single-window image lattice: the window starts at the main column
+    // face and is centred vertically.
+    double windowLeftEdgeX = core.get_columns()[0].get_width() / 2;
+    double windowWidth = windingWindows[0].get_width().value();
+    double windowHeight = windingWindows[0].get_height().value();
+    double pixelXDimension = windowWidth / static_cast<double>(numberPointsX);
+    double pixelYDimension = windowHeight / static_cast<double>(numberPointsY);
+
+    std::vector<FieldPoint> points;
+    points.reserve(numberPointsX * numberPointsY);
+    for (size_t j = 0; j < numberPointsY; ++j) {
+        double y = -windowHeight / 2 + (static_cast<double>(j) + 0.5) * pixelYDimension;
+        for (size_t i = 0; i < numberPointsX; ++i) {
+            FieldPoint fieldPoint;
+            fieldPoint.set_point(std::vector<double>{windowLeftEdgeX + (static_cast<double>(i) + 0.5) * pixelXDimension, y});
+            points.push_back(fieldPoint);
+        }
+    }
+    Field inducedField;
+    inducedField.set_data(points);
+    inducedField.set_frequency(frequency);
+    return {inducedField, pixelXDimension * pixelYDimension};
+}
+
+size_t CoilMesher::get_reference_winding_index(Coil coil) {
+    auto functionalDescription = coil.get_functional_description();
+    for (size_t windingIndex = 0; windingIndex < functionalDescription.size(); ++windingIndex) {
+        if (functionalDescription[windingIndex].get_isolation_side() == IsolationSide::PRIMARY) {
+            return windingIndex;
+        }
+    }
+    throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+        "MAS excitation convention: the coil has no winding with isolationSide \"primary\", so there is no "
+        "reference winding to refer the winding currents to");
+}
+
+std::vector<int8_t> CoilMesher::calculate_current_direction_per_winding(Coil coil) {
+    // MAS excitation convention (2026-09-24): primary-side windings are passive (+ into the
+    // dot), all others source (+ out of the dot). Direction by ISOLATION SIDE, not by index:
+    // a second primary-side winding (push-pull Primary Half 2, a forward's demagnetisation
+    // winding) is +1, not -1.
+    std::vector<int8_t> currentDirectionPerWinding;
+    for (auto& winding : coil.get_functional_description()) {
+        currentDirectionPerWinding.push_back(winding.get_isolation_side() == IsolationSide::PRIMARY ? int8_t(1) : int8_t(-1));
+    }
+    return currentDirectionPerWinding;
+}
+
+std::complex<double> CoilMesher::calculate_harmonic_phasor(const Waveform& waveform, double excitationFrequency, double harmonicFrequency) {
+    auto sampledWaveform = Inputs::calculate_sampled_waveform(waveform, excitationFrequency);
+    const auto& sampledData = sampledWaveform.get_data();
+    // get_time() returns the optional BY VALUE: copy, never bind a reference into it.
+    const auto sampledTimeOptional = sampledWaveform.get_time();
+    if (!sampledTimeOptional || sampledTimeOptional->size() != sampledData.size() || sampledData.empty()) {
+        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Sampled waveform has no matching time axis");
+    }
+    const auto& sampledTime = sampledTimeOptional.value();
+    // Peak phasor X = (2/N) sum x_n exp(-j w t_n): x(t) = Re(X exp(+j w t)).
+    double realPart = 0;
+    double imaginaryPart = 0;
+    double angularFrequency = 2 * std::numbers::pi * harmonicFrequency;
+    for (size_t sampleIndex = 0; sampleIndex < sampledData.size(); ++sampleIndex) {
+        realPart += sampledData[sampleIndex] * std::cos(angularFrequency * sampledTime[sampleIndex]);
+        imaginaryPart -= sampledData[sampleIndex] * std::sin(angularFrequency * sampledTime[sampleIndex]);
+    }
+    return std::complex<double>(realPart, imaginaryPart) * (2.0 / static_cast<double>(sampledData.size()));
+}
+
+std::vector<std::vector<double>> CoilMesher::calculate_current_phase_per_winding(Coil coil, OperatingPoint operatingPoint, const std::vector<size_t>& harmonicIndexes, std::vector<std::optional<double>>* gaugePhasePerHarmonic) {
+    size_t numberWindings = coil.get_functional_description().size();
+    auto excitations = operatingPoint.get_excitations_per_winding();
+    if (excitations.size() < numberWindings) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "The operating point has " + std::to_string(excitations.size()) +
+                                    " excitations for a coil with " + std::to_string(numberWindings) + " windings");
+    }
+    size_t referenceWindingIndex = get_reference_winding_index(coil);
+
+    std::vector<std::vector<double>> phasePerHarmonicPerWinding;
+    for (auto harmonicIndex : harmonicIndexes) {
+        std::vector<double> phasePerWinding(numberWindings, 0.0);
+        std::vector<bool> excitedPerWinding(numberWindings, false);
+        for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
+            auto current = excitations[windingIndex].get_current();
+            if (!current || !current->get_harmonics()) {
+                throw InvalidInputException(ErrorCode::MISSING_DATA, "Current for winding " + std::to_string(windingIndex) + " is missing harmonics in Coil Mesher");
+            }
+            auto harmonics = current->get_harmonics().value();
+            if (harmonicIndex >= harmonics.get_amplitudes().size() || harmonics.get_amplitudes()[harmonicIndex] == 0) {
+                continue;  // no current at this harmonic: its phase is irrelevant
+            }
+            double amplitude = harmonics.get_amplitudes()[harmonicIndex];
+            double harmonicFrequency = harmonics.get_frequencies()[harmonicIndex];
+            if (!current->get_waveform()) {
+                throw InvalidInputException(ErrorCode::MISSING_DATA, "Current for winding " + std::to_string(windingIndex) +
+                                            " has a harmonic at " + std::to_string(harmonicFrequency) +
+                                            " Hz but no waveform to take its phase from");
+            }
+            auto phasor = calculate_harmonic_phasor(current->get_waveform().value(), excitations[windingIndex].get_frequency(), harmonicFrequency);
+            double phasorAmplitude = std::abs(phasor);
+            if (!(phasorAmplitude >= 1e-6 * amplitude)) {
+                throw InvalidInputException(ErrorCode::INVALID_INPUT, "Current waveform of winding " + std::to_string(windingIndex) +
+                                            " does not contain the harmonic its MAS harmonics list at " + std::to_string(harmonicFrequency) +
+                                            " Hz (DFT amplitude " + std::to_string(phasorAmplitude) + " A vs " + std::to_string(amplitude) +
+                                            " A): its phase is undefined");
+            }
+            phasePerWinding[windingIndex] = std::arg(phasor);
+            excitedPerWinding[windingIndex] = true;
+        }
+
+        std::optional<size_t> gaugeWindingIndex;
+        if (excitedPerWinding[referenceWindingIndex]) {
+            gaugeWindingIndex = referenceWindingIndex;
+        }
+        else {
+            for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
+                if (excitedPerWinding[windingIndex]) {
+                    gaugeWindingIndex = windingIndex;
+                    break;
+                }
+            }
+        }
+        std::optional<double> gaugePhaseThisHarmonic;
+        if (gaugeWindingIndex) {
+            double gaugePhase = phasePerWinding[gaugeWindingIndex.value()];
+            gaugePhaseThisHarmonic = gaugePhase;
+            for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
+                if (excitedPerWinding[windingIndex]) {
+                    phasePerWinding[windingIndex] -= gaugePhase;
+                }
+            }
+        }
+        phasePerHarmonicPerWinding.push_back(phasePerWinding);
+        if (gaugePhasePerHarmonic) {
+            gaugePhasePerHarmonic->push_back(gaugePhaseThisHarmonic);
+        }
+    }
+    return phasePerHarmonicPerWinding;
+}
+
 std::vector<Field> CoilMesher::generate_mesh_inducing_coil(Magnetic magnetic, OperatingPoint operatingPoint, double windingLossesHarmonicAmplitudeThreshold, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding, std::optional<CoilMesherModels> coilMesherModel) {
+    return generate_mesh_inducing_coil_phasors(magnetic, operatingPoint, windingLossesHarmonicAmplitudeThreshold, customCurrentDirectionPerWinding, coilMesherModel).fieldPerHarmonic;
+}
+
+InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnetic, OperatingPoint operatingPoint, double windingLossesHarmonicAmplitudeThreshold, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding, std::optional<CoilMesherModels> coilMesherModel) {
     auto coil = magnetic.get_coil();
     if (!coil.get_turns_description()) {
         throw CoilNotProcessedException("Winding does not have turns description");
@@ -303,10 +470,7 @@ std::vector<Field> CoilMesher::generate_mesh_inducing_coil(Magnetic magnetic, Op
 
     std::vector<int8_t> currentDirectionPerWinding;
     if (!customCurrentDirectionPerWinding) {
-        currentDirectionPerWinding.push_back(1);
-        for (size_t windingIndex = 1; windingIndex < coil.get_functional_description().size(); ++windingIndex) {
-            currentDirectionPerWinding.push_back(-1);
-        }
+        currentDirectionPerWinding = calculate_current_direction_per_winding(coil);
     }
     else {
         currentDirectionPerWinding = customCurrentDirectionPerWinding.value();
@@ -378,13 +542,20 @@ std::vector<Field> CoilMesher::generate_mesh_inducing_coil(Magnetic magnetic, Op
 
 
 
+    // Hoisted: the MAS getter copies the whole Core (cached material datasets included);
+    // fetching it per turn dominated this loop's cost.
+    auto meshCore = magnetic.get_core();
     for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
         auto turn = turns[turnIndex];
         int windingIndex = coil.get_winding_index_by_name(turn.get_winding());
         auto wire = wirePerWinding[windingIndex];
-        auto harmonics = operatingPoint.get_excitations_per_winding()[windingIndex].get_current()->get_harmonics().value();
+        auto excitationCurrent = operatingPoint.get_excitations_per_winding()[windingIndex].get_current();
+        if (!excitationCurrent || !excitationCurrent->get_harmonics()) {
+            throw InvalidInputException(ErrorCode::MISSING_DATA, "Current for winding " + std::to_string(windingIndex) + " is missing harmonics in Coil Mesher");
+        }
+        auto harmonics = excitationCurrent->get_harmonics().value();
 
-        auto fieldPoints = breakdownModelPerWinding[windingIndex]->generate_mesh_inducing_turn(turn, wire, turnIndex, turn.get_length(), magnetic.get_core());
+        auto fieldPoints = breakdownModelPerWinding[windingIndex]->generate_mesh_inducing_turn(turn, wire, turnIndex, turn.get_length(), meshCore);
 
         for (auto harmonicIndex : commonHarmonicIndexes) {
             double harmonicCurrentPeak = 0;
@@ -403,10 +574,21 @@ std::vector<Field> CoilMesher::generate_mesh_inducing_coil(Magnetic magnetic, Op
             }
         }
     }
+    std::vector<std::optional<double>> gaugePhasePerCommonHarmonic;
+    auto phasePerCommonHarmonic = calculate_current_phase_per_winding(coil, operatingPoint, commonHarmonicIndexes, &gaugePhasePerCommonHarmonic);
     std::vector<Field> fieldPerHarmonic;
+    std::vector<std::vector<double>> phasePerHarmonicPerWinding;
+    std::vector<std::optional<double>> gaugePhasePerHarmonic;
     for (size_t harmonicIndex = 0; harmonicIndex < tempFieldPerHarmonic.size(); ++harmonicIndex){
         if (tempFieldPerHarmonic[harmonicIndex].get_data().size() > 0) {
             fieldPerHarmonic.push_back(tempFieldPerHarmonic[harmonicIndex]);
+            auto commonPosition = std::find(commonHarmonicIndexes.begin(), commonHarmonicIndexes.end(), harmonicIndex);
+            if (commonPosition == commonHarmonicIndexes.end()) {
+                throw CalculationException(ErrorCode::CALCULATION_ERROR, "generate_mesh_inducing_coil: meshed harmonic " + std::to_string(harmonicIndex) +
+                                           " is not one of the common harmonics");
+            }
+            phasePerHarmonicPerWinding.push_back(phasePerCommonHarmonic[static_cast<size_t>(commonPosition - commonHarmonicIndexes.begin())]);
+            gaugePhasePerHarmonic.push_back(gaugePhasePerCommonHarmonic[static_cast<size_t>(commonPosition - commonHarmonicIndexes.begin())]);
         }
     }
 
@@ -428,7 +610,7 @@ std::vector<Field> CoilMesher::generate_mesh_inducing_coil(Magnetic magnetic, Op
         }
     }
 
-    return fieldPerHarmonic;
+    return {fieldPerHarmonic, phasePerHarmonicPerWinding, gaugePhasePerHarmonic};
 }
 
 std::vector<Field> CoilMesher::generate_mesh_induced_coil(Magnetic magnetic, OperatingPoint operatingPoint, double windingLossesHarmonicAmplitudeThreshold) {
@@ -488,13 +670,19 @@ std::vector<Field> CoilMesher::generate_mesh_induced_coil(Magnetic magnetic, Ope
         tempFieldPerHarmonic[harmonicIndex] = field;
     }
 
+    // Hoisted like the inducing loop: one Core copy for the whole mesh, not one per turn.
+    auto meshCore = magnetic.get_core();
     for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
         auto turn = turns[turnIndex];
         int windingIndex = coil.get_winding_index_by_name(turn.get_winding());
         auto wire = wirePerWinding[windingIndex];
-        auto harmonics = operatingPoint.get_excitations_per_winding()[windingIndex].get_current()->get_harmonics().value();
+        auto excitationCurrent = operatingPoint.get_excitations_per_winding()[windingIndex].get_current();
+        if (!excitationCurrent || !excitationCurrent->get_harmonics()) {
+            throw InvalidInputException(ErrorCode::MISSING_DATA, "Current for winding " + std::to_string(windingIndex) + " is missing harmonics in Coil Mesher");
+        }
+        auto harmonics = excitationCurrent->get_harmonics().value();
 
-        auto fieldPoints = breakdownModelPerWinding[windingIndex]->generate_mesh_induced_turn(turn, wire, turnIndex);
+        auto fieldPoints = breakdownModelPerWinding[windingIndex]->generate_mesh_induced_turn(turn, wire, turnIndex, &meshCore);
 
         for (auto harmonicIndex : commonHarmonicIndexes) {
             for (auto& fieldPoint : fieldPoints) {
@@ -512,12 +700,13 @@ std::vector<Field> CoilMesher::generate_mesh_induced_coil(Magnetic magnetic, Ope
     return fieldPerHarmonic;
 }
 
-std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(Turn turn, [[maybe_unused]] Wire wire, std::optional<size_t> turnIndex, std::optional<double> turnLength, Core core) {
+std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(const Turn& turn, [[maybe_unused]] Wire& wire, std::optional<size_t> turnIndex, std::optional<double> turnLength, Core& core) {
     auto mirroringDimension = settings.get_magnetic_field_mirroring_dimension();
     std::vector<FieldPoint> fieldPoints;
 
     int M = mirroringDimension;
     int N = mirroringDimension;
+    bool completeCells = settings.get_magnetic_field_mirroring_complete_cells();
 
     double corePermeability = core.get_initial_permeability(defaults.ambientTemperature);
     if (!core.get_processed_description()) {
@@ -571,12 +760,40 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(Turn 
                                       double frameLeftEdgeX, double frameBottomY, double signMultiplier) {
             double crossingA = crossingPoint[0] - frameLeftEdgeX;
             double crossingB = crossingPoint[1] - frameBottomY;
-            for (int m = -M; m <= M; ++m)
+            // Image index m places the conductor at m*A + a (m even) or m*A + A - a (m odd), |m| reflections
+            // away. The symmetric range [-M, M] cuts the 2A x 2B mirror cell in two, so the lattice keeps a net
+            // dipole and its sum does not converge to the enclosed-window field: on side-by-side windings
+            // (field crossing the whole window) the leakage energy read 0.68-0.85 of OMFEM 2D (ABT #1240).
+            // Complete cells, m in [-2Kx-1, 2Kx], pair every image with its mirror, so the remainder decays as
+            // a quadrupole lattice. That remainder is set by the lattice's physical extent, so the short side of
+            // the window gets proportionally more cells: Kx = M ceil(B/A), Ky = M ceil(A/B). On a two-chamber
+            // ETD 49 (B/A = 3.5) Kx = Ky = 1 read 0.86 of the converged lattice; Kx = 4 is within 1 %.
+            int cellsX = M;
+            int cellsY = N;
+            if (completeCells) {
+                cellsX = M * static_cast<int>(std::max(1.0, std::ceil(frameB / frameA)));
+                cellsY = N * static_cast<int>(std::max(1.0, std::ceil(frameA / frameB)));
+            }
+            int mMinimum = completeCells && cellsX > 0 ? -2 * cellsX - 1 : -cellsX;
+            int mMaximum = completeCells && cellsX > 0 ? 2 * cellsX : cellsX;
+            int nMinimum = completeCells && cellsY > 0 ? -2 * cellsY - 1 : -cellsY;
+            int nMaximum = completeCells && cellsY > 0 ? 2 * cellsY : cellsY;
+            for (int m = mMinimum; m <= mMaximum; ++m)
             {
-                for (int n = -N; n <= N; ++n)
+                for (int n = nMinimum; n <= nMaximum; ++n)
                 {
                     FieldPoint mirroredFieldPoint;
-                    double currentMultiplier = (corePermeability - std::max(fabs(m), fabs(n))) / (corePermeability + std::max(fabs(m), fabs(n)));
+                    double currentMultiplier;
+                    if (completeCells) {
+                        // A line current reflected in a permeable half-space has the image I (mu - 1) / (mu + 1);
+                        // the image at (m, n) is |m| + |n| reflections away and carries that factor as many times.
+                        // The legacy factor below turns negative once max(|m|, |n|) exceeds mu, which the larger
+                        // complete-cell lattices reach on low-permeability cores.
+                        currentMultiplier = std::pow((corePermeability - 1.0) / (corePermeability + 1.0), std::abs(m) + std::abs(n));
+                    }
+                    else {
+                        currentMultiplier = (corePermeability - std::max(fabs(m), fabs(n))) / (corePermeability + std::max(fabs(m), fabs(n)));
+                    }
                     mirroredFieldPoint.set_value(signMultiplier * currentMultiplier);  // Will be multiplied later
                     if (turnLength) {
                         mirroredFieldPoint.set_turn_length(turnLength.value());
@@ -668,15 +885,21 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(Turn 
         double R_outer = dimensions["A"] / 2.0;  // Outer boundary (core outer wall)
         double attenuation = (corePermeability - 1.0) / (corePermeability + 1.0);
 
-        // Collect all conductor coordinates (main + outer half for toroidal turns)
-        std::vector<std::vector<double>> coordinatesToProcess;
-        coordinatesToProcess.push_back({turn.get_coordinates()[0], turn.get_coordinates()[1]});
+        // Collect all conductor coordinates (main + outer half for toroidal turns).
+        //
+        // A toroidal turn pierces this plane TWICE and the two crossings carry current in
+        // OPPOSITE directions: the wire runs through the bore, over the top, back down
+        // OUTSIDE the core and under the bottom, so the bore crossing and the outer
+        // crossing are the go and return halves of the same loop. The direction is
+        // therefore part of the geometry, not a free choice (ABT #320).
+        std::vector<std::pair<std::vector<double>, double>> coordinatesToProcess;
+        coordinatesToProcess.push_back({{turn.get_coordinates()[0], turn.get_coordinates()[1]}, 1.0});
 
         if (turn.get_additional_coordinates()) {
             auto additionalCoords = turn.get_additional_coordinates().value();
             for (const auto& coord : additionalCoords) {
                 if (coord.size() >= 2) {
-                    coordinatesToProcess.push_back({coord[0], coord[1]});
+                    coordinatesToProcess.push_back({{coord[0], coord[1]}, -1.0});
                 }
             }
         }
@@ -691,14 +914,14 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(Turn 
             throw CoilNotProcessedException("CoilMesher: Turn coordinates are not in cartesian");
         }
 
-        for (const auto& coords : coordinatesToProcess) {
+        for (const auto& [coords, direction] : coordinatesToProcess) {
             double x = coords[0];
             double y = coords[1];
             double r_k_sq = x * x + y * y;
 
             // Real conductor
             FieldPoint realPoint;
-            realPoint.set_value(1.0);
+            realPoint.set_value(direction);
             realPoint.set_rotation(turn.get_rotation().value());
             if (turnLength) {
                 realPoint.set_turn_length(turnLength.value());
@@ -715,7 +938,7 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(Turn 
                 // In Cartesian: scale = R_inner² / |z_k|²
                 double scale_inner = (R_inner * R_inner) / r_k_sq;
                 FieldPoint innerImage;
-                innerImage.set_value(attenuation);
+                innerImage.set_value(direction * attenuation);
                 innerImage.set_rotation(turn.get_rotation().value());
                 if (turnLength) {
                     innerImage.set_turn_length(turnLength.value());
@@ -729,7 +952,7 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(Turn 
                 // Outer boundary image: z_img = R_outer² / conj(z_k)
                 double scale_outer = (R_outer * R_outer) / r_k_sq;
                 FieldPoint outerImage;
-                outerImage.set_value(attenuation);
+                outerImage.set_value(direction * attenuation);
                 outerImage.set_rotation(turn.get_rotation().value());
                 if (turnLength) {
                     outerImage.set_turn_length(turnLength.value());
@@ -746,80 +969,136 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(Turn 
     return fieldPoints;
 }
 
-std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_induced_turn(Turn turn, [[maybe_unused]] Wire wire, std::optional<size_t> turnIndex) {
+// ABT #227.2: a turn with a genuine second plane crossing (additional_coordinates --
+// the out-of-core return half of a rectangular multi-column lateral turn) sees a
+// materially different proximity field at each crossing. Sampling only the primary
+// crossing and billing the WHOLE turn length (both halves) at that single density
+// overestimates the out-of-core half's loss. The models sample both crossings and let
+// WindingProximityEffectLosses weight each by its own length share instead.
+// Toroidal turns are excluded: their outer-return crossing already gets dedicated
+// Kelvin-image handling on the inducing side (see generate_mesh_inducing_turn) and an
+// induced-side split would double-touch behavior that many toroidal characterisation
+// tests already pin. Shared by the Center AND Wang models (the Wang half of the ticket
+// was originally missed, leaving foil/rectangular/planar wires on single-crossing).
+// Returns the secondary crossing's {x, y} when the split applies.
+static std::optional<std::vector<double>> lateral_multi_column_secondary_crossing(const Turn& turn, const Core* core) {
+    if (core == nullptr || core->get_shape_family() == CoreShapeFamily::T) {
+        return std::nullopt;
+    }
+    // Bind once: the MAS getter returns the nested vectors BY VALUE.
+    const auto additionalCoordinates = turn.get_additional_coordinates();
+    if (!additionalCoordinates || additionalCoordinates->empty() || (*additionalCoordinates)[0].size() < 2) {
+        return std::nullopt;
+    }
+    return std::vector<double>{(*additionalCoordinates)[0][0], (*additionalCoordinates)[0][1]};
+}
+
+std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_induced_turn(const Turn& turn, [[maybe_unused]] Wire& wire, std::optional<size_t> turnIndex, const Core* core) {
     std::vector<FieldPoint> fieldPoints;
+
+    auto secondaryCrossing = lateral_multi_column_secondary_crossing(turn, core);
+
     FieldPoint fieldPoint;
-
     fieldPoint.set_point(turn.get_coordinates());
-
     fieldPoint.set_value(0);
     if (turnIndex) {
         fieldPoint.set_turn_index(turnIndex.value());
     }
     fieldPoint.set_label("center");
-    fieldPoints.push_back(fieldPoint);
-
-    return fieldPoints;
-}
-
-std::vector<FieldPoint> CoilMesherWangModel::generate_mesh_induced_turn(Turn turn, Wire wire, std::optional<size_t> turnIndex) {
-    std::vector<FieldPoint> fieldPoints;
-    FieldPoint fieldPoint;
-    fieldPoint.set_value(0);
-    if (turnIndex) {
-        fieldPoint.set_turn_index(turnIndex.value());
+    if (secondaryCrossing) {
+        fieldPoint.set_turn_length(turn.get_length() / 2);
     }
-
-    fieldPoint.set_point({turn.get_coordinates()[0] + wire.get_maximum_conducting_width() / 2, turn.get_coordinates()[1]});
-    fieldPoint.set_label("right");
     fieldPoints.push_back(fieldPoint);
 
-    fieldPoint.set_point({turn.get_coordinates()[0] - wire.get_maximum_conducting_width() / 2, turn.get_coordinates()[1]});
-    fieldPoint.set_label("left");
-    fieldPoints.push_back(fieldPoint);
-
-    fieldPoint.set_point({turn.get_coordinates()[0], turn.get_coordinates()[1] + wire.get_maximum_conducting_height() / 2});
-    fieldPoint.set_label("top");
-    fieldPoints.push_back(fieldPoint);
-
-    fieldPoint.set_point({turn.get_coordinates()[0], turn.get_coordinates()[1] - wire.get_maximum_conducting_height() / 2});
-    fieldPoint.set_label("bottom");
-    fieldPoints.push_back(fieldPoint);
-
-    // Width-resolved samples across the wide face, consumed by the Wang proximity
-    // model's perpendicular-field integral (Roshen 2007 gap fringing + thin-strip
-    // screening bridge). The gap-fringing field varies strongly (up to ~50x) across
-    // a wide flat conductor, so the 4 lumped surface points cannot represent
-    // integral(Hperp(x)^2 dx); these samples make the superposed total field
-    // (proximity + fringing, including their cross term) available along the width.
-    // Only generated when fringing is enabled: without a gap field the lumped
-    // mesh is sufficient and much cheaper.
-    if (settings.get_magnetic_field_include_fringing()) {
-        bool wideAlongY = (wire.get_type() == WireType::FOIL);
-        double wideDimension = wideAlongY ? wire.get_maximum_conducting_height() : wire.get_maximum_conducting_width();
-        double thinDimension = wideAlongY ? wire.get_maximum_conducting_width() : wire.get_maximum_conducting_height();
-        // Self-scaling sample count: enough to resolve the near-gap field decay on
-        // wide traces, cheap on near-square conductors.
-        size_t numberSamples = std::min(size_t(32), std::max(size_t(8), size_t(std::round(wideDimension / thinDimension))));
-        double sampleStep = wideDimension / double(numberSamples);
-        for (size_t sampleIndex = 0; sampleIndex < numberSamples; ++sampleIndex) {
-            double offset = -wideDimension / 2 + (sampleIndex + 0.5) * sampleStep;
-            if (wideAlongY) {
-                fieldPoint.set_point({turn.get_coordinates()[0], turn.get_coordinates()[1] + offset});
-            }
-            else {
-                fieldPoint.set_point({turn.get_coordinates()[0] + offset, turn.get_coordinates()[1]});
-            }
-            fieldPoint.set_label("widthsample");
-            fieldPoints.push_back(fieldPoint);
+    if (secondaryCrossing) {
+        FieldPoint secondaryFieldPoint;
+        secondaryFieldPoint.set_point(secondaryCrossing.value());
+        secondaryFieldPoint.set_value(0);
+        if (turnIndex) {
+            secondaryFieldPoint.set_turn_index(turnIndex.value());
         }
+        secondaryFieldPoint.set_label("center_secondary");
+        secondaryFieldPoint.set_turn_length(turn.get_length() / 2);
+        fieldPoints.push_back(secondaryFieldPoint);
+    }
+
+    return fieldPoints;
+}
+
+std::vector<FieldPoint> CoilMesherWangModel::generate_mesh_induced_turn(const Turn& turn, Wire& wire, std::optional<size_t> turnIndex, const Core* core) {
+    std::vector<FieldPoint> fieldPoints;
+
+    // One full surface cluster per crossing, centred on {centerX, centerY}.
+    auto emitCluster = [&](double centerX, double centerY) {
+        FieldPoint fieldPoint;
+        fieldPoint.set_value(0);
+        if (turnIndex) {
+            fieldPoint.set_turn_index(turnIndex.value());
+        }
+
+        fieldPoint.set_point({centerX + wire.get_maximum_conducting_width() / 2, centerY});
+        fieldPoint.set_label("right");
+        fieldPoints.push_back(fieldPoint);
+
+        fieldPoint.set_point({centerX - wire.get_maximum_conducting_width() / 2, centerY});
+        fieldPoint.set_label("left");
+        fieldPoints.push_back(fieldPoint);
+
+        fieldPoint.set_point({centerX, centerY + wire.get_maximum_conducting_height() / 2});
+        fieldPoint.set_label("top");
+        fieldPoints.push_back(fieldPoint);
+
+        fieldPoint.set_point({centerX, centerY - wire.get_maximum_conducting_height() / 2});
+        fieldPoint.set_label("bottom");
+        fieldPoints.push_back(fieldPoint);
+
+        // Width-resolved samples across the wide face, consumed by the Wang proximity
+        // model's perpendicular-field integral (Roshen 2007 gap fringing + thin-strip
+        // screening bridge). The gap-fringing field varies strongly (up to ~50x) across
+        // a wide flat conductor, so the 4 lumped surface points cannot represent
+        // integral(Hperp(x)^2 dx); these samples make the superposed total field
+        // (proximity + fringing, including their cross term) available along the width.
+        // Only generated when fringing is enabled: without a gap field the lumped
+        // mesh is sufficient and much cheaper.
+        if (settings.get_magnetic_field_include_fringing()) {
+            bool wideAlongY = (wire.get_type() == WireType::FOIL);
+            double wideDimension = wideAlongY ? wire.get_maximum_conducting_height() : wire.get_maximum_conducting_width();
+            double thinDimension = wideAlongY ? wire.get_maximum_conducting_width() : wire.get_maximum_conducting_height();
+            // Self-scaling sample count: enough to resolve the near-gap field decay on
+            // wide traces, cheap on near-square conductors.
+            size_t numberSamples = std::min(size_t(32), std::max(size_t(8), size_t(std::round(wideDimension / thinDimension))));
+            double sampleStep = wideDimension / double(numberSamples);
+            for (size_t sampleIndex = 0; sampleIndex < numberSamples; ++sampleIndex) {
+                double offset = -wideDimension / 2 + (sampleIndex + 0.5) * sampleStep;
+                if (wideAlongY) {
+                    fieldPoint.set_point({centerX, centerY + offset});
+                }
+                else {
+                    fieldPoint.set_point({centerX + offset, centerY});
+                }
+                fieldPoint.set_label("widthsample");
+                fieldPoints.push_back(fieldPoint);
+            }
+        }
+    };
+
+    emitCluster(turn.get_coordinates()[0], turn.get_coordinates()[1]);
+
+    // ABT #227.2 parity with CoilMesherCenterModel: the factory routes PLANAR/RECTANGULAR/
+    // FOIL wires here, and those are exactly the wire types lateral multi-column windings
+    // use — without this second cluster their whole loop length was billed at the
+    // in-window crossing's field density. WindingProximityEffectLosses classifies points
+    // by nearest crossing and weights each half by its own length share.
+    auto secondaryCrossing = lateral_multi_column_secondary_crossing(turn, core);
+    if (secondaryCrossing) {
+        emitCluster(secondaryCrossing.value()[0], secondaryCrossing.value()[1]);
     }
 
     return fieldPoints;
 }
 
 
-std::vector<FieldPoint> CoilMesherWangModel::generate_mesh_inducing_turn(Turn turn, Wire wire, std::optional<size_t> turnIndex, std::optional<double> turnLength, Core core) {
+std::vector<FieldPoint> CoilMesherWangModel::generate_mesh_inducing_turn(const Turn& turn, Wire& wire, std::optional<size_t> turnIndex, std::optional<double> turnLength, [[maybe_unused]] Core& core) {
     std::vector<FieldPoint> fieldPoints;
     FieldPoint fieldPoint;
     fieldPoint.set_value(1);

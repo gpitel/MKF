@@ -75,6 +75,7 @@
 #include <optional>
 #include <array>
 #include <MAS.hpp>
+#include "Constants.h"   // ABT #838: ThermalDefaults for the per-surface emissivity default
 
 using json = nlohmann::json;
 using namespace MAS;  // For TurnCrossSectionalShape, InsulationWireCoating, etc.
@@ -348,7 +349,11 @@ public:
     
     // Optional reference to the actual magnetic component
     std::optional<size_t> windingIndex;
-    std::optional<size_t> turnIndex;
+    std::optional<size_t> turnIndex;              // index of the turn WITHIN its winding (labels only)
+    // ABT #1454: index of the turn in coil.turnsDescription (global). Every lookup into
+    // turnsDescription must use this, never turnIndex: on an interleaved or multi-winding coil
+    // the within-winding index names a different turn.
+    std::optional<size_t> turnDescriptionIndex;
     std::optional<size_t> coreSegmentIndex;
     std::optional<size_t> insulationLayerIndex;  // For INSULATION_LAYER nodes
     
@@ -612,6 +617,7 @@ public:
         
         if (windingIndex.has_value()) j["windingIndex"] = windingIndex.value();
         if (turnIndex.has_value()) j["turnIndex"] = turnIndex.value();
+        if (turnDescriptionIndex.has_value()) j["turnDescriptionIndex"] = turnDescriptionIndex.value();
         if (coreSegmentIndex.has_value()) j["coreSegmentIndex"] = coreSegmentIndex.value();
         
         return j;
@@ -681,6 +687,12 @@ struct ThermalResistanceElement {
     double length = 0.0;            // Conduction path length in m
     double thermalConductivity = 0.0; // Material thermal conductivity W/(m·K)
     SurfaceOrientation orientation = SurfaceOrientation::VERTICAL;
+
+    // ABT #838: the emissivity of THIS surface. Radiation used to read one config-wide value,
+    // which is right for enamelled wire, insulation wrap and ferrite but not for bare copper.
+    // Set when the resistor is built and re-read by recalculateConvectionResistances, so the
+    // per-surface value survives the iteration instead of being overwritten by the global one.
+    double emissivity = ThermalDefaults::kConvection_DefaultEmissivity;
     
     // Backward compatibility: transferType maps to type
     HeatTransferType getTransferType() const { return type; }

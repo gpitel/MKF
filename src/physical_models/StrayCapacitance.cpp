@@ -1,4 +1,6 @@
 #include "physical_models/StrayCapacitance.h"
+#include "physical_models/Impedance.h"
+#include <algorithm>
 #include "support/Settings.h"
 #include "Defaults.h"
 #include "Constants.h"
@@ -66,6 +68,30 @@ static double compute_global_minimum_gap(const std::vector<Turn>& turnsDescripti
     }
     
     return globalMinGap;
+}
+
+// The core "coating" that sits in the winding-to-core dielectric path is the insulating JACKET
+// over the ferrite surface the turns rest on (parylene / epoxy / nylon / glass). A
+// MAGNETIC_EPOXY coating is a different thing: the powder-loaded shield cap moulded over the
+// winding of a semishielded drum. It is not between a turn and the core surface, and its
+// material is a powder core material, not an insulation (looking it up as one threw
+// MISSING_DATA "Insulation material not found: Kool Mµ 26" and made every semishielded drum
+// uncomputable under the full model). So it contributes no jacket layer here: thickness 0,
+// relative permittivity 1; the wire enamel alone bounds the element, as on a bare core.
+static std::pair<double, double> resolve_core_jacket(const Core& core) {
+    auto coating = core.get_functional_description().get_coating();
+    if (coating && std::holds_alternative<CoreCoating>(coating.value())) {
+        auto type = std::get<CoreCoating>(coating.value()).get_type();
+        if (type && type.value() == CoatingType::MAGNETIC_EPOXY) {
+            return {0.0, 1.0};
+        }
+    }
+    double thickness = core.get_coating_thickness();
+    // A bare (uncoated) ferrite has no coating layer; the wire enamel alone then bounds the
+    // element. get_coating_relative_permittivity() throws when there is no coating, so only
+    // resolve it when a coating actually exists.
+    double relativePermittivity = thickness > 0 ? core.get_coating_relative_permittivity() : 1.0;
+    return {thickness, relativePermittivity};
 }
 
 std::vector<std::pair<Turn, size_t>> StrayCapacitance::get_surrounding_turns(Turn currentTurn, std::vector<Turn> turnsDescription, double globalMinimumGap) {
@@ -745,8 +771,21 @@ std::vector<double> StrayCapacitanceModel::preprocess_data_for_round_wires(Turn 
         
         // The "coating thickness" is only the serving/outer insulation
         wireCoatingThicknessFirstWire = (outerDiameterFirstWire - bareBundleDiameter) / 2;
-        if (wireCoatingThicknessFirstWire < 0) {
-            wireCoatingThicknessFirstWire = 0;
+        if (wireCoatingThicknessFirstWire <= 0) {
+            // AN UNSERVED BUNDLE IS NOT A BARE CONDUCTOR. With no serving the outer diameter IS
+            // the bare bundle diameter, so this came out zero and two adjacent turns were treated
+            // as touching with no dielectric between them -- an infinite turn-to-turn capacitance,
+            // which the guard downstream then correctly refused, taking the whole SPICE export
+            // with it. But the surface of a bare litz bundle is made of ENAMELLED STRANDS, so what
+            // separates two touching bundles is two strand enamels, not nothing.
+            //
+            // This is the same reasoning get_wire_insulation_relative_permittivity already applies
+            // to the litz PERMITTIVITY, which falls back to the strand enamel; only the THICKNESS
+            // was missing it. Reached only when the serving is absent, i.e. only in cases that
+            // previously produced an infinity and threw, so no working result can move.
+            wireCoatingThicknessFirstWire =
+                (Wire::get_outer_diameter_round(strandConductingDiameter, grade, standard)
+                 - strandConductingDiameter) / 2;
         }
     } else {
         // ROUND wire
@@ -777,8 +816,11 @@ std::vector<double> StrayCapacitanceModel::preprocess_data_for_round_wires(Turn 
         conductingDiameterSecondWire = bareBundleDiameter;
         
         wireCoatingThicknessSecondWire = (outerDiameterSecondWire - bareBundleDiameter) / 2;
-        if (wireCoatingThicknessSecondWire < 0) {
-            wireCoatingThicknessSecondWire = 0;
+        if (wireCoatingThicknessSecondWire <= 0) {
+            // Unserved bundle: the strand enamel is the surface insulation -- see the first wire.
+            wireCoatingThicknessSecondWire =
+                (Wire::get_outer_diameter_round(strandConductingDiameter, grade, standard)
+                 - strandConductingDiameter) / 2;
         }
     } else {
         // ROUND wire
@@ -789,13 +831,27 @@ std::vector<double> StrayCapacitanceModel::preprocess_data_for_round_wires(Turn 
     
     // Now average the coating thickness (after per-wire computation)
     auto wireCoatingThickness = (wireCoatingThicknessFirstWire + wireCoatingThicknessSecondWire) / 2;
-    auto conductingRadius = (conductingDiameterFirstWire + conductingDiameterSecondWire) / 2;
+    // ABT #851: this is the average conducting RADIUS. It used to be written as
+    // (diameter1 + diameter2) / 2 — the average DIAMETER — and every round-wire pair model
+    // downstream consumed that as the radius, i.e. 2x the real value for equal wires.
+    auto conductingRadius = (conductingDiameterFirstWire + conductingDiameterSecondWire) / 4;
 
     // For toroidal cores, check distance between all coordinate combinations (inner/outer halves)
     auto coords1 = get_all_turn_coordinates(firstTurn);
     auto coords2 = get_all_turn_coordinates(secondTurn);
     
-    double sumDistance = 0;
+    // ABT #851: the separation that sets a turn pair's capacitance is their CLOSEST
+    // APPROACH. A toroidal turn carries inner and outer crossing coordinates, so the
+    // combinations of two ADJACENT turns mix the true near-zero gap (inner-inner) with
+    // across-the-core distances of 10-20 mm (inner-outer). This used to AVERAGE them,
+    // telling every pair model that touching turns sit millimetres apart: the plate-family
+    // statics (Albach/Koch/Duerdoth) collapsed to ~0.07 pF per pair where the near-contact
+    // value is ~3-4 pF, and only Massarini's logarithmic form survived — which is why the
+    // choice of static model appeared to matter enormously on toroids. Adjacency detection
+    // (get_surrounding_turns) already uses the minimum over the same combinations; the
+    // capacitance must see the same geometry it was selected on. Off toroids each turn has
+    // a single coordinate, so min == mean and nothing changes there.
+    double minDistance = std::numeric_limits<double>::max();
     int validDistancesCount = 0;
     for (const auto& c1 : coords1) {
         for (const auto& c2 : coords2) {
@@ -805,14 +861,14 @@ std::vector<double> StrayCapacitanceModel::preprocess_data_for_round_wires(Turn 
             }
             double dist = hypot(c1[0] - c2[0], c1[1] - c2[1]);
             dist -= outerDiameterFirstWire / 2 + outerDiameterSecondWire / 2;
-            sumDistance += dist;
+            minDistance = std::min(minDistance, dist);
             validDistancesCount++;
         }
     }
     
     double distanceBetweenTurns;
     if (validDistancesCount > 0) {
-        distanceBetweenTurns = sumDistance / validDistancesCount;
+        distanceBetweenTurns = minDistance;
     } else {
         // Fallback to single coordinate calculation
         double x1 = firstTurn.get_coordinates()[0];
@@ -907,15 +963,62 @@ std::vector<double> StrayCapacitanceParallelPlateModel::preprocess_data_for_plan
 
     distanceBetweenTurns = roundFloat(distanceBetweenTurns, 6);
 
-    double distanceThroughLayers = distanceBetweenTurns;
-
-    std::vector<double> distancesThroughLayers;
-    std::vector<double> relativePermittivityLayers;
-
+    // ABT #948: the dielectric between the two CONDUCTING surfaces is a SERIES STACK, and
+    // what fills the middle of it is not the same substance for every flat conductor.
+    //
+    // distanceBetweenTurns above is measured conductor-surface to conductor-surface, so it
+    // already contains both wires' coatings plus whatever separates them. This function used to
+    // hand that whole distance to the parallel-plate formula with the permittivity of FR4 —
+    // i.e. it asserted that the entire conductor-to-conductor gap of every flat winding is
+    // board laminate. For a PCB trace that is true, and nothing below changes it. For a WOUND
+    // rectangular or foil conductor it is not: the stack is the wire's own enamel, then air,
+    // then the other wire's enamel, and calling the air FR4 multiplies the pair capacitance by
+    // up to eps_FR4 (~4.4x when the turns are spaced, ~1.3x when they are close-wound). That is
+    // the sign and the size of the error the flat-wire families show against measurement
+    // (IndHCF 3.2x, IndHCFT 9.3x, IndHCI 1.9x HIGH, where every round-wire family is LOW).
+    //
+    // The stack is series, so it reduces exactly: with t_i of relative permittivity eps_i,
+    //     C = eps0 * A / sum(t_i / eps_i),
+    // which the parallel-plate call below reproduces as eps0 * eps_eff * A / d with the same d
+    // and eps_eff = d / sum(t_i / eps_i). get_effective_relative_permittivity is that reduction
+    // for two layers at a time, the same idiom the round-wire preprocess uses.
+    //
+    // Assumptions, stated: (1) the field crosses the layers normally (exact in the
+    // parallel-plate limit the model is already committed to); (2) an inter-turn space that no
+    // coating and no insulation layer accounts for is AIR for a wound conductor and BOARD
+    // DIELECTRIC for a planar one — a PCB trace is embedded in laminate, a wound wire is not.
     auto coatingInsulationMaterial = find_insulation_material_by_name(defaults.defaultPcbInsulationMaterial);
     if (!coatingInsulationMaterial.get_relative_permittivity())
         throw InvalidInputException(ErrorCode::INVALID_INSULATION_DATA, "FR4 insulation material is missing dielectric constant");
-    double effectiveRelativePermittivityLayers = coatingInsulationMaterial.get_relative_permittivity().value();
+    double boardRelativePermittivity = coatingInsulationMaterial.get_relative_permittivity().value();
+
+    bool eitherWireIsPlanar = firstWire.get_type() == WireType::PLANAR || secondWire.get_type() == WireType::PLANAR;
+    double fillRelativePermittivity = eitherWireIsPlanar ? boardRelativePermittivity : 1.0;
+
+    double firstCoatingThickness = firstWire.get_coating_thickness();
+    double secondCoatingThickness = secondWire.get_coating_thickness();
+    double firstCoatingRelativePermittivity = get_wire_insulation_relative_permittivity(firstWire);
+    double secondCoatingRelativePermittivity = get_wire_insulation_relative_permittivity(secondWire);
+    // The coatings cannot be thicker than the gap they sit in (a turn pair whose separation the
+    // winder rounded below the sum of the two coatings); scale them down together rather than
+    // letting the fill thickness go negative.
+    double totalCoatingThickness = firstCoatingThickness + secondCoatingThickness;
+    if (distanceBetweenTurns > 0 && totalCoatingThickness > distanceBetweenTurns && totalCoatingThickness > 0) {
+        double shrink = distanceBetweenTurns / totalCoatingThickness;
+        firstCoatingThickness *= shrink;
+        secondCoatingThickness *= shrink;
+        totalCoatingThickness = distanceBetweenTurns;
+    }
+    double fillThickness = std::max(0.0, distanceBetweenTurns - totalCoatingThickness);
+
+    double effectiveRelativePermittivityLayers = get_effective_relative_permittivity(
+        firstCoatingThickness, firstCoatingRelativePermittivity,
+        secondCoatingThickness, secondCoatingRelativePermittivity);
+    effectiveRelativePermittivityLayers = get_effective_relative_permittivity(
+        totalCoatingThickness, effectiveRelativePermittivityLayers,
+        fillThickness, fillRelativePermittivity);
+
+    double distanceThroughLayers = distanceBetweenTurns;
 
     auto averageTurnLength = (firstTurn.get_length() + secondTurn.get_length()) / 2;
 
@@ -1274,7 +1377,135 @@ double StrayCapacitanceParallelPlateModel::calculate_static_capacitance_between_
     return vacuumPermittivity * relativePermittivityInsulationLayers * overlappingDimension * averageTurnLength / distanceThroughLayers;
 }
 
+// ABT #395: a non-finite turn-to-turn capacitance used to escape this function silently and only
+// surface much later as "Energy cannot be nan", naming neither the turns nor the cause. The
+// arithmetic that converted it: the energy of a pair is 0.5*C*dV^2, and dV is EXACTLY zero between
+// corresponding turns of two parallels (they are the same electrical node, so the per-turn voltage
+// divider gives them identical potentials) -- so an infinite C became 0.5*inf*0 = NaN. That is why
+// the failure separated perfectly on numberParallels: with a single parallel no turn pair is ever
+// at identical potential, so the infinity stayed an infinity and never turned into a NaN.
+//
+// The infinity itself is real, not a rounding artefact: two BARE conductors whose surfaces are in
+// contact have no dielectric and no separation between them, and every model here diverges. That
+// is inconsistent input rather than something to approximate around, so report it where the
+// geometry is still in hand instead of fabricating a minimum gap.
+static void throw_if_capacitance_is_not_finite(double capacitance, Turn firstTurn, Wire firstWire,
+                                               Turn secondTurn, Wire secondWire) {
+    if (std::isfinite(capacitance)) {
+        return;
+    }
+    auto describeTurn = [](Turn turn) {
+        std::string description = turn.get_name();
+        auto coordinates = turn.get_coordinates();
+        return description + " at (" + std::to_string(coordinates[0]) + ", " + std::to_string(coordinates[1]) + ")";
+    };
+    double firstCoatingThickness = firstWire.get_coating_thickness();
+    double secondCoatingThickness = secondWire.get_coating_thickness();
+    double centerToCenterDistance = hypot(firstTurn.get_coordinates()[0] - secondTurn.get_coordinates()[0],
+                                          firstTurn.get_coordinates()[1] - secondTurn.get_coordinates()[1]);
+    // ABT #898: these two separations are NOT the same number, and saying so matters. This one
+    // subtracts the OUTER radii, so it is the gap between the outer surfaces; the message used to
+    // call it the conducting separation, and on a close-wound coil it therefore read "the
+    // conducting surfaces are 0.000000 m apart" while the copper was in fact a full coating
+    // thickness apart on each side. That sent the reader hunting for a winding-geometry fault when
+    // the actual defect was a wire declaring no insulation. Report both, each by its own name.
+    double outerSurfaceSeparation = centerToCenterDistance - firstWire.get_maximum_outer_width() / 2 -
+                                    secondWire.get_maximum_outer_width() / 2;
+    double conductingSurfaceSeparation = centerToCenterDistance - firstWire.get_maximum_conducting_width() / 2 -
+                                         secondWire.get_maximum_conducting_width() / 2;
+    std::string reason;
+    if (firstCoatingThickness <= 0 || secondCoatingThickness <= 0) {
+        reason = " The wires report zero coating thickness (" + std::to_string(firstCoatingThickness) + " m and " +
+                 std::to_string(secondCoatingThickness) +
+                 " m), so there is no dielectric between the conductors; give the wire its insulation"
+                 " (a coating thickness, or an outer diameter larger than the conducting diameter).";
+    }
+    throw NaNResultException("Turn-to-turn capacitance is " + std::to_string(capacitance) + " between " +
+                             describeTurn(firstTurn) + " and " + describeTurn(secondTurn) +
+                             ", whose outer surfaces are " + std::to_string(outerSurfaceSeparation) +
+                             " m apart and whose conducting surfaces are " +
+                             std::to_string(conductingSurfaceSeparation) + " m apart." + reason);
+}
+
+// ABT #406: report the ELECTRICAL fault, from the geometry, before any capacitance model runs.
+//
+// The condition is that the two CONDUCTORS touch. Coating thickness is what normally keeps them
+// apart: in a close-wound coil the OUTER surfaces are in contact by design, and the copper is
+// still separated by t1 + t2, which is perfectly valid. Take the coating away and the outer
+// surface IS the copper, so the same close-wound geometry puts bare metal against bare metal —
+// shorted turns.
+//
+// Testing the geometry rather than the resulting number matters for one case in particular: with
+// a single parallel the divergent capacitance never becomes a NaN (it takes two turns at
+// identical potential to form 0.5*inf*0), so it used to travel all the way into the exported
+// netlist without raising anything — a silently wrong answer rather than a crash. A geometric
+// test fires there too, and does not depend on which capacitance formula happens to diverge.
+//
+// Deliberately conservative: it also requires a missing coating. Turns whose coated conductors
+// merely overlap slightly through layout approximation are left to the existing non-finite guard,
+// so this cannot start rejecting coils that model fine today.
+static void throw_if_turns_are_shorted(Turn firstTurn, Wire firstWire, Turn secondTurn, Wire secondWire) {
+    // Wire::get_coating_thickness() now answers this correctly for litz (it reads the
+    // strand enamel, not the bundle serving), so the local special-case that used to live
+    // here is gone — one definition of "what insulates this conductor", not two.
+    double firstCoatingThickness = firstWire.get_coating_thickness();
+    double secondCoatingThickness = secondWire.get_coating_thickness();
+    if (firstCoatingThickness > 0 && secondCoatingThickness > 0) {
+        return;
+    }
+
+    auto isRoundLike = [](WireType type) {
+        return type == WireType::ROUND || type == WireType::LITZ;
+    };
+    double deltaX = firstTurn.get_coordinates()[0] - secondTurn.get_coordinates()[0];
+    double deltaY = firstTurn.get_coordinates()[1] - secondTurn.get_coordinates()[1];
+
+    // Gap between the CONDUCTING surfaces. Round-like pairs get the true centre-to-centre test;
+    // anything involving a flat wire gets the bounding-box test, whose axes are the ones its
+    // width and height are defined along (a circle test would be wrong for a strip).
+    double conductingSurfaceGap;
+    if (isRoundLike(firstWire.get_type()) && isRoundLike(secondWire.get_type())) {
+        conductingSurfaceGap = hypot(deltaX, deltaY) - firstWire.get_maximum_conducting_width() / 2 -
+                               secondWire.get_maximum_conducting_width() / 2;
+    }
+    else {
+        double gapAlongWidth = fabs(deltaX) - firstWire.get_maximum_conducting_width() / 2 -
+                               secondWire.get_maximum_conducting_width() / 2;
+        double gapAlongHeight = fabs(deltaY) - firstWire.get_maximum_conducting_height() / 2 -
+                                secondWire.get_maximum_conducting_height() / 2;
+        // Separated along EITHER axis is enough to keep them apart.
+        conductingSurfaceGap = std::max(gapAlongWidth, gapAlongHeight);
+    }
+
+    // Contact, not "gap > 0": turns laid exactly one conductor width apart come out of the
+    // winder with a gap of a few 1e-19 m (0.010997 - 0.010797 - 0.0002 in doubles), and a
+    // strict > 0 let that pair through to the models, which then diverged and surfaced as an
+    // anonymous non-finite capacitance instead of this message (seen on a 3-turn bare foil
+    // shield, ABT #853). One nanometre is far below any real dielectric and far above the
+    // rounding of millimetre-scale coordinates, so anything closer than that is touching.
+    constexpr double contactTolerance = 1e-9;
+    if (conductingSurfaceGap > contactTolerance) {
+        return;
+    }
+
+    auto describeTurn = [](Turn turn) {
+        auto coordinates = turn.get_coordinates();
+        return turn.get_name() + " at (" + std::to_string(coordinates[0]) + ", " +
+               std::to_string(coordinates[1]) + ")";
+    };
+    throw ShortedTurnsException(
+        "Turns " + describeTurn(firstTurn) + " and " + describeTurn(secondTurn) +
+        " are in electrical contact: their conducting surfaces are " +
+        std::to_string(conductingSurfaceGap) + " m apart and the wires report coating thicknesses of " +
+        std::to_string(firstCoatingThickness) + " m and " + std::to_string(secondCoatingThickness) +
+        " m, so there is no insulation between the conductors. This describes shorted turns, not a"
+        " capacitance to compute; give the wire its insulation (a coating thickness, or an outer"
+        " diameter larger than the conducting diameter).");
+}
+
 double StrayCapacitance::calculate_static_capacitance_between_two_turns(Turn firstTurn, Wire firstWire, Turn secondTurn, Wire secondWire, std::optional<Coil> coil) {
+    throw_if_turns_are_shorted(firstTurn, firstWire, secondTurn, secondWire);
+
     auto isFlatWire = [](WireType type) {
         return type == WireType::PLANAR || type == WireType::FOIL || type == WireType::RECTANGULAR;
     };
@@ -1285,16 +1516,19 @@ double StrayCapacitance::calculate_static_capacitance_between_two_turns(Turn fir
     if (isFlatWire(firstWire.get_type()) && isFlatWire(secondWire.get_type())) {
         // Both wires are flat: use parallel plate model
         StrayCapacitanceParallelPlateModel model;
+        _methodsUsed.insert(model.methodName);
         auto aux = model.preprocess_data_for_planar_wires(firstTurn, firstWire, secondTurn, secondWire);
         double averageTurnLength = aux[0];
         double overlappingDimension = aux[1];
         double distanceThroughLayers = aux[2];
         double relativePermittivityInsulationLayers = aux[3];
         double capacitance = model.calculate_static_capacitance_between_two_turns(overlappingDimension, averageTurnLength, distanceThroughLayers, relativePermittivityInsulationLayers);
+        throw_if_capacitance_is_not_finite(capacitance, firstTurn, firstWire, secondTurn, secondWire);
         return capacitance;
     }
     else if (isRoundLike(firstWire.get_type()) && isRoundLike(secondWire.get_type())) {
         // Both wires are round-like (ROUND or LITZ): use cylindrical wire model
+        _methodsUsed.insert(_model->methodName);
         auto aux = _model->preprocess_data_for_round_wires(firstTurn, firstWire, secondTurn, secondWire, coil);
         double wireCoatingThickness = aux[0];
         double averageTurnLength = aux[1];
@@ -1304,6 +1538,7 @@ double StrayCapacitance::calculate_static_capacitance_between_two_turns(Turn fir
         double relativePermittivityWireCoating = aux[5];
         double relativePermittivityInsulationLayers = aux[6];
         double capacitance = _model->calculate_static_capacitance_between_two_turns(wireCoatingThickness, averageTurnLength, conductingRadius, distanceThroughLayers, distanceThroughAir, relativePermittivityWireCoating, relativePermittivityInsulationLayers);
+        throw_if_capacitance_is_not_finite(capacitance, firstTurn, firstWire, secondTurn, secondWire);
         return capacitance;
     }
     else {
@@ -1316,6 +1551,7 @@ double StrayCapacitance::calculate_static_capacitance_between_two_turns(Turn fir
         double distanceThroughLayers = aux[2];
         double relativePermittivityInsulationLayers = aux[3];
         double capacitance = model.calculate_static_capacitance_between_two_turns(overlappingDimension, averageTurnLength, distanceThroughLayers, relativePermittivityInsulationLayers);
+        throw_if_capacitance_is_not_finite(capacitance, firstTurn, firstWire, secondTurn, secondWire);
         return capacitance;
     }
 }
@@ -1343,7 +1579,8 @@ static double turn_to_core_equivalent_radius(Wire wire) {
 double StrayCapacitance::calculate_turn_to_core_capacitance(double conductingRadius, double turnLength,
                                                             double wireCoatingThickness, double wireCoatingRelativePermittivity,
                                                             double airGapToCore,
-                                                            double coreCoatingThickness, double coreCoatingRelativePermittivity) {
+                                                            double coreCoatingThickness, double coreCoatingRelativePermittivity,
+                                                            double bobbinThickness, double bobbinRelativePermittivity) {
     // Capacitance of a turn to the equipotential ferrite core, after Kovacic et al.,
     // "Analytical Wideband Model of a Common-Mode Choke" (IEEE TPEL 2012), eqs (36)-(38).
     // The displacement field leaves the bare conductor surface and reaches the ferrite
@@ -1358,6 +1595,20 @@ double StrayCapacitance::calculate_turn_to_core_capacitance(double conductingRad
     // the wire-to-core air gap and the core coating thickness — the terms that set the real,
     // sub-pF turn-to-core value. The wire enamel is kept in the stack so the element stays
     // finite even at zero air gap and no core coating (close-wound, uncoated).
+    //
+    // ABT #848 (2026-08-23): the Kovacic construction above — radial field lines leaving the
+    // lower half of the conductor, each stretched by phi/sin(phi) — is an engineering
+    // approximation, and against the exact solution it is low by 1.3-2x for the geometries the
+    // WE chokes actually have (checked on 230 measured parts: 0.5-0.8x). The exact electrostatic
+    // solution for a conducting cylinder of radius r whose axis sits a height h above a
+    // conducting plane (image method, Smythe §4.13) is
+    //     C' = 2 pi eps0 / acosh(h / r)   per unit length,
+    // and it counts the whole circumference, not a half. The series dielectric layers between
+    // the copper and the ferrite — wire enamel, the wire-to-core air gap and the core coating or
+    // case — enter as their air-equivalent thickness t_i / eps_ri (exact in the parallel-plate
+    // limit t << r; for a thick case wall the result lies between the all-air and
+    // all-dielectric solutions, which is the right order). Same inputs, same bounded behaviour:
+    // finite at zero air gap (the enamel keeps h > r), monotone in the gap and the coating.
     if (conductingRadius <= 0 || turnLength <= 0) {
         return 0;
     }
@@ -1365,26 +1616,1101 @@ double StrayCapacitance::calculate_turn_to_core_capacitance(double conductingRad
     const double wireRadius = conductingRadius;  // contract: conductingRadius is the radius (Dc = 2*r)
     const double enamelTerm = wireCoatingRelativePermittivity > 0 ? wireCoatingThickness / wireCoatingRelativePermittivity : 0.0;
     const double coatingTerm = coreCoatingRelativePermittivity > 0 ? coreCoatingThickness / coreCoatingRelativePermittivity : 0.0;
-
-    const int steps = 400;
-    const double upper = std::numbers::pi / 2.0;
-    double integral = 0.0;
-    for (int k = 0; k <= steps; ++k) {
-        double phi = upper * k / steps;
-        double phiOverSin = phi < 1e-9 ? 1.0 : phi / std::sin(phi);
-        double airLength = phiOverSin * (airGapToCore + wireRadius * (1.0 - std::cos(phi)));
-        double denominator = enamelTerm + airLength + coatingTerm;
-        double integrand = denominator > 0 ? 1.0 / denominator : 0.0;
-        double weight = (k == 0 || k == steps) ? 0.5 : 1.0;  // trapezoidal
-        integral += weight * integrand;
+    // ABT #1164: the bobbin wall is plastic, not air — it enters the series stack as its
+    // air-equivalent thickness t/eps_r, exactly as the wire enamel and the core jacket do. A
+    // bobbin-less part (toroid, bare core) passes thickness 0 and contributes nothing.
+    if (bobbinThickness > 0 && !(bobbinRelativePermittivity > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "Turn-to-core capacitance was given a bobbin wall thickness with no relative"
+            " permittivity: the bobbin layer cannot enter the dielectric stack");
     }
-    integral *= upper / steps;   // dphi
-    integral *= 2.0;             // symmetric over [-pi/2, pi/2]
-
-    return vacuumPermittivity * turnLength * wireRadius * integral;
+    const double bobbinTerm = bobbinThickness > 0 ? bobbinThickness / bobbinRelativePermittivity : 0.0;
+    const double airEquivalentGap = enamelTerm + std::max(0.0, airGapToCore) + coatingTerm + bobbinTerm;
+    if (airEquivalentGap <= 0) {
+        // Bare copper on a bare conductor: the image solution diverges, and so does the physics
+        // — that is a short, which the callers' geometry guards report; never a number here.
+        throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA,
+            "Turn-to-core capacitance asked for a bare conductor in contact with the core (no wire"
+            " coating, no air gap, no core coating): that is a short circuit, not a capacitance");
+    }
+    const double heightOverRadius = 1.0 + airEquivalentGap / wireRadius;
+    return 2.0 * std::numbers::pi * vacuumPermittivity * turnLength / std::acosh(heightOverRadius);
 }
 
-double StrayCapacitance::calculate_winding_to_core_capacitance(Coil coil, Core core, std::string windingName) {
+double StrayCapacitance::core_image_factor(const Core& core, double frequency) {
+    // ABT #848: the floating-core network (turn -> core -> turn) treats the core as an
+    // EQUIPOTENTIAL ELECTRODE — a perfect image plane for every turn. That is exact for a
+    // conductor and, for AC fields, holds for any body whose complex permittivity dwarfs the
+    // dielectric between it and the turns: the field cannot penetrate it, and its surface
+    // polarisation charge follows the field like free charge would. A body whose permittivity
+    // is only a few times the surroundings images a line charge with the dielectric half-space
+    // fraction
+    //     beta = (|eps2| - eps1) / (|eps2| + eps1),
+    // with eps2 the core's COMPLEX relative permittivity at the frequency of interest,
+    //     eps2 = eps' - j eps'',   eps'' = eps''_dielectric + 1 / (omega eps0 rho),
+    // and eps1 the dielectric on the core surface (jacket, else air). MnZn at 1-100 MHz:
+    // |eps2| ~ 1e4-1e5 -> beta = 1.000; nanocrystalline ribbon (rho ~ 1e-6 Ohm.m): |eps2| ~ 1e10
+    // -> beta = 1; NiZn K07 at 10 MHz: eps' 15, conduction negligible -> beta ~ 0.9 bare,
+    // ~0.6 under an epoxy jacket. Every quantity is a MAS material property; nothing chosen.
+    //
+    // Measured (WE NiZn chokes, geometry right): the four K07 parts resonate at x1.20 of
+    // RedExpert with beta = 1, x1.08 with this fraction, and x3.3 with the network switched
+    // OFF — so a dielectric core IS an image plane to its turns (the displacement-based
+    // picture above), and gating the network on conduction alone, which had seemed the safer
+    // physics, is contradicted by the data. The fraction is what the measurements support.
+    //
+    // The external medium eps1 is the dielectric the core surface touches: its jacket when it
+    // has one (parylene/epoxy/nylon case), else air.
+    auto material = core.resolve_material();
+    double epsExternal = 1.0;
+    {
+        auto coating = core.get_functional_description().get_coating();
+        bool magneticShield = coating && std::holds_alternative<CoreCoating>(coating.value()) &&
+                              std::get<CoreCoating>(coating.value()).get_type() &&
+                              std::get<CoreCoating>(coating.value()).get_type().value() == CoatingType::MAGNETIC_EPOXY;
+        if (!magneticShield && core.get_coating_thickness() > 0) {
+            epsExternal = core.get_coating_relative_permittivity();
+        }
+    }
+    double omega = 2.0 * std::numbers::pi * frequency;
+    const double vacuumPermittivity = Constants().vacuumPermittivity;
+    double epsReal = 0.0, epsImag = 0.0;
+    bool haveData = false;
+    if (material.get_permittivity() && material.get_permittivity()->get_complex()) {
+        auto complexPermittivity = material.get_permittivity()->get_complex().value();
+        epsReal = interpolate_permittivity_points(complexPermittivity.get_real(), frequency);
+        epsImag = interpolate_permittivity_points(complexPermittivity.get_imaginary(), frequency);
+        haveData = epsReal > 0;
+    }
+    // Resistivity is optional on a core material since MAS b56fd13. A grade whose maker does
+    // not publish it simply falls through to the NO-DATA case documented below, which is the
+    // correct outcome here: this branch needs a resistivity to say anything at all.
+    else if (material.get_resistivity() && !material.get_resistivity()->empty() && frequency > 0) {
+        // Conduction only (metallic ribbon cores, or a ferrite whose permittivity the database
+        // does not carry but whose resistivity it does): eps'' = 1 / (omega eps0 rho).
+        //
+        // ABT #948: this branch knows eps'' and NOT eps', so it bounds |eps_core| FROM BELOW —
+        // |eps_core| = hypot(eps', eps'') >= eps''. Treating the unknown eps' as ZERO is not a
+        // neutral choice: it asserts the core is less polarisable than vacuum, which no material
+        // is (NiZn ferrites sit at eps' ~ 15-100, MnZn at 1e4-1e5). For a CONDUCTOR the lower
+        // bound is decisive — a nanocrystalline ribbon at rho ~ 1e-6 Ohm.m gives eps'' ~ 1e10, so
+        // beta = 1 whatever eps' is — which is the case this branch was written for. For an
+        // INSULATING grade it is not: rho = 1e6 Ohm.m gives eps'' ~ 2e-4 at 10 MHz, and the
+        // formula then returned beta = 0, silently deleting the entire floating-core term. That
+        // is what it did to the shipped Wurth catalogue: N5D/F5H/F6D/F4D/FB301 all carry
+        // resistivity >= 1e6 Ohm.m and no permittivity record, and the exported self-capacitance
+        // of IndPD/IndTPC/IndTI/IndLQS/IndLQFS did not move at all when the core term was wired
+        // in, while the low-resistivity grades (N2J 6.5, M6D 1e3) moved by 5-10x.
+        //
+        // So the branch is used only where it decides the question: when the conduction term
+        // alone already exceeds the external dielectric. Below that it establishes nothing about
+        // eps' and the state is the documented NO-DATA case handled below (the core is the
+        // electrode), not a measurement of "does not image". A grade whose real eps' matters is
+        // a grade whose permittivity belongs in MAS — that remains the proper fix, and the
+        // permittivity branch above uses it the moment it is there.
+        auto resistivity = material.get_resistivity().value()[0];
+        double rho = resistivity.get_value();
+        if (rho > 0) {
+            double conductionPermittivity = 1.0 / (omega * vacuumPermittivity * rho);
+            if (conductionPermittivity > epsExternal) {
+                epsImag = conductionPermittivity;
+                haveData = true;
+            }
+        }
+    }
+    if (!haveData) {
+        // No permittivity and no resistivity in the database: the model keeps its pre-#848
+        // meaning — the core is the electrode. (A ferrite with no data is not a reason to
+        // invent a permittivity; it is a reason to add it to MAS.)
+        return 1.0;
+    }
+    double epsCoreMagnitude = std::hypot(epsReal, epsImag);
+    double beta = (epsCoreMagnitude - epsExternal) / (epsCoreMagnitude + epsExternal);
+    return std::clamp(beta, 0.0, 1.0);
+}
+
+// One bounding core face as seen by one turn: how much AIR and how much BOBBIN PLASTIC lie
+// between the turn's insulation surface and the ferrite. They are separate members because they
+// are separate layers of the series dielectric stack — air enters at its own thickness, plastic
+// at t/eps_r (ABT #1164).
+struct TurnToCoreFace {
+    double airGap;
+    double bobbinThickness;
+    // The share of the turn's length that faces this surface. 1 for a bobbin-wound turn, whose
+    // whole length faces each flange and the column (a drum turn is a circle at fixed height).
+    // A toroid turn ENCIRCLES the ring cross-section, so its length is split between the bore,
+    // the outer surface and the two flat faces (ABT #1163, ring-turn segments).
+    double lengthFraction;
+};
+
+// ABT #1164: the bobbin plastic between the winding and the ferrite is a DIELECTRIC, not air.
+// turn_to_core_air_gaps used to hand its thickness back inside the air gap ("counted as air ...
+// the conservative side"), which is not conservative but wrong by a factor: the series stack
+// wants t/eps_r, and catalogue bobbins run eps_r 3.6-5.0, so every bobbin-wound winding-to-core
+// term came out several times too LOW.
+//
+// Mirrors resolve_core_jacket above: resolve the permittivity from the record, never invent one.
+// The material is only ever asked for when there IS plastic in the path (column/wall thickness
+// > 0), so a toroid's virtual bobbin (both thicknesses 0) never reaches here. A declared material
+// that the insulation database does not know is MISSING_DATA naming it — never silently air.
+// MKF resolves insulation materials by exact name only.
+//
+// A bobbin with real wall thickness but NO declared material resolves to
+// Defaults().defaultBobbinMaterial ("PET", src/Defaults.h:70) - the single project-wide answer
+// for an undeclared bobbin plastic, already used by Temperature.cpp:253 for the same question.
+// Counting that plastic as air instead is the very error ABT #1164 fixes, and the plastic is
+// certainly there, so a default is better than air. Two caveats a reader must have (Alf's
+// ruling, 2026-09-12, which chose this over throwing):
+//
+//   * PET is recorded at eps_r 3.0, the LOWEST of the eight bobbin plastics in the database -
+//     the others run 3.6 to 5.0 (PBT 3.6, PA66 4.0, Zen.6130L 4.0, PPS 4.2, SKYT.5220FR 4.7,
+//     A3X2G10 5.0, x2g5 5.0). So this default systematically UNDER-states the very term this
+//     ticket exists to raise. That is the conservative direction for the fix but the WRONG
+//     direction for design safety: a real PA66 bobbin's winding-to-core capacitance is reported
+//     low here, and its self-resonance correspondingly high.
+//   * It applies to 116 of the 504 catalogue bobbins (23%) - those whose record declares no
+//     material at all - plus every bobbin MKF synthesises itself (Bobbin::create_quick_bobbin
+//     sets 1 mm walls and no functional description). The declared ones are PA66 176,
+//     SKYT.5220FR 131, PET 42, PPS 14, A3X2G10 13, PBT 8, Zen.6130L 2, x2g5 2.
+//
+// The fix for both is DATA, not code: declare the material on those 116 bobbin records.
+static double resolve_bobbin_wall_relative_permittivity(Bobbin& bobbin) {
+    std::string materialName = Defaults().defaultBobbinMaterial;
+    auto functionalDescription = bobbin.get_functional_description();
+    if (functionalDescription) {
+        auto material = functionalDescription->get_material();
+        if (material) {
+            if (std::holds_alternative<MAS::InsulationMaterial>(material.value())) {
+                OpenMagnetics::InsulationMaterial resolved(std::get<MAS::InsulationMaterial>(material.value()));
+                if (!resolved.get_relative_permittivity()) {
+                    throw InvalidInputException(ErrorCode::MISSING_DATA,
+                        "Bobbin material '" + resolved.get_name() + "' carries no relative permittivity:"
+                        " the bobbin wall cannot enter the turn-to-core dielectric stack");
+                }
+                return resolved.get_relative_permittivity().value();
+            }
+            materialName = std::get<std::string>(material.value());
+        }
+    }
+    auto insulationMaterial = find_insulation_material_by_name(materialName);
+    if (!insulationMaterial.get_relative_permittivity()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA,
+            "Bobbin material '" + materialName + "' carries no relative permittivity in the database:"
+            " the bobbin wall cannot enter the turn-to-core dielectric stack");
+    }
+    return insulationMaterial.get_relative_permittivity().value();
+}
+
+// The turn's OUTER (insulation) half-extents, from the wound geometry. Every turn the winder
+// produces carries them; a turn without them cannot be placed against a core face at all, and
+// per the no-fallbacks rule that is an error rather than an assumed size.
+static std::pair<double, double> turn_outer_half_extents(const Turn& turn) {
+    if (!turn.get_dimensions()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA,
+            "Turn '" + turn.get_name() + "' has no dimensions: its line of sight to the core"
+            " faces cannot be established");
+    }
+    auto dimensions = turn.get_dimensions().value();
+    if (dimensions.size() < 2) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA,
+            "Turn '" + turn.get_name() + "' has fewer than two dimensions: its line of sight to"
+            " the core faces cannot be established");
+    }
+    return {dimensions[0] / 2, dimensions[1] / 2};
+}
+
+// ABT #848: the air gap between a turn's conductor surface and the core surface it faces, from
+// the coil's real geometry instead of "close-wound, 0". Toroid (round window): the first layer
+// sits on the (jacketed) core, a deeper layer sits on the layer below it, so the gap is how far
+// the turn's radial position lies inside the bore surface. Bobbin-wound (rectangular window):
+// the turn is separated from the central ferrite column by the bobbin wall and any inner
+// layers, i.e. by its distance from the ferrite column surface.
+//
+// ABT #1164: the bobbin plastic in that path (column_thickness radially, wall_thickness axially)
+// is returned SEPARATELY from the air, so the caller can put it in the stack as t/eps_r. It used
+// to be handed back as air, which under-stated every bobbin-wound term by the acosh ratio of the
+// two stacks (about 1.7-2x for a 1 mm wall at eps_r 4 under a 0.5 mm wire).
+//
+// ABT #1163: only the turn immediately adjacent to a given core face contributes against it.
+// Outer layers are electrostatically SCREENED by the inner one (Biela/Kolar review; Massarini):
+// their field toward the core terminates on the inner-layer turns, which the model already
+// counts as turn-to-turn energy, so charging them against the core as well is a double count.
+// It is not a small one — 2*pi*eps0/acosh(h/r) decays only logarithmically, so a layer-2 turn
+// still carried ~14% of a layer-1 turn and a layer-3 turn ~11%, and the error grew with layer
+// count and with turns per layer (every turn of a stack was charged against the top flange, not
+// just the topmost). The test below is exactly that statement geometrically: a face is returned
+// only when no other turn lies between this turn and it, per face, so a turn can be screened
+// radially and still face a flange.
+//
+// A bare conductor at zero gap is then only ever asked for when it really is in contact, and
+// calculate_turn_to_core_capacitance refuses it as the short it is.
+static std::vector<TurnToCoreFace> turn_to_core_air_gaps(Coil& coil, const Core& core, const Turn& turn, Wire wire,
+                                                         const std::vector<Turn>& allTurns) {
+    auto bobbin = coil.resolve_bobbin();
+    if (!bobbin.get_processed_description()) {
+        return {{0.0, 0.0, 1.0}};
+    }
+    auto processed = bobbin.get_processed_description().value();
+    auto windows = processed.get_winding_windows();
+    if (windows.empty()) {
+        return {{0.0, 0.0, 1.0}};
+    }
+    auto coordinates = turn.get_coordinates();
+    auto [turnHalfWidth, turnHalfHeight] = turn_outer_half_extents(turn);
+
+    if (bobbin.get_winding_window_shape() == WindingWindowShape::ROUND) {
+        // Bore radius of the surface the first layer rests on; the turn's radius from the axis.
+        //
+        // ABT #964: measured from the turn's INSULATION surface, as the rectangular branch below
+        // is. What this function returns is the AIR in the series stack, and
+        // calculate_turn_to_core_capacitance adds the wire coating separately as t/eps_r.
+        // Measuring from the CONDUCTING surface hands the enamel back a second time, as if it
+        // were air: a turn resting on the bore reports a gap of one enamel thickness instead of
+        // zero, so its air-equivalent stack becomes t/eps + t rather than t/eps -- a factor of
+        // (1 + eps_r), which is 4,5x for enamel. It is a geometry error on its face: the same turn,
+        // in the same place, must report the same gap whichever window it sits in, and ABT #948
+        // recorded it as the remaining inconsistency after correcting the rectangular branch.
+        //
+        // CAUTION, because this branch is NOT unvalidated: the 107 measured WE common-mode chokes
+        // of ABT #848 are toroids, so they were fitted with this form -- and with the powder-core
+        // coating thickness that ABT #964 has now replaced for ferrite. Those two errors push the
+        // series gap in OPPOSITE directions (the enamel double-count widened it, the too-thin
+        // jacket narrowed it), so the corpus was matched with both present and neither can be
+        // corrected alone without moving it. Both are corrected together here. The only toroid
+        // reference in the suite, Test_Impedance_0, lands at +24,6% against its 1,400 MHz with
+        // both applied, against +27,0% with the jacket alone -- but that is ONE part, and the
+        // 107-choke corpus has not been re-measured since. Re-measure it before trusting toroid
+        // capacitance to better than that band.
+        //
+        // A toroid's bobbin is virtual (column and wall thickness 0, BobbinTDataProcessor), so
+        // there is no plastic layer on this face — the bobbin term is 0 here by geometry, not by
+        // assumption.
+        if (!windows[0].get_radial_height()) {
+            return {{0.0, 0.0, 1.0}};
+        }
+        double boreRadius = windows[0].get_radial_height().value();
+        double turnRadius = std::hypot(coordinates[0], coordinates.size() > 1 ? coordinates[1] : 0.0);
+        double turnInsulationRadius = wire.get_maximum_outer_width() / 2;
+
+        // ABT #1163, ring-turn segments. A toroid turn ENCIRCLES the ring cross-section: up the
+        // bore, across the top face, down the outer surface and back under the bottom face. This
+        // branch used to charge the turn's whole length against the bore alone, which is only
+        // harmless while nothing is screened. With screening it is wrong in a specific way: the
+        // bore is the CROWDED part of a toroid (its circumference is roughly half the outer one),
+        // so that is where layers form, and a turn in the second bore layer lost its entire core
+        // term -- while along its outer and flat runs, where there is room, it is typically still
+        // lying on the ferrite and screened by nothing. Measured on the 280 wound WE chokes of
+        // the corpus: a median 35% of turns are screened at the bore and 0% on the outside.
+        //
+        // The ring is fully determined by the core shape's A (outer diameter), B (inner diameter)
+        // and C (height), so the split is geometry, not a chosen parameter. Of the encircling path
+        // P = 2C + (A - B), the bore run takes C/P, the outer run C/P, and the top and bottom runs
+        // (A - B)/2P each. The shares only redistribute turn.get_length(); they never change it.
+        auto shape = core.resolve_shape();
+        if (!shape.get_dimensions()) {
+            throw InvalidInputException(ErrorCode::MISSING_DATA,
+                "Toroidal core shape has no dimensions: the ring cross-section a turn encircles cannot"
+                " be resolved, so its turn-to-core capacitance cannot be split between the ring faces");
+        }
+        auto ringDimensions = flatten_dimensions(shape.get_dimensions().value());
+        for (const std::string key : {"A", "B", "C"}) {
+            if (!ringDimensions.count(key)) {
+                throw InvalidInputException(ErrorCode::MISSING_DATA,
+                    "Toroidal core shape has no dimension " + key + ": the ring cross-section a turn"
+                    " encircles cannot be resolved");
+            }
+        }
+        double ringOuterDiameter = ringDimensions.at("A");
+        double ringInnerDiameter = ringDimensions.at("B");
+        double ringHeight = ringDimensions.at("C");
+        if (!(ringOuterDiameter > ringInnerDiameter) || !(ringHeight > 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "Toroidal core shape has A <= B or C <= 0: it has no ring cross-section for a turn to"
+                " encircle");
+        }
+        double encirclingPath = 2 * ringHeight + (ringOuterDiameter - ringInnerDiameter);
+        double boreShare = ringHeight / encirclingPath;
+        double outerShare = ringHeight / encirclingPath;
+        // Half of ONE flat run (see the trapezoid below).
+        double flatRunHalfShare = (ringOuterDiameter - ringInnerDiameter) / 4.0 / encirclingPath;
+
+        // The outer crossing is the turn's wound position outside the ring. Every toroid the winder
+        // produces records one, EXCEPT the last station of a conductor (ABT #685: its exit terminal
+        // ascends axially instead of crossing to a next station, so it has none by design). A turn
+        // without one that ISN'T that last station cannot be placed against the outer surface, and
+        // that is missing data rather than an assumption -- see the otherTurn loop below for the
+        // last-station case (ABT #1353), which is expected and excluded rather than thrown on.
+        // ABT #1353: the last station of a conductor has no recorded outer crossing by design
+        // (Coil::wind_toroidal_additional_turns, ABT #685: its exit terminal ascends axially instead
+        // of crossing to a next station). Rather than invent a position for it, this turn's own outer
+        // surface, top-outer-half and bottom-outer-half faces are omitted entirely below -- exactly
+        // the treatment a turn that IS screened from outside already gets, since either way nothing
+        // should be charged against a face this turn has no known presence at (owner decision,
+        // 2026-09-24: no positional guess, only the recorded winder geometry).
+        auto turnAdditionalCoordinates = turn.get_additional_coordinates();
+        bool turnHasOuterCrossing = turnAdditionalCoordinates && !turnAdditionalCoordinates->empty() &&
+                                     turnAdditionalCoordinates->at(0).size() >= 2;
+        double outerCrossingRadius = 0.0;
+        double outerCrossingAngle = 0.0;
+        if (turnHasOuterCrossing) {
+            const auto& outerCrossing = turnAdditionalCoordinates->at(0);
+            outerCrossingRadius = std::hypot(outerCrossing[0], outerCrossing[1]);
+            outerCrossingAngle = std::atan2(outerCrossing[1], outerCrossing[0]);
+        }
+
+        // The outer ferrite surface, in the SAME datum as the bore. boreRadius is the winding
+        // window's radial height, which is B/2 for a bare ring and B/2 minus the case for a cased
+        // one; the case is a uniform jacket, so it offsets the outer surface by the same amount.
+        // Validated on the wound corpus rather than assumed: the first-layer outer gap this gives
+        // is 0.0000 wire diameters from p1 to p99 on bare rings and p10 to p99 on cased ones. Both
+        // alternatives fail on real records: A/2 ignores the case (cased median +1.12 diameters),
+        // and radial height + 2*column_width inherits the half/full-width ambiguity of
+        // column_width that ABT #948 found (bare-ring p10 -3.0 diameters).
+        double outerSurfaceRadius = ringOuterDiameter / 2 + (ringInnerDiameter / 2 - boreRadius);
+        double boreGap = std::max(0.0, (boreRadius - turnInsulationRadius) - turnRadius);
+        double outerGap = turnHasOuterCrossing
+            ? std::max(0.0, (outerCrossingRadius - turnInsulationRadius) - outerSurfaceRadius)
+            : 0.0;
+
+        // Screening, at each crossing on its own. At the bore "closer to the core" means a LARGER
+        // radius from the axis; outside the ring it means a SMALLER one. Another turn screens this
+        // one at a crossing when it lies entirely nearer that surface AND blocks the line of sight,
+        // i.e. their separation measured as an arc at the screening turn's radius is under the two
+        // half-widths together -- the polar form of the rectangular branch's overlap test.
+        double turnAngle = std::atan2(coordinates.size() > 1 ? coordinates[1] : 0.0, coordinates[0]);
+        double turnOuterRadius = std::max(turnHalfWidth, turnHalfHeight);
+        bool screenedFromBore = false;
+        // No recorded outer crossing -> no known presence on the outer surface -> nothing is ever
+        // charged against it below, same as if some other turn were found screening it.
+        bool screenedFromOutside = !turnHasOuterCrossing;
+        for (const auto& otherTurn : allTurns) {
+            if (screenedFromBore && screenedFromOutside) {
+                break;
+            }
+            if (otherTurn.get_name() == turn.get_name()) {
+                continue;
+            }
+            auto [otherHalfWidth, otherHalfHeight] = turn_outer_half_extents(otherTurn);
+            double otherOuterRadius = std::max(otherHalfWidth, otherHalfHeight);
+            if (!screenedFromBore) {
+                auto otherCoordinates = otherTurn.get_coordinates();
+                double otherRadius = std::hypot(otherCoordinates[0], otherCoordinates.size() > 1 ? otherCoordinates[1] : 0.0);
+                if (otherRadius - otherOuterRadius >= turnRadius + turnOuterRadius) {
+                    double otherAngle = std::atan2(otherCoordinates.size() > 1 ? otherCoordinates[1] : 0.0, otherCoordinates[0]);
+                    double angleDifference = std::abs(std::remainder(otherAngle - turnAngle, 2 * std::numbers::pi));
+                    if (otherRadius * angleDifference < otherOuterRadius + turnOuterRadius) {
+                        screenedFromBore = true;
+                    }
+                }
+            }
+            if (!screenedFromOutside) {
+                auto otherAdditionalCoordinates = otherTurn.get_additional_coordinates();
+                // ABT #1353: the last station of a conductor is DELIBERATELY left without an outer
+                // crossing (Coil::wind_toroidal_additional_turns, ABT #685) -- its exit terminal
+                // ascends axially instead of crossing to a next station, so no such position exists
+                // to record. That is a known, name-stable state, not missing data: a station with no
+                // presence recorded on the outer surface cannot screen ANYTHING from outside it, so
+                // it is simply excluded from this turn's outside-screening search rather than an error.
+                if (!otherAdditionalCoordinates || otherAdditionalCoordinates->empty() || otherAdditionalCoordinates->at(0).size() < 2) {
+                    continue;
+                }
+                const auto& otherOuterCrossing = otherAdditionalCoordinates->at(0);
+                double otherOuterCrossingRadius = std::hypot(otherOuterCrossing[0], otherOuterCrossing[1]);
+                if (otherOuterCrossingRadius + otherOuterRadius <= outerCrossingRadius - turnOuterRadius) {
+                    double otherAngle = std::atan2(otherOuterCrossing[1], otherOuterCrossing[0]);
+                    double angleDifference = std::abs(std::remainder(otherAngle - outerCrossingAngle, 2 * std::numbers::pi));
+                    if (otherOuterCrossingRadius * angleDifference < otherOuterRadius + turnOuterRadius) {
+                        screenedFromOutside = true;
+                    }
+                }
+            }
+        }
+
+        // The four faces. The bore and outer runs sit at their crossing's standoff. A flat run
+        // joins the two crossings, so its standoff and its screening change along it and neither
+        // crossing describes all of it; the model knows the two ENDS, so each flat run is
+        // integrated by the trapezoid rule -- half its length at the inner crossing's standoff and
+        // screening, half at the outer crossing's. The top and bottom runs are identical here
+        // because the wound description is two-dimensional and carries no axial asymmetry.
+        std::vector<TurnToCoreFace> faces;
+        if (!screenedFromBore) {
+            faces.push_back({boreGap, 0.0, boreShare});           // bore
+            faces.push_back({boreGap, 0.0, flatRunHalfShare});    // top face, inner half
+            faces.push_back({boreGap, 0.0, flatRunHalfShare});    // bottom face, inner half
+        }
+        if (!screenedFromOutside) {
+            faces.push_back({outerGap, 0.0, outerShare});         // outer surface
+            faces.push_back({outerGap, 0.0, flatRunHalfShare});   // top face, outer half
+            faces.push_back({outerGap, 0.0, flatRunHalfShare});   // bottom face, outer half
+        }
+        return faces;
+    }
+    // Rectangular window: the ferrite column surface sits one bobbin wall inside the radial
+    // INNER EDGE OF THE WINDING WINDOW, and the turn's conductor surface at |x| - r.
+    //
+    // ABT #948: the datum used to be column_width - column_thickness. Both are meant to name the
+    // same place (Bobbin.cpp sets column_width = column half-width + wall, so window inner edge
+    // == column_width for a bobbin MKF builds itself), but column_width is a HALF-width while
+    // nothing in the record forces a supplied bobbin to honour that, and catalogue bobbins reach
+    // this code carrying the column's full width there. When they do, the "ferrite surface" lands
+    // outside the whole winding window, every turn's gap goes negative, and the clamp below hands
+    // back 0 for ALL of them -- so an outer layer, a full wire diameter away from the ferrite, is
+    // told it is touching, and its turn-to-core element is inflated by the ratio of acosh terms
+    // (several-fold). Measured on the shipped Wurth catalogue: the multi-layer drum families were
+    // the ones that overshot after the core term was wired in, while single-layer families landed.
+    // The winding window's inner edge is the datum the WINDER itself places turns against, so
+    // deriving the ferrite surface from it cannot disagree with the turn coordinates. It is
+    // identical to the old expression for every bobbin MKF generates.
+    //
+    // ABT #948, second correction in this branch: the gap returned here is the AIR in the stack,
+    // and calculate_turn_to_core_capacitance adds the wire coating to it as a separate series
+    // layer (t_coating / eps_coating). Measuring from the CONDUCTING surface therefore hands back
+    // the coating a second time, as if it were air: a turn resting on the ferrite reports a gap
+    // of one coating thickness instead of zero, and its air-equivalent stack becomes
+    // t/eps + t instead of t/eps -- a factor of (1 + eps) too thick, which for enamel is 4.5x and
+    // cost a factor of ~2 in the element. The insulation surface is the right boundary: outside
+    // it is air, inside it is the coating the callee already accounts for.
+    //
+    // The ROUND (toroid) branch above still measures from the conducting surface. That is not an
+    // oversight: its form is what the 107 measured WE common-mode chokes of ABT #848 were
+    // validated against, no toroid measurement is in scope here, and correcting a term in a
+    // branch this corpus cannot re-measure would be an unverified change. It is recorded in
+    // ABT #948 as the remaining inconsistency.
+    if (!windows[0].get_coordinates() || !windows[0].get_width()) {
+        return {{0.0, 0.0, 1.0}};
+    }
+    double windowInnerEdge = windows[0].get_coordinates().value()[0] - windows[0].get_width().value() / 2;
+    double turnInsulationSurface = std::abs(coordinates[0]) - wire.get_maximum_outer_width() / 2;
+    // ABT #1164: the plastic column wall is between the window's inner edge and the ferrite, and
+    // the air is whatever the turn stands off the window edge by. Their sum is the gap the old
+    // code returned; only the split is new.
+    double columnThickness = processed.get_column_thickness();
+    std::vector<TurnToCoreFace> faces;
+
+    // ABT #1163, radial-inner face: another turn screens this one when it lies entirely closer
+    // to the column (smaller |x|) and overlaps it axially, so it stands in the line of sight.
+    bool screenedRadially = false;
+    for (const auto& otherTurn : allTurns) {
+        if (otherTurn.get_name() == turn.get_name()) {
+            continue;
+        }
+        auto otherCoordinates = otherTurn.get_coordinates();
+        auto [otherHalfWidth, otherHalfHeight] = turn_outer_half_extents(otherTurn);
+        if (std::abs(otherCoordinates[0]) + otherHalfWidth > std::abs(coordinates[0]) - turnHalfWidth) {
+            continue;  // not inside this turn radially
+        }
+        if (std::abs(otherCoordinates[1] - coordinates[1]) < otherHalfHeight + turnHalfHeight) {
+            screenedRadially = true;
+            break;
+        }
+    }
+    if (!screenedRadially) {
+        faces.push_back({std::max(0.0, turnInsulationSurface - windowInnerEdge), columnThickness, 1.0});
+    }
+
+    // ABT #948, third correction: a turn faces the core on more than one side. A winding WINDOW
+    // is by definition the space the core encloses, and for a rectangular one the two AXIAL
+    // boundaries are core as surely as the radial-inner one is — the yoke of an E/EI/PQ/RM/pot
+    // core, the two flanges of a drum. The model counted only the central column, so every turn
+    // was missing the two nearest large ferrite surfaces above and below it, and the whole
+    // floating-core term came out low by the ratio of what was counted to what is there.
+    // Measured on the shipped Wurth catalogue with the real wound coordinates: summing the two
+    // axial faces multiplies the per-turn element by 1.3-1.8x across the drum families, and the
+    // deficit it closes is uniform in turn count (0.45-0.56 of measurement from N=1 to N=50),
+    // which is the signature of a missing SURFACE rather than a mis-scaled one.
+    //
+    // Each face is its own cylinder-over-plane element and they charge the same floating core
+    // node in parallel, so the caller sums them. The turn's full length faces each of them (a
+    // drum turn is a circle at a fixed axial height, so all of it sits at the same distance from
+    // a flange) — the same approximation the radial face already makes.
+    //
+    // wall_thickness is the bobbin plastic between the winding and the yoke, the axial
+    // counterpart of column_thickness, and enters the stack as t/eps_r exactly as
+    // column_thickness does (ABT #1164).
+    //
+    // ABT #1163: and exactly as on the radial face, only the turn adjacent to each flange faces
+    // it — the turns below the topmost one are screened from the upper yoke by it, and their
+    // field toward it terminates on that turn as turn-to-turn energy the model already has.
+    //
+    // NOT included, and recorded in ABT #948 as the remaining known face: the OUTER radial
+    // boundary. It is ferrite for a closed core (a shielded drum's ring, an E core's outer leg)
+    // and air for an open one, and nothing in the bobbin record distinguishes the two — the
+    // processed description carries a column_thickness and a wall_thickness but no outer wall.
+    // Inventing which one it is would be exactly the fabricated input this work refuses. The
+    // shielded families sitting lowest against measurement is the evidence that it is real.
+    if (windows[0].get_height() && windows[0].get_coordinates().value().size() > 1) {
+        double windowCentreY = windows[0].get_coordinates().value()[1];
+        double windowHalfHeight = windows[0].get_height().value() / 2;
+        double wallThickness = processed.get_wall_thickness();
+        double windowUpperEdge = windowCentreY + windowHalfHeight;
+        double windowLowerEdge = windowCentreY - windowHalfHeight;
+
+        bool screenedAbove = false;
+        bool screenedBelow = false;
+        for (const auto& otherTurn : allTurns) {
+            if (otherTurn.get_name() == turn.get_name()) {
+                continue;
+            }
+            auto otherCoordinates = otherTurn.get_coordinates();
+            auto [otherHalfWidth, otherHalfHeight] = turn_outer_half_extents(otherTurn);
+            if (std::abs(otherCoordinates[0] - coordinates[0]) >= otherHalfWidth + turnHalfWidth) {
+                continue;  // no radial overlap: it stands beside this turn, not between it and a yoke
+            }
+            if (otherCoordinates[1] - otherHalfHeight >= coordinates[1] + turnHalfHeight) {
+                screenedAbove = true;
+            }
+            if (otherCoordinates[1] + otherHalfHeight <= coordinates[1] - turnHalfHeight) {
+                screenedBelow = true;
+            }
+        }
+        if (!screenedAbove) {
+            faces.push_back({std::max(0.0, windowUpperEdge - (coordinates[1] + turnHalfHeight)), wallThickness, 1.0});
+        }
+        if (!screenedBelow) {
+            faces.push_back({std::max(0.0, (coordinates[1] - turnHalfHeight) - windowLowerEdge), wallThickness, 1.0});
+        }
+    }
+    return faces;
+}
+
+// One turn's total capacitance to the floating core: the parallel sum of its element against
+// every core surface bounding its winding window that it is not screened from by another turn
+// (ABT #948, ABT #1163). Shared by the three callers so the self, inter-winding and whole-winding
+// paths cannot drift apart on which faces they count.
+static double turn_to_core_element(Coil& coil, const Core& core, const Turn& turn, Wire wire,
+                                   double coreCoatingThickness, double coreCoatingRelativePermittivity,
+                                   const std::vector<Turn>& allTurns) {
+    double conductingRadius = turn_to_core_equivalent_radius(wire);
+    double wireCoatingThickness = wire.get_coating_thickness();
+    double wireCoatingRelativePermittivity = get_wire_insulation_relative_permittivity(wire);
+    auto faces = turn_to_core_air_gaps(coil, core, turn, wire, allTurns);
+    // ABT #1164: resolve the bobbin plastic's permittivity once per turn, and only when there is
+    // plastic in some face's path — a toroid's virtual bobbin never asks the database for one.
+    bool hasBobbinLayer = false;
+    for (const auto& face : faces) {
+        if (face.bobbinThickness > 0) {
+            hasBobbinLayer = true;
+            break;
+        }
+    }
+    double bobbinRelativePermittivity = 1.0;
+    if (hasBobbinLayer) {
+        auto bobbin = coil.resolve_bobbin();
+        bobbinRelativePermittivity = resolve_bobbin_wall_relative_permittivity(bobbin);
+    }
+    double element = 0;
+    for (const auto& face : faces) {
+        element += StrayCapacitance::calculate_turn_to_core_capacitance(
+            conductingRadius, turn.get_length() * face.lengthFraction,
+            wireCoatingThickness, wireCoatingRelativePermittivity,
+            face.airGap, coreCoatingThickness, coreCoatingRelativePermittivity,
+            face.bobbinThickness, bobbinRelativePermittivity);
+    }
+    return element;
+}
+
+// Every turn's turn-to-core element, image factor included, indexed like the turns description.
+// The elements are GEOMETRY (and frequency, through the image factor) and depend on nothing else --
+// not on the per-turn potentials, and in particular not on the V3 offset the orchestration loop
+// converges. So they are built once per capacitance call and the energy functions below only
+// re-weight them. Each element is exactly the expression the energy functions used to evaluate
+// inline, visited in the same turn order, so every sum built on them is bit-identical to computing
+// them in place: this is a hoist, not an approximation.
+static std::vector<double> turn_to_core_elements(Coil& coil, const Core& core, std::optional<double> frequency) {
+    if (!coil.get_turns_description()) {
+        coil.wind();
+    }
+    auto turns = coil.get_turns_description().value();
+    auto wirePerWinding = coil.get_wires();
+    auto [coreCoatingThickness, coreCoatingRelativePermittivity] = resolve_core_jacket(core);
+    double imageFactor = frequency ? StrayCapacitance::core_image_factor(core, frequency.value()) : 1.0;
+
+    std::vector<double> elements;
+    elements.reserve(turns.size());
+    for (auto& turn : turns) {
+        auto wire = wirePerWinding[coil.get_winding_index_by_name(turn.get_winding())];
+        elements.push_back(imageFactor * turn_to_core_element(
+            coil, core, turn, wire, coreCoatingThickness, coreCoatingRelativePermittivity, turns));
+    }
+    return elements;
+}
+
+// ONE winding against the core, re-weighting precomputed elements
+// (the physics is documented on StrayCapacitance::calculate_winding_to_core_self_energy).
+// ===================== ABT #1166 BEGIN (air gap in the through-core path) =====================
+// Self-contained: the classification and the gap element live here, and the only thing
+// calculate_through_core_capacitance does with them is one call before its per-turn loop and one
+// branch after it (both under an ABT #1166 banner there).
+
+// Fringing on a gap between two ferrite faces, as a multiplier on the parallel-plate eps0*A/g.
+//
+// A gap of length g between two faces of area A and perimeter P stores more than eps0*A/g: the
+// field spills outside the footprint. Palmer's edge correction adds an effective rim of width
+//     d = (g/pi) * (1 + ln(2*pi*a/g)),   a = a representative face half-dimension,
+// i.e. a relative excess P*d/A. Worked on an ETD49 centre post (round, r = 8.1 mm,
+// A = 2.06 cm^2, P = 50.9 mm) that is +10% at g = 0.2 mm, +22% at 0.5 mm, +42% at 1 mm and
+// +67% at 2 mm. The correction is therefore strongly gap-dependent and a single constant can
+// only be right in the middle of the range; 1.30 is the value at g ~ 0.7 mm, the gap an offline
+// flyback of this size actually runs, and it sits inside the 20-50% band the design note quotes.
+// It is deliberately a NAMED CONSTANT and an explicit argument to gap_capacitance rather than a
+// number buried in the formula, so a future gap-shape-aware correction replaces it in one place.
+// Note the design note's own worked table (19 pF at 0.2 mm on A = 4.2 cm^2) carries NO fringing,
+// so these results sit ~30% above it in Cgap and ~10-20% above it in the series total; the
+// TREND -- and the series behaviour, which is what the note is demonstrating -- is identical.
+static constexpr double kGapFringingFactor = 1.30;
+
+// A gap whose two faces lie within this multiple of the gap length of a common plane counts as
+// being IN that plane. Two core halves mating on one surface have all their gaps at the same
+// axial height by construction; anything further apart is not a clean two-body split and is left
+// on the historical single-node model rather than guessed at.
+static constexpr double kGapPlaneToleranceInGapLengths = 1.0;
+
+// Relative permittivity of whatever fills the gap, from the core's own record.
+//
+// The GAP record (MAS core/gap.json) carries no filler field -- but the spacer does not live on
+// the gap, it is a GEOMETRICAL ELEMENT of the core: core.json's geometricalDescription items are a
+// oneOf of core/piece.json OR core/spacer.json, and core/spacer.json REQUIRES insulationMaterial,
+// an InsulationMaterialDataOrNameUnion resolving (by record or by name, through
+// find_insulation_material_by_name) into data/insulation_materials.ndjson, which carries
+// relativePermittivity. So a properly recorded spacer-gapped core states its dielectric, and that
+// is what is used here. A solid spacer at eps_r 3-4 multiplies Cgap by that and gives most of the
+// ungapped inter-winding capacitance back, so this is not a detail: reading it wrong is a 3-4x
+// error on the term.
+//
+// WHETHER the gap has a filler at all is decided by the GAP TYPE in the functional description, not
+// by whether a geometrical description happens to have been built:
+//   - SUBTRACTIVE (ground) gaps only -> 1.0, air. Correct by construction: a ground gap is material
+//     removed from the core and no spacer exists. Not a fallback.
+//   - any ADDITIVE gap -> a spacer is shimmed between the halves and MUST be recorded. Its
+//     insulationMaterial is resolved; a core with no geometrical description, or one with no
+//     spacer element, THROWS naming the core and the gap, because required data is missing.
+//     Treating a missing record as air would understate Cgap by the 3-4x above.
+// A spacer that declares no insulationMaterial, or one the database does not carry, THROWS naming
+// it (insulationMaterial is schema-REQUIRED). MKF's own synthesised spacers carry
+// Defaults().defaultSpacerMaterial (PET, ABT #1200), and saved designs with MKF's older spacer
+// forms are migrated to it on load (MasMigration), so these fire only on a malformed record.
+// What a spacer IS comes from Core::get_spacers() (ABT #1170), the single place that knows.
+static double gap_relative_permittivity(Core& core, const std::vector<const CoreGap*>& nonResidualGaps) {
+    const CoreGap* additiveGap = nullptr;
+    for (const auto* gap : nonResidualGaps) {
+        if (gap->get_type() == GapType::ADDITIVE) {
+            additiveGap = gap;
+            break;
+        }
+    }
+    if (!additiveGap) {
+        return 1.0;  // ground gaps only: material removed, no spacer exists -- air by construction
+    }
+
+    auto describeCoreAndGap = [&]() {
+        std::ostringstream description;
+        description << "core '" << (core.get_name() ? core.get_name().value() : std::string("<unnamed>"))
+                    << "', additive gap of length " << additiveGap->get_length() << " m";
+        if (additiveGap->get_coordinates()) {
+            auto coordinates = additiveGap->get_coordinates().value();
+            description << " at (";
+            for (size_t index = 0; index < coordinates.size(); ++index) {
+                description << (index ? ", " : "") << coordinates[index];
+            }
+            description << ")";
+        }
+        return description.str();
+    };
+    if (!core.get_geometrical_description()) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "The " + describeCoreAndGap() + " is a spacer shimmed between the halves, but the core has"
+            " no geometrical description, so the spacer and its insulationMaterial are missing. The gap"
+            " capacitance (ABT #1166) depends directly on that dielectric and it will not be assumed air");
+    }
+    auto spacers = core.get_spacers();
+    if (spacers.empty()) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "The " + describeCoreAndGap() + " is a spacer shimmed between the halves, but the core's"
+            " geometrical description has no spacer element for it. The gap capacitance (ABT #1166)"
+            " depends directly on the spacer's dielectric and it will not be assumed air");
+    }
+
+    bool haveSpacer = false;
+    double relativePermittivity = 0;
+    for (const auto& spacer : spacers) {
+        if (!spacer.get_insulation_material()) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "A spacer in the geometrical description of the " + describeCoreAndGap() +
+                " declares no insulationMaterial, which core/spacer.json requires. The gap capacitance"
+                " (ABT #1166) depends directly on the spacer's relative permittivity and it will not be"
+                " guessed: record the spacer material");
+        }
+        auto materialUnion = spacer.get_insulation_material().value();
+        InsulationMaterial material = std::holds_alternative<MAS::InsulationMaterial>(materialUnion)
+            ? InsulationMaterial(std::get<MAS::InsulationMaterial>(materialUnion))
+            : find_insulation_material_by_name(std::get<std::string>(materialUnion));
+        if (!material.get_relative_permittivity()) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "Spacer insulation material '" + material.get_name() + "' of the " + describeCoreAndGap() +
+                " has no relative permittivity in the database, so the gap capacitance (ABT #1166)"
+                " cannot be computed");
+        }
+        double thisPermittivity = material.get_relative_permittivity().value();
+        if (haveSpacer && thisPermittivity != relativePermittivity) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "The spacers of the " + describeCoreAndGap() + " declare different insulation materials;"
+                " which dielectric the gap capacitance (ABT #1166) should use is ambiguous and will not be"
+                " picked");
+        }
+        relativePermittivity = thisPermittivity;
+        haveSpacer = true;
+    }
+    return relativePermittivity;
+}
+
+double StrayCapacitance::gap_capacitance(double totalGappedArea, double gapLength,
+                                         double gapRelativePermittivity, double fringingFactor) {
+    if (!(totalGappedArea > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Gap capacitance asked for a gapped cross-section of " + std::to_string(totalGappedArea) +
+            " m^2: the core gapping carries no usable area, and an area cannot be invented");
+    }
+    if (!(gapLength > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Gap capacitance asked for a gap length of " + std::to_string(gapLength) +
+            " m: the core gapping carries no usable length, and a length cannot be invented");
+    }
+    if (!(gapRelativePermittivity > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Gap capacitance asked for a relative permittivity of " +
+            std::to_string(gapRelativePermittivity) + ": not a dielectric");
+    }
+    if (!(fringingFactor > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Gap capacitance asked for a fringing factor of " + std::to_string(fringingFactor));
+    }
+    // Every factor is a double: no integer division anywhere in A / g.
+    return fringingFactor * Constants().vacuumPermittivity * gapRelativePermittivity *
+           (totalGappedArea / gapLength);
+}
+
+StrayCapacitance::ThroughCoreGapSplit StrayCapacitance::core_gap_topology(
+        Core core, Coil coil, const std::string& firstWindingName, const std::string& secondWindingName) {
+    return core_gap_topology(core, coil, nullptr, firstWindingName, secondWindingName);
+}
+
+StrayCapacitance::ThroughCoreGapSplit StrayCapacitance::core_gap_topology(
+        Core& core, Coil& coil, const std::vector<Turn>* windingTurns,
+        const std::string& firstWindingName, const std::string& secondWindingName) {
+    ThroughCoreGapSplit split;  // defaults to SHARED_CORE_NODE: the historical behaviour
+
+    // ---- 1. every column carries a non-residual gap? (else case A: the ungapped legs still
+    //         join the two halves into one body) ----
+    const auto& gapping = core.get_gapping();
+    if (gapping.empty()) {
+        return split;
+    }
+    // Read once: the MAS getter returns the optional BY VALUE, so every call is a full copy.
+    const auto processedDescription = core.get_processed_description();
+    if (!processedDescription) {
+        // Nothing says how many columns the core has, so "all legs gapped" cannot be
+        // established. Not a physical quantity to default -- a classification that cannot be
+        // made -- so the model stays where it was.
+        return split;
+    }
+    const auto& columns = processedDescription->get_columns();
+    if (columns.empty()) {
+        return split;
+    }
+
+    // One non-residual gap per column, all in one plane, is what a two-body split means. More
+    // than one gap on a column (a distributed gapping) makes more than two bodies and is not
+    // this model; it stays on the single-node path.
+    std::vector<int> nonResidualGapsPerColumn(columns.size(), 0);
+    double planeSum = 0;
+    double planeMinimum = std::numeric_limits<double>::max();
+    double planeMaximum = std::numeric_limits<double>::lowest();
+    double totalArea = 0;
+    double shortestGap = std::numeric_limits<double>::max();
+    double longestGap = std::numeric_limits<double>::lowest();
+    size_t countedGaps = 0;
+    std::vector<const CoreGap*> nonResidualGaps;  // into `gapping`, which outlives this function body
+    for (const auto& gap : gapping) {
+        if (gap.get_type() == GapType::RESIDUAL) {
+            continue;
+        }
+        nonResidualGaps.push_back(&gap);
+        if (!gap.get_coordinates() || gap.get_coordinates()->size() < 2) {
+            // Which column this gap is on cannot be established, so neither can "all legs
+            // gapped". Historical model, no invented geometry.
+            return split;
+        }
+        auto coordinates = gap.get_coordinates().value();
+        int columnIndex = Core::find_closest_column_index_by_coordinates(columns, coordinates);
+        if (columnIndex < 0 || static_cast<size_t>(columnIndex) >= columns.size()) {
+            return split;
+        }
+        nonResidualGapsPerColumn[static_cast<size_t>(columnIndex)] += 1;
+        planeSum += coordinates[1];
+        planeMinimum = std::min(planeMinimum, coordinates[1]);
+        planeMaximum = std::max(planeMaximum, coordinates[1]);
+        shortestGap = std::min(shortestGap, gap.get_length());
+        longestGap = std::max(longestGap, gap.get_length());
+        countedGaps += 1;
+        // The area is only demanded once the core is already known to be case C -- see below --
+        // so a case A/B core with an area-less gap is not made to throw by this work.
+        if (gap.get_area()) {
+            totalArea += gap.get_area().value();
+        }
+        else {
+            totalArea = std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+    if (countedGaps == 0) {
+        return split;  // residual gapping only: the halves are in contact
+    }
+    for (size_t columnIndex = 0; columnIndex < columns.size(); ++columnIndex) {
+        if (nonResidualGapsPerColumn[columnIndex] != 1) {
+            // A column with no non-residual gap still joins the halves (case A); a column with
+            // several is a distributed gapping, which is more than two bodies.
+            return split;
+        }
+    }
+    double gapPlane = planeSum / static_cast<double>(countedGaps);
+    if (planeMaximum - planeMinimum > kGapPlaneToleranceInGapLengths * longestGap) {
+        return split;  // the gaps are not one mating surface
+    }
+
+    // ---- 2. do the two windings sit on OPPOSITE sides of that plane? (else case B: each
+    //         winding faces both halves and the couplings shunt the gap) ----
+    if (!coil.get_turns_description()) {
+        coil.wind();
+    }
+    auto bobbin = coil.resolve_bobbin();
+    if (bobbin.get_winding_window_shape() == WindingWindowShape::ROUND) {
+        // A round (toroidal) window's turn coordinates are polar -- coordinates[1] is an angle,
+        // not an axial height -- so the plane test below is meaningless there. Toroids are
+        // ungapped anyway; this guard makes that explicit rather than incidental.
+        return split;
+    }
+
+    // The caller's turns when it has them (no copy); otherwise this coil's own, held by value --
+    // MAS getters return by value, so a reference would bind into a temporary optional that dies
+    // at the end of the statement (the dangling-reference trap).
+    std::vector<Turn> ownTurns;
+    if (!windingTurns) {
+        ownTurns = coil.get_turns_description().value();
+        windingTurns = &ownTurns;
+    }
+    const std::vector<Turn>& turns = *windingTurns;
+    double firstMinimum = std::numeric_limits<double>::max();
+    double firstMaximum = std::numeric_limits<double>::lowest();
+    double secondMinimum = std::numeric_limits<double>::max();
+    double secondMaximum = std::numeric_limits<double>::lowest();
+    size_t firstTurns = 0;
+    size_t secondTurns = 0;
+    for (const auto& turn : turns) {
+        const auto& coordinates = turn.get_coordinates();  // a reference into the live turn
+        if (coordinates.size() < 2) {
+            return split;
+        }
+        double axial = coordinates[1];
+        if (turn.get_winding() == firstWindingName) {
+            firstMinimum = std::min(firstMinimum, axial);
+            firstMaximum = std::max(firstMaximum, axial);
+            firstTurns += 1;
+        }
+        else if (turn.get_winding() == secondWindingName) {
+            secondMinimum = std::min(secondMinimum, axial);
+            secondMaximum = std::max(secondMaximum, axial);
+            secondTurns += 1;
+        }
+    }
+    if (firstTurns == 0 || secondTurns == 0) {
+        return split;
+    }
+    // Strictly on opposite sides. Concentric (overlapping) windings both straddle the plane and
+    // fail this on both orderings, which is exactly case B. Two windings stacked in the SAME
+    // half also fail it -- correctly, since the gap then cuts neither of them off from the other.
+    bool firstAbove = firstMinimum > gapPlane && secondMaximum < gapPlane;
+    bool firstBelow = firstMaximum < gapPlane && secondMinimum > gapPlane;
+    if (!firstAbove && !firstBelow) {
+        return split;
+    }
+
+    // ---- 3. case C. Now, and only now, the gap's area and length are required inputs. ----
+    if (!(totalArea > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "An all-legs-gapped core with side-by-side windings puts the gap in series with the"
+            " inter-winding path (ABT #1166), but at least one of its gaps carries no area: the"
+            " gap capacitance cannot be computed and will not be guessed");
+    }
+    if (!(shortestGap > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "An all-legs-gapped core with side-by-side windings puts the gap in series with the"
+            " inter-winding path (ABT #1166), but its gap length is not positive");
+    }
+    // The gaps of the different columns are in PARALLEL between the two core bodies, so the
+    // total gapped cross-section is what enters; the length is the one plane's thickness, and
+    // the columns of a spacer/ground gapping share it. Where they differ (a ground gapping
+    // grinds the centre leg only, and the lateral gaps are then shorter), the SHORTEST gap is
+    // the one that would have to be bridged and using it is the conservative -- largest-Cgap,
+    // smallest-correction -- choice.
+    //
+    // What fills the gap is decided by the gap type: ground gaps are air by construction, an
+    // additive gap's spacer is read from the core's geometrical description (its schema-required
+    // insulationMaterial) and is never assumed. See gap_relative_permittivity above.
+    const double gapRelativePermittivity = gap_relative_permittivity(core, nonResidualGaps);
+    split.topology = ThroughCoreGapTopology::SPLIT_CORE_NODES;
+    split.totalGappedArea = totalArea;
+    split.gapLength = shortestGap;
+    split.gapPlaneAxialCoordinate = gapPlane;
+    split.gapCapacitance = gap_capacitance(totalArea, shortestGap, gapRelativePermittivity,
+                                           kGapFringingFactor);
+    return split;
+}
+
+// Energy stored in the turn-to-core elements when the core is TWO floating bodies joined by
+// Cgap, body 0 facing the first winding and body 1 the second (case C above).
+//
+// Charge balance on the two floating nodes, with CA = sum of body-0 elements, SA = sum C_i V_i
+// over body 0 (CB, SB likewise):
+//     (CA + Cg) Va -        Cg  Vb = SA
+//         - Cg   Va + (CB + Cg) Vb = SB
+// and W = 0.5 sum_A C_i (V_i - Va)^2 + 0.5 sum_B C_j (V_j - Vb)^2 + 0.5 Cg (Va - Vb)^2.
+//
+// This is exactly the series network the design note describes: with every turn of a winding at
+// one potential (Cpc = Csc = C, +-V/2) it reduces analytically to C*Cg/(C + 2*Cg), i.e.
+// 1/Ctot = 1/Cpc + 1/Cgap + 1/Csc -- and to the single-node answer Cpc/2 as Cg -> infinity, so
+// it degrades continuously into the behaviour it replaces.
+static double through_core_split_core_energy(const std::vector<double>& turnCoreCapacitance,
+                                             const std::vector<double>& turnPotential,
+                                             const std::vector<bool>& turnOnFirstBody,
+                                             double gapCapacitance) {
+    double capacitanceFirstBody = 0;
+    double capacitanceSecondBody = 0;
+    double chargeFirstBody = 0;
+    double chargeSecondBody = 0;
+    for (size_t k = 0; k < turnCoreCapacitance.size(); ++k) {
+        if (turnOnFirstBody[k]) {
+            capacitanceFirstBody += turnCoreCapacitance[k];
+            chargeFirstBody += turnCoreCapacitance[k] * turnPotential[k];
+        }
+        else {
+            capacitanceSecondBody += turnCoreCapacitance[k];
+            chargeSecondBody += turnCoreCapacitance[k] * turnPotential[k];
+        }
+    }
+    if (!(capacitanceFirstBody > 0) || !(capacitanceSecondBody > 0) || !(gapCapacitance > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "The split-core through-core path (ABT #1166) needs a positive turn-to-core"
+            " capacitance on each core body and a positive gap capacitance");
+    }
+    double determinant = capacitanceFirstBody * capacitanceSecondBody +
+                         gapCapacitance * (capacitanceFirstBody + capacitanceSecondBody);
+    double potentialFirstBody = (chargeFirstBody * (capacitanceSecondBody + gapCapacitance) +
+                                 gapCapacitance * chargeSecondBody) / determinant;
+    double potentialSecondBody = (chargeSecondBody * (capacitanceFirstBody + gapCapacitance) +
+                                  gapCapacitance * chargeFirstBody) / determinant;
+
+    double energy = 0;
+    for (size_t k = 0; k < turnCoreCapacitance.size(); ++k) {
+        double bodyPotential = turnOnFirstBody[k] ? potentialFirstBody : potentialSecondBody;
+        energy += 0.5 * turnCoreCapacitance[k] * std::pow(turnPotential[k] - bodyPotential, 2);
+    }
+    energy += 0.5 * gapCapacitance * std::pow(potentialFirstBody - potentialSecondBody, 2);
+    return energy;
+}
+// ====================== ABT #1166 END ======================
+
+static double winding_to_core_self_energy_from_elements(const std::vector<Turn>& turns,
+        const std::vector<double>& elements, const std::string& windingName,
+        const std::vector<double>& voltagesPerTurn, std::optional<double> fixedCorePotential) {
+    std::vector<double> turnCoreCapacitance;
+    std::vector<double> turnPotential;
+    double sumCV = 0;
+    double sumC = 0;
+    for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
+        if (turns[turnIndex].get_winding() != windingName) {
+            continue;
+        }
+        double capacitance = elements[turnIndex];
+        turnCoreCapacitance.push_back(capacitance);
+        turnPotential.push_back(voltagesPerTurn[turnIndex]);
+        sumCV += capacitance * voltagesPerTurn[turnIndex];
+        sumC += capacitance;
+    }
+    if (sumC <= 0) {
+        return 0;
+    }
+    // ABT #1167: a FLOATING core takes the charge-balanced potential of the turns facing it;
+    // a BONDED one (clip, strap, flux band, conductive tape) is held at its reference and the
+    // charge balance no longer applies -- the reference sources whatever charge the difference
+    // demands. For a linear potential ramp and uniform elements the two give C0/12 and C0/3
+    // respectively, a factor of 4 on identical copper (see MAS magnetic.md, "Core electrical
+    // reference"). Absent reference == nullopt == floating == the pre-#1167 behaviour.
+    double corePotential = fixedCorePotential ? fixedCorePotential.value() : sumCV / sumC;
+    double energy = 0;
+    for (size_t k = 0; k < turnCoreCapacitance.size(); ++k) {
+        energy += 0.5 * turnCoreCapacitance[k] * std::pow(turnPotential[k] - corePotential, 2);
+    }
+    return energy;
+}
+
+// A winding PAIR against the floating core, re-weighting precomputed elements
+// (the physics is documented on StrayCapacitance::calculate_winding_pair_to_core_energy).
+static double winding_pair_to_core_energy_from_elements(const std::vector<Turn>& turns,
+        const std::vector<double>& elements, const std::string& firstWindingName,
+        const std::string& secondWindingName, const std::vector<double>& voltagesPerTurn,
+        double firstWindingPotentialOffset,
+        const StrayCapacitance::ThroughCoreGapSplit& gapSplit) {
+    if (firstWindingName == secondWindingName) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "calculate_winding_pair_to_core_energy asked for a pair of one winding ('" +
+            firstWindingName + "') with itself: use calculate_winding_to_core_self_energy");
+    }
+    std::vector<double> turnCoreCapacitance;
+    std::vector<double> turnPotential;
+    // ABT #1166: which of the two core bodies each turn faces, used only in case C below.
+    std::vector<bool> turnOnFirstBody;
+    double sumCV = 0;
+    double sumC = 0;
+    for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
+        const auto& windingName = turns[turnIndex].get_winding();
+        double potential;
+        if (windingName == firstWindingName) {
+            potential = firstWindingPotentialOffset + voltagesPerTurn[turnIndex];
+        }
+        else if (windingName == secondWindingName) {
+            potential = -voltagesPerTurn[turnIndex];  // opposing DM current
+        }
+        else {
+            continue;
+        }
+        double capacitance = elements[turnIndex];
+        turnCoreCapacitance.push_back(capacitance);
+        turnPotential.push_back(potential);
+        // Case C puts each winding on one core body: the classification established that the
+        // two windings sit on opposite sides of the gap plane, so winding identity IS the body.
+        turnOnFirstBody.push_back(windingName == firstWindingName);
+        sumCV += capacitance * potential;
+        sumC += capacitance;
+    }
+    if (sumC <= 0) {
+        return 0;
+    }
+    // ----- ABT #1166: case C -- the gap cuts every conductive route between the two windings'
+    // footprints, so the core is two floating bodies joined by Cgap instead of one node. Same
+    // turn elements and the same per-turn potentials; only the energy changes. Cases A and B
+    // never enter here and are bit-for-bit unchanged. -----
+    if (gapSplit.topology == StrayCapacitance::ThroughCoreGapTopology::SPLIT_CORE_NODES) {
+        return through_core_split_core_energy(turnCoreCapacitance, turnPotential, turnOnFirstBody,
+                                              gapSplit.gapCapacitance);
+    }
+    double corePotential = sumCV / sumC;
+    double energy = 0;
+    for (size_t k = 0; k < turnCoreCapacitance.size(); ++k) {
+        energy += 0.5 * turnCoreCapacitance[k] * std::pow(turnPotential[k] - corePotential, 2);
+    }
+    return energy;
+}
+
+double StrayCapacitance::calculate_winding_to_core_capacitance(Coil coil, Core core, std::string windingName, std::optional<double> frequency) {
     // Total capacitance from one whole winding to the (equipotential) ferrite core,
     // = the parallel sum of every turn's turn-to-core element (all turns of the
     // winding share the single core node). This is the building block for the
@@ -1400,14 +2726,8 @@ double StrayCapacitance::calculate_winding_to_core_capacitance(Coil coil, Core c
         coil.wind();
     }
 
-    double coreCoatingThickness = core.get_coating_thickness();
-    // A bare (uncoated) ferrite has no coating layer; the wire enamel alone then
-    // bounds the element. get_coating_relative_permittivity() throws when there is
-    // no coating, so only resolve it when a coating actually exists.
-    double coreCoatingRelativePermittivity = 1.0;
-    if (coreCoatingThickness > 0) {
-        coreCoatingRelativePermittivity = core.get_coating_relative_permittivity();
-    }
+    auto [coreCoatingThickness, coreCoatingRelativePermittivity] = resolve_core_jacket(core);
+    double imageFactor = frequency ? core_image_factor(core, frequency.value()) : 1.0;
 
     auto turns = coil.get_turns_description().value();
     auto wirePerWinding = coil.get_wires();
@@ -1418,110 +2738,192 @@ double StrayCapacitance::calculate_winding_to_core_capacitance(Coil coil, Core c
     // wires use their true radius; flat conductors use an area-equivalent radius
     // (see turn_to_core_equivalent_radius), so planar/foil/rectangular windings get a
     // finite through-core element instead of throwing.
-    double conductingRadius = turn_to_core_equivalent_radius(wire);
-    double wireCoatingThickness = wire.get_coating_thickness();
-    double wireCoatingRelativePermittivity = get_wire_insulation_relative_permittivity(wire);
-    constexpr double airGapToCore = 0.0;  // close-wound onto the coated core
-
     double windingToCore = 0;
     for (auto& turn : turns) {
         if (turn.get_winding() != windingName) {
             continue;
         }
-        windingToCore += calculate_turn_to_core_capacitance(
-            conductingRadius, turn.get_length(),
-            wireCoatingThickness, wireCoatingRelativePermittivity,
-            airGapToCore,
-            coreCoatingThickness, coreCoatingRelativePermittivity);
+        windingToCore += imageFactor * turn_to_core_element(
+            coil, core, turn, wire, coreCoatingThickness, coreCoatingRelativePermittivity, turns);
     }
     return windingToCore;
 }
 
-double StrayCapacitance::calculate_through_core_capacitance(Coil coil, Core core,
+double StrayCapacitance::calculate_winding_pair_to_core_energy(Coil coil, Core core,
         const std::string& firstWindingName, const std::string& secondWindingName,
-        const std::vector<double>& voltagesPerTurn) {
-    // Inter-winding capacitance between two separated windings through the floating,
+        const std::vector<double>& voltagesPerTurn, double firstWindingPotentialOffset,
+        std::optional<double> frequency) {
+    // Energy in the turn -> core -> turn path of a winding PAIR, against the floating,
     // equipotential ferrite core. Energy method (CPSS 2025 core-potential approach):
     //   1. each turn i has a turn-to-core element C_i and sits at potential V_i;
     //   2. the two windings carry opposing DM currents, so the second winding's turns
-    //      enter with the opposite sign (V_i -> -V_i);
-    //   3. the core is a single floating node — its potential balances the charge:
+    //      enter with the opposite sign (V_i -> -V_i); the first winding's turns carry
+    //      the common-mode offset the orchestration loop is converging (V3);
+    //   3. the core is a single floating node -- its potential balances the charge:
     //      V_core = sum(C_i V_i) / sum(C_i);
     //   4. the energy stored in all the turn-to-core capacitors is
-    //      W = sum 0.5 C_i (V_i - V_core)^2, and the effective inter-winding
-    //      capacitance referenced to the differential terminal voltage V_dm is
-    //      C = 2W / V_dm^2.
+    //      W = sum 0.5 C_i (V_i - V_core)^2.
     // Weighting by the actual per-turn potential (instead of summing every turn at the
     // full winding voltage) is what removes the gross overestimate of the naive sum.
+    //
+    // ABT #1165: this path exists for EVERY pair, not only for windings with no adjacent
+    // turns. The caller adds this energy to the turn-to-turn energy of the same pair and
+    // reduces the sum once against the pair's terminal voltage, so the through-core term
+    // adds to the direct term instead of replacing it.
+    //
+    // The per-turn elements are geometry and are built once, in turn_to_core_elements; this entry
+    // point builds them for its own call, the orchestration loop builds them once for all pairs.
+    auto elements = turn_to_core_elements(coil, core, frequency);
+    auto turns = coil.get_turns_description().value();
+    // ABT #1166: an all-legs gap with the two windings on opposite sides of the gap plane puts
+    // Cgap in series with this path; anything else keeps the single shared core node.
+    auto gapSplit = core_gap_topology(core, coil, &turns, firstWindingName, secondWindingName);
+    return winding_pair_to_core_energy_from_elements(turns, elements, firstWindingName, secondWindingName,
+                                                     voltagesPerTurn, firstWindingPotentialOffset, gapSplit);
+}
+
+double StrayCapacitance::calculate_through_core_capacitance(Coil coil, Core core,
+        const std::string& firstWindingName, const std::string& secondWindingName,
+        const std::vector<double>& voltagesPerTurn, std::optional<double> frequency) {
+    // Terminal-referenced form of the pair energy above: C = 2W / V_dm^2, with V_dm the
+    // differential terminal voltage across the two windings (the first winding spans
+    // [0, maxFirst]; the second, negated, spans [minSecond, 0]). Kept as the standalone
+    // entry point for callers that want the through-core capacitance on its own; the
+    // orchestration loop folds the ENERGY in instead (ABT #1165) so that one reduction
+    // covers the direct and the through-core path together.
+    double energy = calculate_winding_pair_to_core_energy(
+        coil, core, firstWindingName, secondWindingName, voltagesPerTurn, 0.0, frequency);
+    if (energy <= 0) {
+        return 0;
+    }
     if (!coil.get_turns_description()) {
         coil.wind();
     }
     auto turns = coil.get_turns_description().value();
-    auto wirePerWinding = coil.get_wires();
-
-    double coreCoatingThickness = core.get_coating_thickness();
-    double coreCoatingRelativePermittivity = 1.0;
-    if (coreCoatingThickness > 0) {
-        coreCoatingRelativePermittivity = core.get_coating_relative_permittivity();
-    }
-
-    std::vector<double> turnCoreCapacitance;
-    std::vector<double> turnPotential;
-    double sumCV = 0;
-    double sumC = 0;
+    double maxFirstPotential = -std::numeric_limits<double>::max();
+    double minSecondPotential = std::numeric_limits<double>::max();
     for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
         auto windingName = turns[turnIndex].get_winding();
-        double sign;
+        double potential;
         if (windingName == firstWindingName) {
-            sign = 1.0;
+            potential = voltagesPerTurn[turnIndex];
         }
         else if (windingName == secondWindingName) {
-            sign = -1.0;  // opposing DM current
+            potential = -voltagesPerTurn[turnIndex];
         }
         else {
             continue;
         }
-
-        auto wire = wirePerWinding[coil.get_winding_index_by_name(windingName)];
-        // Bare-conductor radius for the field-spreading integral; flat conductors
-        // use an area-equivalent radius (see turn_to_core_equivalent_radius).
-        double capacitance = calculate_turn_to_core_capacitance(
-            turn_to_core_equivalent_radius(wire), turns[turnIndex].get_length(),
-            wire.get_coating_thickness(), get_wire_insulation_relative_permittivity(wire),
-            0.0 /* air gap: close-wound */,
-            coreCoatingThickness, coreCoatingRelativePermittivity);
-        double potential = sign * voltagesPerTurn[turnIndex];
-
-        turnCoreCapacitance.push_back(capacitance);
-        turnPotential.push_back(potential);
-        sumCV += capacitance * potential;
-        sumC += capacitance;
-    }
-
-    if (sumC <= 0) {
-        return 0;
-    }
-    double corePotential = sumCV / sumC;
-
-    double energy = 0;
-    double maxFirstPotential = -std::numeric_limits<double>::max();
-    double minSecondPotential = std::numeric_limits<double>::max();
-    for (size_t k = 0; k < turnCoreCapacitance.size(); ++k) {
-        energy += 0.5 * turnCoreCapacitance[k] * std::pow(turnPotential[k] - corePotential, 2);
-        if (turnPotential[k] >= 0) {
-            maxFirstPotential = std::max(maxFirstPotential, turnPotential[k]);
+        if (potential >= 0) {
+            maxFirstPotential = std::max(maxFirstPotential, potential);
         }
         else {
-            minSecondPotential = std::min(minSecondPotential, turnPotential[k]);
+            minSecondPotential = std::min(minSecondPotential, potential);
         }
     }
-    // Differential terminal voltage across the two windings (first winding spans
-    // [0, maxFirst]; second, negated, spans [minSecond, 0]).
     double differentialVoltage = maxFirstPotential - minSecondPotential;
     if (differentialVoltage <= 0) {
         return 0;
     }
     return 2.0 * energy / (differentialVoltage * differentialVoltage);
+}
+
+double StrayCapacitance::calculate_winding_to_core_self_energy(Coil coil, Core core,
+        const std::string& windingName,
+        const std::vector<double>& voltagesPerTurn, std::optional<double> frequency,
+        std::optional<double> fixedCorePotential) {
+    // One winding against the floating core (ABT #848). Mirrors
+    // calculate_through_core_capacitance exactly — same per-turn elements, same
+    // charge-balanced core node — but over a single winding's turns, all with
+    // positive sign, and returning the ENERGY rather than a terminal-referenced
+    // capacitance: the caller folds it into the self-pair energy sum, which is
+    // already referenced to the winding's own voltage span.
+    auto elements = turn_to_core_elements(coil, core, frequency);
+    auto turns = coil.get_turns_description().value();
+    return winding_to_core_self_energy_from_elements(turns, elements, windingName, voltagesPerTurn, fixedCorePotential);
+}
+
+std::optional<double> StrayCapacitance::resolve_core_reference_potential(Coil& coil,
+        const std::optional<CoreElectricalReference>& coreElectricalReference,
+        const StrayCapacitanceOutput& voltagesOutput,
+        const std::map<std::string, double>& voltageRmsPerWinding) {
+    // ABT #1167. Returns the potential the core node is HELD at, or nullopt when it floats.
+    if (!coreElectricalReference) {
+        return std::nullopt;  // absent means floating: exactly the pre-#1167 behaviour
+    }
+    switch (coreElectricalReference->get_type()) {
+        case CoreElectricalReferenceType::FLOATING:
+            return std::nullopt;
+        case CoreElectricalReferenceType::GROUNDED:
+            // A node with no potential swing. The per-turn potentials of every winding are
+            // expressed against a single zero (each winding's voltage divider runs from its
+            // full voltage down to 0 at its end terminal), so the local ground of any
+            // isolation side and protective earth are the same 0 in this frame:
+            // isolationSide identifies WHICH node it is, it does not move it. What the bond
+            // changes is that the core no longer charge-balances -- and that the
+            // primary->core->secondary path is diverted to the reference (handled by the
+            // caller, which drops the inter-winding through-core term).
+            return 0.0;
+        case CoreElectricalReferenceType::TIED_TO_WINDING:
+            break;
+    }
+
+    if (!coreElectricalReference->get_winding() || !coreElectricalReference->get_terminal()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA,
+            "coreElectricalReference of type tiedToWinding needs both a winding name and a "
+            "terminal (start or end); the schema requires them and this document has "
+            + std::string(coreElectricalReference->get_winding() ? "no terminal" : "no winding"));
+    }
+    auto referenceWindingName = coreElectricalReference->get_winding().value();
+    auto terminal = coreElectricalReference->get_terminal().value();
+
+    if (!coil.get_turns_description()) {
+        coil.wind();
+    }
+    auto turns = coil.get_turns_description().value();
+    bool found = false;
+    size_t firstTurnIndexOfWinding = 0;
+    size_t lastTurnIndexOfWinding = 0;
+    for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
+        if (turns[turnIndex].get_winding() != referenceWindingName) {
+            continue;
+        }
+        if (!found) {
+            firstTurnIndexOfWinding = turnIndex;
+            found = true;
+        }
+        lastTurnIndexOfWinding = turnIndex;
+    }
+    if (!found) {
+        std::string known;
+        for (auto& winding : coil.get_functional_description()) {
+            known += (known.empty() ? "" : ", ") + winding.get_name();
+        }
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "coreElectricalReference ties the core to winding '" + referenceWindingName +
+            "', which this coil does not have (its windings are: " + known + ")");
+    }
+    if (!voltageRmsPerWinding.contains(referenceWindingName)) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA,
+            "coreElectricalReference ties the core to winding '" + referenceWindingName +
+            "', which has no voltage in this calculation");
+    }
+    if (!voltagesOutput.get_voltage_divider_start_per_turn() || !voltagesOutput.get_voltage_divider_end_per_turn()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA,
+            "coreElectricalReference of type tiedToWinding needs the per-turn voltage dividers "
+            "to locate the winding's terminal potential, and they are missing");
+    }
+    // The TERMINAL potentials, not the turn centres voltagesPerTurn carries: the divider at the
+    // start of the winding's first turn is 1 (its full voltage) and at the end of its last turn
+    // is 0. With parallels every parallel repeats the same ramp, so the first and last turn of
+    // the winding carry the same two ends.
+    auto voltageDividerStartPerTurn = voltagesOutput.get_voltage_divider_start_per_turn().value();
+    auto voltageDividerEndPerTurn = voltagesOutput.get_voltage_divider_end_per_turn().value();
+    double windingVoltage = voltageRmsPerWinding.at(referenceWindingName);
+    if (terminal == WindingTerminal::START) {
+        return windingVoltage * voltageDividerStartPerTurn[firstTurnIndexOfWinding];
+    }
+    return windingVoltage * voltageDividerEndPerTurn[lastTurnIndexOfWinding];
 }
 
 double StrayCapacitance::calculate_energy_between_two_turns(Turn firstTurn, Wire firstWire, Turn secondTurn, Wire secondWire, double voltageDrop, std::optional<Coil> coil) {
@@ -1551,6 +2953,27 @@ std::map<std::pair<size_t, size_t>, double> StrayCapacitance::calculate_capacita
 
     std::set<std::pair<size_t, size_t>> turnsCombinations;
 
+    // ABT #853: corresponding turns of two parallels of the SAME winding are one electrical
+    // node -- the parallels join at the terminals, and the per-turn voltage divider
+    // (calculate_voltages_per_turn) hands turn k of every parallel the identical potential.
+    // There is no voltage across such a pair, hence no capacitor to compute and nothing that
+    // can short, however tightly a bifilar/trifilar pair is wound. get_surrounding_turns()
+    // filters by coordinates only, so without this the pair reached the short-circuit guard
+    // as an ordinary neighbour and a bare (or zero-derived) coating declared the winding
+    // shorted. The ordinal is counted exactly as the voltage divider counts it (per winding,
+    // per parallel, in turns order) so "same node" here means "same potential" there.
+    std::map<std::string, std::map<int64_t, size_t>> nextOrdinalPerWindingPerParallel;
+    std::vector<size_t> ordinalWithinParallel;
+    ordinalWithinParallel.reserve(turns.size());
+    for (auto& turn : turns) {
+        ordinalWithinParallel.push_back(nextOrdinalPerWindingPerParallel[turn.get_winding()][turn.get_parallel()]++);
+    }
+    auto areSameElectricalNode = [&](size_t firstIndex, size_t secondIndex) {
+        return turns[firstIndex].get_winding() == turns[secondIndex].get_winding() &&
+               turns[firstIndex].get_parallel() != turns[secondIndex].get_parallel() &&
+               ordinalWithinParallel[firstIndex] == ordinalWithinParallel[secondIndex];
+    };
+
     for (size_t turnIndex = 0; turnIndex <  turns.size(); ++turnIndex) {
         auto turnWindingIndex = coil.get_winding_index_by_name(turns[turnIndex].get_winding());
         auto turnWire = wirePerWinding[turnWindingIndex];
@@ -1560,6 +2983,10 @@ std::map<std::pair<size_t, size_t>, double> StrayCapacitance::calculate_capacita
             auto key = std::make_pair(turnIndex, surroundingTurnIndex);
             auto inverseKey = std::make_pair(surroundingTurnIndex, turnIndex);
             if (turnsCombinations.contains(key) || turnsCombinations.contains(inverseKey)) {
+                continue;
+            }
+            if (areSameElectricalNode(turnIndex, surroundingTurnIndex)) {
+                turnsCombinations.insert(key);
                 continue;
             }
             auto surroundingTurnWindingIndex = coil.get_winding_index_by_name(surroundingTurn.get_winding());
@@ -1665,17 +3092,28 @@ SixCapacitorNetworkPerWinding StrayCapacitance::calculate_six_capacitor_network(
 }
 
 
-StrayCapacitanceOutput StrayCapacitance::calculate_capacitance(Coil coil, std::optional<Core> core) {
+StrayCapacitanceOutput StrayCapacitance::calculate_capacitance(const Magnetic& magnetic, std::optional<double> frequency) {
+    // ABT #1167: the magnetic is the object that knows how its core is bonded.
+    return calculate_capacitance(magnetic.get_coil(), std::optional<Core>(magnetic.get_core()), frequency,
+                                 magnetic.get_core_electrical_reference());
+}
+
+StrayCapacitanceOutput StrayCapacitance::calculate_capacitance(const Magnetic& magnetic, OperatingPoint operatingPoint, std::optional<double> frequency) {
+    return calculate_capacitance(magnetic.get_coil(), operatingPoint, std::optional<Core>(magnetic.get_core()), frequency,
+                                 magnetic.get_core_electrical_reference());
+}
+
+StrayCapacitanceOutput StrayCapacitance::calculate_capacitance(Coil coil, std::optional<Core> core, std::optional<double> frequency, std::optional<CoreElectricalReference> coreElectricalReference) {
     std::map<std::string, double> voltageRmsPerWinding;
     double primaryNumberTurns = coil.get_functional_description()[0].get_number_turns();
     for (auto winding : coil.get_functional_description()) {
         double turnsRatio = primaryNumberTurns /  winding.get_number_turns();
         voltageRmsPerWinding[winding.get_name()] = 10.0 / turnsRatio;
     }
-    return calculate_capacitance_with_voltages(coil, voltageRmsPerWinding, core);
+    return calculate_capacitance_with_voltages(coil, voltageRmsPerWinding, core, frequency, coreElectricalReference);
 }
 
-StrayCapacitanceOutput StrayCapacitance::calculate_capacitance(Coil coil, OperatingPoint operatingPoint, std::optional<Core> core) {
+StrayCapacitanceOutput StrayCapacitance::calculate_capacitance(Coil coil, OperatingPoint operatingPoint, std::optional<Core> core, std::optional<double> frequency, std::optional<CoreElectricalReference> coreElectricalReference) {
     // Extract actual RMS voltages from operating point
     std::map<std::string, double> voltageRmsPerWinding;
     
@@ -1702,10 +3140,14 @@ StrayCapacitanceOutput StrayCapacitance::calculate_capacitance(Coil coil, Operat
         voltageRmsPerWinding[coil.get_functional_description()[windingIndex].get_name()] = rmsVoltage.value();
     }
 
-    return calculate_capacitance_with_voltages(coil, voltageRmsPerWinding, core);
+    return calculate_capacitance_with_voltages(coil, voltageRmsPerWinding, core, frequency, coreElectricalReference);
 }
 
-StrayCapacitanceOutput StrayCapacitance::calculate_capacitance_with_voltages(Coil coil, std::map<std::string, double> voltageRmsPerWinding, std::optional<Core> core) {
+StrayCapacitanceOutput StrayCapacitance::calculate_capacitance_with_voltages(Coil coil, std::map<std::string, double> voltageRmsPerWinding, std::optional<Core> core, std::optional<double> frequency, std::optional<CoreElectricalReference> coreElectricalReference) {
+    // Per-call, not per-object: the same StrayCapacitance is reused across magnetics (the SPICE
+    // export calls it twice, once to estimate resonance and once refined), and a stale entry would
+    // report a model that ran for a previous coil.
+    _methodsUsed.clear();
     std::map<std::pair<size_t, size_t>, double> electricEnergyBetweenTurnsMap;
     std::map<std::pair<size_t, size_t>, double> voltageDropBetweenTurnsMap;
     std::map<std::string, std::map<std::string, ScalarMatrixAtFrequency>> capacitanceMatrix;
@@ -1716,6 +3158,21 @@ StrayCapacitanceOutput StrayCapacitance::calculate_capacitance_with_voltages(Coi
 
     auto strayCapacitanceOutput = StrayCapacitance::calculate_voltages_per_turn(coil, voltageRmsPerWinding);
     auto voltagesPerTurn = strayCapacitanceOutput.get_voltage_per_turn().value();
+    // ABT #1167: nullopt = the core floats (charge-balanced node), which is what an absent
+    // reference means and what every result before this ticket assumed. A value means the core
+    // is bonded and HELD there, which both fixes the self term's core potential and diverts the
+    // inter-winding through-core path to the reference (so that term disappears from the pair).
+    auto fixedCorePotential = resolve_core_reference_potential(coil, coreElectricalReference, strayCapacitanceOutput, voltageRmsPerWinding);
+    // The turn-to-core elements are geometry (and frequency, through the image factor): they do not
+    // depend on the per-turn potentials nor on the V3 offset converged below. Build them ONCE here,
+    // not once per winding pair per V3 iteration, and let the loop only re-weight them -- the energy
+    // sums are bit-identical either way, the cost is not.
+    std::vector<double> turnCoreElements;
+    std::vector<Turn> turnsFacingCore;
+    if (core) {
+        turnCoreElements = turn_to_core_elements(coil, core.value(), frequency);
+        turnsFacingCore = coil.get_turns_description().value();
+    }
     auto windings = coil.get_functional_description();
     std::map<std::pair<std::string, std::string>, double> capacitanceMapPerWindings;
     for (auto firstWinding : windings) {
@@ -1732,6 +3189,15 @@ StrayCapacitanceOutput StrayCapacitance::calculate_capacitance_with_voltages(Coi
             double maxVoltageInFirstWinding = std::numeric_limits<double>::lowest();
             double minVoltageInSecondWinding = std::numeric_limits<double>::max();
             double maxVoltageInSecondWinding = std::numeric_limits<double>::lowest();
+
+            // ABT #1166: the gap classification is pure geometry -- the gapping, the columns and
+            // where the two windings sit relative to the gap plane -- so it is the same on every
+            // V3 iteration and for every turn pair. Computed once per winding pair, here.
+            StrayCapacitance::ThroughCoreGapSplit gapSplit;
+            if (core && firstWindingName != secondWindingName) {
+                gapSplit = core_gap_topology(core.value(), coil, &turnsFacingCore,
+                                             firstWindingName, secondWindingName);
+            }
 
             double V3 = 0;
             double V3calculated = 0;
@@ -1778,34 +3244,113 @@ StrayCapacitanceOutput StrayCapacitance::calculate_capacitance_with_voltages(Coi
                             voltageDropBetweenTurnsMap[turnsKey] = voltageDropAmongTurns;
 
                             if (std::isnan(energyInBetweenTheseWindings)) {
-                                throw NaNResultException("Energy cannot be nan");
+                                // ABT #395: say WHICH pair and WHICH factor, so a NaN arriving by a
+                                // route the capacitance guard does not cover is still localisable
+                                // instead of being an anonymous failure of the whole export.
+                                throw NaNResultException(
+                                    "Energy cannot be nan: turns " + std::to_string(turnInFirstWinding) + " (" +
+                                    firstWindingName + ", " + std::to_string(firstTurnVoltage) + " V) and " +
+                                    std::to_string(turnInSecondWinding) + " (" + secondWindingName + ", " +
+                                    std::to_string(secondTurnVoltage) + " V) have capacitance " +
+                                    std::to_string(capacitanceAmongTurns[turnsKey]) + " F across a voltage drop of " +
+                                    std::to_string(voltageDropAmongTurns) + " V");
                             }
                         }
                     }
                 }
-                if (windingAreNotAdjacent) {
-                    // No turn of the first winding is adjacent to any turn of the second,
-                    // so there is no direct turn-to-turn capacitive path between them (the
-                    // separated-winding CMC case: the two windings sit on opposite arcs of
-                    // the toroid). The only path is through the core: turn -> core -> turn.
-                    // The energy method (potential-weighted, floating-core node) builds it
-                    // from the per-turn turn-to-core elements. Requires the core (its coating
-                    // sets the dielectric floor); without it we fall back to 0 (old behaviour).
-                    double throughCore = 0;
-                    if (core && firstWindingName != secondWindingName) {
-                        throughCore = calculate_through_core_capacitance(coil, core.value(), firstWindingName, secondWindingName, voltagesPerTurn);
+                // ABT #848: a winding's self-capacitance is chain PLUS core. The pair sum
+                // above only carries the turn-to-turn chain, which SHRINKS with turn count
+                // (adjacent turns differ by V/(N-1)); the turn-to-core elements against the
+                // floating core GROW with it, and on toroids they dominate — without them
+                // the self term came out ~50-100x low against 107 measured WE chokes
+                // (near-zero for single-layer windings). Same energy method and per-turn
+                // elements as the through-core inter-winding path below.
+                if (core) {
+                    if (firstWindingName == secondWindingName) {
+                        energyInBetweenTheseWindings += winding_to_core_self_energy_from_elements(
+                            turnsFacingCore, turnCoreElements, firstWindingName, voltagesPerTurn, fixedCorePotential);
                     }
-                    capacitanceMapPerWindings[windingsKey] = throughCore;
-                    continue;
+                    // ABT #1165: the turn -> core -> turn path between two DIFFERENT windings
+                    // exists whether or not they have adjacent turns. It used to be computed
+                    // only when they had none (the separated-winding CMC), so every concentric
+                    // or contiguous transformer pair on a bobbin was reported with its direct
+                    // turn-to-turn coupling alone -- although the outer winding still faces the
+                    // yokes and flanges that #948 made the model count, and its displacement
+                    // current still returns through the core to the other winding. Folding the
+                    // ENERGY into the same sum as the turn-to-turn pairs (rather than reducing a
+                    // second capacitance against a second voltage) makes the separated case the
+                    // special case of one path: there the turn-to-turn sum is simply empty.
+                    //
+                    // ABT #1167: unless the core is BONDED. A clip, strap or flux band returns
+                    // the first winding's displacement current to the reference instead of
+                    // letting it close through the core into the second winding, and each
+                    // winding's turn-to-core elements become a defined shunt to that reference
+                    // (already carried by the self term above, evaluated at the fixed potential).
+                    // So a grounded or tied core diverts exactly the term #1165 adds.
+                    else if (!fixedCorePotential) {
+                        // ABT #1166: the gap classification is geometry, so it is the same on
+                        // every V3 iteration; it is computed once per pair, outside the loop.
+                        energyInBetweenTheseWindings += winding_pair_to_core_energy_from_elements(
+                            turnsFacingCore, turnCoreElements, firstWindingName, secondWindingName, voltagesPerTurn, V3,
+                            gapSplit);
+                    }
                 }
 
                 voltageDropBetweenWindings = maxVoltageInFirstWinding - minVoltageInSecondWinding + V3;
+                if (windingAreNotAdjacent && firstWindingName == secondWindingName) {
+                    // A winding none of whose turns neighbours another turn of the same winding
+                    // (a single-turn winding, or one the winder has scattered): no turn-to-turn
+                    // chain, and no voltage drop across the pair either, so the 2E/dV^2 reduction
+                    // below has nothing to divide by. Reported as zero self-capacitance, which is
+                    // what this branch did before ABT #1165 -- unchanged here deliberately, since
+                    // giving a one-turn winding the core term it also drops is a separate
+                    // question from the inter-winding path this ticket is about.
+                    capacitanceMapPerWindings[windingsKey] = 0;
+                    continue;
+                }
+
+                if (windingAreNotAdjacent) {
+                    // No turn of the first winding is adjacent to any turn of the second, so
+                    // there is no direct turn-to-turn capacitive path between them (the
+                    // separated-winding CMC case: the two windings sit on opposite arcs of the
+                    // toroid). Everything the pair has is the through-core energy folded in
+                    // above, and it is reduced against the same terminal voltage below. There is
+                    // no three-input multipole to solve -- the six-capacitor representation
+                    // describes a DIRECT two-port coupling -- so the common-mode offset V3 stays
+                    // at 0 and no capacitance matrix is built for this pair, exactly as before.
+                    if (energyInBetweenTheseWindings == 0) {
+                        capacitanceMapPerWindings[windingsKey] = 0;
+                    }
+                    else if (voltageDropBetweenWindings == 0) {
+                        throw NaNResultException("Nonzero through-core energy with zero voltage drop between windings '"
+                                                 + firstWindingName + "' and '" + secondWindingName + "'");
+                    }
+                    else {
+                        capacitanceMapPerWindings[windingsKey] = energyInBetweenTheseWindings * 2 / pow(voltageDropBetweenWindings, 2);
+                    }
+                    continue;
+                }
+
                 relativeTurnsRatio = static_cast<double>(firstWinding.get_number_turns()) / secondWinding.get_number_turns(); 
                 capacitanceMatrixBetweenWindings = calculate_capacitance_matrix_between_windings(energyInBetweenTheseWindings, voltageDropBetweenWindings, relativeTurnsRatio);
                 if (firstWindingName != secondWindingName) {
                     V3calculated = fabs(-(resolve_dimensional_values(capacitanceMatrixBetweenWindings.get_mutable_magnitude()["1"]["3"]) * maxVoltageInFirstWinding + resolve_dimensional_values(capacitanceMatrixBetweenWindings.get_mutable_magnitude()["2"]["3"]) * fabs(minVoltageInSecondWinding)) / resolve_dimensional_values(capacitanceMatrixBetweenWindings.get_mutable_magnitude()["3"]["3"]));
                 }
-                capacitanceMapPerWindings[windingsKey] = energyInBetweenTheseWindings * 2 / pow(voltageDropBetweenWindings, 2);
+                // ABT #278: a single-turn winding has no intra-winding turn pairs, so its
+                // self-capacitance term has zero energy AND zero voltage drop — the formula's 0/0
+                // produced NaN (found by the example battery on the 1-turn current-sense primary).
+                // Zero energy means zero capacitance exactly, whatever the voltage drop; a nonzero
+                // energy with no voltage drop is inconsistent and must fail loudly, not divide.
+                if (energyInBetweenTheseWindings == 0) {
+                    capacitanceMapPerWindings[windingsKey] = 0;
+                }
+                else if (voltageDropBetweenWindings == 0) {
+                    throw NaNResultException("Nonzero inter-turn energy with zero voltage drop between windings '"
+                                             + firstWindingName + "' and '" + secondWindingName + "'");
+                }
+                else {
+                    capacitanceMapPerWindings[windingsKey] = energyInBetweenTheseWindings * 2 / pow(voltageDropBetweenWindings, 2);
+                }
             }
             capacitanceMatrix[firstWindingName][secondWindingName] = capacitanceMatrixBetweenWindings;
             capacitanceMatrix[secondWindingName][firstWindingName] = capacitanceMatrixBetweenWindings;
@@ -1918,7 +3463,20 @@ StrayCapacitanceOutput StrayCapacitance::calculate_capacitance_with_voltages(Coi
     strayCapacitanceOutput.set_six_capacitor_network_per_winding(sixCapacitorNetworkPerWinding);
     strayCapacitanceOutput.set_tripole_capacitance_per_winding(tripoleCapacitancePerWinding);
     strayCapacitanceOutput.set_origin(ResultOrigin::SIMULATION);
-    strayCapacitanceOutput.set_method_used(_model->methodName);
+    // The method the caller ASKED for is _model->methodName; what actually ran is what the
+    // dispatch recorded. They differ whenever a pair involves a flat conductor, and a winding can
+    // legitimately use both. Naming every model that contributed is the only honest answer for a
+    // mixed winding, and it costs nothing to read (ABT #950).
+    if (_methodsUsed.empty()) {
+        strayCapacitanceOutput.set_method_used(_model->methodName);
+    }
+    else {
+        std::string used;
+        for (const auto& name : _methodsUsed) {
+            used += (used.empty() ? "" : "+") + name;
+        }
+        strayCapacitanceOutput.set_method_used(used);
+    }
 
     return strayCapacitanceOutput;
 }
@@ -1971,34 +3529,70 @@ double capacitance_turn_to_shield(double turnDiameter, double wireRadius, double
 }
 
 double cab(double n, double ctt, double cts) {
-    if (n == 2) {
-        return ctt + cts / 2;
+    // Iterative ladder (ABT #346). The former n-2 recursion with exact
+    // n==2 / n==3 base cases never terminated for n < 2 or non-integer n
+    // (0-turn placeholder coils), and legitimately-huge turn counts (open
+    // magnetic circuits needing tens of thousands of turns) exceeded the
+    // WASM call-depth budget and killed the whole Magnetic Adviser.
+    if (n < 2 || n != std::floor(n)) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Stray capacitance ladder cab() needs an integer number of turns >= 2, got " + std::to_string(n));
     }
-    else if (n == 3) {
-        return ctt / 2 + cts / 2;
+    bool even = std::fmod(n, 2) == 0;
+    double value = even ? (ctt + cts / 2) : (ctt / 2 + cts / 2);
+    for (double k = even ? 2 : 3; k < n; k += 2) {
+        value = (value * ctt / 2) / (value + ctt / 2) + cts / 2;
     }
-    else {
-        double cabValue = cab(n - 2, ctt, cts);
-        return (cabValue * ctt / 2) / (cabValue  + ctt / 2) + cts / 2;
-    }
+    return value;
 }
 
 double cas(double n, double ctt, double cts) {
-    if (n == 1) {
-        return cts;
+    // Iterative ladder (ABT #346), same reasoning as cab().
+    if (n < 1 || n != std::floor(n)) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Stray capacitance ladder cas() needs an integer number of turns >= 1, got " + std::to_string(n));
     }
-    else {
-        double casValue = cas(n - 1, ctt, cts);
-        return (casValue * ctt) / (casValue  + ctt) + cts;
+    double value = cts;
+    for (double k = 1; k < n; k += 1) {
+        value = (value * ctt) / (value + ctt) + cts;
     }
+    return value;
 }
 
-double StrayCapacitanceOneLayer::calculate_capacitance(Coil coil) {
+double StrayCapacitanceOneLayer::calculate_capacitance(Coil coil, std::optional<Core> core) {
     // Baed on https://sci-hub.st/https://ieeexplore.ieee.org/document/793378
     double numberTurns = coil.get_functional_description()[0].get_number_turns();
     auto wireRadius = coil.resolve_wire(0).get_maximum_conducting_width() / 2;
-    double distanceTurnsToCore = coil.resolve_bobbin().get_processed_description()->get_column_thickness() + coil.resolve_wire(0).get_maximum_outer_width() / 2;
-    double turnDiameter = 2 * std::numbers::pi * (coil.resolve_bobbin().get_processed_description()->get_column_width().value() + wireRadius);
+    double columnThickness = coil.resolve_bobbin().get_processed_description()->get_column_thickness();
+    double distanceTurnsToCore = columnThickness + coil.resolve_wire(0).get_maximum_outer_width() / 2;
+
+    // ABT #846: capacitance_turn_to_turn / capacitance_turn_to_shield are the textbook
+    // per-unit-length forms (pi*e0/acosh, 2*pi*e0/acosh) times pi*turnDiameter, so the
+    // parameter must be a DIAMETER — the turn length is then pi*D. column_width is the
+    // column RADIUS (Bobbin sets it to coreColumn.width/2 + columnThickness), so the turn
+    // wraps at radius (column_width + wireRadius) and its diameter is twice that. The old
+    // code passed the CIRCUMFERENCE 2*pi*(column_width + wireRadius), making every
+    // capacitance pi times too large (verified against Medhurst's 1947 solenoid data).
+    double turnDiameter = 2 * (coil.resolve_bobbin().get_processed_description()->get_column_width().value() + wireRadius);
+
+    // A toroid's winding window is ROUND; its turn does not circle a round column but wraps
+    // the core CROSS-SECTION — length 2*(radialThickness + height) plus the rounding of the
+    // four corners at radius (columnThickness + wireRadius). The core height never enters
+    // the bobbin's column data, so this needs the core itself (ABT #845/#846).
+    bool toroidal = coil.resolve_bobbin().get_winding_window_shape(0) == WindingWindowShape::ROUND;
+    if (toroidal && numberTurns > 1) {
+        // The toroid model below is only correct with the core's cross-section: the bobbin
+        // column carries no height, so without the core the turn length would silently fall
+        // back to the column-based circle — neither the old behaviour nor the new one.
+        // Require it loudly instead of guessing (the optional default serves non-toroids).
+        if (!core || !core->get_processed_description()) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "StrayCapacitanceOneLayer needs the processed core for a toroidal coil: the "
+                "turn wraps the core cross-section (width and height), which the bobbin's "
+                "column data cannot provide. Pass the core, or process its description first.");
+        }
+        auto column = core->get_processed_description()->get_columns().at(0);
+        double turnLength = 2 * (column.get_width() + column.get_depth()) + 2 * std::numbers::pi * (columnThickness + wireRadius);
+        turnDiameter = turnLength / std::numbers::pi;
+    }
     double centerSeparation = coil.resolve_wire(0).get_maximum_outer_width();
     if (coil.get_turns_description()) {
         if (coil.get_turns_description().value().size() > 1) {
@@ -2035,6 +3629,38 @@ double StrayCapacitanceOneLayer::calculate_capacitance(Coil coil) {
 
     double ctt = capacitance_turn_to_turn(turnDiameter, wireRadius, centerSeparation);
     double cts = capacitance_turn_to_shield(turnDiameter, wireRadius, distanceTurnsToCore);
+
+    // ABT #845: the cas/cab ladder models a GROUNDED shield, which screens distant turns and
+    // makes the result converge to the fixed point sqrt(cts*ctt), independent of turn count
+    // above ~15 turns. A magnetic core has no terminal: it is a FLOATING conductor that
+    // settles at the potential where its displacement currents balance (Pasko, Kazimierczuk,
+    // Grzesik, IEEE Trans. EMC 57(2), 2015). For a single-layer toroid with the standard
+    // linear voltage distribution V_k = V*k/(N-1), charge balance puts the core at V/2 and
+    // the stored energies reduce to two closed forms:
+    //   turn-to-turn chain: (N-1) series gaps of V/(N-1) -> C_chain = ctt / (N-1)
+    //   turn-to-core:       (1/2)*cts*Sum((k/(N-1) - 1/2)^2)*V^2 -> C_core ~ N*cts/12
+    // The core term GROWS with N — measured WE common-mode chokes scale as C ~ N^+1.3 while
+    // the grounded ladder scales as N^-0.05, resonating 3x high on many-turn parts and
+    // parking a spurious low resonance on few-turn parts (ABT #845 has the data).
+    //
+    // N=1 deliberately falls through to the ladder below (which reduces to cts): the chain
+    // term ctt/(N-1) is singular at one turn, and a single turn has no turn-to-turn chain
+    // for the floating-core reduction to act on. The model discontinuity at N=2 is known
+    // and intended — do not "fix" the guard to >= 1.
+    if (toroidal && numberTurns > 1) {
+        double capacitance = ctt / (numberTurns - 1) + numberTurns * cts / 12;
+        if (std::isnan(capacitance)) {
+            throw NaNResultException("capacitance cannot be NaN");
+        }
+        // Deliberately NO layers multiplier here (unlike the ladder path below): the
+        // floating-core energy sum already counts every turn once, and on a multi-layer
+        // toroid the outer layers sit FARTHER from the core, weakening — not multiplying —
+        // their coupling. Applying the legacy x-layers heuristic doubled the capacitance of
+        // the 110-turn T12.5/7.5/5 anchor (2 layers) and moved its self-resonance from the
+        // measured ~180 kHz to 130 kHz; without it the single-layer form lands on the pin.
+        return capacitance;
+    }
+
     double C2;
     double casValue = cas(numberTurns, ctt, cts);
 

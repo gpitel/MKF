@@ -376,17 +376,18 @@ namespace WindingLossesTestData {
         config.includeFringing = true;
         config.mirroringDimension = 1;
         
-        // Re-pinned (July 2026): gap fringing is now actually delivered (see the
-        // One_Turn_Litz_Many_Strands note for the == gate fix and the OMFEM 1 mm
-        // mechanism check). Old pins captured the fringing-disabled bug state.
+        // Re-pinned (ABT #832, 2026-08-20): ALBACH fringing now routes through the
+        // Roshen conformal path, so the July 2026 pins (taken under the equivalent-
+        // current construction, which the July litz FEM campaign itself measured as
+        // ~2x ABOVE the OMFEM fringing delta) come down toward FEM.
         config.expectedValues = {
-            {0.01, 0.033848},
-            {25000, 0.033953},
-            {50000, 0.034267},
-            {100000, 0.035526},
-            {200000, 0.040559},
-            {250000, 0.044332},
-            {500000, 0.075709}
+            {0.01, 0.034288},
+            {25000, 0.034323},
+            {50000, 0.034430},
+            {100000, 0.034855},
+            {200000, 0.036554},
+            {250000, 0.037828},
+            {500000, 0.048421}
         };
         
         config.createMagnetic = []() {
@@ -439,16 +440,15 @@ namespace WindingLossesTestData {
         config.includeFringing = true;
         config.mirroringDimension = 1;
         
-        // Re-pinned (July 2026): gap fringing is now actually delivered (see the
-        // One_Turn_Litz_Many_Strands note for the == gate fix and the OMFEM 1 mm
-        // mechanism check). Old pins captured the fringing-disabled bug state.
+        // Re-pinned (ABT #832, 2026-08-20): same Roshen re-routing as
+        // Ten_Turns_Litz_Sinusoidal above.
         config.expectedValues = {
-            {0.01, 0.10731},
-            {25000, 0.10897},
-            {50000, 0.11396},
-            {100000, 0.13389},
-            {200000, 0.21362},
-            {250000, 0.27338}
+            {0.01, 0.10863},
+            {25000, 0.10913},
+            {50000, 0.11064},
+            {100000, 0.11667},
+            {200000, 0.14080},
+            {250000, 0.15888}
         };
         
         config.createMagnetic = []() {
@@ -557,8 +557,20 @@ namespace WindingLossesTestData {
             OpenMagnetics::Wire wire;
             wire.set_nominal_value_conducting_width(0.0001);
             wire.set_nominal_value_conducting_height(0.0016);
-            wire.set_nominal_value_outer_width(0.00015);
-            wire.set_nominal_value_outer_height(0.00165);
+            // ABT #1264: same defect as the PQ fixture above -- no coating declared while the outer
+            // size (0.15 x 1.65 mm) exceeded the 0.1 x 1.6 mm conductor, which MKF's validation
+            // refuses, and the 50 um corridor matches no IEC grade. Grade 1 on this conductor gives
+            // 0.10425 x 1.685 mm from the standard.
+            InsulationWireCoating coating;
+            coating.set_type(InsulationWireCoatingType::ENAMELLED);
+            coating.set_grade(1);
+            wire.set_coating(coating);
+            // The outer sizes come FROM the standard for that grade, not from hand-typed
+            // numbers, so wire and coating cannot drift apart again.
+            wire.set_nominal_value_outer_width(
+                OpenMagnetics::Wire::get_outer_width_rectangular(0.0001, 1, WireStandard::IEC_60317));
+            wire.set_nominal_value_outer_height(
+                OpenMagnetics::Wire::get_outer_height_rectangular(0.0016, 1, WireStandard::IEC_60317));
             wire.set_number_conductors(1);
             wire.set_material("copper");
             wire.set_type(WireType::RECTANGULAR);
@@ -595,18 +607,30 @@ namespace WindingLossesTestData {
         config.includeFringing = true;
         config.mirroringDimension = 2;
         
+        // Pinned to 2D OMFEM WITHOUT the 5 um residual gaps (ABT #1425, 2026-09-27), like the
+        // five-turn PQ 20/16: each AC value is OMFEM's OWN R_ac/R_dc (its own DC) times MKF's DC for
+        // this fixture (1.15494 mW), so the +-25% check compares the two solvers' R_ac/R_dc, never
+        // watts across different turn lengths. The residual gaps are left out because MKF excludes
+        // residual (mating-surface) gaps from every field source (ABT #832); with them OMFEM reads
+        // R_ac/R_dc 22.96 at 500 kHz, without them 14.98 (the near field of the residual gap on the
+        // turns next to it, ABT #1441). OMFEM R_ac/R_dc without residual gaps: 6.704 / 9.421 /
+        // 11.55 / 13.36 / 14.98 / 16.40 / 17.74 / 18.97 / 20.08 / 21.27 at 100 k .. 1 MHz (planar
+        // solve, automatic conductor mesh = skin depth / 3). Mesh check at 500 kHz: 14.98 / 14.99 /
+        // 15.30 at conductor targets 30.7 / 10 / 7 um. Caveat: PQ windows are only partly enclosed
+        // by the core, so OMFEM's fully imaged planar frame may overstate field confinement; OMFEM
+        // is nevertheless the reference.
         config.expectedValues = {
-            {0.01, 0.00019313 + 0.00019313 * 6},
-            {100000, 0.0025456},
-            {200000, 0.00342804},
-            {300000, 0.00419621},
-            {400000, 0.00484483},
-            {500000, 0.0054165},
-            {600000, 0.0059334},
-            {700000, 0.00640876},
-            {800000, 0.00685123},
-            {900000, 0.00726681},
-            {1000000, 0.00765988}
+            {0.01, 0.0011519},
+            {100000, 0.0077427},
+            {200000, 0.010881},
+            {300000, 0.013344},
+            {400000, 0.015431},
+            {500000, 0.017295},
+            {600000, 0.018942},
+            {700000, 0.02049},
+            {800000, 0.021905},
+            {900000, 0.023196},
+            {1000000, 0.02456}
         };
         
         config.createMagnetic = []() {
@@ -618,8 +642,23 @@ namespace WindingLossesTestData {
             OpenMagnetics::Wire wire;
             wire.set_nominal_value_conducting_width(0.0038);
             wire.set_nominal_value_conducting_height(0.00076);
-            wire.set_nominal_value_outer_height(0.0007676);
-            wire.set_nominal_value_outer_width(0.003838);
+            // ABT #1264: this wire declared NO coating while its outer size exceeded the
+            // conductor (0.003838 x 0.0007676 against 0.0038 x 0.00076), which MKF's own validation
+            // refuses -- 'states no coating, but its outer size exceeds its conductor'. The
+            // hand-typed corridor was not a coating either: it was asymmetric, and no IEC
+            // grade produces it. Declare the enamel the sizes imply and let the STANDARD set
+            // the outer dimensions, as the catalogue's own 'Rectangular 4x0.90 - Grade 1'
+            // does (it stores no outer size at all).
+            InsulationWireCoating coating;
+            coating.set_type(InsulationWireCoatingType::ENAMELLED);
+            coating.set_grade(1);
+            wire.set_coating(coating);
+            // The outer sizes come FROM the standard for that grade, not from hand-typed
+            // numbers, so wire and coating cannot drift apart again.
+            wire.set_nominal_value_outer_width(
+                OpenMagnetics::Wire::get_outer_width_rectangular(0.0038, 1, WireStandard::IEC_60317));
+            wire.set_nominal_value_outer_height(
+                OpenMagnetics::Wire::get_outer_height_rectangular(0.00076, 1, WireStandard::IEC_60317));
             wire.set_number_conductors(1);
             wire.set_material("copper");
             wire.set_type(WireType::RECTANGULAR);
@@ -880,16 +919,44 @@ namespace WindingLossesTestData {
         config.includeFringing = true;
         config.mirroringDimension = 1;
         
-        // Expected values with Kelvin-mirrored boundary conditions (Mühlethaler 2026)
-        // TODO: verify these values against FEM simulation for T 40/24/16 toroid
+        // FEM-referenced, 2026-07-27 (ABT #190a, user-approved re-pin). The previous values
+        // carried "TODO: verify these against FEM simulation" and had never been checked; they
+        // are replaced here by OMFEM 2D harmonic-eddy results for this exact magnetic.
+        //
+        // METHOD. omfem_mas (2D Cartesian cut through the toroid plane: the annular core plus
+        // all 20 conductor crossings) was run at each frequency from a MAS file carrying this
+        // magnetic and a 1 A rms sinusoid. Its magnetostatics check out — L = 539.1 uH against
+        // MKF's 530.1 uH and a closed-form mu0*mu_r*N^2*Ae/le = 525.6 uH — so the model is sound
+        // even though the tool prints a bogus "MKF 113.9 uH" reference (an OMFEM-side bug, filed
+        // separately; it is what made an earlier attempt wrongly discard this result). What
+        // transfers is the RATIO R_ac/R_dc, not OMFEM's absolute P_cu, because the 2D cut assigns
+        // its own conductor length; each value below is therefore (OMFEM R_ac/R_dc) x (MKF's DC
+        // loss 0.02119087 W), which leaves the DC anchor untouched.
+        //
+        // R_ac/R_dc — pinned-before / OMFEM / MKF-now:
+        //    25 kHz  1.150 / 1.213 /  1.440       200 kHz  3.568 / 4.439 /  ----
+        //    50 kHz  1.516 / 1.725 /  2.507       250 kHz  4.020 / 5.050 /  9.116
+        //   100 kHz  2.358 / 2.841 /  4.892       500 kHz  5.775 / 7.494 / 13.374
+        // The FEM lies BETWEEN the two at every point: MKF over-predicts by 19% at 25 kHz rising
+        // to ~80% above 200 kHz, the old constants under-predicted by 5-23%. MKF's skin term is
+        // right (F_R = 1.011 at 25 kHz, the analytic value for r/delta = 0.85); the excess is
+        // entirely proximity — the field the Kelvin-mirrored configuration imposes on conductors
+        // that sit 7.5 mm apart on a 24 mm bore. THIS TEST IS EXPECTED TO FAIL ABOVE 25 kHz until
+        // that model is corrected; that is what a FEM-referenced pin is for.
+        //
+        // CAVEAT for whoever revisits: the 2D cut treats each crossing as infinitely long (no end
+        // turns, no return path), and its core-loss/temperature outputs for this case are not
+        // usable (B_peak ~0.6 T drives iGSE far out of range). A 3D real-turn arbitration is
+        // blocked — OMFEM's transport drive hard-wires its electrodes to quarter-symmetry cut
+        // planes, and a closed poloidal turn has no equivalent (ABT #315).
         config.expectedValues = {
             {0.01, 0.02119087},
-            {25000, 0.02436939},
-            {50000, 0.03212591},
-            {100000, 0.04997908},
-            {200000, 0.07561326},
-            {250000, 0.08518898},
-            {500000, 0.12237422}
+            {25000, 0.02570510},
+            {50000, 0.03655488},
+            {100000, 0.06020424},
+            {200000, 0.09406778},
+            {250000, 0.10701607},
+            {500000, 0.15880821}
         };
         
         config.createMagnetic = []() {
@@ -1451,18 +1518,32 @@ namespace WindingLossesTestData {
         config.includeFringing = true;
         config.mirroringDimension = 2;
         
+        // Pinned to 2D OMFEM WITHOUT the 5 um residual gaps (ABT #1425, 2026-09-27): each AC value
+        // is OMFEM's OWN R_ac/R_dc (its own DC) times MKF's DC for this fixture (0.49121 mW), the
+        // same normalisation as ABT #1409, so the +-25% check compares the two solvers' R_ac/R_dc,
+        // never watts across different turn lengths. The residual gaps are left out because MKF
+        // excludes residual (mating-surface) gaps from every field source (ABT #832); OMFEM meshes
+        // them, and with them its loss is ~2.4x higher at 500 kHz (R_ac/R_dc 33.2 vs 13.9): the
+        // middle turn sits 42 um from the column, right in front of the residual gap, and carries
+        // 73% of the loss. That near-field effect is tracked as a possible future field source,
+        // not tested here. OMFEM R_ac/R_dc without residual gaps: 6.261 / 8.815 / 10.80 / 12.47 /
+        // 13.92 / 15.29 / 16.46 / 17.64 / 18.78 / 19.90 at 100 k .. 1 MHz (planar solve, automatic
+        // conductor mesh = skin depth / 3). Mesh check at 500 kHz: 13.92 / 14.02 / 14.24 / 14.24 /
+        // 14.78 at conductor targets 30.7 / 15.5 / 10 / 7 / 5 um, i.e. within ~6% of the pin.
+        // Caveat: PQ windows are only partly enclosed by the core, so OMFEM's fully imaged planar
+        // frame may overstate field confinement; OMFEM is nevertheless the reference.
         config.expectedValues = {
-            {0.01, 0.00011974 + 0.0003736},
-            {100000, 0.00087387 + 0.0003736},
-            {200000, 0.0012227 + 0.0003736},
-            {300000, 0.001487 + 0.0003736},
-            {400000, 0.0017156 + 0.0003736},
-            {500000, 0.001927 + 0.0003736},
-            {600000, 0.0021237 + 0.0003736},
-            {700000, 0.0023129 + 0.0003736},
-            {800000, 0.0024954 + 0.0003736},
-            {900000, 0.0026719 + 0.0003736},
-            {1000000, 0.002843 + 0.0003736}
+            {0.01, 0.00048949},
+            {100000, 0.0030755},
+            {200000, 0.00433},
+            {300000, 0.0053041},
+            {400000, 0.0061269},
+            {500000, 0.0068376},
+            {600000, 0.0075121},
+            {700000, 0.0080853},
+            {800000, 0.0086659},
+            {900000, 0.0092264},
+            {1000000, 0.0097726}
         };
         
         config.createMagnetic = []() {
@@ -1474,8 +1555,23 @@ namespace WindingLossesTestData {
             OpenMagnetics::Wire wire;
             wire.set_nominal_value_conducting_width(0.004);
             wire.set_nominal_value_conducting_height(0.0009);
-            wire.set_nominal_value_outer_height(0.000909);
-            wire.set_nominal_value_outer_width(0.00404);
+            // ABT #1264: this wire declared NO coating while its outer size exceeded the
+            // conductor (0.00404 x 0.000909 against 0.004 x 0.0009), which MKF's own validation
+            // refuses -- 'states no coating, but its outer size exceeds its conductor'. The
+            // hand-typed corridor was not a coating either: it was asymmetric, and no IEC
+            // grade produces it. Declare the enamel the sizes imply and let the STANDARD set
+            // the outer dimensions, as the catalogue's own 'Rectangular 4x0.90 - Grade 1'
+            // does (it stores no outer size at all).
+            InsulationWireCoating coating;
+            coating.set_type(InsulationWireCoatingType::ENAMELLED);
+            coating.set_grade(1);
+            wire.set_coating(coating);
+            // The outer sizes come FROM the standard for that grade, not from hand-typed
+            // numbers, so wire and coating cannot drift apart again.
+            wire.set_nominal_value_outer_width(
+                OpenMagnetics::Wire::get_outer_width_rectangular(0.004, 1, WireStandard::IEC_60317));
+            wire.set_nominal_value_outer_height(
+                OpenMagnetics::Wire::get_outer_height_rectangular(0.0009, 1, WireStandard::IEC_60317));
             wire.set_number_conductors(1);
             wire.set_material("copper");
             wire.set_type(WireType::RECTANGULAR);
@@ -1512,18 +1608,21 @@ namespace WindingLossesTestData {
         config.includeFringing = true;
         config.mirroringDimension = 2;
         
+        // Pinned to 2D OMFEM without the residual gaps like the 1 A variant (same geometry and
+        // R_ac/R_dc; OMFEM run at 7 A gives the same ratios to 4 digits: 13.920 at 500 kHz), times
+        // MKF's DC here (24.0692 mW). See the 1 A config for why the residual gaps are left out.
         config.expectedValues = {
-            {0.01, 0.0058551 * 5},
-            {100000, 0.03363 + 0.0058551 * 5},
-            {200000, 0.06063 + 0.0058551 * 5},
-            {300000, 0.073721 + 0.0058551 * 5},
-            {400000, 0.084989 + 0.0058551 * 5},
-            {500000, 0.095376 + 0.0058551 * 5},
-            {600000, 0.10525 + 0.0058551 * 5},
-            {700000, 0.11477 + 0.0058551 * 5},
-            {800000, 0.12399 + 0.0058551 * 5},
-            {900000, 0.13296 + 0.0058551 * 5},
-            {1000000, 0.141661 + 0.0058551 * 5}
+            {0.01, 0.023985},
+            {100000, 0.1507},
+            {200000, 0.21217},
+            {300000, 0.2599},
+            {400000, 0.30022},
+            {500000, 0.33504},
+            {600000, 0.36809},
+            {700000, 0.39618},
+            {800000, 0.42463},
+            {900000, 0.45209},
+            {1000000, 0.47886}
         };
         
         config.createMagnetic = []() {
@@ -1535,8 +1634,23 @@ namespace WindingLossesTestData {
             OpenMagnetics::Wire wire;
             wire.set_nominal_value_conducting_width(0.004);
             wire.set_nominal_value_conducting_height(0.0009);
-            wire.set_nominal_value_outer_height(0.000909);
-            wire.set_nominal_value_outer_width(0.00404);
+            // ABT #1264: this wire declared NO coating while its outer size exceeded the
+            // conductor (0.00404 x 0.000909 against 0.004 x 0.0009), which MKF's own validation
+            // refuses -- 'states no coating, but its outer size exceeds its conductor'. The
+            // hand-typed corridor was not a coating either: it was asymmetric, and no IEC
+            // grade produces it. Declare the enamel the sizes imply and let the STANDARD set
+            // the outer dimensions, as the catalogue's own 'Rectangular 4x0.90 - Grade 1'
+            // does (it stores no outer size at all).
+            InsulationWireCoating coating;
+            coating.set_type(InsulationWireCoatingType::ENAMELLED);
+            coating.set_grade(1);
+            wire.set_coating(coating);
+            // The outer sizes come FROM the standard for that grade, not from hand-typed
+            // numbers, so wire and coating cannot drift apart again.
+            wire.set_nominal_value_outer_width(
+                OpenMagnetics::Wire::get_outer_width_rectangular(0.004, 1, WireStandard::IEC_60317));
+            wire.set_nominal_value_outer_height(
+                OpenMagnetics::Wire::get_outer_height_rectangular(0.0009, 1, WireStandard::IEC_60317));
             wire.set_number_conductors(1);
             wire.set_material("copper");
             wire.set_type(WireType::RECTANGULAR);

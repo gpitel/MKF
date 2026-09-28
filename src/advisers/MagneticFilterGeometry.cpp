@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 
 namespace OpenMagnetics {
 
@@ -102,11 +103,34 @@ std::pair<bool, double> MagneticFilterTurnsRatios::evaluate_magnetic(Magnetic* m
             if (!check_requirement(turnsRatioRequirement, magneticTurnsRatios[i])) {
                 return {false, 0.0};
             }
-            scoring += abs(resolve_dimensional_values(turnsRatioRequirement) - resolve_dimensional_values(magneticTurnsRatios[i]));
+            // std::fabs, not abs: bare abs() resolves to the INTEGER overload
+            // here and truncated the distance, so every candidate closer than
+            // one whole turns-ratio unit scored exactly 0 — which is every
+            // realistic match. The filter then reported one identical value for
+            // every accepted candidate and provided no ranking signal at all,
+            // while two candidates 15.05 and 15.959 away scored the same
+            // (ABT #801). Proven from the outside: the normalized scores were
+            // exactly those of integer distances 1, 14, 15, 24.
+            scoring += std::fabs(resolve_dimensional_values(turnsRatioRequirement) - resolve_dimensional_values(magneticTurnsRatios[i]));
         }
     }
     return {valid, scoring};
 }
+
+namespace {
+
+// The size filters read Magnetic::get_maximum_dimensions, which a datasheet-only part answers
+// from its published body size.
+bool has_dimensions(Magnetic* magnetic) {
+    return (magnetic->has_core() && magnetic->has_coil()) || magnetic->has_datasheet_dimensions();
+}
+
+}  // namespace
+
+bool MagneticFilterMaximumDimensions::applies_to(Magnetic* magnetic) const { return has_dimensions(magnetic); }
+bool MagneticFilterVolume::applies_to(Magnetic* magnetic) const { return has_dimensions(magnetic); }
+bool MagneticFilterArea::applies_to(Magnetic* magnetic) const { return has_dimensions(magnetic); }
+bool MagneticFilterHeight::applies_to(Magnetic* magnetic) const { return has_dimensions(magnetic); }
 
 std::pair<bool, double> MagneticFilterMaximumDimensions::evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs) {
     bool valid = true;
@@ -114,12 +138,69 @@ std::pair<bool, double> MagneticFilterMaximumDimensions::evaluate_magnetic(Magne
     if (inputs->get_design_requirements().get_maximum_dimensions()) {
         auto maximumDimensions = inputs->get_design_requirements().get_maximum_dimensions().value();
         auto magneticDimensions = magnetic->get_maximum_dimensions();
-        scoring = sqrt(pow(maximumDimensions.get_width().value() - magneticDimensions[0], 2) + pow(maximumDimensions.get_height().value() - magneticDimensions[1], 2)+ pow(maximumDimensions.get_depth().value() - magneticDimensions[2], 2));
+        // Only the axes the envelope states: a height-only limit (the common PCB case) left
+        // width and depth disengaged, and reading them threw bad_optional_access.
+        double squaredDistance = 0;
+        if (maximumDimensions.get_width()) {
+            squaredDistance += pow(maximumDimensions.get_width().value() - magneticDimensions[0], 2);
+        }
+        if (maximumDimensions.get_height()) {
+            squaredDistance += pow(maximumDimensions.get_height().value() - magneticDimensions[1], 2);
+        }
+        if (maximumDimensions.get_depth()) {
+            squaredDistance += pow(maximumDimensions.get_depth().value() - magneticDimensions[2], 2);
+        }
+        scoring = sqrt(squaredDistance);
         if (!magnetic->fits(maximumDimensions, true)) {
             valid = false;
         }
     }
     return {valid, scoring};
+}
+
+namespace {
+// One mounting: the height as stated, and the part turned on the board if needed (width and
+// depth may swap).
+bool fits_in_orientation(double height, double footprintA, double footprintB, const MaximumDimensions& maximumDimensions) {
+    if (maximumDimensions.get_height() && height > maximumDimensions.get_height().value()) {
+        return false;
+    }
+    double maximumWidth = maximumDimensions.get_width().value_or(std::numeric_limits<double>::infinity());
+    double maximumDepth = maximumDimensions.get_depth().value_or(std::numeric_limits<double>::infinity());
+    return (footprintA <= maximumWidth && footprintB <= maximumDepth) ||
+           (footprintA <= maximumDepth && footprintB <= maximumWidth);
+}
+
+// Design-mode fit, as the part can actually be mounted. dimensions = {width, height, depth} in
+// MKF's frame. A bobbin-wound part keeps its height: laying it down needs a horizontal bobbin
+// and pinout the design doesn't have. A toroid mounts either flat or on edge on a vertical
+// header without changing the magnetic; MKF builds it on edge (width = height = OD, depth =
+// axial length), so flat means height = that axial depth and footprint = OD x OD.
+bool fits_as_mounted(const std::vector<double>& dimensions, bool isToroid, const MaximumDimensions& maximumDimensions) {
+    bool fitsAsBuilt = fits_in_orientation(dimensions[1], dimensions[0], dimensions[2], maximumDimensions);
+    if (!isToroid) {
+        return fitsAsBuilt;
+    }
+    return fitsAsBuilt || fits_in_orientation(dimensions[2], dimensions[0], dimensions[1], maximumDimensions);
+}
+}
+
+bool MagneticFilterMaximumDimensions::core_fits(Core& core, const Inputs& inputs) {
+    auto maximumDimensions = inputs.get_design_requirements().get_maximum_dimensions();
+    if (!maximumDimensions) {
+        return true;
+    }
+    return fits_as_mounted(core.get_maximum_dimensions(),
+                           core.get_shape_family() == CoreShapeFamily::T, maximumDimensions.value());
+}
+
+bool MagneticFilterMaximumDimensions::magnetic_fits(Magnetic& magnetic, const Inputs& inputs) {
+    auto maximumDimensions = inputs.get_design_requirements().get_maximum_dimensions();
+    if (!maximumDimensions) {
+        return true;
+    }
+    return fits_as_mounted(magnetic.get_maximum_dimensions(),
+                           magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::T, maximumDimensions.value());
 }
 
 std::pair<bool, double> MagneticFilterVolume::evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs) {
@@ -191,6 +272,67 @@ std::pair<bool, double> MagneticFilterLossesNoProximityTimesVolumeTimesTemperatu
     double temperature = cached_or_compute_scoring(magnetic, inputs, outputs, MagneticFilters::TEMPERATURE_RISE, _magneticFilterTemperatureRise);
     auto [volumeValid, volumeScoring] = MagneticFilterVolume().evaluate_magnetic(magnetic, inputs, outputs);
     return {true, losses * volumeScoring * temperature};
+}
+
+} // namespace OpenMagnetics
+
+namespace OpenMagnetics {
+
+std::optional<size_t> MagneticFilterLayerParity::calculate_number_layers(Winding winding, Section section) {
+    auto wire = Coil::resolve_wire(winding);
+    if (section.get_dimensions().size() < 2) {
+        return std::nullopt;
+    }
+    // Overlapping (concentric) sections stack layers along x and lay turns along y.
+    double sectionLengthAlongTurns = section.get_dimensions()[1];
+    double wireDimensionAlongTurns = wire.get_maximum_outer_height();
+    if (!(sectionLengthAlongTurns > 0) || !(wireDimensionAlongTurns > 0)) {
+        return std::nullopt;
+    }
+    auto numberTurnsPerLayer = static_cast<size_t>(std::floor(sectionLengthAlongTurns / wireDimensionAlongTurns));
+    if (numberTurnsPerLayer == 0) {
+        return std::nullopt;
+    }
+    auto totalTurns = static_cast<double>(winding.get_number_turns()) * static_cast<double>(winding.get_number_parallels());
+    return static_cast<size_t>(std::ceil(totalTurns / static_cast<double>(numberTurnsPerLayer)));
+}
+
+std::pair<bool, double> MagneticFilterLayerParity::evaluate_magnetic(Winding winding, Section section) {
+    auto numberLayers = calculate_number_layers(winding, section);
+    if (!numberLayers) {
+        // Nothing to say about a candidate whose layer count cannot be worked out; it is not
+        // rejected and it is not penalised, and the caller can tell it apart from an even one
+        // only through calculate_number_layers. No default layer count is invented here.
+        return {true, 0.0};
+    }
+    if (numberLayers.value() <= 1) {
+        return {true, 0.0};
+    }
+    if ((numberLayers.value() % 2) != 0) {
+        return {true, 1.0};
+    }
+    return {true, 0.0};
+}
+
+std::pair<bool, double> MagneticFilterLayerParity::evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs) {
+    (void)inputs;
+    (void)outputs;
+    bool valid = true;
+    double scoring = 0;
+    auto windings = magnetic->get_coil().get_functional_description();
+    for (auto& winding : windings) {
+        auto sections = magnetic->get_mutable_coil().get_sections_by_winding(winding.get_name());
+        if (sections.empty()) {
+            continue;
+        }
+        auto [auxValid, auxScoring] = evaluate_magnetic(winding, sections[0]);
+        valid &= auxValid;
+        scoring += auxScoring;
+    }
+    if (!windings.empty()) {
+        scoring /= static_cast<double>(windings.size());
+    }
+    return {valid, scoring};
 }
 
 } // namespace OpenMagnetics

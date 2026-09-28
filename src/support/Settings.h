@@ -33,6 +33,7 @@ class Settings
 
         bool _inputsTrimHarmonics = true;
         size_t _inputsNumberPointsSampledWaveforms;
+        size_t _inputsMaximumNumberPointsSampledImportedWaveforms;
 
         bool _magnetizingInductanceIncludeAirInductance = false;
 
@@ -49,6 +50,42 @@ class Settings
         // ignored. When true, the winder accounts for the space reserved by connection/lead wires
         // (affecting filling factors) and their length is included in the winding losses.
         bool _coilUseRealWindingGeometry = false;
+        // ABT #685 (Alf, 2026-08-16): COATING SQUISH. When true, the sections/layers fit check
+        // tolerates a filling factor up to 1 + 1e-3: the helical stacking pitch (turns tangent
+        // in 3D, ABT #780) is a second-order correction ((K*od/L)^2/2, always well under 0.1%),
+        // so a layer that was EXACTLY full under flat-stack arithmetic now overflows by a few
+        // tens of um — physically absorbed by the wire coating squishing, which every real
+        // winder relies on. Default OFF: fit stays exact unless the caller opts in.
+        bool _coilAllowCoatingSquish = false;
+        // ABT #685 (Alf, 2026-08-16): HORIZONTAL OVERFLOW. When true, the fit check ignores
+        // overflow on the LAYER axis (x for overlapping windings): the winding may bulge
+        // radially past the window edge (real windings do, past the bobbin flange), while the
+        // turn axis (y) stays strict. Lets over-full example designs wind with real-winding
+        // blocking applied instead of silently skipping it. Default OFF.
+        bool _coilAllowHorizontalOverflow = false;
+        // ABT #1220: when magnetic_autocomplete builds a quick bobbin from the core, also give it
+        // a synthesised two-row THT pinout (Bobbin::synthesise_quick_bobbin_pinout) mounted in
+        // _coilQuickBobbinPinsOrientation, so Coil::assign_pins has pins to assign. Default OFF:
+        // quick bobbins stay pinless. A core family with no catalogue evidence throws when ON.
+        bool _coilQuickBobbinGeneratePins = false;
+        // ABT #1237 (Alf, 2026-09-13): connecting winding leads to the bobbin's pins. When false
+        // (default) magnetic_autocomplete assigns no pins, so connections[] get no pinName/end from
+        // it and every terminal lead ends at the window border (its pre-WP3 length). When true it runs
+        // Coil::assign_pins and the terminal routes continue to their pins. An explicit
+        // Coil::assign_pins call, or pins the design names itself, work regardless.
+        bool _coilConnectLeadsToPins = false;
+        OrientationEnum _coilQuickBobbinPinsOrientation = OrientationEnum::VERTICAL;  // Keep in sync with reset()
+        // ABT #1248 (Alf, 2026-09-13): how a wound TOROID is mounted in the 3D assembly frame
+        // (MVB++ reads it where the toroid geometry is built). VERTICAL (default, what most
+        // toroidal inductors and 2-winding CMCs look like, e.g. WE-CMB/WE-TI): the ring stands on
+        // its rim, hole axis horizontal (Z), ring plane XY with Y up; it is turned about the hole
+        // axis so every winding's start and finish sit at the bottom, and each terminal lead leaves
+        // its crossing straight down (-Y) to one common XZ plane below the ring. HORIZONTAL: the
+        // ring lies flat, hole axis along Y; each lead runs out past the rim and drops -Y to the
+        // same kind of common XZ plane. Both mountings put every toroid terminal cap in an XZ plane
+        // with normal -Y. A toroid base record's own base.mounting overrides this setting.
+        // The MKF-side terminal-lead route/length (ABT #1217) must follow this geometry.
+        OrientationEnum _toroidMounting = OrientationEnum::VERTICAL;  // Keep in sync with reset()
         size_t _coilMaximumLayersPlanar = 32;  // Keep in sync with reset()
 
         bool _useOnlyCoresInStock = true;
@@ -64,6 +101,22 @@ class Settings
         // secondary wound on a lateral leg (integrated-leakage designs). Off by
         // default so the adviser surface is unchanged unless explicitly requested.
         bool _coilAdviserAllowLateralPlacement = false;
+        // Opt-in (ABT #1176): CoilAdviser sizes a betweenSections magnetic shunt on every wound
+        // candidate whose design requirements carry a leakage inductance, with
+        // MagneticShuntModel::size_shunt_for_leakage. The sheet material and its gaps to the columns
+        // have no defaults: switching this on without setting them throws.
+        bool _coilAdviserSizeMagneticShunts = false;
+        std::string _coilAdviserMagneticShuntMaterial = "";
+        std::optional<double> _coilAdviserMagneticShuntGapToInnerColumn;
+        std::optional<double> _coilAdviserMagneticShuntGapToOuterColumn;
+        // ABT #1177 (WP8, DFM rule R1): when true, WireAdviser penalises a wire candidate
+        // whose winding would land on an ODD number of layers in its section. An odd layer
+        // count forces a drag-back (bump, window loss, extra leakage, a 45-90 degree wire
+        // crossing some safety standards forbid, manual tape work) - see
+        // src/data/dfm_rules.json rule R1. Default OFF: the adviser ranking is unchanged
+        // unless the caller explicitly opts in, because whether DFM should outrank losses is
+        // a product decision, not this work package's.
+        bool _wireAdviserPenalizeOddLayerCount = false;
         EffectiveParameterStandard _effectiveParameterStandard = EffectiveParameterStandard::IEC_60205;
         double _nanocrystallineStackingFactor = 0.80;  // Stacking factor for tape-wound nanocrystalline cores (0.75-0.85 typical)
 
@@ -91,6 +144,7 @@ class Settings
         std::string _painterColorSilk = "0xe7e7e8";
         std::string _painterColorMargin = "0xfff05b";
         std::string _painterColorSpacer = "0x3b3b3b";
+        std::string _painterColorShunt = "0x6a5acd";
         std::string _painterColorLines = "0x010000";
         std::string _painterColorText = "0x000000";
         std::string _painterColorCurrentDensity = "0x0892D0";
@@ -101,6 +155,18 @@ class Settings
         // std::source_location::current().file_name() — the BUILD machine's
         // absolute path — into the value, which broke relocated wheels/WASM.
         std::optional<std::string> _painterCciCoordinatesPath = std::nullopt;
+
+        // ABT #1172: the bend a CONSUMER will draw at the corners of a pin run. MKF plans the run
+        // as straight legs meeting at right angles, but MVB++ (and any other 3D consumer) sweeps
+        // each corner with a finite centreline radius, and a rounded corner cuts the INSIDE of the
+        // bend — which is the obstacle edge the run turns around. Planning the legs exactly one
+        // wire radius off both faces therefore puts copper inside the pin rail. These two carry
+        // the consumer's own bend so MKF can plan for the corner that will actually be drawn:
+        // effectiveBend = max(factor * coated radius, minimum). Both unset = sharp corners, which
+        // is the historical geometry, and the route then records r so the mismatch surfaces at the
+        // consumer instead of hiding.
+        std::optional<double> _coilLeadBendRadiusFactor = std::nullopt;   // multiplies the coated radius
+        std::optional<double> _coilLeadMinimumBendRadius = std::nullopt;  // metres, absolute floor
         std::string _painterColorMagneticFieldMinimum = "0x2b35f5";
         std::string _painterColorMagneticFieldMaximum = "0xe84922";
         std::optional<MagneticFieldStrengthModels> _painterMagneticFieldStrengthModel = std::nullopt;
@@ -108,6 +174,10 @@ class Settings
         size_t _magneticFieldNumberPointsX = 25;
         size_t _magneticFieldNumberPointsY = 50;
         int _magneticFieldMirroringDimension;
+        // Image lattice of the rectangular-window field models (CoilMesherCenterModel). false: images
+        // m, n in [-M, M] (M = mirroring dimension), the historical lattice used by the loss models.
+        // true: M complete 2A x 2B mirror cells on each side, m, n in [-2M-1, 2M] (ABT #1240).
+        bool _magneticFieldMirroringCompleteCells = false;
         bool _magneticFieldIncludeFringing = true;
 
         double _coilMesherInsideTurnsFactor = 1.05;
@@ -143,6 +213,13 @@ class Settings
         // (ABT #13). The evaluation temperature is max(operating, this), so an
         // already-hotter spec is never made cooler. Default 100 C (Maniktala Ch.5).
         double _coreAdviserSaturationDeratingTemperature = 100.0;
+
+        // ABT #1454: what the thermal network does with a wound turn whose drawn geometry
+        // overlaps its enclosure (bobbin column/flange, core window edge) — a coil that does not
+        // fit its window. TRUE (default): throw, because the contact path has no real geometry.
+        // FALSE: skip that turn's conduction path to the enclosure, log an ERROR naming the turn
+        // and the overlap, and solve the rest of the network.
+        bool   _thermalNetworkStrictGeometry = true;
         GappingOptimizationStrategy _gappingStrategy = GappingOptimizationStrategy::SIMPLE;
 
 
@@ -152,9 +229,19 @@ class Settings
         bool _wireAdviserIncludeLitz = true;
         bool _wireAdviserIncludeRound = true;
         bool _wireAdviserAllowRectangularInToroidalCores = false;
+        // Wire standard the advisers restrict themselves to (ABT #1110: the web follows the
+        // profile unit system, IEC 60317 under SI and NEMA MW 1000 C under imperial). Empty
+        // means no preference: the wire adviser takes any standard and the coil adviser
+        // keeps its built-in preference (Defaults::commonWireStandard).
+        std::optional<WireStandard> _preferredWireStandard = std::nullopt;
 
         bool _harmonicAmplitudeThresholdQuickMode = true;
         double _harmonicAmplitudeThreshold;
+
+        // Memory the magnetic field may keep for the turn-field sums of recently evaluated
+        // meshes, so re-evaluating a part (a catalogue search, an operating-point sweep) skips
+        // its turn-to-turn kernel sum. Least recently used first out; 0 keeps nothing.
+        size_t _magneticFieldTurnSumsCacheBytes = 64 * 1024 * 1024;
 
 
         std::vector<CoreLossesModels> _coreLossesModelNames;
@@ -243,6 +330,9 @@ class Settings
         size_t get_inputs_number_points_sampled_waveforms() const;
         void set_inputs_number_points_sampled_waveforms(size_t value);
 
+        size_t get_inputs_maximum_number_points_sampled_imported_waveforms() const;
+        void set_inputs_maximum_number_points_sampled_imported_waveforms(size_t value);
+
         bool get_magnetizing_inductance_include_air_inductance() const;
         void set_magnetizing_inductance_include_air_inductance(bool value);
 
@@ -276,6 +366,22 @@ class Settings
         bool get_coil_use_real_winding_geometry() const;
         void set_coil_use_real_winding_geometry(bool value);
 
+        bool get_coil_allow_coating_squish() const;
+        void set_coil_allow_coating_squish(bool value);
+
+        bool get_coil_allow_horizontal_overflow() const;
+        void set_coil_allow_horizontal_overflow(bool value);
+
+        bool get_coil_connect_leads_to_pins() const;
+        void set_coil_connect_leads_to_pins(bool value);
+
+        bool get_coil_quick_bobbin_generate_pins() const;
+        void set_coil_quick_bobbin_generate_pins(bool value);
+        OrientationEnum get_coil_quick_bobbin_pins_orientation() const;
+        void set_coil_quick_bobbin_pins_orientation(OrientationEnum value);
+        OrientationEnum get_toroid_mounting() const;
+        void set_toroid_mounting(OrientationEnum value);
+
         size_t get_coil_maximum_layers_planar() const;
         void set_coil_maximum_layers_planar(size_t value);
 
@@ -290,6 +396,18 @@ class Settings
 
         bool get_coil_adviser_allow_lateral_placement() const;
         void set_coil_adviser_allow_lateral_placement(bool value);
+
+        bool get_coil_adviser_size_magnetic_shunts() const;
+        void set_coil_adviser_size_magnetic_shunts(bool value);
+        std::string get_coil_adviser_magnetic_shunt_material() const;
+        void set_coil_adviser_magnetic_shunt_material(std::string value);
+        std::optional<double> get_coil_adviser_magnetic_shunt_gap_to_inner_column() const;
+        void set_coil_adviser_magnetic_shunt_gap_to_inner_column(std::optional<double> value);
+        std::optional<double> get_coil_adviser_magnetic_shunt_gap_to_outer_column() const;
+        void set_coil_adviser_magnetic_shunt_gap_to_outer_column(std::optional<double> value);
+
+        bool get_wire_adviser_penalize_odd_layer_count() const;
+        void set_wire_adviser_penalize_odd_layer_count(bool value);
 
     EffectiveParameterStandard get_effective_parameter_standard() const;
     void set_effective_parameter_standard(EffectiveParameterStandard value);
@@ -348,13 +466,34 @@ class Settings
         std::string get_painter_color_spacer() const;
         void set_painter_color_spacer(std::string value);
 
+        std::string get_painter_color_shunt() const;
+        void set_painter_color_shunt(std::string value);
+
         std::string get_painter_color_lines() const;
         void set_painter_color_lines(std::string value);
 
         std::string get_painter_color_text() const;
         void set_painter_color_text(std::string value);
 
+        // ABT #647: the non-throwing half of get_painter_cci_coordinates_path().
+        // The CCI coordinate directory is OPTIONAL — strand counts up to 1000 use
+        // the build-time embedded coordinates and never need it — so a caller that
+        // merely REPORTS the settings (a get_settings() dump, a UI, a serializer)
+        // must be able to ask "is one resolvable?" without an exception. Returns
+        // nullopt when nothing resolves. Same rule as try_find_core_shape_by_name
+        // (ABT #631): ask, don't throw-and-catch. Consumers that genuinely require
+        // the catalog keep calling get_painter_cci_coordinates_path(), which throws.
+        std::optional<std::string> try_get_painter_cci_coordinates_path() const;
         std::string get_painter_cci_coordinates_path() const;
+
+        std::optional<double> get_coil_lead_bend_radius_factor() const;
+        void set_coil_lead_bend_radius_factor(std::optional<double> value);
+        std::optional<double> get_coil_lead_minimum_bend_radius() const;
+        void set_coil_lead_minimum_bend_radius(std::optional<double> value);
+        // The bend radius a lead of this coated radius will be drawn with, and the leg offset that
+        // keeps a bend of that radius clear of the edge it turns around. See ABT #1172.
+        static double resolve_lead_bend_radius(double coatedRadius);
+        static double lead_leg_clearance(double sweptRadius, double bendRadius, double turnAngle);
         void set_painter_cci_coordinates_path(std::string value);
 
         std::string get_painter_color_enamel() const;
@@ -414,6 +553,9 @@ class Settings
         int get_magnetic_field_mirroring_dimension() const;
         void set_magnetic_field_mirroring_dimension(int value);
 
+        bool get_magnetic_field_mirroring_complete_cells() const;
+        void set_magnetic_field_mirroring_complete_cells(bool value);
+
         size_t get_coil_adviser_maximum_number_wires() const;
         void set_coil_adviser_maximum_number_wires(size_t value);
 
@@ -441,6 +583,9 @@ class Settings
         double get_core_adviser_saturation_derating_temperature() const;
         void   set_core_adviser_saturation_derating_temperature(double value);
 
+        bool   get_thermal_network_strict_geometry() const;
+        void   set_thermal_network_strict_geometry(bool value);
+
         GappingOptimizationStrategy get_gapping_strategy() const;
         void set_gapping_strategy(GappingOptimizationStrategy value);
 
@@ -460,10 +605,15 @@ class Settings
         void set_wire_adviser_include_round(bool value);
 
         bool get_wire_adviser_allow_rectangular_in_toroidal_cores() const;
+        std::optional<WireStandard> get_preferred_wire_standard() const;
+        void set_preferred_wire_standard(std::optional<WireStandard> value);
         void set_wire_adviser_allow_rectangular_in_toroidal_cores(bool value);
 
         bool get_harmonic_amplitude_threshold_quick_mode() const;
         void set_harmonic_amplitude_threshold_quick_mode(bool value);
+
+        size_t get_magnetic_field_turn_sums_cache_bytes() const;
+        void set_magnetic_field_turn_sums_cache_bytes(size_t value);
 
         double get_harmonic_amplitude_threshold() const;
         void set_harmonic_amplitude_threshold(double value);

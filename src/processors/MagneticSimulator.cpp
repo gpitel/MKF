@@ -24,6 +24,28 @@ Mas MagneticSimulator::simulate(const Inputs& inputs, const Magnetic& magnetic, 
     std::vector<OperatingPoint> simulatedOperatingPoints;
     mas.set_inputs(inputs);
 
+    // Every winding must carry its own excitation (ABT #814). Deeper models
+    // catch SOME of these — winding losses throw "Missing current excitation
+    // for winding 2" once a later winding is unexcited — but a two-winding
+    // magnetic given a single excitation used to run all the way through and
+    // report complete, plausible losses for a component whose second winding
+    // the caller never described. Silent under-specification is worse than a
+    // refusal: the numbers look right and cannot be checked.
+    {
+        size_t numberWindings = magnetic.get_coil().get_functional_description().size();
+        const auto& operatingPoints = mas.get_inputs().get_operating_points();
+        for (size_t index = 0; index < operatingPoints.size(); ++index) {
+            size_t numberExcitations = operatingPoints[index].get_excitations_per_winding().size();
+            if (numberExcitations != numberWindings) {
+                throw InvalidInputException(
+                    ErrorCode::MISSING_DATA,
+                    "Operating point " + std::to_string(index) + " has " +
+                    std::to_string(numberExcitations) + " excitations for a magnetic with " +
+                    std::to_string(numberWindings) + " windings; every winding needs exactly one excitation");
+            }
+        }
+    }
+
     for (auto& operatingPoint : mas.get_mutable_inputs().get_mutable_operating_points()){
         Outputs output;
         InductanceOutput inductanceOutput;
@@ -36,6 +58,19 @@ Mas MagneticSimulator::simulate(const Inputs& inputs, const Magnetic& magnetic, 
         output.set_inductance(inductanceOutput);
         output.set_core_losses(calculate_core_losses(operatingPoint, magnetic));
         output.set_winding_losses(calculate_winding_losses(operatingPoint, magnetic, operatingPoint.get_conditions().get_ambient_temperature()));
+        if (!fastMode) {
+            // ABT #838: one corrective pass. The core-loss loop above ran before any winding
+            // result existed, so it converged the core's temperature on core losses alone; now
+            // that the winding's losses are known, re-run it with them and let the core losses
+            // settle at the temperature the whole part actually reaches. Skipped in fast mode,
+            // where the advisers call this per candidate and pay for every extra network solve.
+            output.set_core_losses(calculate_core_losses(operatingPoint, magnetic, output.get_winding_losses()));
+        }
+        if (!fastMode) {
+            // Full-network hot-spot from the losses just simulated, so the exported MAS
+            // carries the same temperature the UI's temperature map shows (ABT #906).
+            output.set_temperature(calculate_temperature(operatingPoint, magnetic, output));
+        }
 
         outputs.push_back(output);
         simulatedOperatingPoints.push_back(operatingPoint);
@@ -47,7 +82,7 @@ Mas MagneticSimulator::simulate(const Inputs& inputs, const Magnetic& magnetic, 
 }
 
 MagnetizingInductanceOutput MagneticSimulator::calculate_magnetizing_inductance(OperatingPoint& operatingPoint, Magnetic magnetic){
-    return _magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(magnetic.get_core(), magnetic.get_coil(), &operatingPoint);
+    return _magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(magnetic, &operatingPoint);
 }
 
 LeakageInductanceOutput MagneticSimulator::calculate_leakage_inductance(OperatingPoint& operatingPoint, Magnetic magnetic){
@@ -83,7 +118,29 @@ WindingLossesOutput MagneticSimulator::calculate_winding_losses(OperatingPoint& 
     return losses;
 }
 
-CoreLossesOutput MagneticSimulator::calculate_core_losses(OperatingPoint& operatingPoint, Magnetic magnetic) {
+TemperatureOutput MagneticSimulator::calculate_temperature(OperatingPoint& operatingPoint, Magnetic magnetic, const Outputs& output) {
+    // The full thermal network needs turn nodes; wind a local copy if the coil is bare.
+    if (!magnetic.get_coil().get_turns_description()) {
+        magnetic.get_mutable_coil().wind();
+    }
+    auto config = TemperatureConfig::fromSimulatedOutput(operatingPoint, output);
+    auto thermalResult = Temperature(magnetic, config).calculateTemperatures();
+
+    TemperatureOutput temperatureOutput;
+    temperatureOutput.set_initial_temperature(config.ambientTemperature);
+    temperatureOutput.set_maximum_temperature(thermalResult.maximumTemperature);
+    double totalLosses = config.coreLosses + config.windingLosses;
+    if (totalLosses > 0) {
+        temperatureOutput.set_bulk_thermal_resistance(
+            (thermalResult.maximumTemperature - config.ambientTemperature) / totalLosses);
+    }
+    temperatureOutput.set_method_used("ThermalNetwork");
+    temperatureOutput.set_origin(ResultOrigin::SIMULATION);
+    return temperatureOutput;
+}
+
+CoreLossesOutput MagneticSimulator::calculate_core_losses(OperatingPoint& operatingPoint, Magnetic magnetic,
+                                                          std::optional<WindingLossesOutput> knownWindingLosses) {
     OperatingPointExcitation excitation = operatingPoint.get_excitations_per_winding()[0];
     if (!excitation.get_current()) {
         throw InvalidInputException(ErrorCode::MISSING_DATA, "Missing current in operating point");
@@ -100,7 +157,7 @@ CoreLossesOutput MagneticSimulator::calculate_core_losses(OperatingPoint& operat
         excitation = operatingPoint.get_excitations_per_winding()[0];
         operatingPoint.get_mutable_conditions().set_ambient_temperature(temperature);
 
-        magneticFluxDensity = _magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(magnetic.get_core(), magnetic.get_coil(), &operatingPoint).second;
+        magneticFluxDensity = _magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(magnetic, &operatingPoint).second;
         excitation.set_magnetic_flux_density(magneticFluxDensity);
         operatingPoint.get_mutable_excitations_per_winding()[0] = excitation;
 
@@ -112,7 +169,17 @@ CoreLossesOutput MagneticSimulator::calculate_core_losses(OperatingPoint& operat
         TemperatureConfig temperatureConfig;
         temperatureConfig.ambientTemperature = operatingPoint.get_conditions().get_ambient_temperature();
         temperatureConfig.coreLosses = coreLossesOutput.get_core_losses();
-        temperatureConfig.coreOnly = true;
+        // ABT #838: with the winding's losses in hand, solve the FULL network — the winding is
+        // typically as large a heat source as the core, and it warms the core through the bobbin.
+        // Core-only with core losses alone is the first pass, before any winding result exists.
+        if (knownWindingLosses) {
+            temperatureConfig.windingLosses = knownWindingLosses->get_winding_losses();
+            temperatureConfig.windingLossesOutput = knownWindingLosses;
+            temperatureConfig.coreOnly = false;
+        }
+        else {
+            temperatureConfig.coreOnly = true;
+        }
         temperatureConfig.plotSchematic = false;
         temperatureConfig.masCooling = operatingPoint.get_conditions().get_cooling();
         temperatureAfterLosses = Temperature(magnetic, temperatureConfig).calculateTemperatures().maximumTemperature;
@@ -308,25 +375,15 @@ MagneticManufacturerInfo MagneticSimulator::build_datasheet(Mas& mas) {
             continue;
         }
         double ambient = operatingPoints[operatingPointIndex].get_conditions().get_ambient_temperature();
-        double coreLosses = outputs[operatingPointIndex].get_core_losses()->get_core_losses();
-        double windingLosses = outputs[operatingPointIndex].get_winding_losses()
-            ? outputs[operatingPointIndex].get_winding_losses()->get_winding_losses() : 0;
-
-        TemperatureConfig config;
-        config.ambientTemperature = ambient;
-        config.masCooling = operatingPoints[operatingPointIndex].get_conditions().get_cooling();
-        config.coreLosses = coreLosses;
-        config.windingLosses = windingLosses;
-        if (outputs[operatingPointIndex].get_winding_losses()) {
-            config.windingLossesOutput = outputs[operatingPointIndex].get_winding_losses();
-        }
-        config.plotSchematic = false;
+        // Shared config builder (ABT #906) — same as outputs[].temperature and the plot wrappers.
+        auto config = TemperatureConfig::fromSimulatedOutput(operatingPoints[operatingPointIndex],
+                                                             outputs[operatingPointIndex]);
 
         double hotspot = Temperature(thermalMagnetic, config).calculateTemperatures().maximumTemperature;
         double temperatureRise = hotspot - ambient;
         if (temperatureRise > worstTemperatureRise) {
             worstTemperatureRise = temperatureRise;
-            double totalLosses = coreLosses + windingLosses;
+            double totalLosses = config.coreLosses + config.windingLosses;
             worstThermalResistance = totalLosses > 0 ? std::optional<double>(temperatureRise / totalLosses)
                                                      : std::nullopt;
         }

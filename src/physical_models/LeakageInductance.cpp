@@ -73,12 +73,46 @@ std::pair<size_t, size_t> LeakageInductance::calculate_number_points_needed_for_
 }
 
 std::pair<ComplexField, double> LeakageInductance::calculate_magnetic_field(OperatingPoint operatingPoint, Magnetic magnetic, size_t sourceIndex, size_t destinationIndex, size_t harmonicIndex, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding) {
+    auto phasorField = calculate_magnetic_field_phasor(operatingPoint, magnetic, sourceIndex, destinationIndex, harmonicIndex, customCurrentDirectionPerWinding);
+    return {phasorField.inPhase, phasorField.dA};
+}
+
+LeakageInductance::PhasorField LeakageInductance::calculate_magnetic_field_phasor(OperatingPoint operatingPoint, Magnetic magnetic, size_t sourceIndex, size_t destinationIndex, size_t harmonicIndex, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding) {
 
     auto harmonics = operatingPoint.get_excitations_per_winding()[0].get_current()->get_harmonics().value();
     auto frequency = harmonics.get_frequencies()[harmonicIndex];
     auto [numberPointsX, numberPointsY] = calculate_grid_points(magnetic, frequency);
 
-    auto meshResult = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY);
+    // ABT #1240. The window field is the exact 2-D field of the conductors (true cross-section, true
+    // current, uniform density) inside the high-permeability window, built from a complete image lattice,
+    // and its energy is integrated over the WHOLE core winding window. Measured against OMFEM 2D, each of
+    // the removed shortcuts under-read the leakage: copper excluded from the grid (planar), points far from
+    // every turn dropped (tall windows, separated sections), the grid stopping at the bobbin window edge,
+    // the Wang two-filament planar mesh (no images), the truncated [-M, M] lattice (side-by-side sections
+    // 0.68-0.85) and the zeroed in-conductor field.
+    SettingsGuard<bool> completeCellsGuard(settings, &Settings::get_magnetic_field_mirroring_complete_cells, &Settings::set_magnetic_field_mirroring_complete_cells, true);
+    auto bobbin = magnetic.get_mutable_coil().resolve_bobbin();
+    bool singleRectangularWindow = bobbin.get_winding_window_shape() == WindingWindowShape::RECTANGULAR &&
+                                   magnetic.get_mutable_core().get_shape_family() != CoreShapeFamily::T &&
+                                   magnetic.get_mutable_core().get_winding_windows().size() == 1;
+    std::pair<Field, double> meshResult;
+    if (singleRectangularWindow) {
+        // The point counts resolve the bobbin window (window 0, a single chamber on a sectioned bobbin); keep
+        // that pitch over the larger core window.
+        auto bobbinWindowDimensions = bobbin.get_winding_window_dimensions();
+        auto coreWindingWindow = magnetic.get_mutable_core().get_winding_windows()[0];
+        if (!coreWindingWindow.get_width() || !coreWindingWindow.get_height()) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Cannot calculate leakage inductance: the core winding window has no width or height");
+        }
+        double coreWindowWidth = coreWindingWindow.get_width().value();
+        double coreWindowHeight = coreWindingWindow.get_height().value();
+        size_t coreNumberPointsX = static_cast<size_t>(std::ceil(static_cast<double>(numberPointsX) * coreWindowWidth / bobbinWindowDimensions[0]));
+        size_t coreNumberPointsY = static_cast<size_t>(std::ceil(static_cast<double>(numberPointsY) * coreWindowHeight / bobbinWindowDimensions[1]));
+        meshResult = CoilMesher::generate_mesh_core_winding_window_grid(magnetic, frequency, coreNumberPointsX, coreNumberPointsY);
+    }
+    else {
+        meshResult = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY);
+    }
     Field inducedField = meshResult.first;
 
         if (inducedField.get_data().size() == 0) {
@@ -103,10 +137,13 @@ std::pair<ComplexField, double> LeakageInductance::calculate_magnetic_field(Oper
     }
 
     ComplexField field;
+    ComplexField quadratureField;
     {
-        CoilMesherModels modelToUse = select_mesh_model(magnetic);
-        auto windingWindowMagneticStrengthFieldOutput = magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic, inducedField, customCurrentDirectionPerWinding, modelToUse);
+        // Every conductor as its true cross-section with its images (CENTER); the Wang mesh splits a planar
+        // track into two full-current filaments without images, a proximity-loss construction.
+        auto windingWindowMagneticStrengthFieldOutput = magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic, inducedField, customCurrentDirectionPerWinding, CoilMesherModels::CENTER);
         field = windingWindowMagneticStrengthFieldOutput.get_field_per_frequency()[0];
+        quadratureField = windingWindowMagneticStrengthFieldOutput.get_quadrature_field_per_frequency()[0];
     }
     auto turns = magnetic.get_coil().get_turns_description().value();
 
@@ -128,15 +165,18 @@ std::pair<ComplexField, double> LeakageInductance::calculate_magnetic_field(Oper
         magnetic.get_mutable_coil().set_turns_description(turns);
         auto windingWindowMagneticStrengthFieldOutput = magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic, inducedField, customCurrentDirectionPerWinding);
         auto additionalField = windingWindowMagneticStrengthFieldOutput.get_field_per_frequency()[0];
+        auto additionalQuadratureField = windingWindowMagneticStrengthFieldOutput.get_quadrature_field_per_frequency()[0];
         for (size_t pointIndex = 0; pointIndex < field.get_data().size(); ++pointIndex) {
             if (hypot(field.get_data()[pointIndex].get_point()[0], field.get_data()[pointIndex].get_point()[1]) > windingWindowRadialHeight) {
                 field.get_mutable_data()[pointIndex].set_real(additionalField.get_data()[pointIndex].get_real());
                 field.get_mutable_data()[pointIndex].set_imaginary(additionalField.get_data()[pointIndex].get_imaginary());
+                quadratureField.get_mutable_data()[pointIndex].set_real(additionalQuadratureField.get_data()[pointIndex].get_real());
+                quadratureField.get_mutable_data()[pointIndex].set_imaginary(additionalQuadratureField.get_data()[pointIndex].get_imaginary());
             }
         }
     }
 
-    return {field, dA};
+    return {field, quadratureField, dA};
 }
 
 LeakageInductanceOutput LeakageInductance::calculate_leakage_inductance(Magnetic magnetic, double frequency, size_t sourceIndex, size_t destinationIndex, size_t harmonicIndex) {
@@ -147,6 +187,25 @@ LeakageInductanceOutput LeakageInductance::calculate_leakage_inductance(Magnetic
         throw CoreNotProcessedException(
             "Cannot calculate leakage inductance: the core has no processed description "
             "(effective parameters/shape unresolved). Run magnetic autocomplete / process the core first.");
+    }
+
+    // Magnetic shunts (MAS-RFC 0015, ABT #1176). A sheet across the window carries the leakage flux
+    // through its own reluctance network, which the air-field integral below cannot see.
+    if (magnetic.get_shunts() && !magnetic.get_shunts()->empty()) {
+        MagneticShuntModel::check_supported_placements(magnetic);
+        if (MagneticShuntModel::has_leakage_shunts(magnetic)) {
+            if (ReluctanceNetwork::has_non_main_placement(magnetic)) {
+                throw NotImplementedException("Leakage inductance with a magnetic shunt for windings placed on several columns");
+            }
+            auto shuntResult = calculate_shunt_leakage(magnetic, frequency, sourceIndex, destinationIndex, harmonicIndex);
+            LeakageInductanceOutput shuntOutput;
+            shuntOutput.set_method_used("Shunt");
+            shuntOutput.set_origin(ResultOrigin::SIMULATION);
+            DimensionWithTolerance shuntDimensionWithTolerance;
+            shuntDimensionWithTolerance.set_nominal(shuntResult.leakageInductance);
+            shuntOutput.set_leakage_inductance_per_winding({shuntDimensionWithTolerance});
+            return shuntOutput;
+        }
     }
 
     // Multi-column winding: the window-energy method below integrates the field of ONE
@@ -203,14 +262,19 @@ LeakageInductanceOutput LeakageInductance::calculate_leakage_inductance(Magnetic
     currentDirectionPerWinding[sourceIndex] = 1;
     currentDirectionPerWinding[destinationIndex] = -1;
 
-    auto magneticFieldResult = calculate_magnetic_field(operatingPoint, magnetic, sourceIndex, destinationIndex, harmonicIndex, currentDirectionPerWinding);
-    ComplexField field = magneticFieldResult.first;
-    double dA = magneticFieldResult.second;
+    auto magneticFieldResult = calculate_magnetic_field_phasor(operatingPoint, magnetic, sourceIndex, destinationIndex, harmonicIndex, currentDirectionPerWinding);
+    ComplexField field = magneticFieldResult.inPhase;
+    double dA = magneticFieldResult.dA;
 
-    double energy = integrate_leakage_energy(magnetic, field, dA);
+    // Time-averaged energy of a phasor field: in-phase plus quadrature.
+    double energy = integrate_leakage_energy(magnetic, field, dA) + integrate_leakage_energy(magnetic, magneticFieldResult.quadrature, dA);
 
-    double currentRms = operatingPoint.get_excitations_per_winding()[sourceIndex].get_current()->get_processed()->get_rms().value();
-    double leakageInductance = 2.0 / pow(currentRms, 2) * energy;
+    // The field model drives every turn with the PEAK amplitude of the current harmonic
+    // (CoilMesher::generate_mesh_inducing_coil), so |H|^2 is a peak-squared field and the
+    // integral is the peak stored energy W = L I_peak^2 / 2. Normalise by the same peak
+    // amplitude. Dividing by I_rms^2 (as before ABT #1211) doubled every Energy-method result.
+    double sourceCurrentPeak = harmonic_peak_current_at_field_frequency(operatingPoint.get_excitations_per_winding()[sourceIndex], field.get_frequency());
+    double leakageInductance = 2.0 * energy / (sourceCurrentPeak * sourceCurrentPeak);
     LeakageInductanceOutput leakageInductanceOutput;
 
     leakageInductanceOutput.set_method_used("Energy");
@@ -220,6 +284,30 @@ LeakageInductanceOutput LeakageInductance::calculate_leakage_inductance(Magnetic
     leakageInductanceOutput.set_leakage_inductance_per_winding({dimensionWithTolerance});
 
     return leakageInductanceOutput;
+}
+
+MagneticShuntLeakageResult LeakageInductance::calculate_shunt_leakage(Magnetic magnetic, double frequency, size_t sourceIndex, size_t destinationIndex, size_t harmonicIndex,
+                                                                     std::optional<std::vector<double>> relativePermeabilityPerShunt) {
+    if (!magnetic.get_shunts() || magnetic.get_shunts()->empty()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Shunt leakage method called on a magnetic without shunts");
+    }
+    MagneticShuntModel::check_supported_placements(magnetic);
+    auto shunts = magnetic.get_shunts().value();
+    if (relativePermeabilityPerShunt && relativePermeabilityPerShunt->size() != shunts.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Shunt leakage method: " + std::to_string(relativePermeabilityPerShunt->size()) +
+                                    " relative permeabilities given for " + std::to_string(shunts.size()) + " shunts");
+    }
+
+    // The windings' own leakage, by the air-field Energy method, without the sheets.
+    Magnetic withoutShunts = magnetic;
+    withoutShunts.set_shunts(std::nullopt);
+    auto windingOutput = calculate_leakage_inductance(withoutShunts, frequency, sourceIndex, destinationIndex, harmonicIndex);
+    if (windingOutput.get_method_used() != "Energy") {
+        throw NotImplementedException("Shunt leakage method on top of the " + windingOutput.get_method_used() + " leakage method");
+    }
+    double windingLeakageInductance = windingOutput.get_leakage_inductance_per_winding()[0].get_nominal().value();
+
+    return MagneticShuntModel::assemble_leakage(magnetic, windingLeakageInductance, frequency, sourceIndex, destinationIndex, relativePermeabilityPerShunt);
 }
 
 ComplexField LeakageInductance::calculate_leakage_magnetic_field(Magnetic magnetic, double frequency, size_t sourceIndex, size_t destinationIndex, size_t harmonicIndex) {
@@ -246,7 +334,7 @@ ComplexField LeakageInductance::calculate_leakage_magnetic_field(Magnetic magnet
 LeakageInductanceOutput LeakageInductance::calculate_leakage_inductance_all_windings(Magnetic magnetic, double frequency, size_t sourceIndex, size_t harmonicIndex) {
     LeakageInductanceOutput leakageInductanceOutput;
 
-    leakageInductanceOutput.set_method_used("Energy");
+    leakageInductanceOutput.set_method_used(MagneticShuntModel::has_leakage_shunts(magnetic) ? "Shunt" : "Energy");
     leakageInductanceOutput.set_origin(ResultOrigin::SIMULATION);
     std::vector<DimensionWithTolerance> leakageInductancePerWinding;
 
@@ -313,6 +401,9 @@ double LeakageInductance::integrate_leakage_energy(Magnetic& magnetic, ComplexFi
 }
 
 double LeakageInductance::calculate_leakage_field_energy(Magnetic magnetic, const std::vector<double>& currentsRmsSigned, double frequency, size_t harmonicIndex) {
+    if (MagneticShuntModel::has_leakage_shunts(magnetic)) {
+        throw NotImplementedException("Leakage field energy (and the leakage inductance matrix) of a magnetic with a shunt in the window");
+    }
     if (!magnetic.get_core().get_processed_description()) {
         throw CoreNotProcessedException(
             "Cannot calculate leakage field energy: the core has no processed description "
@@ -346,11 +437,12 @@ double LeakageInductance::calculate_leakage_field_energy(Magnetic magnetic, cons
 
     OperatingPoint operatingPoint = create_excitation_operating_point(magnetic, currentsRmsSigned, frequency);
 
-    auto magneticFieldResult = calculate_magnetic_field(operatingPoint, magnetic, 0, 1, harmonicIndex, directions);
-    ComplexField field = magneticFieldResult.first;
-    double dA = magneticFieldResult.second;
+    auto magneticFieldResult = calculate_magnetic_field_phasor(operatingPoint, magnetic, 0, 1, harmonicIndex, directions);
+    ComplexField field = magneticFieldResult.inPhase;
+    double dA = magneticFieldResult.dA;
 
-    double energy = integrate_leakage_energy(magnetic, field, dA);
+    // Time-averaged energy of a phasor field: in-phase plus quadrature.
+    double energy = integrate_leakage_energy(magnetic, field, dA) + integrate_leakage_energy(magnetic, magneticFieldResult.quadrature, dA);
 
     return energy;
 }
@@ -371,25 +463,52 @@ std::vector<std::vector<double>> LeakageInductance::calculate_leakage_inductance
     }
 
     std::vector<std::vector<double>> leakageMatrix(numberWindings, std::vector<double>(numberWindings, 0.0));
-    // Diagonal: Λ_aa = 4·W(e_a). The factor 4 = 2/I_rms² with the unit reference current's
-    // RMS of 1/sqrt(2), matching calculate_leakage_inductance's 2·energy/I_rms² convention.
+    // The unit reference excitation is a sinusoid of 1 A peak; the field (and so W) is built from
+    // the peak amplitude of its fundamental harmonic, a. With W = 1/2 i^T Λ i for peak currents:
+    //   Λ_aa = 2·W(e_a)/a²,   Λ_ab = [W(e_a+e_b) − W(e_a) − W(e_b)]/a²
+    // (ABT #1211: this used 4·W and 2·[...], the I_rms normalisation that doubled every value).
+    std::vector<double> unitCurrents(numberWindings, 0.0);
+    unitCurrents[0] = 1.0;
+    auto unitOperatingPoint = create_excitation_operating_point(magnetic, unitCurrents, frequency);
+    double referencePeak = harmonic_peak_current_at_field_frequency(unitOperatingPoint.get_excitations_per_winding()[0], frequency);
+    double referencePeakSquared = referencePeak * referencePeak;
     for (size_t a = 0; a < numberWindings; ++a) {
-        leakageMatrix[a][a] = 4.0 * selfEnergy[a];
+        leakageMatrix[a][a] = 2.0 * selfEnergy[a] / referencePeakSquared;
     }
-    // Off-diagonal via polarization: Λ_ab = 2·[W(e_a+e_b) − W(e_a) − W(e_b)].
+    // Off-diagonal via polarization.
     for (size_t a = 0; a < numberWindings; ++a) {
         for (size_t b = a + 1; b < numberWindings; ++b) {
             std::vector<double> currents(numberWindings, 0.0);
             currents[a] = 1.0;
             currents[b] = 1.0;
             double pairEnergy = calculate_leakage_field_energy(magnetic, currents, frequency, harmonicIndex);
-            double mutualLeakage = 2.0 * (pairEnergy - selfEnergy[a] - selfEnergy[b]);
+            double mutualLeakage = (pairEnergy - selfEnergy[a] - selfEnergy[b]) / referencePeakSquared;
             leakageMatrix[a][b] = mutualLeakage;
             leakageMatrix[b][a] = mutualLeakage;
         }
     }
 
     return leakageMatrix;
+}
+
+double LeakageInductance::harmonic_peak_current_at_field_frequency(const OperatingPointExcitation& excitation, double fieldFrequency) {
+    if (!excitation.get_current() || !excitation.get_current()->get_harmonics()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Leakage inductance: the source excitation has no current harmonics");
+    }
+    auto harmonics = excitation.get_current()->get_harmonics().value();
+    auto& frequencies = harmonics.get_frequencies();
+    auto& amplitudes = harmonics.get_amplitudes();
+    for (size_t harmonicIndex = 0; harmonicIndex < frequencies.size(); ++harmonicIndex) {
+        if (frequencies[harmonicIndex] > 0 && std::abs(frequencies[harmonicIndex] - fieldFrequency) <= 1e-9 * fieldFrequency) {
+            if (!(amplitudes[harmonicIndex] > 0)) {
+                throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Leakage inductance: the source current harmonic at " +
+                                           std::to_string(fieldFrequency) + " Hz has no amplitude");
+            }
+            return amplitudes[harmonicIndex];
+        }
+    }
+    throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Leakage inductance: the source current has no harmonic at the field frequency " +
+                               std::to_string(fieldFrequency) + " Hz");
 }
 
 OperatingPoint LeakageInductance::create_excitation_operating_point(Magnetic& magnetic, const std::vector<double>& currentsRmsSigned, double frequency) {
@@ -484,23 +603,6 @@ OperatingPoint LeakageInductance::create_leakage_operating_point(Magnetic& magne
     OperatingPoint operatingPoint;
     operatingPoint.set_excitations_per_winding(excitationPerWinding);
     return operatingPoint;
-}
-
-CoilMesherModels LeakageInductance::select_mesh_model(Magnetic& magnetic) {
-    auto isPlanar = magnetic.get_wires()[0].get_type() == WireType::PLANAR;
-
-    if (isPlanar) {
-        double minimumRatio = DBL_MAX;
-        for (auto wire : magnetic.get_wires()) {
-            minimumRatio = std::min(minimumRatio, wire.get_maximum_conducting_width() / wire.get_maximum_conducting_height());
-        }
-        auto isThickPlanar = minimumRatio < PLANAR_THICKNESS_RATIO_THRESHOLD;
-        if (!isThickPlanar) {
-            return CoilMesherModels::WANG;
-        }
-    }
-
-    return CoilMesherModels::CENTER;
 }
 
 std::pair<size_t, size_t> LeakageInductance::calculate_grid_points(Magnetic& magnetic, double frequency) {

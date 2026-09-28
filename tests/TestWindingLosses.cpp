@@ -11,6 +11,12 @@
 #include "TestingUtils.h"
 #include "TestWindingLosses.h"
 #include "advisers/CoilAdviser.h"
+#include "processors/Sweeper.h"
+#include "physical_models/WindingSkinEffectLosses.h"
+#include "physical_models/WindingProximityEffectLosses.h"
+#include "physical_models/Resistivity.h"
+#include "physical_models/WindingLossesPeec2D.h"
+#include <numbers>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -25,6 +31,7 @@
 #include <typeinfo>
 #include <cmath>
 #include <chrono>
+#include <sstream>
 #include <optional>
 
 using namespace MAS;
@@ -180,6 +187,72 @@ namespace TestWindingLossesRound {
         settings.reset();
     }
 
+    TEST_CASE("Test_Winding_Losses_Underspecified_Current_Normalised", "[physical-model][winding-losses][round][rectangular-winding-window][bug]") {
+        // ABT #598/#599: an excitation whose current carried only a raw
+        // waveform (no processed block, no harmonics) returned
+        // windingLosses=0.0 labelled "Ohm" (its RMS silently read as 0 A), and
+        // one with processed data but no harmonics threw bad optional access
+        // in prune_harmonics. calculate_losses now normalises such operating
+        // points through Inputs::process_operating_point, so both variants
+        // must reproduce the fully-processed result.
+        settings.reset();
+        clear_databases();
+
+        double temperature = 20;
+        double frequency = 100000;
+        double magnetizingInductance = 1e-3;
+        double peakToPeak = 2 * 1.73205;
+        std::string shapeName = "ETD 34/17/11";
+
+        auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+            frequency, magnetizingInductance, temperature, WaveformLabel::TRIANGULAR, peakToPeak, 0.5, 0);
+
+        std::vector<int64_t> numberTurns({1});
+        std::vector<int64_t> numberParallels({1});
+        auto coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, shapeName, 1,
+                                                         WindingOrientation::OVERLAPPING,
+                                                         WindingOrientation::OVERLAPPING,
+                                                         CoilAlignment::CENTERED,
+                                                         CoilAlignment::CENTERED);
+        auto core = OpenMagneticsTesting::get_quick_core(shapeName, OpenMagneticsTesting::get_ground_gap(2e-5), 1, "3C97");
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(coil);
+
+        auto processedLosses = WindingLosses().calculate_losses(magnetic, inputs.get_operating_point(0), temperature);
+        REQUIRE(processedLosses.get_winding_losses() > 0);
+
+        // Same operating point stripped down to the raw waveform only.
+        OperatingPoint rawOperatingPoint = inputs.get_operating_point(0);
+        {
+            auto& excitation = rawOperatingPoint.get_mutable_excitations_per_winding()[0];
+            SignalDescriptor rawCurrent;
+            rawCurrent.set_waveform(excitation.get_current()->get_waveform().value());
+            excitation.set_current(rawCurrent);
+            excitation.set_magnetizing_current(std::nullopt);
+            excitation.set_voltage(std::nullopt);
+        }
+        auto rawLosses = WindingLosses().calculate_losses(magnetic, rawOperatingPoint, temperature);
+        REQUIRE_THAT(rawLosses.get_winding_losses(),
+                     Catch::Matchers::WithinRel(processedLosses.get_winding_losses(), 0.01));
+
+        // And stripped down to the processed block only (no waveform, no harmonics).
+        OperatingPoint processedOnlyOperatingPoint = inputs.get_operating_point(0);
+        {
+            auto& excitation = processedOnlyOperatingPoint.get_mutable_excitations_per_winding()[0];
+            SignalDescriptor processedOnlyCurrent;
+            processedOnlyCurrent.set_processed(excitation.get_current()->get_processed().value());
+            excitation.set_current(processedOnlyCurrent);
+            excitation.set_magnetizing_current(std::nullopt);
+            excitation.set_voltage(std::nullopt);
+        }
+        auto processedOnlyLosses = WindingLosses().calculate_losses(magnetic, processedOnlyOperatingPoint, temperature);
+        REQUIRE_THAT(processedOnlyLosses.get_winding_losses(),
+                     Catch::Matchers::WithinRel(processedLosses.get_winding_losses(), 0.01));
+
+        settings.reset();
+    }
+
     TEST_CASE("Test_Winding_Losses_One_Turn_Round_Sinusoidal", "[physical-model][winding-losses][round][rectangular-winding-window][!mayfail]") {
         // [!mayfail] golden values predate skin-effect bug fixes in commit 90dde3ae
         // (Wojda 3/4 integer division, Payne FR vs FR-1, Lotfi current scaling).
@@ -192,22 +265,27 @@ namespace TestWindingLossesRound {
              {600000, 0.0048621}, {700000, 0.0051882}, {800000, 0.0054789}, {900000, 0.0057414}, {1000000, 0.0059805}});
     }
 
-    TEST_CASE("Test_Winding_Losses_Twelve_Turns_Round_Sinusoidal", "[physical-model][winding-losses][round][rectangular-winding-window][!mayfail]") {
-        // SKIP: Model shows ~118% error at 3MHz. High frequency proximity effect needs improvement.
-        // TEST-001: Was SKIP - now runs with [!mayfail] to track regression
+    TEST_CASE("Test_Winding_Losses_Twelve_Turns_Round_Sinusoidal", "[physical-model][winding-losses][round][rectangular-winding-window]") {
         // Test to evaluate proximity effect losses, as there is no fringing and the wire is small enough to avoid skin
+        // ABT #832 (2026-08-20): FEM-verified — OMFEM on this fixture gives R_ac/R_dc
+        // 1.003/1.067/1.263/2.705 at 100k/500k/1M/3M and MKF lands within 1.3% at every
+        // point. Only the 3 MHz pin was updated (the old 0.34496 was 20% below FEM);
+        // the rest of the historical table passes as-is.
         WindingLossesTestHelpers::runJsonBasedWindingLossesTest(
             "Test_Winding_Losses_Twelve_Turns_Round_Sinusoidal.json", 22,
             {{1, 0.17371}, {10000, 0.17372}, {20000, 0.17373}, {30000, 0.17374}, {40000, 0.17375},
              {50000, 0.17378}, {60000, 0.1738}, {70000, 0.17384}, {80000, 0.17387}, {90000, 0.17391},
              {100000, 0.17396}, {200000, 0.1747}, {300000, 0.17593}, {400000, 0.17764}, {500000, 0.17983},
              {600000, 0.18248}, {700000, 0.1856}, {800000, 0.18916}, {900000, 0.19315}, {1000000, 0.19755},
-             {3000000, 0.34496}});
+             {3000000, 0.43591}});
     }
 
     TEST_CASE("Test_Winding_Losses_One_Turn_Round_Sinusoidal_Fringing", "[physical-model][winding-losses][round][rectangular-winding-window][!mayfail]") {
-        // SKIP: Model shows ~101% error at 20kHz due to fringing effect overestimation.
-        // TEST-001: Was SKIP - now runs with [!mayfail] to track regression
+        // [!mayfail] ABT #832 (2026-08-20): OMFEM on this fixture gives R_ac/R_dc
+        // 1.443/3.137/4.400 at 100k/500k/1M; MKF (Roshen conformal fringing) is 1.4-1.9x
+        // over on the AC part for this close-to-the-gap turn (point-sampled 1/r near-field
+        // bathes the whole conductor) — ABT #837. The historical pins are themselves ~10%
+        // below FEM. Not re-pinned until the close-gap sampling is fixed.
         WindingLossesTestHelpers::runJsonBasedWindingLossesTest(
             "Test_Winding_Losses_One_Turn_Round_Sinusoidal_Fringing.json", 22,
             {{1, 167.89}, {10000, 169.24}, {20000, 174.77}, {30000, 183.33}, {40000, 194.12},
@@ -216,21 +294,22 @@ namespace TestWindingLossesRound {
              {600000, 649.64}, {700000, 699.9}, {800000, 746.3}, {900000, 789.66}, {1000000, 830.49}});
     }
 
-    TEST_CASE("Test_Winding_Losses_One_Turn_Round_Sinusoidal_Fringing_Far", "[physical-model][winding-losses][round][rectangular-winding-window][!mayfail]") {
-        // SKIP: Model shows ~56% error at higher frequencies with distant fringing.
-        // TEST-001: Was SKIP - now runs with [!mayfail] to track regression
-        // Worst error in this one - use 40% tolerance
+    TEST_CASE("Test_Winding_Losses_One_Turn_Round_Sinusoidal_Fringing_Far", "[physical-model][winding-losses][round][rectangular-winding-window]") {
+        // Re-pinned (ABT #832, 2026-08-20) against 2D OMFEM: FEM gives R_ac/R_dc
+        // 1.002/1.168/2.188/2.984 at 10k/100k/500k/1M and MKF lands within 4% of FEM
+        // across the sweep (the far turn sees almost pure skin; the old pins predated
+        // the 90dde3ae skin fixes and sat ~25% low at 1 MHz).
         WindingLossesTestHelpers::runJsonBasedWindingLossesTest(
             "Test_Winding_Losses_One_Turn_Round_Sinusoidal_Fringing_Far.json", 22,
-            {{1, 204.23}, {10000, 204.61}, {20000, 205.73}, {30000, 207.52}, {40000, 209.9},
-             {50000, 212.74}, {60000, 215.94}, {70000, 219.41}, {80000, 223.07}, {90000, 226.85},
-             {100000, 230.71}, {200000, 269.05}, {300000, 303.53}, {400000, 333.71}, {500000, 360.06},
-             {600000, 383.12}, {700000, 403.36}, {800000, 421.2}, {900000, 436.95}, {1000000, 450.91}},
-            0.4);  // 40% max error for this test
+            {{1, 187.478}, {10000, 188.535}, {20000, 191.619}, {30000, 196.491}, {40000, 202.820},
+             {50000, 210.249}, {60000, 218.446}, {70000, 227.141}, {80000, 236.126}, {90000, 245.253},
+             {100000, 254.420}, {200000, 340.544}, {300000, 412.027}, {400000, 471.485}, {500000, 523.057},
+             {600000, 569.418}, {700000, 612.033}, {800000, 651.753}, {900000, 689.109}, {1000000, 724.472}});
     }
 
-    TEST_CASE("Test_Winding_Losses_Eight_Turns_Round_Sinusoidal_Rectangular_Column", "[physical-model][winding-losses][round][rectangular-winding-window][!mayfail]") {
-        // [!mayfail] golden values predate skin-effect bug fixes in commit 90dde3ae.
+    TEST_CASE("Test_Winding_Losses_Eight_Turns_Round_Sinusoidal_Rectangular_Column", "[physical-model][winding-losses][round][rectangular-winding-window]") {
+        // ABT #832 (2026-08-20): passes against the historical pins since the residual-gap
+        // fringing gate; OMFEM on this fixture: R_ac/R_dc 1.193 @1MHz vs MKF 1.195 (+0.2%).
         // Test to evaluate proximity effect losses, as there is no fringing and the wire is small enough to avoid skin
         WindingLossesTestHelpers::runJsonBasedWindingLossesTest(
             "Test_Winding_Losses_Eight_Turns_Round_Sinusoidal_Rectangular_Column.json", 22,
@@ -319,8 +398,9 @@ namespace TestWindingLossesRound {
         settings.reset();
     }
 
-    TEST_CASE("Test_Winding_Losses_Twelve_Turns_Round_Sinusoidal_No_Interleaving", "[physical-model][winding-losses][round][rectangular-winding-window][!mayfail]") {
-        // [!mayfail] golden values predate skin-effect bug fixes in commit 90dde3ae.
+    TEST_CASE("Test_Winding_Losses_Twelve_Turns_Round_Sinusoidal_No_Interleaving", "[physical-model][winding-losses][round][rectangular-winding-window]") {
+        // ABT #832 (2026-08-20): passes against the historical pins since the residual-gap
+        // fringing gate; F_R FEM-verified on the sibling fixtures (P3.3/ER11/E4 within 1.3%).
         // Test to evaluate proximity effect losses, as there is no fringing and the wire is small enough to avoid skin
         WindingLossesTestHelpers::runJsonBasedWindingLossesTest(
             "Test_Winding_Losses_Twelve_Turns_Round_Sinusoidal_No_Interleaving.json", 22,
@@ -330,9 +410,9 @@ namespace TestWindingLossesRound {
              {600000, 0.1411}, {700000, 0.14206}, {800000, 0.14314}, {900000, 0.14437}, {1000000, 0.14572}});
     }
 
-    TEST_CASE("Test_Winding_Losses_Twelve_Turns_Round_Sinusoidal_No_Interleaving_2", "[physical-model][winding-losses][round][rectangular-winding-window][!mayfail]") {
-        // SKIP: Model shows ~41% error. Non-interleaved winding model needs calibration.
-        // TEST-001: Was SKIP - now runs with [!mayfail] to track regression
+    TEST_CASE("Test_Winding_Losses_Twelve_Turns_Round_Sinusoidal_No_Interleaving_2", "[physical-model][winding-losses][round][rectangular-winding-window]") {
+        // ABT #832 (2026-08-20): passes against the historical pins since the residual-gap
+        // fringing gate; OMFEM on this fixture: R_ac/R_dc 1.112 @1MHz vs MKF 1.117 (+0.5%).
         // Test to evaluate proximity effect losses, as there is no fringing and the wire is small enough to avoid skin
         WindingLossesTestHelpers::runJsonBasedWindingLossesTest(
             "Test_Winding_Losses_Twelve_Turns_Round_Sinusoidal_No_Interleaving_2.json", 22,
@@ -409,23 +489,20 @@ namespace TestWindingLossesRectangular {
             WindingLossesTestHelpers::maximumError, false);  // includeFringing = false
     }
 
-    TEST_CASE("Test_Winding_Losses_Five_Turns_Rectangular_Ungapped_Sinusoidal", "[physical-model][winding-losses][rectangular][rectangular-winding-window][!mayfail]") {
-        // SKIP: Model shows ~229% error. Rectangular wire losses severely underestimated.
-        // TEST-001: Was SKIP - now runs with [!mayfail] to track regression
+    TEST_CASE("Test_Winding_Losses_Five_Turns_Rectangular_Ungapped_Sinusoidal", "[physical-model][winding-losses][rectangular][rectangular-winding-window]") {
+        // Pinned to 2D OMFEM's own R_ac/R_dc WITHOUT the residual gaps (ABT #1425); see the config comment.
         auto config = WindingLossesTestData::createFiveTurnsRectangularUngappedConfig();
         WindingLossesTestHelpers::runWindingLossesTest(config);
     }
 
-    TEST_CASE("Test_Winding_Losses_Five_Turns_Rectangular_Ungapped_Sinusoidal_7_Amps", "[physical-model][winding-losses][rectangular][rectangular-winding-window][!mayfail]") {
-        // SKIP: Model shows ~220% error. Rectangular wire losses severely underestimated.
-        // TEST-001: Was SKIP - now runs with [!mayfail] to track regression
+    TEST_CASE("Test_Winding_Losses_Five_Turns_Rectangular_Ungapped_Sinusoidal_7_Amps", "[physical-model][winding-losses][rectangular][rectangular-winding-window]") {
+        // Pinned to 2D OMFEM's own R_ac/R_dc without the residual gaps, like the 1 A variant (ABT #1425).
         auto config = WindingLossesTestData::createFiveTurnsRectangularUngapped7AmpsConfig();
         WindingLossesTestHelpers::runWindingLossesTest(config);
     }
 
-    TEST_CASE("Test_Winding_Losses_Five_Turns_Rectangular_Gapped_Sinusoidal_7_Amps", "[physical-model][winding-losses][rectangular][rectangular-winding-window][!mayfail]") {
-        // SKIP: Model shows ~220% error. Rectangular wire with gap losses underestimated.
-        // TEST-001: Was SKIP - now runs with [!mayfail] to track regression
+    TEST_CASE("Test_Winding_Losses_Five_Turns_Rectangular_Gapped_Sinusoidal_7_Amps", "[physical-model][winding-losses][rectangular][rectangular-winding-window]") {
+        // Aliases the ungapped 7 A config (no gap), so it carries the same OMFEM pins.
         auto config = WindingLossesTestData::createFiveTurnsRectangularGapped7AmpsConfig();
         WindingLossesTestHelpers::runWindingLossesTest(config);
     }
@@ -555,7 +632,13 @@ namespace TestWindingLossesFoil {
         // dissipate P/l = breadth * rho / delta * H^2 * G(t/delta) per unit
         // length (Dowell 1966 / Lammeraner & Stafl 1966) — no cross-section
         // prefactor (the old c*h form under-predicted by ~2500x at t = 0.4 mm).
+        //
+        // ABT #1188: this pins WANG's slab form specifically, so it must SELECT Wang rather than
+        // read the default. Reading the default would silently turn a model-specific unit pin
+        // into a test of whichever model happens to be default.
         settings.reset();
+        settings.set_coil_enable_user_winding_losses_models(true);
+        settings.set_winding_proximity_effect_losses_model(WindingProximityEffectLossesModels::WANG);
         clear_databases();
         auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "bug_foil_proximity_ih_transformer.json");
         auto mas = OpenMagneticsTesting::mas_loader(path);
@@ -714,7 +797,12 @@ namespace TestWindingLossesToroidalCores {
         WindingLossesTestHelpers::runWindingLossesTest(config);
     }
 
-    TEST_CASE("Test_Winding_Losses_Ten_Turn_Round_Sinusoidal_Toroidal_Core_Rectangular_Wire", "[physical-model][winding-losses][rectangular][round-winding-window]") {
+    TEST_CASE("Test_Winding_Losses_Ten_Turn_Round_Sinusoidal_Toroidal_Core_Rectangular_Wire", "[physical-model][winding-losses][rectangular][round-winding-window][!mayfail]") {
+        // [!mayfail] ABT #832 (2026-08-20): OMFEM gives R_ac/R_dc 6.81/14.8/36.3 at
+        // 25k/100k/500k — the historical pins (2.18 @25k) sat 3x BELOW FEM (they were
+        // green only against the c*h prefactor bug that zeroed rectangular proximity).
+        // The slab-form model now reads 1.35-1.6x ABOVE FEM here (edge-point sampling on
+        // tightly packed toroidal turns — ABT #837). Not re-pinned until that lands.
         auto config = WindingLossesTestData::createTenTurnsRectangularToroidalConfig();
         WindingLossesTestHelpers::runWindingLossesTest(config);
     }
@@ -742,26 +830,32 @@ namespace TestWindingLossesPlanar {
             maximumError, false);  // includeFringing = false
     }
 
-    TEST_CASE("Test_Winding_Losses_One_Turn_Planar_Sinusoidal_Fringing", "[physical-model][winding-losses][planar][smoke-test]") {
-        // MKF snapshot (July 2026, width-resolved gap-fringing kernel, C=8 FEM-calibrated).
-        // Cross-checked against 2D FEM (OMFEM, mesh-converged) at the length-independent
-        // R_ac/R_dc level (OMFEM approximates the racetrack turn as circular, so absolute
-        // watts differ by the turn-length ratio):
-        //   f       MKF R_ac/R_dc   OMFEM
-        //   10 kHz      2.63         4.12   (LF bridge under-predicts ~35%)
-        //   100 kHz     8.97         9.70
-        //   500 kHz    19.2         19.05
-        //   1 MHz      26.8         27.3
-        //   1.5 MHz    32.7         34.0
-        // The previous pinned values (128 W ... 2.5 MW, ~f^2) came from an unskinned
-        // analytical benchmark, not FEM: 355 kW at 500 kHz vs 991 W actual FEM.
+    TEST_CASE("Test_Winding_Losses_One_Turn_Planar_Sinusoidal_Fringing", "[physical-model][winding-losses][planar]") {
+        // ABT #1274 / #139: these expectations are 2D OMFEM (omfem_mas, full-geometry P_cu),
+        // NOT an MKF snapshot. Alf's ruling 2026-09-20: trust OMFEM for these pins.
+        //
+        // THIS TEST IS EXPECTED TO FAIL until ABT #1274 is fixed, and that is the point. The
+        // values it replaced were an MKF snapshot running 1.15x (10 kHz) to 1.82x (400 kHz) above
+        // FEM, so the test was holding MKF to its own output rather than to the physics. Against
+        // FEM, MKF is now measurably wrong here and says so.
+        //
+        // Do NOT re-pin these back to whatever MKF computes. The gap is the finding: MKF reports
+        // a field component normal to a planar trace's wide face that two independent models
+        // (MARTINEZ, DOWELL) turn into 679x the FEM loss on the sibling 16-parallel fixture. The
+        // WANG default lands closer only because its c*h prefactor divides by h ~ 1e-4.
+        //
+        // References: /home/alf/OpenMagnetics/.mkf-fem/fem_repin.json (20 points, one_turn_fringing).
+        // (The July 2026 note that stood here described the MKF snapshot these values replace,
+        // and its R_ac/R_dc cross-check was against a CIRCULAR-turn OMFEM approximation, so it
+        // could not compare absolute watts. omfem_mas meshes the real geometry, so these are
+        // directly comparable in watts.)
         WindingLossesTestHelpers::runJsonBasedWindingLossesTest(
             "Test_Winding_Losses_One_Turn_Planar_Sinusoidal_Fringing.json", 22,
-            {{10000, 245.47}, {20000, 375.20}, {30000, 467.47}, {40000, 541.06},
-             {50000, 603.70}, {60000, 659.07}, {70000, 709.21}, {80000, 755.39},
-             {90000, 798.40}, {100000, 838.84}, {200000, 1160.4}, {300000, 1404.5},
-             {400000, 1609.9}, {500000, 1790.9}, {600000, 1954.7}, {700000, 2105.5},
-             {800000, 2246.0}, {900000, 2378.3}, {1000000, 2503.6}, {1500000, 3054.9}},
+            {{10000, 214.34}, {20000, 285.87}, {30000, 333.2}, {40000, 369.27},
+             {50000, 398.92}, {60000, 424.44}, {70000, 447.1}, {80000, 467.71},
+             {90000, 486.85}, {100000, 504.61}, {200000, 651.06}, {300000, 774.08},
+             {400000, 885.5}, {500000, 987.94}, {600000, 1082.4}, {700000, 1171},
+             {800000, 1254.7}, {900000, 1334.9}, {1000000, 1405.7}, {1500000, 1742.7}},
             maximumError, true);  // includeFringing = true
     }
 
@@ -782,6 +876,26 @@ namespace TestWindingLossesPlanar {
     }
 
     TEST_CASE("Test_Winding_Losses_Sixteen_Turns_Planar_Sinusoidal_Fringing_Close", "[physical-model][winding-losses][planar]") {
+        // Re-pinned 2026-07-31 (ABT #378, user-approved after FEM validation). Dropping the
+        // column-width clamp from Zhang's h — Fig. 7's caption defines 2h as the height of a
+        // core-limb SEGMENT, along the limb axis, never the column WIDTH — lowered these by a
+        // fairly uniform 1.36-1.49x. The clamp had substituted a larger h, inflating the
+        // fringing permeance, and the #378 note predicted the error would be worst on
+        // short-window/planar cores. This is where it landed.
+        //
+        // Validated against 2D FEA (OMFEM omfem_mas, conductor volume integral) rather than
+        // re-pinned to another MKF snapshot. The new values are closer at EVERY point measured:
+        //
+        //                     FEA_cu     old pin   old/FEA        new     new/FEA
+        //   Close  10 kHz     118.93      2683.8     22.57     1796.9      15.11
+        //         100 kHz     424.19       22084     52.06      14815      34.93
+        //           1 MHz    1348.30       78230     58.02      53916      39.99
+        //   Far    10 kHz      79.57      1190.6     14.96     799.01      10.04
+        //         100 kHz     266.62      6210.0     23.29     4208.5      15.78
+        //
+        // Still 10-40x above FEA, which is the KNOWN LIMIT below, not this change: 1 turn x 16
+        // PARALLEL traces screen each other (inner traces shielded within a skin depth) and
+        // per-trace field superposition cannot see it. Screening follow-up: ABT #139.
         // MKF snapshot (July 2026, width-resolved gap-fringing kernel, C=8). Close-to-gap
         // winding: ~2.9x the Far variant at 100 kHz (26.4 kW vs 9.1 kW) — the model now
         // discriminates winding position, which the previous ~f^2 pinned values (up to
@@ -799,11 +913,11 @@ namespace TestWindingLossesPlanar {
         // isolated-trace One_Turn pins were unchanged by #182 (byte-identical).
         WindingLossesTestHelpers::runJsonBasedWindingLossesTest(
             "Test_Winding_Losses_Sixteen_Turns_Planar_Sinusoidal_Fringing_Close.json", 100,
-            {{10000, 2683.8}, {20000, 6321.5}, {30000, 9391.5}, {40000, 11936},
-             {50000, 14107}, {60000, 16012}, {70000, 17722}, {80000, 19284},
-             {90000, 20731}, {100000, 22084}, {200000, 32772}, {300000, 40989},
-             {400000, 48006}, {500000, 54225}, {600000, 59839}, {700000, 64968},
-             {800000, 69700}, {900000, 74103}, {1000000, 78230}},
+            {{10000, 1796.9}, {20000, 4229.8}, {30000, 6284.5}, {40000, 7989.3},
+             {50000, 9444.9}, {60000, 10724}, {70000, 11874}, {80000, 12926},
+             {90000, 13901}, {100000, 14815}, {200000, 22103}, {300000, 27798},
+             {400000, 32714}, {500000, 37091}, {600000, 41046}, {700000, 44653},
+             {800000, 47969}, {900000, 51044}, {1000000, 53916}},
             maximumError, true);  // includeFringing = true
     }
 
@@ -815,11 +929,11 @@ namespace TestWindingLossesPlanar {
         // (3.6x at 100 kHz).
         WindingLossesTestHelpers::runJsonBasedWindingLossesTest(
             "Test_Winding_Losses_Sixteen_Turns_Planar_Sinusoidal_Fringing_Far.json", 100,
-            {{10000, 1190.6}, {20000, 2248.3}, {30000, 3015.6}, {40000, 3633.0},
-             {50000, 4162.7}, {60000, 4635.2}, {70000, 5067.4}, {80000, 5469.8},
-             {90000, 5849.1}, {100000, 6210.0}, {200000, 9281.0}, {300000, 11901},
-             {400000, 14273}, {500000, 16432}, {600000, 18391}, {700000, 20166},
-             {800000, 21779}, {900000, 23255}, {1000000, 24614}},
+            {{10000, 799.01}, {20000, 1507.6}, {30000, 2023.3}, {40000, 2439.9},
+             {50000, 2799.0}, {60000, 3120.9}, {70000, 3417.0}, {80000, 3694.2},
+             {90000, 3956.9}, {100000, 4208.5}, {200000, 6412.1}, {300000, 8375.2},
+             {400000, 10197}, {500000, 11872}, {600000, 13393}, {700000, 14766},
+             {800000, 16006}, {900000, 17130}, {1000000, 18158}},
             maximumError, true);  // includeFringing = true
     }
 
@@ -1170,9 +1284,17 @@ namespace TestWindingLossesWeb {
         auto magnetic = mas.get_magnetic();
         auto inputs = mas.get_inputs();
 
+        // huge_losses.json follows the MAS excitation convention (2026-09-24) since it was
+        // converted: its secondary voltage is in the dot reference and its current in source
+        // convention (the fixture had referred the secondary to the opposite terminal).
         auto losses = WindingLosses().calculate_losses(magnetic, inputs.get_operating_point(0), 25);
 
-        REQUIRE(losses.get_winding_losses() < 2);
+        // Was < 2 W under the amplitude-only field, which forced the secondary into exact
+        // antiphase with the primary. A flyback's primary and secondary never conduct together
+        // (fundamentals ~80 degrees apart here, harmonics up to ~170), so their fields no longer
+        // cancel: the phase-aware field gives 2.62 W. The bound still guards the historical
+        // "huge losses" bug (harmonics from CSV).
+        REQUIRE(losses.get_winding_losses() < 3);
         settings.reset();
     }
 
@@ -1939,9 +2061,19 @@ TEST_CASE("Comprehensive_Winding_Losses_Model_Comparison_Skin_And_Proximity", "[
                 if (reason.find("only supports") != std::string::npos ||
                     reason.find("not implemented") != std::string::npos ||
                     reason.find("Not implemented") != std::string::npos ||
-                    reason.find("Model not") != std::string::npos) {
-                    // Documented unsupported model/wire combination: recorded in the
-                    // crash statistics, not a test failure.
+                    reason.find("Model not") != std::string::npos ||
+                    // ABT #376: a model REFUSING to extrapolate outside its published validity
+                    // domain is correct behaviour, not a defect — Lammeraner's proximity model
+                    // says so explicitly ("only valid for low frequencies where
+                    // conductor_dimension/skin_depth < 1") and this sweep deliberately drives
+                    // combinations to 1 MHz on 7 A rectangular wire, far outside it. Treating
+                    // that as a failure made the sweep permanently red (219 of these per run)
+                    // and buried any real regression in the noise. Recorded in the same crash
+                    // statistics as the other declined combinations.
+                    reason.find("only valid for") != std::string::npos ||
+                    reason.find("outside the validity") != std::string::npos) {
+                    // Documented unsupported model/wire combination, or a model declining to
+                    // extrapolate: recorded in the crash statistics, not a test failure.
                 } else {
                     FAIL_CHECK(config.name << " / " << skinModelName << "+" << proximityModelName << " @ "
                                            << frequency << " Hz threw: " << e.what());
@@ -2175,13 +2307,34 @@ TEST_CASE("Ultimate_Model_Combination_Comparison_All_4_Types", "[physical-model]
     
     
     // Define all model types
-    std::vector<std::pair<MagneticFieldStrengthModels, std::string>> hFieldModels = {
-        {MagneticFieldStrengthModels::BINNS_LAWRENSON, "Binns_Lawrenson"},
-        {MagneticFieldStrengthModels::LAMMERANER, "Lammeraner"},
-        {MagneticFieldStrengthModels::DOWELL, "Dowell_HField"},
-        {MagneticFieldStrengthModels::WANG, "Wang_HField"},
-        {MagneticFieldStrengthModels::ALBACH, "Albach_HField"}
-    };
+    // ABT #376: enumerate only the field-strength models the FACTORY implements. The enum
+    // carries DOWELL but MagneticFieldStrengthModel::factory has no branch for it, so every
+    // combination involving it threw [MODEL_NOT_AVAILABLE] — ~3800 throws and 4737 failed
+    // assertions per run, which is why this sweep was permanently red. Skipping silently would
+    // hide the gap, so the skipped models are probed once and REPORTED.
+    std::vector<std::pair<MagneticFieldStrengthModels, std::string>> hFieldModels;
+    std::vector<std::string> unimplementedFieldModels;
+    for (auto& [candidateModel, candidateName] : std::vector<std::pair<MagneticFieldStrengthModels, std::string>>{
+             {MagneticFieldStrengthModels::BINNS_LAWRENSON, "Binns_Lawrenson"},
+             {MagneticFieldStrengthModels::LAMMERANER, "Lammeraner"},
+             {MagneticFieldStrengthModels::DOWELL, "Dowell_HField"},
+             {MagneticFieldStrengthModels::WANG, "Wang_HField"},
+             {MagneticFieldStrengthModels::ALBACH, "Albach_HField"}}) {
+        try {
+            MagneticField::factory(candidateModel);
+            hFieldModels.push_back({candidateModel, candidateName});
+        }
+        catch (const std::exception&) {
+            unimplementedFieldModels.push_back(candidateName);
+        }
+    }
+    INFO("field-strength models declared in the enum but not implemented by the factory (skipped): "
+         << [&] {
+                std::string joined;
+                for (auto& name : unimplementedFieldModels) joined += name + " ";
+                return joined.empty() ? std::string("none") : joined;
+            }());
+    REQUIRE(hFieldModels.size() >= 4);
     
     std::vector<std::pair<MagneticFieldStrengthFringingEffectModels, std::string>> fringingModels = {
         {MagneticFieldStrengthFringingEffectModels::ROSHEN, "Roshen"},
@@ -2320,7 +2473,12 @@ TEST_CASE("Ultimate_Model_Combination_Comparison_All_4_Types", "[physical-model]
                             } catch (const std::exception& e) {
                                 crashCount++;
                                 std::string reason = e.what();
-                                if (reason.find("only supports") != std::string::npos ||
+                                // ABT #376: a model declining to extrapolate outside its
+                                // published validity domain is correct behaviour (see the note
+                                // in the skin/proximity sweep above); count it, do not fail.
+                                if (reason.find("only valid for") != std::string::npos ||
+                                    reason.find("outside the validity") != std::string::npos ||
+                                    reason.find("only supports") != std::string::npos ||
                                     reason.find("not implemented") != std::string::npos ||
                                     reason.find("Not implemented") != std::string::npos ||
                                     reason.find("Model not") != std::string::npos) {
@@ -2479,3 +2637,1021 @@ TEST_CASE("Test_Core_Get_Columns_Throws_When_Unprocessed", "[physical-model][cor
     core.set_processed_description(std::nullopt);
     REQUIRE_THROWS_AS(core.get_columns(), CoreNotProcessedException);
 }
+
+// ABT #368: what does the drumRing's gap-fringing omission actually cost?
+//
+// MKF's width-resolved fringing kernel (the widthsamples path in MagneticField.cpp) is gated on
+// a FUNCTIONAL gap — MagneticField.cpp:390-396 only counts SUBTRACTIVE or ADDITIVE. A shielded
+// drum's two annular flange-to-ring clearances are synthesized as RESIDUAL (nothing is ground
+// on an assembled drum+ring), so the kernel skips them even though they are ~50 um wide, sit at
+// the flange rims facing the outer turns, and DOMINATE the reluctance. That typing is also what
+// heimdall's validated 477-file inductance sweep used, so it is not a free choice.
+//
+// This test does not "fix" that — the kernel is FEM-validated for a functional gap facing a FLAT
+// conductor, and a radial annular gap at a flange rim facing round wire is a different geometry
+// (the PQI lesson: do not ship an unvalidated gap model). It MEASURES the omission by pricing the
+// same geometry both ways, so the decision is quantitative rather than assumed, and it fails if
+// the gate silently changes behaviour.
+TEST_CASE("Test_Drum_Ring_Fringing_Loss_Omission_Is_Quantified",
+          "[physical-model][winding-losses][drum-ring]") {
+    auto buildMagnetic = [](GapType clearanceGapType) {
+        auto core = OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "N87");
+        // Re-type the synthesized annular clearances to ask the counterfactual.
+        auto gapping = core.get_functional_description().get_gapping();
+        for (auto& gap : gapping) {
+            gap.set_type(clearanceGapType);
+        }
+        core.get_mutable_functional_description().set_gapping(gapping);
+
+        json coilJson;
+        coilJson["bobbin"] = "Dummy";
+        coilJson["functionalDescription"] = json::array({{
+            {"name", "winding 0"}, {"numberTurns", 8}, {"numberParallels", 1},
+            {"isolationSide", "primary"}, {"wire", "Round 0.1 - Grade 1"}}});
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
+        return OpenMagnetics::magnetic_autocomplete(magnetic);
+    };
+
+    settings.reset();
+    clear_databases();
+    settings.set_magnetic_field_include_fringing(true);
+
+    double frequency = 1e6;
+    double temperature = 25;
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+        frequency, 14e-6, temperature, WaveformLabel::TRIANGULAR, 0.4, 0.5, 1.0);
+
+    auto residualMagnetic = buildMagnetic(GapType::RESIDUAL);
+    auto functionalMagnetic = buildMagnetic(GapType::ADDITIVE);
+    double residualLosses = WindingLosses()
+        .calculate_losses(residualMagnetic, inputs.get_operating_point(0), temperature)
+        .get_winding_losses();
+    double functionalLosses = WindingLosses()
+        .calculate_losses(functionalMagnetic, inputs.get_operating_point(0), temperature)
+        .get_winding_losses();
+
+    REQUIRE(residualLosses > 0);
+    REQUIRE(functionalLosses > 0);
+    double omissionRatio = functionalLosses / residualLosses;
+    UNSCOPED_INFO("drumRing winding losses @1MHz, 0.4A pk-pk + 1A DC: residual-typed "
+                  << residualLosses * 1e3 << " mW vs functional-typed " << functionalLosses * 1e3
+                  << " mW (ratio " << omissionRatio << ")");
+    // TRIPWIRE, updated DELIBERATELY (ABT #832, 2026-08-20): the residual-gap fringing gate
+    // plus the Albach->Roshen routing made re-typing matter for the first time — functional-
+    // typed clearances now pick up a (tiny) Roshen conformal fringing contribution that
+    // residual-typed ones deliberately do not (measured ratio 1.00019 at this operating
+    // point). The annular-gap kernel of ABT #368 has still NOT landed; when it does, the
+    // functional-typed number should grow well past this sliver and the band below must be
+    // revisited against its FEM data.
+    // ABT #1463 (2026-09-28): the Roshen gap field now enters with the turns' sign (it was
+    // antiparallel to the gap flux before), so at this point the functional-gap fringing field
+    // slightly CANCELS the turns' field and the ratio moved 1.00019 -> 0.99950. The tripwire
+    // therefore asserts the size of the sliver, not its sign: re-typing the clearances changes
+    // the loss by well under 1% until the annular-gap kernel lands.
+    CHECK(std::abs(omissionRatio - 1.0) < 1e-2);
+    settings.reset();
+}
+
+// ABT #1127: Sweeper::sweep_resistance_over_frequency showed a vertical notch — the effective
+// resistance rose smoothly with frequency, collapsed almost to the DC value in one step, then
+// climbed again. The cause was Ferreira's round-conductor proximity factor (Eq. A8), evaluated
+// through the Kelvin-function power series in Utils.cpp: bessel_first_kind divided its terms by
+// tgammaf(k+1)*tgammaf(order+k+1) and stopped as soon as that SINGLE-precision product hit inf,
+// i.e. around k = 34 whatever the argument. For gamma = d/(delta*sqrt(2)) above ~23 the series
+// was still on its rising terms there, so the sum was cut mid-peak and the "loss" it produced
+// went to zero and then NEGATIVE. Two invariants pin it: the proximity factor is a dissipation
+// and can never be negative, and in the strong-skin-effect limit it must approach the exact
+// closed form G = pi * rho * (sqrt(2)*gamma - 1).
+TEST_CASE("Test_Winding_Proximity_Factor_High_Frequency_Is_Physical", "[physical-model][winding-losses][abt1127]") {
+    auto wire = OpenMagnetics::find_wire_by_name("Round 0.475 - Grade 1");
+    double temperature = 25;
+    double conductingDiameter = OpenMagnetics::resolve_dimensional_values(wire.get_conducting_diameter().value());
+    auto resistivityModel = OpenMagnetics::ResistivityModel::factory(OpenMagnetics::ResistivityModels::WIRE_MATERIAL);
+    double resistivity = (*resistivityModel).get_resistivity(wire.resolve_material(), temperature);
+
+    double previousFactor = 0;
+    for (double frequency = 1e6; frequency <= 2e8; frequency *= 1.1) {
+        double skinDepth = OpenMagnetics::WindingSkinEffectLosses::calculate_skin_depth(wire, frequency, temperature);
+        double gamma = conductingDiameter / (skinDepth * sqrt(2));
+        double factor = OpenMagnetics::WindingProximityEffectLossesFerreiraModel::calculate_proximity_factor(wire, frequency, temperature);
+
+        UNSCOPED_INFO("f = " << frequency << " Hz, gamma = " << gamma << ", G = " << factor);
+        // A proximity factor multiplies H^2 to give a power: it is a dissipation and is
+        // monotonically increasing in gamma. Before the fix it crossed zero near gamma = 28.
+        CHECK(factor > 0);
+        CHECK(factor > previousFactor);
+        previousFactor = factor;
+
+        // Strong-skin-effect limit, exact to better than 0.2% for gamma >= 20.
+        if (gamma >= 20) {
+            double asymptotic = std::numbers::pi * resistivity * (sqrt(2) * gamma - 1);
+            CHECK_THAT(factor, Catch::Matchers::WithinRel(asymptotic, 0.01));
+        }
+    }
+}
+
+// ABT #1127, the sweep the user actually looks at: single winding of round wire on a small pot
+// core. Effective resistance is ohmic (flat) + skin (rises with sqrt(f)) + proximity (rises with
+// gamma), so it must increase monotonically over the whole band. Before the fix it peaked at
+// ~20 MHz and fell by an order of magnitude by ~32 MHz.
+TEST_CASE("Test_Sweeper_Resistance_Over_Frequency_Has_No_Notch", "[physical-model][winding-losses][abt1127]") {
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    settings.reset();
+
+    std::vector<int64_t> numberTurns = {15};
+    std::vector<int64_t> numberParallels = {1};
+    std::string shapeName = "P 11/7";
+    std::vector<OpenMagnetics::Wire> wires;
+    wires.push_back(OpenMagnetics::find_wire_by_name("Round 0.475 - Grade 1"));
+
+    auto coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, shapeName, 1,
+                                                    MAS::WindingOrientation::OVERLAPPING,
+                                                    MAS::WindingOrientation::OVERLAPPING,
+                                                    MAS::CoilAlignment::CENTERED,
+                                                    MAS::CoilAlignment::CENTERED,
+                                                    wires, true);
+    coil.wind();
+    auto core = OpenMagneticsTesting::get_quick_core(shapeName, OpenMagneticsTesting::get_ground_gap(0.0000008), 1, "98");
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(coil);
+
+    auto curve = OpenMagnetics::Sweeper().sweep_resistance_over_frequency(magnetic, 1e6, 1e8, 60);
+    auto frequencies = curve.get_x_points();
+    auto resistances = curve.get_y_points();
+    REQUIRE(frequencies.size() == resistances.size());
+    REQUIRE(frequencies.size() > 10);
+
+    for (size_t index = 1; index < resistances.size(); ++index) {
+        UNSCOPED_INFO("f = " << frequencies[index] << " Hz, R = " << resistances[index]
+                      << " ohm, previous R = " << resistances[index - 1] << " ohm");
+        CHECK(resistances[index] > 0);
+        // No fall anywhere: allow only floating-point noise, not a notch.
+        CHECK(resistances[index] >= resistances[index - 1] * 0.999);
+    }
+
+    settings.reset();
+}
+
+// Every winding-loss model value must survive the JSON the bindings use: PyOpenMagnetics' get_settings, set_settings and
+// get_all_*_models go through these to_json / from_json, and MagneticAdviser sends the magic_enum UPPER name. MARTINEZ and
+// EWALD were added to the enum without them, so listing the proximity models threw on the first new value; this walks the
+// whole enum so the next one added cannot do the same.
+TEST_CASE("Test_Winding_Losses_Model_Enums_Round_Trip_Through_Json", "[physical-model][winding-losses][smoke-test]") {
+    auto check = [](auto value) {
+        using Enum = decltype(value);
+        json serialised;
+        REQUIRE_NOTHROW(serialised = value);
+        CHECK(serialised.template get<Enum>() == value);
+        json upperName = std::string(magic_enum::enum_name(value));
+        CHECK(upperName.template get<Enum>() == value);
+    };
+    for (auto value : magic_enum::enum_values<MagneticFieldStrengthModels>()) check(value);
+    for (auto value : magic_enum::enum_values<MagneticFieldStrengthFringingEffectModels>()) check(value);
+    for (auto value : magic_enum::enum_values<WindingSkinEffectLossesModels>()) check(value);
+    for (auto value : magic_enum::enum_values<WindingProximityEffectLossesModels>()) check(value);
+}
+
+
+// ABT #1409: one layer of 22 flat rectangular turns (7.0 x 1.1 mm, wide face radial, 1.29 mm
+// pitch) on an EQ 41/28/19.9 N97 core, 117.6 kHz sinusoid -- a CLLC resonant inductor from a
+// field report. 2D OMFEM (omfem_mas, conductor target 0.04 mm, mesh-converged: 268.6 at
+// 0.064 mm) gives R_ac/R_dc 268.0 with THREE 3.9 mm spacer gaps and 386.5 with one 2.0 mm
+// ground centre gap; its per-turn loss is ~0 at the yoke ends (turn 0: 4.4) and peaks at the
+// gap plane. PEEC-2D charged each lateral gap the FULL flux and gave the gap sheets the
+// winding's own sign, so turns + gaps summed to ~2NI in the window: 478 (1.78x) and 536
+// (1.39x), with the end turn at 277 and 258. The mesh here (5760 cells, ~15 s) is
+// under-resolved and converges UPWARD (3.9 mm spacers: 180 / 215 / 233 at 2880 / 5760 /
+// 9600 cells), so the band is [0.75, 1.05] of OMFEM.
+TEST_CASE("Test_Winding_Losses_Peec2D_Rect_Stack_Beside_Gaps_Vs_OMFEM", "[physical-model][winding-losses][peec][abt1409]") {
+    for (auto [fileName, omfemRacOverRdc] : std::vector<std::pair<std::string, double>>{
+             {"abt1409_rect_stack_spacer_gaps_3.9mm.json", 268.0},
+             {"abt1409_rect_stack_ground_gap_2.0mm.json", 386.5}}) {
+        settings.reset();
+        auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), fileName);
+        auto mas = OpenMagneticsTesting::mas_loader(path);
+        auto magnetic = mas.get_magnetic();
+        auto inputs = mas.get_inputs();
+        auto operatingPoint = inputs.get_operating_point(0);
+
+        WindingLossesPeec2D peec;
+        peec.cellsPerSkinDepth = 2.0;
+        peec.maximumCellsWide = 24;
+        peec.maximumCellsThin = 8;
+        peec.calculate_losses(magnetic, operatingPoint, 25);
+
+        double fullLoss = 0;
+        double dcEquivalentLoss = 0;
+        const auto perTurn = peec.get_diagnostics().perTurnPerHarmonic;
+        REQUIRE(perTurn.size() == 22);
+        for (const auto& turn : perTurn) {
+            for (const auto& harmonic : turn) {
+                fullLoss += harmonic.fullLoss;
+                dcEquivalentLoss += harmonic.dcEquivalentLoss;
+            }
+        }
+        double racOverRdc = fullLoss / dcEquivalentLoss;
+        INFO(fileName << ": PEEC R_ac/R_dc " << racOverRdc << ", OMFEM " << omfemRacOverRdc);
+        CHECK(racOverRdc > 0.75 * omfemRacOverRdc);
+        CHECK(racOverRdc < 1.05 * omfemRacOverRdc);
+
+        // The yoke-end turn sits where the two core halves are equipotential: ~no field.
+        double endTurnRatio = perTurn[0][0].fullLoss / perTurn[0][0].dcEquivalentLoss;
+        INFO("end turn R_ac/R_dc " << endTurnRatio << ", OMFEM 4.4");
+        CHECK(endTurnRatio < 20);
+    }
+    settings.reset();
+}
+
+// ABT #1409: the IMAGED_MMF_SHEETS field model on the same 22-turn flat-rectangular stack
+// (EQ 41/28/19.9 N97, 117.6 kHz) with three spacer gaps of 3.9 / 2.0 / 0.5 mm. 2D OMFEM
+// (conductor target 0.04 mm) gives R_ac/R_dc 268.0 / 297.9 / 282.2 and ~4 at the yoke-end
+// turn; the default Binns-Lawrenson + Roshen pair reads 887 / 625 / 400 and 963 / 809 / 613
+// at the end turn, because a free-space fringing field is never balanced by the winding.
+// The model reads 296.8 / 309.1 / 274.8 (end turn 7.1 / 7.4 / 8.0), hence the band
+// [0.85, 1.20] of OMFEM.
+//
+// NOT covered, and the reason this is not the default: on the centre-ground 2.0 mm variant
+// (abt1409_rect_stack_ground_gap_2.0mm.json, OMFEM 386.5) it reads 883, and on the existing
+// FEM-arbitrated fixtures it is worse than the default pair (single planar trace 2.1x FEM,
+// ungapped five-turn rectangular 0.46x). The turns at the gap plane are over-read 1.8-3x;
+// the width-sample loss kernel was derived for the bare fringing field it replaces.
+TEST_CASE("Test_Winding_Losses_Imaged_Mmf_Sheets_Rect_Stack_Beside_Spacer_Gaps_Vs_OMFEM", "[physical-model][winding-losses][rectangular][abt1409]") {
+    for (auto [fileName, omfemRacOverRdc] : std::vector<std::pair<std::string, double>>{
+             {"abt1409_rect_stack_spacer_gaps_3.9mm.json", 268.0},
+             {"abt1409_rect_stack_spacer_gaps_2.0mm.json", 297.9},
+             {"abt1409_rect_stack_spacer_gaps_0.5mm.json", 282.2}}) {
+        settings.reset();
+        clear_databases();
+        auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), fileName);
+        auto mas = OpenMagneticsTesting::mas_loader(path);
+        auto magnetic = mas.get_magnetic();
+        auto inputs = mas.get_inputs();
+        auto operatingPoint = inputs.get_operating_point(0);
+        double currentRms = operatingPoint.get_excitations_per_winding()[0].get_current()->get_processed()->get_rms().value();
+
+        WindingLossesModels models;
+        models.magneticFieldStrengthModel = MagneticFieldStrengthModels::IMAGED_MMF_SHEETS;
+        auto output = WindingLosses(models).calculate_losses(magnetic, operatingPoint, 25);
+
+        const auto rdcPerTurn = output.get_dc_resistance_per_turn().value();
+        double rdcTotal = 0;
+        for (auto r : rdcPerTurn) {
+            rdcTotal += r;
+        }
+        double racOverRdc = output.get_winding_losses() / (currentRms * currentRms * rdcTotal);
+        INFO(fileName << ": IMAGED_MMF_SHEETS R_ac/R_dc " << racOverRdc << ", OMFEM " << omfemRacOverRdc);
+        CHECK(racOverRdc > 0.85 * omfemRacOverRdc);
+        CHECK(racOverRdc < 1.20 * omfemRacOverRdc);
+
+        const auto perTurn = output.get_winding_losses_per_turn().value();
+        const auto endTurn = perTurn[0];
+        double endTurnLoss = endTurn.get_ohmic_losses()->get_losses();
+        const auto skinLosses = endTurn.get_skin_effect_losses().value();
+        const auto proximityLosses = endTurn.get_proximity_effect_losses().value();
+        for (auto loss : skinLosses.get_losses_per_harmonic()) {
+            endTurnLoss += loss;
+        }
+        for (auto loss : proximityLosses.get_losses_per_harmonic()) {
+            endTurnLoss += loss;
+        }
+        double endTurnRatio = endTurnLoss / (currentRms * currentRms * rdcPerTurn[0]);
+        INFO("end turn R_ac/R_dc " << endTurnRatio << ", OMFEM ~4");
+        CHECK(endTurnRatio < 20);
+    }
+    settings.reset();
+}
+
+// ABT #1409: WANG_STACKED on 16 stacked parallel planar traces (20 x 0.209 mm, 0.1 mm slits) of
+// one turn beside a 3 mm gap, 100 kHz. 2D OMFEM gives R_ac/R_dc 100.1: the stack excludes the
+// field as one body. WANG puts an isolated conductor's edge crowding on every trace and reads
+// 2008; with each trace carrying its share of the stack outline WANG_STACKED reads 103, hence
+// the band [0.8, 1.25] of OMFEM. On a single trace (nothing stacked) the two kernels are the
+// same number, which the second half checks.
+TEST_CASE("Test_Winding_Losses_Wang_Stacked_Planar_Parallel_Stack_Vs_OMFEM", "[physical-model][winding-losses][planar][abt1409]") {
+    auto racOverRdc = [](const std::string& fileName, WindingProximityEffectLossesModels proximityModel) {
+        settings.reset();
+        clear_databases();
+        auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), fileName);
+        auto mas = OpenMagneticsTesting::mas_loader(path);
+        auto magnetic = mas.get_magnetic();
+        auto inputs = mas.get_inputs();
+        OperatingPoint operatingPoint = inputs.get_operating_point(0);
+        OpenMagnetics::Inputs::scale_time_to_frequency(operatingPoint, 100000, true);
+        MagnetizingInductance magnetizingInductanceModel("ZHANG");
+        double magnetizingInductance = OpenMagnetics::resolve_dimensional_values(
+            magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(
+                magnetic.get_core(), magnetic.get_coil(), &operatingPoint).get_magnetizing_inductance());
+        operatingPoint = OpenMagnetics::Inputs::process_operating_point(operatingPoint, magnetizingInductance);
+        settings.set_magnetic_field_mirroring_dimension(1);
+        settings.set_magnetic_field_include_fringing(true);
+        WindingLossesModels models;
+        models.proximityEffectModel = proximityModel;
+        auto output = WindingLosses(models).calculate_losses(magnetic, operatingPoint, 25);
+        const auto perTurn = output.get_winding_losses_per_turn().value();
+        double ohmic = 0;
+        for (const auto& turn : perTurn) {
+            ohmic += turn.get_ohmic_losses()->get_losses();
+        }
+        settings.reset();
+        return output.get_winding_losses() / ohmic;
+    };
+
+    double stacked = racOverRdc("Test_Winding_Losses_Sixteen_Turns_Planar_Sinusoidal_Fringing_Close.json", WindingProximityEffectLossesModels::WANG_STACKED);
+    INFO("16 stacked parallel traces, WANG_STACKED R_ac/R_dc " << stacked << ", OMFEM 100.1");
+    CHECK(stacked > 0.8 * 100.1);
+    CHECK(stacked < 1.25 * 100.1);
+
+    double singleStacked = racOverRdc("Test_Winding_Losses_One_Turn_Planar_Sinusoidal_Fringing.json", WindingProximityEffectLossesModels::WANG_STACKED);
+    double singleWang = racOverRdc("Test_Winding_Losses_One_Turn_Planar_Sinusoidal_Fringing.json", WindingProximityEffectLossesModels::WANG);
+    CHECK(singleStacked == singleWang);
+}
+
+// ABT #1409 investigation driver (hidden, untagged): every proximity kernel on a SUPPLIED field.
+// Same inputs as Debug_Abt1409_Field_Dump. Without env ABT1409_FIELD_IN it writes the induced
+// mesh (points, labels, turns) of the first operating point's fundamental to ABT1409_OUT; with
+// it (a JSON [[hx, hy], ...] in that order) the fundamental is replaced by that field (other
+// harmonics zeroed, quadrature zero) and every kernel's per-turn (ohmic + skin + proximity) /
+// ohmic is written to ABT1409_OUT.
+TEST_CASE("Debug_Abt1409_Kernel_On_Field", "[debug][abt1409-kernels][.]") {
+    const char* outPath = std::getenv("ABT1409_OUT");
+    REQUIRE(outPath != nullptr);
+
+    settings.reset();
+    clear_databases();
+    settings.set_magnetic_field_turn_sums_cache_bytes(0);
+    OpenMagnetics::Magnetic magnetic;
+    OperatingPoint operatingPoint;
+    OpenMagnetics::Inputs inputs;
+    if (const char* masPath = std::getenv("ABT1409_MAS")) {
+        auto mas = OpenMagneticsTesting::mas_loader(masPath);
+        magnetic = mas.get_magnetic();
+        inputs = mas.get_inputs();
+        operatingPoint = inputs.get_operating_point(0);
+    }
+    else if (const char* configName = std::getenv("ABT1409_CONFIG")) {
+        const char* frequencyText = std::getenv("ABT1409_FREQ");
+        REQUIRE(frequencyText != nullptr);
+        auto config = WindingLossesTestData::getAllTestConfigs().at(configName);
+        magnetic = config.createMagnetic();
+        settings.set_magnetic_field_mirroring_dimension(config.mirroringDimension);
+        settings.set_magnetic_field_include_fringing(std::getenv("ABT1409_FRINGE") ? true : config.includeFringing);
+        inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+            std::stod(frequencyText), config.magnetizingInductance, config.temperature,
+            config.waveform, config.peakToPeak, config.dutyCycle, config.offset);
+        operatingPoint = inputs.get_operating_point(0);
+    }
+    else {
+        const char* jsonName = std::getenv("ABT1409_JSON");
+        const char* frequencyText = std::getenv("ABT1409_FREQ");
+        REQUIRE(jsonName != nullptr);
+        REQUIRE(frequencyText != nullptr);
+        auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), jsonName);
+        auto mas = OpenMagneticsTesting::mas_loader(path);
+        magnetic = mas.get_magnetic();
+        inputs = mas.get_inputs();
+        operatingPoint = inputs.get_operating_point(0);
+        OpenMagnetics::Inputs::scale_time_to_frequency(operatingPoint, std::stod(frequencyText), true);
+        MagnetizingInductance magnetizingInductanceModel("ZHANG");
+        double magnetizingInductance = OpenMagnetics::resolve_dimensional_values(
+            magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(
+                magnetic.get_core(), magnetic.get_coil(), &operatingPoint).get_magnetizing_inductance());
+        operatingPoint = OpenMagnetics::Inputs::process_operating_point(operatingPoint, magnetizingInductance);
+        settings.set_magnetic_field_mirroring_dimension(1);
+        settings.set_magnetic_field_include_fringing(true);
+    }
+    MagneticField magneticField(MagneticFieldStrengthModels::BINNS_LAWRENSON, MagneticFieldStrengthFringingEffectModels::ROSHEN);
+    auto field = magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic);
+    const auto harmonics = operatingPoint.get_excitations_per_winding()[0].get_current()->get_harmonics().value();
+    double fundamental = harmonics.get_frequencies()[1];
+    auto perFrequency = field.get_field_per_frequency();
+    auto quadraturePerFrequency = field.get_quadrature_field_per_frequency();
+    json out;
+    const char* fieldInPath = std::getenv("ABT1409_FIELD_IN");
+    if (!fieldInPath) {
+        json points = json::array();
+        for (size_t h = 0; h < perFrequency.size(); ++h) {
+            if (std::abs(perFrequency[h].get_frequency() - fundamental) > 1e-6 * fundamental) continue;
+            for (const auto& point : perFrequency[h].get_data()) {
+                json p;
+                p["x"] = point.get_point()[0];
+                p["y"] = point.get_point()[1];
+                if (point.get_label()) p["label"] = point.get_label().value();
+                if (point.get_turn_index()) p["turn"] = point.get_turn_index().value();
+                points.push_back(p);
+            }
+        }
+        out["points"] = points;
+    }
+    else {
+        std::ifstream fieldFile(fieldInPath);
+        json supplied = json::parse(fieldFile);
+        for (size_t h = 0; h < perFrequency.size(); ++h) {
+            auto data = perFrequency[h].get_data();
+            auto quadrature = quadraturePerFrequency[h].get_data();
+            bool isFundamental = std::abs(perFrequency[h].get_frequency() - fundamental) <= 1e-6 * fundamental;
+            if (isFundamental) {
+                REQUIRE(supplied.size() == data.size());
+            }
+            for (size_t i = 0; i < data.size(); ++i) {
+                data[i].set_real(isFundamental ? supplied[i][0].get<double>() : 0.0);
+                data[i].set_imaginary(isFundamental ? supplied[i][1].get<double>() : 0.0);
+                quadrature[i].set_real(0.0);
+                quadrature[i].set_imaginary(0.0);
+            }
+            perFrequency[h].set_data(data);
+            quadraturePerFrequency[h].set_data(quadrature);
+        }
+        field.set_field_per_frequency(perFrequency);
+        field.set_quadrature_field_per_frequency(quadraturePerFrequency);
+        auto coil = magnetic.get_coil();
+        for (auto kernel : magic_enum::enum_values<WindingProximityEffectLossesModels>()) {
+            json row;
+            try {
+                auto base = WindingOhmicLosses::calculate_ohmic_losses(coil, operatingPoint, 25);
+                base = WindingSkinEffectLosses::calculate_skin_effect_losses(coil, 25, base, settings.get_harmonic_amplitude_threshold());
+                auto result = WindingProximityEffectLosses::calculate_proximity_effect_losses(coil, 25, base, field, kernel);
+                const auto perTurn = result.get_winding_losses_per_turn().value();
+                json ratios = json::array();
+                double ohmicTotal = 0;
+                for (const auto& turn : perTurn) {
+                    double ohmic = turn.get_ohmic_losses()->get_losses();
+                    ohmicTotal += ohmic;
+                    double loss = ohmic;
+                    const auto skin = turn.get_skin_effect_losses().value();
+                    const auto proximity = turn.get_proximity_effect_losses().value();
+                    for (auto l : skin.get_losses_per_harmonic()) loss += l;
+                    for (auto l : proximity.get_losses_per_harmonic()) loss += l;
+                    ratios.push_back(loss / ohmic);
+                }
+                row["perTurn"] = ratios;
+                row["total"] = result.get_winding_losses() / ohmicTotal;
+            }
+            catch (const std::exception& e) {
+                row["error"] = std::string(e.what()).substr(0, 120);
+            }
+            out[to_string(kernel)] = row;
+        }
+    }
+    std::ofstream file(outPath);
+    file << out.dump();
+    settings.reset();
+}
+
+// ABT #1409 comparison driver (hidden): every field x fringing model on the MAS file in env
+// ABT1409_MAS, first operating point. Prints total R_ac/R_dc, the end and gap-plane turns, and
+// the time per loss evaluation (turn-sum cache off, so each call does the full work).
+TEST_CASE("Debug_Abt1409_Model_Table", "[debug][abt1409-table][.]") {
+    const char* masPath = std::getenv("ABT1409_MAS");
+    REQUIRE(masPath != nullptr);
+    settings.reset();
+    settings.set_magnetic_field_turn_sums_cache_bytes(0);
+    auto mas = OpenMagneticsTesting::mas_loader(masPath);
+    auto magnetic = mas.get_magnetic();
+    auto inputs = mas.get_inputs();
+    auto operatingPoint = inputs.get_operating_point(0);
+    double currentRms = operatingPoint.get_excitations_per_winding()[0].get_current()->get_processed()->get_rms().value();
+    auto turns = magnetic.get_coil().get_turns_description().value();
+    size_t gapTurn = 0;
+    for (size_t t = 0; t < turns.size(); ++t) {
+        if (std::abs(turns[t].get_coordinates()[1]) < std::abs(turns[gapTurn].get_coordinates()[1])) gapTurn = t;
+    }
+    auto run = [&](MagneticFieldStrengthModels field, MagneticFieldStrengthFringingEffectModels fringing) {
+        WindingLossesModels models;
+        models.magneticFieldStrengthModel = field;
+        models.magneticFieldStrengthFringingEffectModel = fringing;
+        if (const char* proximityName = std::getenv("ABT1409_PROX")) {
+            WindingProximityEffectLossesModels proximityModel;
+            from_json(json(std::string(proximityName)), proximityModel);
+            models.proximityEffectModel = proximityModel;
+        }
+        WindingLosses windingLosses(models);
+        try {
+            auto start = std::chrono::steady_clock::now();
+            auto output = windingLosses.calculate_losses(magnetic, operatingPoint, 25);
+            output = windingLosses.calculate_losses(magnetic, operatingPoint, 25);
+            output = windingLosses.calculate_losses(magnetic, operatingPoint, 25);
+            double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() / 3;
+            auto perTurn = output.get_winding_losses_per_turn().value();
+            auto rdcPerTurn = output.get_dc_resistance_per_turn().value();
+            double rdcTotal = 0;
+            for (auto r : rdcPerTurn) rdcTotal += r;
+            auto turnRatio = [&](size_t i) {
+                const auto& turn = perTurn[i];
+                if (!turn.get_ohmic_losses() || !turn.get_skin_effect_losses() || !turn.get_proximity_effect_losses()) {
+                    std::cout << "MISSING per-turn component on turn " << i << " ohm=" << bool(turn.get_ohmic_losses())
+                              << " skin=" << bool(turn.get_skin_effect_losses()) << " prox=" << bool(turn.get_proximity_effect_losses()) << std::endl;
+                    return std::nan("");
+                }
+                double loss = turn.get_ohmic_losses()->get_losses();
+                const auto skinLosses = turn.get_skin_effect_losses().value();
+                const auto proximityLosses = turn.get_proximity_effect_losses().value();
+                for (auto l : skinLosses.get_losses_per_harmonic()) loss += l;
+                for (auto l : proximityLosses.get_losses_per_harmonic()) loss += l;
+                return loss / turn.get_ohmic_losses()->get_losses();
+            };
+            double ohmicTotal = 0;
+            for (const auto& turn : perTurn) ohmicTotal += turn.get_ohmic_losses()->get_losses();
+            std::cout << "ROW " << to_string(field) << " " << to_string(fringing) << " total=" << output.get_winding_losses() / ohmicTotal
+                      << " end=" << turnRatio(0) << " gap=" << turnRatio(gapTurn) << " ms=" << milliseconds << std::endl;
+        }
+        catch (const std::exception& e) {
+            std::cout << "ROW " << to_string(field) << " " << to_string(fringing) << " THREW " << e.what() << std::endl;
+        }
+    };
+    if (std::getenv("ABT1409_ALLPROX")) {
+        for (auto field : magic_enum::enum_values<MagneticFieldStrengthModels>()) {
+            for (auto proximity : magic_enum::enum_values<WindingProximityEffectLossesModels>()) {
+                setenv("ABT1409_PROX", std::string(magic_enum::enum_name(proximity)).c_str(), 1);
+                std::cout << "KERNEL " << to_string(proximity) << " ";
+                run(field, MagneticFieldStrengthFringingEffectModels::ROSHEN);
+            }
+        }
+        unsetenv("ABT1409_PROX");
+    }
+    else {
+        for (auto field : magic_enum::enum_values<MagneticFieldStrengthModels>()) {
+            if (field == MagneticFieldStrengthModels::IMAGED_MMF_SHEETS) {
+                run(field, MagneticFieldStrengthFringingEffectModels::ROSHEN);
+                continue;
+            }
+            for (auto fringing : magic_enum::enum_values<MagneticFieldStrengthFringingEffectModels>()) {
+                run(field, fringing);
+            }
+        }
+    }
+    settings.reset();
+}
+
+// ABT #1409 comparison driver (hidden): watts per field x fringing model over a frequency list
+// (env ABT1409_FREQS, comma separated) on either a test-data JSON (env ABT1409_JSON, prepared
+// like runJsonBasedWindingLossesTest) or a WindingLossesTestData config (env ABT1409_CONFIG,
+// prepared like runWindingLossesTest).
+TEST_CASE("Debug_Abt1409_Model_Sweep", "[debug][abt1409-sweep][.]") {
+    const char* frequenciesText = std::getenv("ABT1409_FREQS");
+    REQUIRE(frequenciesText != nullptr);
+    std::vector<double> frequencies;
+    {
+        std::stringstream stream(frequenciesText);
+        std::string item;
+        while (std::getline(stream, item, ',')) frequencies.push_back(std::stod(item));
+    }
+    const char* jsonName = std::getenv("ABT1409_JSON");
+    const char* configName = std::getenv("ABT1409_CONFIG");
+    REQUIRE((jsonName != nullptr) != (configName != nullptr));
+
+    auto evaluate = [&](MagneticFieldStrengthModels field, MagneticFieldStrengthFringingEffectModels fringing, double frequency) {
+        settings.reset();
+        clear_databases();
+        settings.set_magnetic_field_turn_sums_cache_bytes(0);
+        WindingLossesModels models;
+        models.magneticFieldStrengthModel = field;
+        models.magneticFieldStrengthFringingEffectModel = fringing;
+        if (const char* proximityName = std::getenv("ABT1409_PROX")) {
+            WindingProximityEffectLossesModels proximityModel;
+            from_json(json(std::string(proximityName)), proximityModel);
+            models.proximityEffectModel = proximityModel;
+        }
+        OpenMagnetics::Magnetic magnetic;
+        OperatingPoint operatingPoint;
+        double temperature;
+        if (jsonName) {
+            auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), jsonName);
+            auto mas = OpenMagneticsTesting::mas_loader(path);
+            magnetic = mas.get_magnetic();
+            auto inputs = mas.get_inputs();
+            operatingPoint = inputs.get_operating_point(0);
+            OpenMagnetics::Inputs::scale_time_to_frequency(operatingPoint, frequency, true);
+            MagnetizingInductance magnetizingInductanceModel("ZHANG");
+            double magnetizingInductance = OpenMagnetics::resolve_dimensional_values(
+                magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(
+                    magnetic.get_core(), magnetic.get_coil(), &operatingPoint).get_magnetizing_inductance());
+            operatingPoint = OpenMagnetics::Inputs::process_operating_point(operatingPoint, magnetizingInductance);
+            settings.set_magnetic_field_mirroring_dimension(1);
+            settings.set_magnetic_field_include_fringing(true);
+            temperature = std::getenv("ABT1409_TEMP") ? std::stod(std::getenv("ABT1409_TEMP")) : 22.0;
+        }
+        else {
+            auto config = WindingLossesTestData::getAllTestConfigs().at(configName);
+            magnetic = config.createMagnetic();
+            settings.set_magnetic_field_mirroring_dimension(config.mirroringDimension);
+            settings.set_magnetic_field_include_fringing(std::getenv("ABT1409_FRINGE") ? true : config.includeFringing);
+            auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+                frequency, config.magnetizingInductance, config.temperature,
+                config.waveform, config.peakToPeak, config.dutyCycle, config.offset);
+            operatingPoint = inputs.get_operating_point(0);
+            temperature = config.temperature;
+        }
+        auto start = std::chrono::steady_clock::now();
+        auto output = WindingLosses(models).calculate_losses(magnetic, operatingPoint, temperature);
+        double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        return std::pair<double, double>{output.get_winding_losses(), milliseconds};
+    };
+    for (auto field : magic_enum::enum_values<MagneticFieldStrengthModels>()) {
+        for (auto fringing : magic_enum::enum_values<MagneticFieldStrengthFringingEffectModels>()) {
+            if (field == MagneticFieldStrengthModels::IMAGED_MMF_SHEETS && fringing != MagneticFieldStrengthFringingEffectModels::ROSHEN) continue;
+            std::cout << "SWEEP " << to_string(field) << " " << to_string(fringing);
+            for (auto frequency : frequencies) {
+                try {
+                    auto [watts, milliseconds] = evaluate(field, fringing, frequency);
+                    std::cout << " " << frequency << ":" << watts << "(" << milliseconds << "ms)";
+                }
+                catch (const std::exception& e) {
+                    std::cout << " " << frequency << ":THREW(" << std::string(e.what()).substr(0, 60) << ")";
+                }
+            }
+            std::cout << std::endl;
+        }
+    }
+    settings.reset();
+}
+
+// ABT #1409 investigation driver (hidden, untagged): dumps, for the first operating point of a
+// MAS (env ABT1409_MAS, absolute path) or of a test-data file prepared like
+// runJsonBasedWindingLossesTest at env ABT1409_FREQ (env ABT1409_JSON), the processed MAS (for
+// OMFEM), the field model's H on its own induced mesh at the fundamental, H at arbitrary points
+// (env ABT1409_POINTS, a JSON [[x, y], ...]), the turn rectangles and the per-turn losses.
+// Model: env ABT1409_FIELD_MODEL / ABT1409_FRINGING (JSON names). Output: env ABT1409_OUT.
+TEST_CASE("Debug_Abt1409_Field_Dump", "[debug][abt1409-dump][.]") {
+    const char* outPath = std::getenv("ABT1409_OUT");
+    REQUIRE(outPath != nullptr);
+    settings.reset();
+    clear_databases();
+    settings.set_magnetic_field_turn_sums_cache_bytes(0);
+    OpenMagnetics::Magnetic magnetic;
+    OperatingPoint operatingPoint;
+    OpenMagnetics::Inputs inputs;
+    if (const char* masPath = std::getenv("ABT1409_MAS")) {
+        auto mas = OpenMagneticsTesting::mas_loader(masPath);
+        magnetic = mas.get_magnetic();
+        inputs = mas.get_inputs();
+        operatingPoint = inputs.get_operating_point(0);
+    }
+    else if (const char* configName = std::getenv("ABT1409_CONFIG")) {
+        const char* frequencyText = std::getenv("ABT1409_FREQ");
+        REQUIRE(frequencyText != nullptr);
+        auto config = WindingLossesTestData::getAllTestConfigs().at(configName);
+        magnetic = config.createMagnetic();
+        settings.set_magnetic_field_mirroring_dimension(config.mirroringDimension);
+        settings.set_magnetic_field_include_fringing(std::getenv("ABT1409_FRINGE") ? true : config.includeFringing);
+        inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+            std::stod(frequencyText), config.magnetizingInductance, config.temperature,
+            config.waveform, config.peakToPeak, config.dutyCycle, config.offset);
+        operatingPoint = inputs.get_operating_point(0);
+    }
+    else {
+        const char* jsonName = std::getenv("ABT1409_JSON");
+        const char* frequencyText = std::getenv("ABT1409_FREQ");
+        REQUIRE(jsonName != nullptr);
+        REQUIRE(frequencyText != nullptr);
+        auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), jsonName);
+        auto mas = OpenMagneticsTesting::mas_loader(path);
+        magnetic = mas.get_magnetic();
+        inputs = mas.get_inputs();
+        operatingPoint = inputs.get_operating_point(0);
+        OpenMagnetics::Inputs::scale_time_to_frequency(operatingPoint, std::stod(frequencyText), true);
+        MagnetizingInductance magnetizingInductanceModel("ZHANG");
+        double magnetizingInductance = OpenMagnetics::resolve_dimensional_values(
+            magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(
+                magnetic.get_core(), magnetic.get_coil(), &operatingPoint).get_magnetizing_inductance());
+        operatingPoint = OpenMagnetics::Inputs::process_operating_point(operatingPoint, magnetizingInductance);
+        settings.set_magnetic_field_mirroring_dimension(1);
+        settings.set_magnetic_field_include_fringing(true);
+    }
+    MagneticFieldStrengthModels fieldModel = MagneticFieldStrengthModels::IMAGED_MMF_SHEETS;
+    MagneticFieldStrengthFringingEffectModels fringingModel = MagneticFieldStrengthFringingEffectModels::ROSHEN;
+    if (const char* v = std::getenv("ABT1409_FIELD_MODEL")) from_json(json(std::string(v)), fieldModel);
+    if (const char* v = std::getenv("ABT1409_FRINGING")) from_json(json(std::string(v)), fringingModel);
+
+    json out;
+    {
+        OpenMagnetics::Inputs dumpInputs = inputs;
+        dumpInputs.set_operating_points({operatingPoint});
+        OpenMagnetics::Mas dumpMas;
+        dumpMas.set_inputs(dumpInputs);
+        dumpMas.set_magnetic(magnetic);
+        json masJson;
+        to_json(masJson, dumpMas);
+        out["mas"] = masJson;
+    }
+    const auto harmonics = operatingPoint.get_excitations_per_winding()[0].get_current()->get_harmonics().value();
+    double fundamental = harmonics.get_frequencies()[1];
+    out["frequency"] = fundamental;
+
+    auto dumpField = [&](const WindingWindowMagneticStrengthFieldPhasorOutput& field) {
+        json points = json::array();
+        const auto perFrequency = field.get_field_per_frequency();
+        const auto quadraturePerFrequency = field.get_quadrature_field_per_frequency();
+        for (size_t h = 0; h < perFrequency.size(); ++h) {
+            if (std::abs(perFrequency[h].get_frequency() - fundamental) > 1e-6 * fundamental) continue;
+            const auto data = perFrequency[h].get_data();
+            const auto quadrature = quadraturePerFrequency[h].get_data();
+            for (size_t i = 0; i < data.size(); ++i) {
+                json p;
+                p["x"] = data[i].get_point()[0];
+                p["y"] = data[i].get_point()[1];
+                p["hx"] = data[i].get_real();
+                p["hy"] = data[i].get_imaginary();
+                p["qx"] = quadrature[i].get_real();
+                p["qy"] = quadrature[i].get_imaginary();
+                if (data[i].get_label()) p["label"] = data[i].get_label().value();
+                if (data[i].get_turn_index()) p["turn"] = data[i].get_turn_index().value();
+                points.push_back(p);
+            }
+        }
+        return points;
+    };
+    MagneticField magneticField(fieldModel, fringingModel);
+    out["mesh"] = dumpField(magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic));
+
+    if (const char* pointsPath = std::getenv("ABT1409_POINTS")) {
+        std::ifstream pointsFile(pointsPath);
+        json requested = json::parse(pointsFile);
+        Field external;
+        external.set_frequency(fundamental);
+        std::vector<FieldPoint> externalPoints;
+        for (auto& xy : requested) {
+            FieldPoint fieldPoint;
+            fieldPoint.set_point({xy[0].get<double>(), xy[1].get<double>()});
+            fieldPoint.set_value(0);
+            externalPoints.push_back(fieldPoint);
+        }
+        external.set_data(externalPoints);
+        MagneticField externalField(fieldModel, fringingModel);
+        out["points"] = dumpField(externalField.calculate_magnetic_field_strength_field(operatingPoint, magnetic, external));
+    }
+
+    json turnsJson = json::array();
+    auto wires = magnetic.get_mutable_coil().get_wires();
+    const auto turns = magnetic.get_coil().get_turns_description().value();
+    for (const auto& turn : turns) {
+        size_t windingIndex = magnetic.get_mutable_coil().get_winding_index_by_name(turn.get_winding());
+        auto wire = wires[windingIndex];
+        json t;
+        t["x"] = turn.get_coordinates()[0];
+        t["y"] = turn.get_coordinates()[1];
+        t["w"] = wire.get_maximum_conducting_width();
+        t["h"] = wire.get_maximum_conducting_height();
+        t["length"] = turn.get_length();
+        turnsJson.push_back(t);
+    }
+    out["turns"] = turnsJson;
+
+    WindingLossesModels models;
+    models.magneticFieldStrengthModel = fieldModel;
+    models.magneticFieldStrengthFringingEffectModel = fringingModel;
+    if (const char* proximityName = std::getenv("ABT1409_PROX")) {
+        WindingProximityEffectLossesModels proximityModel;
+        from_json(json(std::string(proximityName)), proximityModel);
+        models.proximityEffectModel = proximityModel;
+    }
+    auto losses = WindingLosses(models).calculate_losses(magnetic, operatingPoint, 25);
+    out["rdcPerTurn"] = losses.get_dc_resistance_per_turn().value();
+    json perTurnJson = json::array();
+    const auto perTurn = losses.get_winding_losses_per_turn().value();
+    for (const auto& turn : perTurn) {
+        const auto skin = turn.get_skin_effect_losses().value();
+        const auto proximity = turn.get_proximity_effect_losses().value();
+        double skinTotal = 0, proximityTotal = 0;
+        for (auto l : skin.get_losses_per_harmonic()) skinTotal += l;
+        for (auto l : proximity.get_losses_per_harmonic()) proximityTotal += l;
+        perTurnJson.push_back({{"ohmic", turn.get_ohmic_losses()->get_losses()}, {"skin", skinTotal}, {"proximity", proximityTotal}});
+    }
+    out["lossesPerTurn"] = perTurnJson;
+    out["currentRms"] = operatingPoint.get_excitations_per_winding()[0].get_current()->get_processed()->get_rms().value();
+    out["currentPeakFundamental"] = harmonics.get_amplitudes()[1];
+    std::ofstream file(outPath);
+    file << out.dump();
+    settings.reset();
+}
+
+// ABT #1463 driver (hidden): per-winding, per-harmonic ohmic/skin/proximity losses of the MAS file
+// in env ABT1463_MAS ({inputs, magnetic}, first operating point, taken as is), written as JSON to
+// env ABT1463_OUT together with each winding's complex current phasor (MAS convention sign) for a
+// phasor-driven FEM comparison. Env ABT1463_FRINGING=0 turns the gap field off. Prints the time per
+// loss evaluation with the turn-sum cache off.
+TEST_CASE("Debug_Abt1463_Harmonics", "[debug][abt1463-driver][.]") {
+    const char* masPath = std::getenv("ABT1463_MAS");
+    const char* outPath = std::getenv("ABT1463_OUT");
+    REQUIRE(masPath != nullptr);
+    REQUIRE(outPath != nullptr);
+    settings.reset();
+    clear_databases();
+    if (const char* fringing = std::getenv("ABT1463_FRINGING")) {
+        settings.set_magnetic_field_include_fringing(std::string(fringing) != "0");
+    }
+    if (const char* fieldModelName = std::getenv("ABT1463_FIELD_MODEL")) {
+        MagneticFieldStrengthModels fieldModel;
+        from_json(json(std::string(fieldModelName)), fieldModel);
+        settings.set_magnetic_field_strength_model(fieldModel);
+    }
+    if (const char* fringingModelName = std::getenv("ABT1463_FRINGING_MODEL")) {
+        MagneticFieldStrengthFringingEffectModels fringingModel;
+        from_json(json(std::string(fringingModelName)), fringingModel);
+        settings.set_magnetic_field_strength_fringing_effect_model(fringingModel);
+    }
+    std::ifstream in(masPath);
+    json masJson = json::parse(in);
+    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+    OperatingPoint operatingPoint(masJson["inputs"]["operatingPoints"][0]);
+    double temperature = 40;
+    if (const char* temperatureText = std::getenv("ABT1463_TEMPERATURE")) {
+        temperature = std::stod(temperatureText);
+    }
+    auto output = WindingLosses().calculate_losses(magnetic, operatingPoint, temperature);
+    settings.set_magnetic_field_turn_sums_cache_bytes(0);
+    int repetitions = 5;
+    auto start = std::chrono::steady_clock::now();
+    for (int repetition = 0; repetition < repetitions; ++repetition) {
+        output = WindingLosses().calculate_losses(magnetic, operatingPoint, temperature);
+    }
+    double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() / repetitions;
+    auto directions = CoilMesher::calculate_current_direction_per_winding(magnetic.get_coil());
+    json out;
+    out["total"] = output.get_winding_losses();
+    out["ms"] = milliseconds;
+    auto perWinding = output.get_winding_losses_per_winding().value();
+    for (size_t windingIndex = 0; windingIndex < perWinding.size(); ++windingIndex) {
+        const auto& winding = perWinding[windingIndex];
+        const auto& excitation = operatingPoint.get_excitations_per_winding()[windingIndex];
+        auto harmonics = excitation.get_current()->get_harmonics().value();
+        json row;
+        row["name"] = magnetic.get_coil().get_functional_description()[windingIndex].get_name();
+        row["ohmic"] = winding.get_ohmic_losses()->get_losses();
+        row["skin"] = winding.get_skin_effect_losses()->get_losses_per_harmonic();
+        row["prox"] = winding.get_proximity_effect_losses()->get_losses_per_harmonic();
+        row["freqs"] = winding.get_proximity_effect_losses()->get_harmonic_frequencies();
+        row["mkf_amp"] = harmonics.get_amplitudes();
+        std::vector<double> phasorReal, phasorImaginary;
+        for (size_t harmonicIndex = 0; harmonicIndex < harmonics.get_frequencies().size(); ++harmonicIndex) {
+            std::complex<double> phasor = 0;
+            if (harmonicIndex > 0) {
+                phasor = CoilMesher::calculate_harmonic_phasor(excitation.get_current()->get_waveform().value(), excitation.get_frequency(), harmonics.get_frequencies()[harmonicIndex]);
+            }
+            else {
+                phasor = harmonics.get_amplitudes()[0];
+            }
+            phasorReal.push_back(directions[windingIndex] * phasor.real());
+            phasorImaginary.push_back(directions[windingIndex] * phasor.imag());
+        }
+        row["phasor_re"] = phasorReal;
+        row["phasor_im"] = phasorImaginary;
+        out["windings"].push_back(row);
+    }
+    std::cout << "ABT1463 total=" << output.get_winding_losses() << " W, " << milliseconds << " ms per call" << std::endl;
+    std::ofstream file(outPath);
+    file << out.dump();
+    settings.reset();
+}
+
+// ABT #1463: the gap-fringing field is driven by the magnetizing flux of EVERY harmonic, on its
+// own phase, and enters the superposition with the turns' sign. Reference: OMFEM (axisymmetric
+// HarmonicEddy, massive conductors, each harmonic driven with every winding's true complex
+// current phasor as two real solves), R_ac/R_dc per harmonic with each solver's own DC.
+// Made-up designs (testData):
+//  - Test_Winding_Losses_Abt1463_Flyback.json: DCM flyback, ETD 29/16/10 3C95, 0.82 mm ground
+//    gap, 42 t TIW 27 AWG primary (inner) + 6 t Round 1.00 mm secondary (outer), 100 kHz.
+//  - Test_Winding_Losses_Abt1463_Inductor.json: ETD 29/16/10 3C95, 1.0 mm gap, 30 t Round 0.80,
+//    100 kHz triangular, 3 A pk-pk.
+//  - Test_Winding_Losses_Abt1463_Transformer.json: 1:1, 12 + 12 t Round 0.80, 0.5 mm gap, 200 kHz,
+//    sinusoidal currents in exact antiphase (net MMF zero) and 20 V on each winding.
+namespace {
+    // R_ac/R_dc of every winding at every harmonic, each harmonic normalised to MKF's own DC
+    // resistance of that winding (ohmic loss over I_rms^2).
+    std::vector<std::vector<double>> abt1463_ac_to_dc_per_harmonic(const std::string& fileName, OperatingPoint* operatingPointOut = nullptr) {
+        auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), fileName);
+        std::ifstream in(path);
+        json masJson = json::parse(in);
+        OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+        OperatingPoint operatingPoint(masJson["inputs"]["operatingPoints"][0]);
+        auto output = WindingLosses().calculate_losses(magnetic, operatingPoint, 40);
+        auto perWinding = output.get_winding_losses_per_winding().value();
+        std::vector<std::vector<double>> ratioPerWindingPerHarmonic;
+        for (size_t windingIndex = 0; windingIndex < perWinding.size(); ++windingIndex) {
+            auto amplitudes = operatingPoint.get_excitations_per_winding()[windingIndex].get_current()->get_harmonics()->get_amplitudes();
+            double squaredRms = amplitudes[0] * amplitudes[0];
+            for (size_t harmonicIndex = 1; harmonicIndex < amplitudes.size(); ++harmonicIndex) {
+                squaredRms += amplitudes[harmonicIndex] * amplitudes[harmonicIndex] / 2;
+            }
+            double dcResistance = perWinding[windingIndex].get_ohmic_losses()->get_losses() / squaredRms;
+            auto skin = perWinding[windingIndex].get_skin_effect_losses()->get_losses_per_harmonic();
+            auto proximity = perWinding[windingIndex].get_proximity_effect_losses()->get_losses_per_harmonic();
+            std::vector<double> ratioPerHarmonic(amplitudes.size(), 0.0);
+            for (size_t harmonicIndex = 1; harmonicIndex < amplitudes.size() && harmonicIndex < proximity.size(); ++harmonicIndex) {
+                double dcLoss = 0.5 * amplitudes[harmonicIndex] * amplitudes[harmonicIndex] * dcResistance;
+                if (dcLoss > 0) {
+                    ratioPerHarmonic[harmonicIndex] = (dcLoss + skin[harmonicIndex] + proximity[harmonicIndex]) / dcLoss;
+                }
+            }
+            ratioPerWindingPerHarmonic.push_back(ratioPerHarmonic);
+        }
+        if (operatingPointOut) {
+            *operatingPointOut = operatingPoint;
+        }
+        return ratioPerWindingPerHarmonic;
+    }
+}
+
+TEST_CASE("Test_Winding_Losses_Abt1463_Flyback_Per_Harmonic_Vs_OMFEM", "[physical-model][winding-losses][fringing][abt-1463]") {
+    // Before the fix the secondary read 2.5x OMFEM at h = 1 (the Roshen gap field added with the
+    // opposite sign to the turns' field) and the primary 0.71x at h = 2 (gap field only at the
+    // fundamental).
+    settings.reset();
+    clear_databases();
+    auto ratios = abt1463_ac_to_dc_per_harmonic("Test_Winding_Losses_Abt1463_Flyback.json");
+    // {harmonic, OMFEM primary, OMFEM secondary}
+    std::vector<std::tuple<size_t, double, double>> omfem = {
+        {1, 6.923, 3.168}, {2, 5.417, 4.443}, {3, 3.663, 6.130}, {4, 8.628, 6.142}, {5, 12.157, 6.778}, {6, 10.396, 7.904},
+        {7, 10.654, 8.468}, {8, 10.840, 9.127}, {10, 14.204, 10.083}, {12, 16.028, 11.019}, {15, 15.923, 12.672}, {20, 19.927, 14.567}};
+    REQUIRE(ratios.size() == 2);
+    for (auto [harmonic, primary, secondary] : omfem) {
+        INFO("h = " << harmonic << ": primary MKF " << ratios[0][harmonic] << " vs OMFEM " << primary
+             << ", secondary MKF " << ratios[1][harmonic] << " vs OMFEM " << secondary);
+        CHECK_THAT(ratios[0][harmonic], Catch::Matchers::WithinRel(primary, 0.15));
+        CHECK_THAT(ratios[1][harmonic], Catch::Matchers::WithinRel(secondary, 0.15));
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_Winding_Losses_Abt1463_Gapped_Inductor_Harmonic_Distribution_Vs_OMFEM", "[physical-model][winding-losses][fringing][abt-1463]") {
+    // What this ticket fixes is the gap field's distribution over harmonics, so that is what is
+    // checked: R_ac/R_dc at h = 2, 3 relative to h = 1. Before the fix h = 2, 3 got no gap field
+    // (MKF h2/h1 0.19 vs OMFEM 1.63). The absolute level is NOT checked here: with the fix every
+    // harmonic reads 1.20-1.23x OMFEM (h1 25.5 vs 20.8), uniformly, i.e. the Roshen gap field's
+    // amplitude/reach on this inductor, not its per-harmonic drive.
+    settings.reset();
+    clear_databases();
+    auto ratios = abt1463_ac_to_dc_per_harmonic("Test_Winding_Losses_Abt1463_Inductor.json");
+    std::vector<std::pair<size_t, double>> omfem = {{1, 20.759}, {2, 33.914}, {3, 43.681}};
+    REQUIRE(ratios.size() == 1);
+    for (auto [harmonic, reference] : omfem) {
+        if (harmonic == 1) {
+            continue;
+        }
+        double mkfRelative = ratios[0][harmonic] / ratios[0][1];
+        double omfemRelative = reference / omfem[0].second;
+        INFO("h = " << harmonic << ": MKF " << ratios[0][harmonic] << " (x" << mkfRelative << " of h1) vs OMFEM " << reference << " (x" << omfemRelative << ")");
+        CHECK_THAT(mkfRelative, Catch::Matchers::WithinRel(omfemRelative, 0.15));
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_Winding_Losses_Abt1463_Ideal_Transformer_Keeps_Magnetizing_Gap_Field", "[physical-model][winding-losses][fringing][abt-1463]") {
+    // Guard: ideal transformer currents cancel exactly (net MMF zero), yet the core carries the
+    // magnetizing flux the 20 V impose, and its gap fringes. The gap field must come from that
+    // flux (Faraday), not from the windings' net MMF, which would give no gap field at all and so
+    // results bit-identical to fringing off. (Whether the gap field raises or lowers the loss
+    // depends on where it adds to the leakage field; here it lowers it.)
+    settings.reset();
+    clear_databases();
+    settings.set_magnetic_field_include_fringing(false);
+    auto withoutFringing = abt1463_ac_to_dc_per_harmonic("Test_Winding_Losses_Abt1463_Transformer.json");
+    settings.set_magnetic_field_include_fringing(true);
+    auto withFringing = abt1463_ac_to_dc_per_harmonic("Test_Winding_Losses_Abt1463_Transformer.json");
+    for (size_t windingIndex = 0; windingIndex < 2; ++windingIndex) {
+        INFO("winding " << windingIndex << " h = 1: with fringing " << withFringing[windingIndex][1] << ", without " << withoutFringing[windingIndex][1]);
+        CHECK(withFringing[windingIndex][1] != withoutFringing[windingIndex][1]);
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_Magnetic_Field_Abt1463_Roshen_Fringing_Follows_The_Gap_Flux", "[physical-model][magnetic-field][fringing][abt-1463]") {
+    // A positive gap field (positive magnetizing MMF) is flux up (+y) the central leg and down
+    // (-y) the lateral legs, the frame of the turn kernels. At the gap mouth the fringing field
+    // continues the gap's own flux, and it must be continuous around the edge.
+    MagneticFieldStrengthRoshenModel roshen;
+    double gapLength = 1e-3;
+    double magneticFieldStrengthGap = 1000;
+    CoreGap centralGap;
+    centralGap.set_type(GapType::SUBTRACTIVE);
+    centralGap.set_length(gapLength);
+    centralGap.set_coordinates(std::vector<double>{0, 0, 0});
+    centralGap.set_section_dimensions(std::vector<double>{0.01, 0.01});
+    CoreGap lateralGap(centralGap);
+    lateralGap.set_coordinates(std::vector<double>{0.02, 0, 0});
+    lateralGap.set_section_dimensions(std::vector<double>{0.005, 0.01});
+    auto field_at = [&](CoreGap gap, double x, double y) {
+        FieldPoint point;
+        point.set_point(std::vector<double>{x, y});
+        return roshen.get_magnetic_field_strength_between_gap_and_point(gap, magneticFieldStrengthGap, point);
+    };
+    double centralEdge = 0.005;
+    double lateralEdge = 0.02 - 0.0025;
+    // Gap mouth.
+    CHECK(field_at(centralGap, centralEdge + 1e-6, 0).get_imaginary() > 0.8 * magneticFieldStrengthGap);
+    CHECK(field_at(lateralGap, lateralEdge - 1e-6, 0).get_imaginary() < -0.8 * magneticFieldStrengthGap);
+    // Above the gap centre: the central leg's flux (+y) bends back into its upper pole (towards
+    // the leg, -x); the lateral leg's flux (-y) leaves its upper pole (away from the leg, -x).
+    CHECK(field_at(centralGap, centralEdge + gapLength, gapLength).get_real() < 0);
+    CHECK(field_at(lateralGap, lateralEdge - gapLength, gapLength).get_real() < 0);
+    // Continuous across the circle of radius l_g / 2 around the edge (window side).
+    for (auto [gap, sign, edge] : std::vector<std::tuple<CoreGap, double, double>>{{centralGap, 1.0, centralEdge}, {lateralGap, -1.0, lateralEdge}}) {
+        double inside = field_at(gap, edge + sign * 0.499 * gapLength, 0).get_imaginary();
+        double outside = field_at(gap, edge + sign * 0.501 * gapLength, 0).get_imaginary();
+        INFO("inside " << inside << " outside " << outside);
+        CHECK_THAT(inside, Catch::Matchers::WithinRel(outside, 0.01));
+    }
+}
+

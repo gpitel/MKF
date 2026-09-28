@@ -27,7 +27,17 @@ class MagneticFieldStrengthModel {
         std::vector<Wire> _wirePerWinding;
         std::vector<double> _wireMaxOuterWidth;  // Precomputed for performance
         std::vector<double> _wireMaxOuterHeight; // Precomputed for performance
-        virtual ComplexFieldPoint get_magnetic_field_strength_between_two_points(FieldPoint inducingFieldPoint, FieldPoint inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt) = 0;
+        // ABT #376: winding breadth b — the window dimension PARALLEL to the layers, over which
+        // Dowell's one-dimensional field is assumed uniform (H = enclosed MMF / b). Only the
+        // Dowell model reads it; the point-to-point models derive everything from the two points.
+        double _windingWindowBreadth = 0;
+        virtual ComplexFieldPoint get_magnetic_field_strength_between_two_points(const FieldPoint& inducingFieldPoint, const FieldPoint& inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt) = 0;
+        // (Hx, Hy) only: the point-pair sum calls this for every inducing/induced pair, and building a
+        // ComplexFieldPoint (a heap-allocated point copy) per pair dominated its cost.
+        virtual std::pair<double, double> get_magnetic_field_strength_components_between_two_points(const FieldPoint& inducingFieldPoint, const FieldPoint& inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt) {
+            auto complexFieldPoint = get_magnetic_field_strength_between_two_points(inducingFieldPoint, inducedFieldPoint, inducingWireIndex);
+            return {complexFieldPoint.get_real(), complexFieldPoint.get_imaginary()};
+        }
 };
 
 class MagneticFieldStrengthFringingEffectModel {
@@ -64,22 +74,52 @@ class MagneticField {
         static SignalDescriptor calculate_magnetic_field_strength(SignalDescriptor magneticFluxDensity,
                                                                     double initialPermeability);
 
-        WindingWindowMagneticStrengthFieldOutput calculate_magnetic_field_strength_field(OperatingPoint operatingPoint, Magnetic magnetic, std::optional<Field> externalInducedField = std::nullopt, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding = std::nullopt, std::optional<CoilMesherModels> coilMesherModel = std::nullopt);
+        // Returns the in-phase field (inherited field_per_frequency, what every earlier reader
+        // used) AND the quadrature field (see WindingWindowMagneticStrengthFieldPhasorOutput).
+        // Default current directions follow the MAS excitation convention by isolation side
+        // (CoilMesher::calculate_current_direction_per_winding); a custom vector overrides
+        // them. Phases always come from the windings' current waveforms.
+        WindingWindowMagneticStrengthFieldPhasorOutput calculate_magnetic_field_strength_field(OperatingPoint operatingPoint, Magnetic magnetic, std::optional<Field> externalInducedField = std::nullopt, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding = std::nullopt, std::optional<CoilMesherModels> coilMesherModel = std::nullopt);
 
         static std::shared_ptr<MagneticFieldStrengthFringingEffectModel> factory(MagneticFieldStrengthFringingEffectModels modelName);
         static std::shared_ptr<MagneticFieldStrengthModel> factory(MagneticFieldStrengthModels modelName);
         static std::shared_ptr<MagneticFieldStrengthModel> factory();
+
+        // The turn-field sums kept between calls (Settings::magnetic_field_turn_sums_cache_bytes):
+        // how often a mesh was found, how often it was summed afresh, and what is held now.
+        struct TurnSumsCacheStatistics {
+            size_t hits = 0;
+            size_t misses = 0;
+            size_t entries = 0;
+            size_t bytes = 0;
+        };
+        static TurnSumsCacheStatistics get_turn_sums_cache_statistics();
+        static void clear_turn_sums_cache();
 };
 
 
 
-// // Based on Effects of eddy currents in transformer windings by P. L. Dowell.
-// // https://sci-hub.st/10.1049/piee.1966.0236
-// class MagneticFieldStrengthDowellModel : public MagneticFieldStrengthModel {
-//     public:
-//         std::string methodName = "Dowell";
-//         ComplexFieldPoint get_magnetic_field_strength_between_two_points(FieldPoint inducingFieldPoint, FieldPoint inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt);
-// };
+// Based on Effects of eddy currents in transformer windings by P. L. Dowell.
+// https://sci-hub.st/10.1049/piee.1966.0236
+//
+// ABT #376: Dowell is a ONE-DIMENSIONAL model and does not fit the point-to-point interface the
+// way Lammeraner or Binns-Lawrenson do — there is no "field of one conductor at a point" in his
+// formulation. He assumes the layers span the whole winding breadth b, so the field is parallel
+// to the layers, uniform along them, and set purely by the MMF enclosed between the point and
+// the zero-field boundary: H = (enclosed ampere-turns) / b. Expressed per inducing conductor
+// that is exactly the MMF staircase — each conductor adds its own I/b to every point on ONE
+// side of it and nothing on the other — which is what this implementation returns, so summing
+// over conductors reproduces Dowell's staircase exactly.
+//
+// The consequence is worth stating: unlike the 2-D models this one has NO distance dependence,
+// so it does not resolve fringing near a gap, and its accuracy relies on the layers being long
+// against the window (Dowell's own assumption). It is the right model for a classic layered
+// transformer window and the wrong one for a gapped inductor.
+class MagneticFieldStrengthDowellModel : public MagneticFieldStrengthModel {
+    public:
+        std::string methodName = "Dowell";
+        ComplexFieldPoint get_magnetic_field_strength_between_two_points(const FieldPoint& inducingFieldPoint, const FieldPoint& inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt);
+};
 
 
 
@@ -88,7 +128,7 @@ class MagneticField {
 class MagneticFieldStrengthWangModel : public MagneticFieldStrengthModel {
     public:
         std::string methodName = "Wang";
-        ComplexFieldPoint get_magnetic_field_strength_between_two_points(FieldPoint inducingFieldPoint, FieldPoint inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt);
+        ComplexFieldPoint get_magnetic_field_strength_between_two_points(const FieldPoint& inducingFieldPoint, const FieldPoint& inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt);
 };
 
 
@@ -98,7 +138,8 @@ class MagneticFieldStrengthWangModel : public MagneticFieldStrengthModel {
 class MagneticFieldStrengthBinnsLawrensonModel : public MagneticFieldStrengthModel {
     public:
         std::string methodName = "BinnsLawrenson";
-        ComplexFieldPoint get_magnetic_field_strength_between_two_points(FieldPoint inducingFieldPoint, FieldPoint inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt);
+        ComplexFieldPoint get_magnetic_field_strength_between_two_points(const FieldPoint& inducingFieldPoint, const FieldPoint& inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt);
+        std::pair<double, double> get_magnetic_field_strength_components_between_two_points(const FieldPoint& inducingFieldPoint, const FieldPoint& inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt) override;
 };
 
 
@@ -107,7 +148,8 @@ class MagneticFieldStrengthBinnsLawrensonModel : public MagneticFieldStrengthMod
 class MagneticFieldStrengthLammeranerModel : public MagneticFieldStrengthModel {
     public:
         std::string methodName = "Lammeraner";
-        ComplexFieldPoint get_magnetic_field_strength_between_two_points(FieldPoint inducingFieldPoint, FieldPoint inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt);
+        ComplexFieldPoint get_magnetic_field_strength_between_two_points(const FieldPoint& inducingFieldPoint, const FieldPoint& inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt);
+        std::pair<double, double> get_magnetic_field_strength_components_between_two_points(const FieldPoint& inducingFieldPoint, const FieldPoint& inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt) override;
 };
 
 
@@ -259,8 +301,8 @@ public:
      * This per-turn-pair method should not be called and will throw an error.
      */
     ComplexFieldPoint get_magnetic_field_strength_between_two_points(
-        FieldPoint inducingFieldPoint, 
-        FieldPoint inducedFieldPoint, 
+        const FieldPoint& inducingFieldPoint,
+        const FieldPoint& inducedFieldPoint, 
         std::optional<size_t> inducingWireIndex = std::nullopt
     ) override;
     
@@ -321,6 +363,73 @@ private:
      * @return pair<H_r, H_z> Magnetic field components in A/m
      */
     std::pair<double, double> calculateMagneticField(double r, double z) const;
+};
+
+// ============================================================================
+// IMAGED_MMF_SHEETS: turns and gap MMF sheets imaged together (ABT #1409)
+// ============================================================================
+/**
+ * @brief Window field of the turns and of every functional gap, imaged as one system.
+ *
+ * A gap in an otherwise high-permeability core is equivalent to a current sheet on the
+ * leg face next to the window, carrying the MMF the gap absorbs and OPPOSING the winding
+ * (Ampere around the window). Turns and gap sheets are placed in the same method-of-images
+ * lattice the CoilMesher uses for the core walls, so the window carries ~no net current and
+ * the lattice sum is the ideal-core window field. Away from the gap plane the two core
+ * halves are equipotential and the field there collapses; it concentrates at the gap plane.
+ * Free-space fringing kernels (Roshen) superposed on a separately computed turn field
+ * cannot reproduce that, which is what read R_ac/R_dc 887 against 2D FEM's 268 on a stack
+ * of flat turns beside 3.9 mm spacer gaps.
+ *
+ * Everything is closed form: a flat conductor (rectangular, foil, planar) is a uniform-
+ * current rectangle, a round/litz turn a line current, a gap sheet a uniform line segment.
+ * Gap MMF per unit magnetizing current: flux N/R_total (the reluctance model's total),
+ * shared between lateral columns in proportion to their gap conductances, times the gap's
+ * own reluctance. Only functional (subtractive/additive) gaps carry a sheet (ABT #832).
+ *
+ * The own turn is excluded at its own points (its field there is skin effect); its images
+ * are kept, being the core's response. Scope: single-window, non-toroidal cores. Anything
+ * else throws.
+ */
+class MagneticFieldStrengthImagedMmfSheetsModel : public MagneticFieldStrengthModel {
+  public:
+    std::string methodName = "ImagedMmfSheets";
+
+    struct Source {
+        double x1, x2, y1, y2;             // extent; x1 == x2 for a sheet, both extents collapse for a filament
+        double weight;                     // image multiplier (times turn divider and direction for turns)
+        std::optional<size_t> turnIndex;   // set on turn sources
+        bool isImage;                      // false only for the real (m = n = 0) copy
+        size_t windingIndex;
+    };
+
+    ComplexFieldPoint get_magnetic_field_strength_between_two_points(
+        const FieldPoint& inducingFieldPoint,
+        const FieldPoint& inducedFieldPoint,
+        std::optional<size_t> inducingWireIndex = std::nullopt) override;
+
+    void setup(Magnetic magnetic, const std::vector<Wire>& wirePerWinding,
+               const std::vector<double>& currentDividerPerTurn,
+               const std::vector<int8_t>& currentDirectionPerWinding,
+               double frequency);
+
+    // Field of all turns (per winding current amplitudes, signed), own real turn excluded.
+    std::pair<double, double> turns_field(double x, double y, const std::vector<double>& currentPerWinding,
+                                          std::optional<size_t> excludedTurn) const;
+    // Field of all gap sheets per ampere of magnetizing current.
+    std::pair<double, double> gaps_field(double x, double y) const;
+
+    static std::pair<double, double> rectangle_field(double x, double y, double x1, double x2, double y1, double y2, double current);
+    static std::pair<double, double> vertical_sheet_field(double x, double y, double xs, double y1, double y2, double current);
+    static std::pair<double, double> filament_field(double x, double y, double xs, double ys, double current);
+
+    const std::vector<Source>& get_turn_sources() const { return _turnSources; }
+    const std::vector<Source>& get_gap_sources() const { return _gapSources; }
+
+  private:
+    std::vector<Source> _turnSources;
+    std::vector<Source> _gapSources;
+    static std::pair<double, double> source_field(const Source& source, double x, double y, double current);
 };
 
 } // namespace OpenMagnetics

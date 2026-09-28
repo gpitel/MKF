@@ -5,6 +5,9 @@
 #include "json.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <filesystem>
+#include <source_location>
+#include <fstream>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 using namespace MAS;
@@ -404,6 +407,333 @@ TEST_CASE("MultiColumnWinding_CustomSectionRect_RepacksAndSurvivesRewind", "[con
     // runs for the rest of the coil; the drawn section is re-imposed after).
     REQUIRE(coil.wind(std::vector<double>{0.7, 0.3}, std::vector<size_t>{0, 1}, 1));
     check_custom_layout();
+}
+
+// ABT #730: a turn is judged against ITS OWN winding window's envelope. Every core in the
+// corpus has windows with identical extents, which is what hid the old window-0-only test —
+// so this fixture makes one: the RIGHT lateral window is shifted UP by a quarter height. A
+// secondary wound into it (top-aligned) legitimately fills the shifted box, with its top
+// copper ABOVE window 0's top edge; the window-0-only check refused exactly this fitting
+// design (windTurns=false, silently dropping real-winding blocking for it — the ABT #650
+// degradation class).
+TEST_CASE("MultiColumnWinding_AsymmetricWindow_FitsAgainstItsOwnEnvelope", "[constructive-model][coil][multi-column][abt730]") {
+    auto& settings = Settings::GetInstance();
+    settings.set_core_per_column_winding_windows(true);
+    auto core = OpenMagneticsTesting::get_quick_core("E 42/21/20", json::parse("[]"), 1, "Dummy");
+    auto quickBobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.001, 0.001);
+    auto columns = core.get_processed_description()->get_columns();
+    auto quickWindows = quickBobbin.get_processed_description()->get_winding_windows();
+    REQUIRE(quickWindows.size() == 3);
+
+    // Window 1 sits at +x (no mirror in play); shift it up by a quarter of its height.
+    auto shiftedWindow = quickWindows[1];
+    const double shift = shiftedWindow.get_height().value() * 0.25;
+    auto shiftedCoordinates = shiftedWindow.get_coordinates().value();
+    shiftedCoordinates[1] += shift;
+    shiftedWindow.set_coordinates(shiftedCoordinates);
+    auto processedDescription = quickBobbin.get_processed_description().value();
+    processedDescription.set_winding_windows({quickWindows[0], shiftedWindow, quickWindows[2]});
+    quickBobbin.set_processed_description(processedDescription);
+
+    json bobbinJson;
+    to_json(bobbinJson, quickBobbin);
+    json coilJson;
+    coilJson["bobbin"] = bobbinJson;
+    coilJson["functionalDescription"] = json::array();
+    coilJson["functionalDescription"].push_back(json{{"name", "Primary"}, {"numberTurns", 20}, {"numberParallels", 1},
+                                                     {"isolationSide", "primary"}, {"wire", "Round 0.475 - Grade 1"}});
+    coilJson["functionalDescription"].push_back(json{{"name", "Secondary"}, {"numberTurns", 10}, {"numberParallels", 1},
+                                                     {"isolationSide", "secondary"}, {"wire", "Round 0.475 - Grade 1"}});
+    OpenMagnetics::Coil coil(coilJson, false);
+    coil.get_mutable_functional_description()[1].set_winding_window(1);
+    coil.set_core_columns(columns);
+    coil.set_turns_alignment(CoilAlignment::INNER_OR_TOP);
+    REQUIRE(coil.wind());
+    CHECK(coil.are_sections_and_layers_fitting());
+
+    // The fixture must actually bite: the secondary's top copper sits above window 0's top,
+    // so the old window-0-only envelope would have refused this wind.
+    const double window0Top = quickWindows[0].get_coordinates().value()[1] + quickWindows[0].get_height().value() / 2;
+    const auto turns = coil.get_turns_description().value();
+    auto wires = coil.get_wires();
+    double secondaryTopCopper = std::numeric_limits<double>::lowest();
+    for (const auto& turn : turns) {
+        if (turn.get_winding() != "Secondary") {
+            continue;
+        }
+        const double halfHeight = wires[1].get_maximum_outer_height() / 2;
+        secondaryTopCopper = std::max(secondaryTopCopper, turn.get_coordinates()[1] + halfHeight);
+    }
+    INFO("secondary top copper " << secondaryTopCopper * 1e3 << " mm vs window-0 top " << window0Top * 1e3 << " mm");
+    CHECK(secondaryTopCopper > window0Top + 1e-6);
+    settings.reset();
+}
+
+// Per-column bobbin ARRAY (MAS coil.bobbin array form): a catalog-style centre
+// bobbin plus an ad-hoc lateral bobbin — two BOM items. The boundary must
+// merge them into one effective multi-window bobbin for winding while
+// serialization keeps the honest two-element array. Each element's windows
+// carry their own column edge, which is what the winder follows.
+TEST_CASE("MultiColumnWinding_PerColumnBobbinArray_MergesWindsAndRoundTrips", "[constructive-model][coil][multi-column][smoke-test]") {
+    auto& settings = Settings::GetInstance();
+    settings.set_core_per_column_winding_windows(true);
+    auto core = OpenMagneticsTesting::get_quick_core("E 42/21/20", json::parse("[]"), 1, "Dummy");
+    auto quickBobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.001, 0.001);
+    auto columns = core.get_processed_description()->get_columns();
+    auto quickWindows = quickBobbin.get_processed_description()->get_winding_windows();
+    REQUIRE(quickWindows.size() == 3);
+
+    // Centre part: window 0 only (what a real catalog bobbin describes).
+    auto centerBobbin = quickBobbin;
+    auto centerProcessedDescription = centerBobbin.get_processed_description().value();
+    centerProcessedDescription.set_winding_windows({quickWindows[0]});
+    centerBobbin.set_processed_description(centerProcessedDescription);
+
+    // Ad-hoc lateral part: the left-lateral window only, its column edge intact.
+    auto lateralBobbin = quickBobbin;
+    auto lateralProcessedDescription = lateralBobbin.get_processed_description().value();
+    lateralProcessedDescription.set_winding_windows({quickWindows[2]});
+    lateralBobbin.set_processed_description(lateralProcessedDescription);
+    size_t lateralColumnIndex = static_cast<size_t>(quickWindows[2].get_column().value());
+    REQUIRE(columns[lateralColumnIndex].get_type() == ColumnType::LATERAL);
+
+    json centerJson;
+    json lateralJson;
+    to_json(centerJson, centerBobbin);
+    to_json(lateralJson, lateralBobbin);
+    json coilJson;
+    coilJson["bobbin"] = json::array({centerJson, lateralJson});
+    coilJson["functionalDescription"] = json::array();
+    coilJson["functionalDescription"].push_back(json{{"name", "Primary"}, {"numberTurns", 20}, {"numberParallels", 1},
+                                                     {"isolationSide", "primary"}, {"wire", "Round 0.475 - Grade 1"}});
+    coilJson["functionalDescription"].push_back(json{{"name", "Secondary"}, {"numberTurns", 10}, {"numberParallels", 1},
+                                                     {"isolationSide", "secondary"}, {"wire", "Round 0.475 - Grade 1"}});
+
+    OpenMagnetics::Coil coil(coilJson, false);
+
+    // The effective bobbin is the merge: centre window + lateral window.
+    auto mergedWindows = coil.resolve_bobbin().get_processed_description()->get_winding_windows();
+    REQUIRE(mergedWindows.size() == 2);
+    REQUIRE(mergedWindows[1].get_column());
+    CHECK(static_cast<size_t>(mergedWindows[1].get_column().value()) == lateralColumnIndex);
+
+    // Wind the secondary in the lateral window (merged index 1).
+    coil.get_mutable_functional_description()[1].set_winding_window(1);
+    coil.set_core_columns(columns);
+    REQUIRE(coil.wind());
+    CHECK(section_x(coil, "Primary") > 0);
+    CHECK(section_x(coil, "Secondary") < 0);
+    size_t secondaryTurns = 0;
+    auto woundTurns = coil.get_turns_description().value();
+    for (auto& turn : woundTurns) {
+        if (turn.get_winding() == "Secondary") {
+            secondaryTurns++;
+            CHECK(turn.get_coordinates()[0] < 0);
+        }
+    }
+    CHECK(secondaryTurns == 10);
+
+    // Serialization must re-emit the two-element array (the honest BOM), with
+    // each part keeping its own single window — never the merged working bobbin.
+    json serialized;
+    to_json(serialized, coil);
+    REQUIRE(serialized["bobbin"].is_array());
+    REQUIRE(serialized["bobbin"].size() == 2);
+    CHECK(serialized["bobbin"][0]["processedDescription"]["windingWindows"].size() == 1);
+    CHECK(serialized["bobbin"][1]["processedDescription"]["windingWindows"].size() == 1);
+
+    // Reload and rewind: placement and merge survive the round trip.
+    OpenMagnetics::Coil reloaded(serialized, false);
+    REQUIRE(reloaded.get_per_column_bobbins());
+    CHECK(reloaded.get_per_column_bobbins()->size() == 2);
+    reloaded.set_core_columns(columns);
+    CHECK(section_x(reloaded, "Secondary") < 0);
+    REQUIRE(reloaded.wind());
+    CHECK(section_x(reloaded, "Secondary") < 0);
+}
+
+// Winding-style override (winding studio): the user can force multifilar
+// (consecutive parallels) or turn-by-turn (consecutive turns) per winding;
+// the heuristic keeps deciding for windings without an override.
+TEST_CASE("WindingStyleOverride_ForcesConsecutiveTurns", "[constructive-model][coil][multi-column][smoke-test]") {
+    auto& settings = Settings::GetInstance();
+    settings.set_core_per_column_winding_windows(false);
+    auto core = OpenMagneticsTesting::get_quick_core("E 42/21/20", json::parse("[]"), 1, "Dummy");
+    auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.001, 0.001);
+    json coilJson;
+    json bobbinJson;
+    to_json(bobbinJson, bobbin);
+    coilJson["bobbin"] = bobbinJson;
+    coilJson["functionalDescription"] = json::array();
+    coilJson["functionalDescription"].push_back(json{{"name", "Primary"}, {"numberTurns", 20}, {"numberParallels", 2},
+                                                     {"isolationSide", "primary"}, {"wire", "Round 0.475 - Grade 1"}});
+
+    auto windWithOverride = [&](std::optional<WindingStyle> styleOverride) {
+        OpenMagnetics::Coil coil(coilJson, false);
+        if (styleOverride) {
+            coil.preload_winding_style_overrides({{"Primary", styleOverride.value()}});
+        }
+        REQUIRE(coil.wind());
+        auto sections = coil.get_sections_description().value();
+        for (auto& section : sections) {
+            if (section.get_type() == ElectricalType::CONDUCTION) {
+                REQUIRE(section.get_winding_style());
+                return section.get_winding_style().value();
+            }
+        }
+        throw std::runtime_error("no conduction section");
+    };
+
+    // Heuristic default for 20 turns × 2 parallels in one slot: parallels grouped.
+    CHECK(windWithOverride(std::nullopt) == WindingStyle::WIND_BY_CONSECUTIVE_PARALLELS);
+    // Override flips it; the wind still lands every turn.
+    CHECK(windWithOverride(WindingStyle::WIND_BY_CONSECUTIVE_TURNS) == WindingStyle::WIND_BY_CONSECUTIVE_TURNS);
+}
+
+// woundWith through the JSON boundary: same silent-drop bug class as the
+// winding-level windingWindow — the custom Winding serializer must carry it,
+// or WASM/file loads never group the windings into shared sections.
+TEST_CASE("WoundWith_SurvivesJsonBoundary_AndGroupsSections", "[constructive-model][coil][multi-column][smoke-test]") {
+    auto& settings = Settings::GetInstance();
+    settings.set_core_per_column_winding_windows(false);
+    auto core = OpenMagneticsTesting::get_quick_core("E 42/21/20", json::parse("[]"), 1, "Dummy");
+    auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.001, 0.001);
+    json coilJson;
+    json bobbinJson;
+    to_json(bobbinJson, bobbin);
+    coilJson["bobbin"] = bobbinJson;
+    coilJson["functionalDescription"] = json::array();
+    coilJson["functionalDescription"].push_back(json{{"name", "Primary"}, {"numberTurns", 12}, {"numberParallels", 1},
+                                                     {"isolationSide", "primary"}, {"wire", "Round 0.475 - Grade 1"},
+                                                     {"woundWith", json::array({"Bias"})}});
+    coilJson["functionalDescription"].push_back(json{{"name", "Bias"}, {"numberTurns", 12}, {"numberParallels", 1},
+                                                     {"isolationSide", "primary"}, {"wire", "Round 0.475 - Grade 1"},
+                                                     {"woundWith", json::array({"Primary"})}});
+
+    OpenMagnetics::Coil coil(coilJson, false);
+    REQUIRE(coil.get_functional_description()[0].get_wound_with());
+    CHECK(coil.get_functional_description()[0].get_wound_with().value() == std::vector<std::string>{"Bias"});
+    REQUIRE(coil.wind());
+
+    // The pair shares its conduction sections (bifilar: both partial windings
+    // in the same section) and every turn of both windings lands.
+    auto sections = coil.get_sections_description().value();
+    bool sharedSectionFound = false;
+    for (auto& section : sections) {
+        if (section.get_type() == ElectricalType::CONDUCTION && section.get_partial_windings().size() == 2) {
+            sharedSectionFound = true;
+        }
+    }
+    CHECK(sharedSectionFound);
+    std::map<std::string, size_t> turnsPerWinding;
+    auto turnsForCount = coil.get_turns_description().value();
+    for (auto& turn : turnsForCount) {
+        turnsPerWinding[turn.get_winding()]++;
+    }
+    CHECK(turnsPerWinding["Primary"] == 12);
+    CHECK(turnsPerWinding["Bias"] == 12);
+
+    // Round trip: the serialized coil keeps the grouping.
+    json serialized;
+    to_json(serialized, coil);
+    REQUIRE(serialized["functionalDescription"][0].contains("woundWith"));
+    CHECK(serialized["functionalDescription"][0]["woundWith"] == json::array({"Bias"}));
+
+    // The proportions/pattern overload — the one every web wind call uses —
+    // must handle the grouped pair too (it virtualizes and devirtualizes).
+    // The WASM wind path (wind_impl): default-constructed coil + setters,
+    // wind-even-if-not-fit + include-additional-coordinates settings, then an
+    // explicit compaction pass. Must survive a devirtualized grouped coil.
+    settings.set_coil_wind_even_if_not_fit(true);
+    settings.set_coil_delimit_and_compact(true);
+    settings.set_coil_include_additional_coordinates(true);
+    OpenMagnetics::Coil coilLikeWasm;
+    coilLikeWasm.set_bobbin_from_json(coilJson["bobbin"]);
+    coilLikeWasm.set_functional_description(std::vector<OpenMagnetics::Winding>(coilJson["functionalDescription"]));
+    coilLikeWasm.preload_margins({});
+    coilLikeWasm.set_layers_orientation(WindingOrientation::OVERLAPPING);
+    coilLikeWasm.set_turns_alignment(CoilAlignment::CENTERED);
+    REQUIRE(coilLikeWasm.wind(std::vector<double>{0.5, 0.5}, std::vector<size_t>{0, 1}, 1));
+    REQUIRE(coilLikeWasm.delimit_and_compact());
+    std::map<std::string, size_t> turnsPerWindingPattern;
+    auto turnsForPatternCount = coilLikeWasm.get_turns_description().value();
+    for (auto& turn : turnsForPatternCount) {
+        turnsPerWindingPattern[turn.get_winding()]++;
+    }
+    CHECK(turnsPerWindingPattern["Primary"] == 12);
+    CHECK(turnsPerWindingPattern["Bias"] == 12);
+}
+
+// Single-window coils must NOT gain additionalCoordinates from the placement
+// pass: StrayCapacitance/Temperature/CoilMesher interpret them as REAL
+// conductor positions, so emitting the center-leg mirror would silently
+// change their results for every classic design. The winding studio draws
+// that mirror as pure display geometry instead (a regression here would be a
+// physics change, not a display fix).
+TEST_CASE("SingleWindow_CenterLegTurns_NoAdditionalCoordinates", "[constructive-model][coil][multi-column][smoke-test]") {
+    auto& settings = Settings::GetInstance();
+    settings.set_core_per_column_winding_windows(false);
+    settings.set_coil_include_additional_coordinates(true);
+    auto core = OpenMagneticsTesting::get_quick_core("E 42/21/20", json::parse("[]"), 1, "Dummy");
+    auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.001, 0.001);
+    json coilJson;
+    json bobbinJson;
+    to_json(bobbinJson, bobbin);
+    coilJson["bobbin"] = bobbinJson;
+    coilJson["functionalDescription"] = json::array();
+    coilJson["functionalDescription"].push_back(json{{"name", "Primary"}, {"numberTurns", 10}, {"numberParallels", 1},
+                                                     {"isolationSide", "primary"}, {"wire", "Round 0.475 - Grade 1"}});
+    OpenMagnetics::Coil coil(coilJson, false);
+    REQUIRE(coil.wind());
+    auto woundTurns = coil.get_turns_description().value();
+    REQUIRE(woundTurns.size() == 10);
+    for (auto& turn : woundTurns) {
+        CHECK(turn.get_coordinates()[0] > 0);
+        CHECK(!turn.get_additional_coordinates());
+    }
+}
+
+// Grouping through the web fixture (multi-window bobbin): reproduces the WASM
+// wind path on the exact coil the studio sends.
+TEST_CASE("WoundWith_WebFixtureMultiWindowBobbin", "[constructive-model][coil][multi-column][smoke-test]") {
+    auto& settings = Settings::GetInstance();
+    settings.set_coil_wind_even_if_not_fit(true);
+    settings.set_coil_delimit_and_compact(true);
+    settings.set_coil_include_additional_coordinates(true);
+    // ABT #929: was an absolute path into a WebFrontend checkout, so this MKF test only ran on
+    // one machine and silently depended on a sibling repo existing. MKF ships the same fixture in
+    // its own testData (both copies corrected together in ABT #925); read ours.
+    auto fixturePath = std::filesystem::path{std::source_location::current().file_name()}
+                           .parent_path().append("testData").append("multicolumn_e42_transformer.json");
+    std::ifstream fixtureFile(fixturePath);
+    REQUIRE(fixtureFile.is_open());
+    json fixture = json::parse(fixtureFile);
+    json coilJson = fixture["magnetic"]["coil"];
+    coilJson.erase("sectionsDescription");
+    coilJson.erase("layersDescription");
+    coilJson.erase("turnsDescription");
+    coilJson["functionalDescription"][0]["numberTurns"] = 12;
+    coilJson["functionalDescription"][1]["numberTurns"] = 12;
+    coilJson["functionalDescription"][1]["isolationSide"] = coilJson["functionalDescription"][0]["isolationSide"];
+    coilJson["functionalDescription"][1]["wire"] = coilJson["functionalDescription"][0]["wire"];
+    coilJson["functionalDescription"][0]["woundWith"] = json::array({"Secondary"});
+    coilJson["functionalDescription"][1]["woundWith"] = json::array({"Primary"});
+
+    OpenMagnetics::Coil coil;
+    coil.set_bobbin_from_json(coilJson["bobbin"]);
+    coil.set_functional_description(std::vector<OpenMagnetics::Winding>(coilJson["functionalDescription"]));
+    coil.preload_margins({});
+    coil.set_layers_orientation(WindingOrientation::OVERLAPPING);
+    coil.set_turns_alignment(CoilAlignment::CENTERED);
+    REQUIRE(coil.wind(std::vector<double>{0.5, 0.5}, std::vector<size_t>{0, 1}, 1));
+    REQUIRE(coil.delimit_and_compact());
+    std::map<std::string, size_t> turnsPerWinding;
+    auto turnsForCount = coil.get_turns_description().value();
+    for (auto& turn : turnsForCount) {
+        turnsPerWinding[turn.get_winding()]++;
+    }
+    CHECK(turnsPerWinding["Primary"] == 12);
+    CHECK(turnsPerWinding["Secondary"] == 12);
 }
 
 // Three windings, two sharing the main window plus one lateral: the shared

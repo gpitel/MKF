@@ -2,6 +2,7 @@
 #include "physical_models/MagnetizingInductance.h"
 #include "processors/MagneticSimulator.h"
 #include "support/Utils.h"
+#include "constructive_models/CorePiece.h"
 #include "support/Logger.h"
 #include "json.hpp"
 
@@ -176,6 +177,18 @@ std::optional<InductanceFluxCacheEntry> get_cached_inductance_flux(
 }
 
 void add_scoring(std::string name, MagneticFilters filter, double scoring) {
+    // A NaN score is a filter saying "no meaningful score for this candidate"
+    // (it always travels with valid=false, which already rejects the part).
+    // It must NOT be recorded: normalize_scoring throws on NaN, so one
+    // eliminated candidate would poison the scoring report for every VALID
+    // candidate in the run ("scoring cannot be nan in normalize_scoring",
+    // ABT #793) — and only on the first run of a session, because the
+    // filter-level memo caches mask it afterwards, making the adviser's
+    // verdict depend on call history.
+    if (std::isnan(scoring)) {
+        logEntry("add_scoring: skipping NaN score for '" + name + "'", "Utils", 2);
+        return;
+    }
     if (scoring != -1) {
         _scorings[filter][name] = scoring;
     }
@@ -225,6 +238,27 @@ void logEntry(std::string entry, std::string module, uint8_t entryVerbosity) {
     logger.log(level, module.empty() ? "OpenMagnetics" : module, entry);
 }
 
+// ABT #1328: with useOnlyCoresInStock set, the stock catalogue is the only acceptable answer. The
+// choice used to be "stock if embedded, otherwise the full catalogue", so a build whose resource
+// list left cores_stock.ndjson out (PyOpenMagnetics and MKFNet list their own files) silently
+// loaded all of cores.ndjson under a setting that says the opposite: 18943 cores instead of 1573,
+// each with its geometrical description, ~2.4 GB resident before any advising, and an
+// available-cores MagneticAdviser run that grew past 16 GB. Refuse instead.
+std::string select_embedded_cores_catalogue(bool useOnlyCoresInStock, bool stockCatalogueEmbedded) {
+    if (!useOnlyCoresInStock) {
+        return "MAS/data/cores.ndjson";
+    }
+    if (!stockCatalogueEmbedded) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA,
+            "settings.useOnlyCoresInStock is set, but this build does not embed MAS/data/cores_stock.ndjson. "
+            "Loading MAS/data/cores.ndjson instead would ignore the setting and hand every consumer the full "
+            "core catalogue. Embed cores_stock.ndjson in the build's MAS resources (MKF's own CMake does; a "
+            "binding with its own resource list must add it), or set useOnlyCoresInStock to false to ask for "
+            "the full catalogue explicitly.");
+    }
+    return "MAS/data/cores_stock.ndjson";
+}
+
 void load_cores(std::optional<std::string> fileToLoad) {
     throw_if_databases_frozen("load_cores");
     bool includeToroidalCores = settings.get_use_toroidal_cores();
@@ -232,9 +266,11 @@ void load_cores(std::optional<std::string> fileToLoad) {
     bool useOnlyCoresInStock = settings.get_use_only_cores_in_stock();
 
     auto fs = cmrc::data::get_filesystem();
-    const bool stockPath = (useOnlyCoresInStock && fs.exists("MAS/data/cores_stock.ndjson"));
-    const std::string resourcePath = stockPath ? "MAS/data/cores_stock.ndjson"
-                                               : "MAS/data/cores.ndjson";
+    const bool stockCatalogueEmbedded = fs.exists("MAS/data/cores_stock.ndjson");
+    const bool stockPath = useOnlyCoresInStock && stockCatalogueEmbedded;
+    // A caller-supplied file replaces the embedded catalogue, so only the embedded choice is checked.
+    const std::string resourcePath = fileToLoad ? std::string()
+                                                : select_embedded_cores_catalogue(useOnlyCoresInStock, stockCatalogueEmbedded);
 
     // Both branches now use the same NDJSON streaming loader and filter on
     // parse, instead of the previous code that std::regex_replace'd the
@@ -248,10 +284,32 @@ void load_cores(std::optional<std::string> fileToLoad) {
         const bool keep = (includeToroidalCores  && type == CoreType::TOROIDAL)
                        || (includeConcentricCores && type != CoreType::TOROIDAL);
         if (!keep) return;
-        if (stockPath) {
-            coreDatabase.emplace_back(jf, false, true, false);
-        } else {
-            coreDatabase.emplace_back(jf);  // defaults: include geometricalDescription
+        // ABT #407/#1189: a CATALOGUE record whose gapping cannot fit its columns is corrupt, and
+        // must not enter the database looking usable. Since ABT #1189 the Core(json) constructor
+        // refuses it itself, with a GapException naming the gap and the column height it does not
+        // fit — but not the RECORD, and a catalogue loader has to say WHICH of three thousand
+        // parts is bad. (Before #1189 the constructor swallowed the failure, and what arrived here
+        // was a core carrying gaps with no area; it was that missing area this block used to look
+        // for, and it killed the first consumer to sweep the whole catalogue with a bare "Gap Area
+        // is not set", naming neither the core nor the reason. That is how the seven Magnetics
+        // parts with mil-as-metre gap lengths surfaced.) So the construction failure is re-raised,
+        // unchanged in meaning, as the named InvalidInputException load_cores() callers expect:
+        // nothing is swallowed, nothing continues, and no half-built core reaches the database.
+        try {
+            if (stockPath) {
+                coreDatabase.emplace_back(jf, false, true, false);
+            } else {
+                coreDatabase.emplace_back(jf);  // defaults: include geometricalDescription
+            }
+        }
+        catch (const GapException& gapException) {
+            std::string coreName = "<unnamed>";
+            if (jf.contains("name") && jf["name"].is_string()) {
+                coreName = jf["name"].get<std::string>();
+            }
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "Catalogue core '" + coreName + "' has a gapping that does not fit its columns: " +
+                gapException.message() + ". The record is corrupt and cannot be loaded.");
         }
     });
 }
@@ -360,6 +418,102 @@ void load_advanced_core_materials(std::string fileToLoad, bool onlyDataFromManuf
     });
 }
 
+// ABT #307: structurally impossible geometry is corrupt data, not a modelling gap — it
+// must never reach the catalog. A POCO toroid shipped with an inner diameter larger than
+// its outer diameter (T 32.5/78.6/20.3, ABT #306); CorePieceT then derived negative shape
+// constants and every adviser sweep that touched it died with a message
+// ("IEC 63182 effective parameters cannot be negative or 0") that named nothing useful.
+static void check_core_shape_geometry(const CoreShape& coreShape) {
+    auto name = coreShape.get_name().value_or("<unnamed>");
+    auto dimensions = coreShape.get_dimensions();
+    if (!dimensions) {
+        return;  // dimensional data is optional in the schema; families that need it throw on their own
+    }
+
+    // A dimension that is simply absent is legal (the schema makes dimensions optional and
+    // families read only the keys they need); a dimension that IS specified and is not a
+    // positive length is not. Distinguish the two rather than letting the resolver's
+    // "neither nominal, minimum nor maximum set" throw stand in for both.
+    auto specified = [](const Dimension& dimension) -> std::optional<double> {
+        if (std::holds_alternative<double>(dimension)) {
+            return std::get<double>(dimension);
+        }
+        auto& withTolerance = std::get<DimensionWithTolerance>(dimension);
+        if (!withTolerance.get_nominal() && !withTolerance.get_minimum() && !withTolerance.get_maximum()) {
+            return std::nullopt;
+        }
+        return resolve_dimensional_values(dimension);
+    };
+
+    auto resolve = [&](const std::string& key) -> std::optional<double> {
+        auto found = dimensions->find(key);
+        if (found == dimensions->end()) {
+            return std::nullopt;
+        }
+        return specified(found->second);
+    };
+
+    // Only the primary extents A/B/C are checked for positivity. The auxiliary keys are
+    // NOT all lengths: EFD's K is a signed offset (-0.2 mm on EFD 10/5/3), and H, r1, R2
+    // are legitimately 0 on RM/P/U shapes (no fillet, no recess). Rejecting every
+    // non-positive dimension aborts the load on perfectly good catalog records.
+    for (auto& key : {"A", "B", "C"}) {
+        auto value = resolve(key);
+        if (value && (!std::isfinite(*value) || *value <= 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "Core shape '" + name + "' has a non-positive principal dimension " + key + " = " +
+                std::to_string(*value) + ". The catalog record is corrupt and cannot be loaded.");
+        }
+    }
+
+    if (coreShape.get_family() == CoreShapeFamily::T) {
+        auto outerDiameter = resolve("A");
+        auto innerDiameter = resolve("B");
+        if (outerDiameter && innerDiameter && *innerDiameter >= *outerDiameter) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "Toroidal core shape '" + name + "' has an inner diameter (B = " + std::to_string(*innerDiameter) +
+                " m) at least as large as its outer diameter (A = " + std::to_string(*outerDiameter) +
+                " m). The catalog record is corrupt and cannot be loaded.");
+        }
+    }
+}
+
+// ABT #924: an alias never overwrites a real shape. Aliases are applied after the whole
+// catalog is in the map, and only onto free keys, so a name that another record already
+// owns keeps pointing at its own geometry.
+static void register_core_shape_aliases(const std::vector<std::pair<std::string, CoreShape>>& aliases) {
+    std::vector<std::string> shadowed;
+    for (const auto& [alias, coreShape] : aliases) {
+        auto [it, inserted] = coreShapeDatabase.emplace(alias, coreShape);
+        if (!inserted && it->second.get_name() != coreShape.get_name()) {
+            shadowed.push_back(alias);
+        }
+    }
+    if (!shadowed.empty()) {
+        std::string summary;
+        for (const auto& alias : shadowed) {
+            if (!summary.empty()) {
+                summary += ", ";
+            }
+            summary += "'" + alias + "'";
+        }
+        OM_WARNING_M("Utils", "Ignored " + std::to_string(shadowed.size()) + " core shape alias(es) that collide "
+                              "with the name of a different shape (" + summary + "). The name resolves to the shape "
+                              "that owns it; the aliased shape is still reachable by its own name.");
+    }
+}
+
+// ABT #924: the shape database doubles as an alias index, so its keys are NOT a catalog.
+// Anything that LISTS shapes (the UI dropdowns, the adviser sweeps) must show each shape
+// exactly once, under the name the engine will echo back — otherwise picking "EFD 25"
+// silently re-labels itself "EFD 25/13/9" and reads as the tool choosing another size.
+static bool is_canonical_core_shape_key(const std::string& key, const CoreShape& shape) {
+    if (!shape.get_name()) {
+        return true;
+    }
+    return key == shape.get_name().value();
+}
+
 void load_core_shapes(bool withAliases, std::optional<std::string> fileToLoad) {
     throw_if_databases_frozen("load_core_shapes");
     if (!_addInternalData) {
@@ -369,20 +523,59 @@ void load_core_shapes(bool withAliases, std::optional<std::string> fileToLoad) {
     bool includeConcentricCores = settings.get_use_concentric_cores();
 
     std::string database = load_ndjson_data("MAS/data/core_shapes.ndjson", fileToLoad);
-    parse_ndjson(database, [withAliases, includeToroidalCores, includeConcentricCores](const json& jf) {
-        CoreShape coreShape(jf);
+    // ABT #307: one unbuildable record used to abort a whole adviser sweep (a single
+    // malformed POCO toroid killed DMC advising, and the dangling UI/PQI records do the
+    // same). Two different problems, two different answers: a family whose geometry
+    // class does not exist yet is a KNOWN GAP — leave those shapes out of the catalog
+    // and say so once — while geometry that cannot exist is CORRUPT DATA and must never
+    // load at all.
+    std::map<CoreShapeFamily, size_t> skippedPerFamily;
+    // ABT #924: aliases are LOOKUP keys, never catalog entries. They are collected here and
+    // inserted only after every canonical name is in the map, with emplace rather than
+    // operator[], so an alias can never shadow a shape that carries that name for real
+    // ("RM 6-S" is both the canonical name of one shape and an alias of "RM 6/I"; the
+    // straight-line assignment made "RM 6-S" resolve to RM 6/I, a different gapped part).
+    std::vector<std::pair<std::string, CoreShape>> pendingAliases;
+    parse_ndjson(database, [withAliases, includeToroidalCores, includeConcentricCores, &skippedPerFamily, &pendingAliases](const json& jf) {
+        // Alias families (H -> DRUM, ABT #277) are stored under the family they are modelled as.
+        CoreShape coreShape = canonicalize_core_shape_family(CoreShape(jf));
+        check_core_shape_geometry(coreShape);
+        if (!CorePiece::is_family_supported(coreShape.get_family())) {
+            skippedPerFamily[coreShape.get_family()]++;
+            return;
+        }
         if ((includeToroidalCores && coreShape.get_family() == CoreShapeFamily::T) || (includeConcentricCores && coreShape.get_family() != CoreShapeFamily::T)) {
             if (std::find(coreShapeFamiliesInDatabase.begin(), coreShapeFamiliesInDatabase.end(), coreShape.get_family()) == coreShapeFamiliesInDatabase.end()) {
                 coreShapeFamiliesInDatabase.push_back(coreShape.get_family());
             }
             coreShapeDatabase[jf["name"]] = coreShape;
-            if (withAliases) {
-                for (auto& alias : jf["aliases"]) {
-                    coreShapeDatabase[alias] = coreShape;
+            // jf is CONST here: operator[] on a missing key is UB (no insertion) — with the
+            // first alias-less entries (2026-07 vendor toroid batches) it yielded a garbage
+            // scalar whose iteration crashed every named-shape lookup with
+            // "type must be string, but is number". Guard instead of indexing.
+            if (withAliases && jf.contains("aliases")) {
+                for (auto& alias : jf.at("aliases")) {
+                    pendingAliases.emplace_back(alias.get<std::string>(), coreShape);
                 }
             }
         }
     });
+    register_core_shape_aliases(pendingAliases);
+
+    if (!skippedPerFamily.empty()) {
+        std::string summary;
+        size_t total = 0;
+        for (auto& [family, count] : skippedPerFamily) {
+            if (!summary.empty()) {
+                summary += ", ";
+            }
+            summary += std::string(magic_enum::enum_name(family)) + " x" + std::to_string(count);
+            total += count;
+        }
+        OM_WARNING_M("Utils", "Left " + std::to_string(total) + " catalog shape(s) out of the database: no CorePiece "
+                              "geometry for their family (" + summary + "). Cores using them cannot be advised or "
+                              "built until the family is implemented.");
+    }
 }
 
 void load_wires(std::optional<std::string> fileToLoad) {
@@ -397,6 +590,35 @@ void load_wires(std::optional<std::string> fileToLoad) {
     });
 }
 
+// ABT #1175: a catalogue row that declares numberChambers > 1 without the chamber labels is valid
+// MAS data (the count is stated, the walls are not transcribed yet), but Bobbin::process_data
+// refuses to split its window by invention. The catalogue keeps such a row as functional data, and
+// asks BEFORE processing rather than throwing and catching: an exceptionless (WASM) build would
+// otherwise lose the whole catalogue to its first untranscribed chamber former. Using the row in a
+// design processes it, and that is where the refusal is reported.
+static Bobbin load_catalogue_bobbin(const json& jf) {
+    // Asked on the raw row, before any parse: the catalogue is loaded on every clear_databases,
+    // and a second from_json per row just to ask this question is not free.
+    // ABT #1173: a catalogue toroid base (family t, a base, no ring dimensions) holds no ring yet, so it
+    // has no winding window to process; it stays functional data until a core is seated in it
+    // (Bobbin::create_toroid_bobbin_on_base). Asked on the raw row for the same reason as below.
+    if (jf.contains("functionalDescription") && jf["functionalDescription"].contains("base") &&
+        jf["functionalDescription"].contains("family") && jf["functionalDescription"]["family"] == "t") {
+        Bobbin unprocessed(jf, false);
+        if (Bobbin::is_toroid_base_record(unprocessed.get_functional_description().value())) {
+            return unprocessed;
+        }
+    }
+    if (jf.contains("functionalDescription") && jf["functionalDescription"].contains("numberChambers") &&
+        jf["functionalDescription"]["numberChambers"].get<int64_t>() > 1) {
+        Bobbin unprocessed(jf, false);
+        if (!Bobbin::has_chamber_geometry(unprocessed.get_functional_description().value())) {
+            return unprocessed;
+        }
+    }
+    return Bobbin(jf);
+}
+
 void load_bobbins() {
     throw_if_databases_frozen("load_bobbins");
     if (!_addInternalData) {
@@ -404,8 +626,7 @@ void load_bobbins() {
     }
     std::string database = load_ndjson_data("MAS/data/bobbins.ndjson");
     parse_ndjson(database, [](const json& jf) {
-        Bobbin bobbin(jf);
-        bobbinDatabase[jf["name"]] = bobbin;
+        bobbinDatabase[jf["name"]] = load_catalogue_bobbin(jf);
     });
 }
 
@@ -470,6 +691,7 @@ void load_databases(json data, bool withAliases, bool addInternalData) {
         }
     }
 
+    std::vector<std::pair<std::string, CoreShape>> pendingCoreShapeAliases;
     for (auto& element : data["coreShapes"].items()) {
         json jf = element.value();
 
@@ -492,12 +714,13 @@ void load_databases(json data, bool withAliases, bool addInternalData) {
 
         coreShapeDatabase[jf["name"]] = coreShape;
 
-        if (withAliases) {
-            for (auto& alias : jf["aliases"]) {
-                coreShapeDatabase[alias] = coreShape;
+        if (withAliases && jf.contains("aliases")) {
+            for (auto& alias : jf.at("aliases")) {
+                pendingCoreShapeAliases.emplace_back(alias.get<std::string>(), coreShape);
             }
         }
     }
+    register_core_shape_aliases(pendingCoreShapeAliases);
 
     for (auto& element : data["wires"].items()) {
         json jf = element.value();
@@ -517,8 +740,7 @@ void load_databases(json data, bool withAliases, bool addInternalData) {
 
     for (auto& element : data["bobbins"].items()) {
         json jf = element.value();
-        Bobbin bobbin(jf);
-        bobbinDatabase[jf["name"]] = bobbin;
+        bobbinDatabase[jf["name"]] = load_catalogue_bobbin(jf);
     }
 
     for (auto& element : data["insulationMaterials"].items()) {
@@ -538,12 +760,26 @@ Core find_core_by_name(std::string name) {
     if (coreDatabase.empty()) {
         load_cores();
     }
+    // The name is optional in MAS, so a catalogue record can carry none (four Fair-Rite drum
+    // rows did, with their name nested inside functionalDescription instead — fixed in MAS
+    // data). This loop used to dereference it unconditionally, so ONE such row turned every
+    // core lookup in the process into an opaque "bad optional access" with nothing naming the
+    // culprit. A nameless record simply cannot match a name query: skip it, and if the query
+    // finds nothing, say how many rows were unnameable so corrupt data is visible.
+    size_t namelessRecords = 0;
     for (auto core : coreDatabase) {
+        if (!core.get_name()) {
+            namelessRecords++;
+            continue;
+        }
         if (core.get_name().value() == name) {
             return core;
         }
     }
-    throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Core not found: " + name);
+    std::string namelessNote = namelessRecords > 0
+        ? " (" + std::to_string(namelessRecords) + " loaded core(s) carry no name and were skipped)"
+        : "";
+    throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Core not found: " + name + namelessNote);
 }
 
 CoreMaterial find_core_material_by_name(std::string name) {
@@ -574,23 +810,39 @@ CoreMaterial find_core_material_by_name(std::string name) {
     }
 }
 
-CoreShape find_core_shape_by_name(std::string name) {
+// ABT #631: the non-throwing half of find_core_shape_by_name. A catalogue scan that
+// legitimately expects some entries not to resolve (the bobbin catalogue carries rows
+// pointing at shape families MAS does not ship) must not use an exception to say so:
+// wherever the engine is built with exception CATCHING disabled — the Emscripten default,
+// and how MVB++'s WASM module is compiled — the surrounding catch is deleted and the
+// throw escapes to the caller instead of skipping one row. Ask, don't throw-and-catch.
+std::optional<CoreShape> try_find_core_shape_by_name(std::string name) {
     if (coreShapeDatabase.empty()) {
         load_core_shapes();
     }
     if (coreShapeDatabase.count(name)) {
         return coreShapeDatabase[name];
     }
-    else {
-        for (const auto& [key, value] : coreShapeDatabase) {
-            std::string dbName = key;
-            dbName.erase(remove(dbName.begin(), dbName.end(), ' '), dbName.end());
-            if (name == dbName) {
-                return value;
-            }
+    for (const auto& [key, value] : coreShapeDatabase) {
+        std::string dbName = key;
+        dbName.erase(remove(dbName.begin(), dbName.end(), ' '), dbName.end());
+        if (name == dbName) {
+            return value;
         }
+    }
+    return std::nullopt;
+}
+
+bool core_shape_exists(std::string name) {
+    return try_find_core_shape_by_name(name).has_value();
+}
+
+CoreShape find_core_shape_by_name(std::string name) {
+    auto coreShape = try_find_core_shape_by_name(name);
+    if (!coreShape) {
         throw CoreShapeNotFoundException(name);
     }
+    return coreShape.value();
 }
 
 std::vector<std::string> get_core_material_names(std::optional<std::string> manufacturer) {
@@ -650,6 +902,9 @@ std::vector<std::string> get_core_shape_names(CoreShapeFamily family) {
     std::vector<std::string> shapeNames;
  
     for (auto& [name, shape] : coreShapeDatabase) {
+        if (!is_canonical_core_shape_key(name, shape)) {
+            continue;
+        }
         if (shape.get_family() == family) {
             shapeNames.push_back(name);
         }
@@ -668,6 +923,9 @@ std::vector<std::string> get_core_shape_names() {
     std::vector<std::string> shapeNames;
  
     for (auto& [name, shape] : coreShapeDatabase) {
+        if (!is_canonical_core_shape_key(name, shape)) {
+            continue;
+        }
         if ((includeToroidalCores && shape.get_family() == CoreShapeFamily::T) || (includeConcentricCores && shape.get_family() != CoreShapeFamily::T)) {
             shapeNames.push_back(name);
         }
@@ -715,8 +973,24 @@ std::vector<std::string> get_shape_family_dimensions(CoreShapeFamily family, std
         load_core_shapes(true);
     }
 
+    // What the GEOMETRY needs, which is a property of the CorePiece class and is therefore
+    // answerable for every buildable family. Scanning the database alone returned an empty
+    // list for the eleven families that ship no bare-core record (ABT #1007), so the builder
+    // offered the family and then no dimension fields, and a custom shape could not be made.
+    //
+    // Family-level ONLY. A subtype query asks a narrower question — which dimensions THIS
+    // subtype's published shapes carry — and seeding it with the whole family's requirements
+    // answers the wrong one: UR subtype "2" gained a dimension no UR-2 shape has. A family with
+    // no catalogue shape has no subtypes either, so the ABT #1007 case is unaffected.
     std::vector<std::string> distinctDimensions;
- 
+    if (!familySubtype) {
+        distinctDimensions = get_core_shape_family_required_dimensions(family);
+    }
+
+    // Plus whatever the published shapes additionally carry. These are real: some are optional
+    // geometry the class reads behind a guard (drum's A2, a toroid's R/r0), and some this
+    // engine never reads at all but other consumers do — MVB++ renders EC's T and PM's alpha.
+    // Dropping them would silently remove input fields that work today.
     for (auto& [name, shape] : coreShapeDatabase) {
         if (shape.get_family() == family) {
             if (familySubtype && shape.get_family_subtype()) {
@@ -734,6 +1008,11 @@ std::vector<std::string> get_shape_family_dimensions(CoreShapeFamily family, std
     }
 
     std::sort(distinctDimensions.begin(), distinctDimensions.end(), [](std::string a, std::string b) {return a<b;});
+
+    if (distinctDimensions.empty()) {
+        throw std::runtime_error("No dimensions resolved for shape family: " +
+                                 std::string{magic_enum::enum_name(family)});
+    }
 
     return distinctDimensions;
 }
@@ -849,9 +1128,15 @@ std::vector<CoreShape> get_shapes(bool includeToroidal) {
 
     std::vector<CoreShape> shapes;
 
-    for (auto& datum : coreShapeDatabase) {
-        if (includeToroidal || (datum.second.get_family() != CoreShapeFamily::T)) {
-            shapes.push_back(datum.second);
+    // ABT #1070: coreShapeDatabase is an alias INDEX (ABT #924), so iterating its entries
+    // hands back a shape once per alias — 2021 rows for 1581 shapes in the web shape table,
+    // and 2-5x redundant work in every bulk consumer. Only canonical keys are catalogue entries.
+    for (auto& [key, shape] : coreShapeDatabase) {
+        if (!is_canonical_core_shape_key(key, shape)) {
+            continue;
+        }
+        if (includeToroidal || (shape.get_family() != CoreShapeFamily::T)) {
+            shapes.push_back(shape);
         }
     }
 
@@ -925,6 +1210,64 @@ std::vector<Bobbin> get_bobbins() {
 }
 
 
+std::vector<Bobbin> find_toroid_bases_for_core(Core core, std::optional<OrientationEnum> mounting) {
+    return find_toroid_bases_for_core(core, get_bobbins(), mounting);
+}
+
+std::vector<Bobbin> find_toroid_bases_for_core(Core core, const std::vector<Bobbin>& candidates, std::optional<OrientationEnum> mounting) {
+    if (core.get_shape_family() != CoreShapeFamily::T) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "Toroid bases hold toroidal cores; core shape '" + core.get_shape_name() + "' is not toroidal.");
+    }
+    if (!core.get_processed_description()) {
+        core.process_data();
+    }
+    const auto shapeDimensions = flatten_dimensions(core.resolve_shape().get_dimensions().value());
+    for (const auto* label : {"A", "C"}) {
+        if (!shapeDimensions.count(label) || !(shapeDimensions.at(label) > 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "Toroidal shape '" + core.get_shape_name() + "' has no dimension '" + label + "'.");
+        }
+    }
+    // The base holds the COATED ring: the coating is what touches the pocket, the boat and the limits.
+    const double coating = core.get_coating_thickness();
+    const double ringOuterDiameter = shapeDimensions.at("A") + 2 * coating;
+    const double ringHeight = shapeDimensions.at("C") * static_cast<double>(core.get_number_stacks()) + 2 * coating;
+
+    std::vector<Bobbin> bases;
+    for (const auto& bobbin : candidates) {
+        if (!bobbin.get_functional_description() || !Bobbin::is_toroid_base_record(bobbin.get_functional_description().value())) {
+            continue;
+        }
+        const auto base = bobbin.get_base();
+        if (mounting && base.get_mounting() != mounting.value()) {
+            continue;
+        }
+        // Outer diameter: the stated limit, else the pocket a horizontal base drops the ring into. A base
+        // that states neither says nothing about which ring fits, and is not offered.
+        std::optional<double> outerDiameterLimit;
+        if (base.get_maximum_core_outer_diameter()) {
+            outerDiameterLimit = base.get_maximum_core_outer_diameter().value();
+        }
+        else if (base.get_mounting() == OrientationEnum::HORIZONTAL && base.get_pocket_inner_diameter()) {
+            outerDiameterLimit = resolve_dimensional_values(base.get_pocket_inner_diameter().value(), DimensionalValues::MINIMUM);
+        }
+        if (!outerDiameterLimit || ringOuterDiameter > outerDiameterLimit.value()) {
+            continue;
+        }
+        // Height: the stated limit, and on a vertical base the boat the ring stands in.
+        if (base.get_maximum_core_height() && ringHeight > base.get_maximum_core_height().value()) {
+            continue;
+        }
+        if (base.get_mounting() == OrientationEnum::VERTICAL && base.get_boat_width() &&
+            ringHeight > resolve_dimensional_values(base.get_boat_width().value(), DimensionalValues::MINIMUM)) {
+            continue;
+        }
+        bases.push_back(bobbin);
+    }
+    return bases;
+}
+
 std::vector<InsulationMaterial> get_insulation_materials() {
     if (insulationMaterialDatabase.empty()) {
         load_insulation_materials();
@@ -967,7 +1310,7 @@ Wire find_wire_by_name(std::string name) {
 }
 
 
-Wire find_wire_by_dimension(double dimension, std::optional<WireType> wireType, std::optional<WireStandard> wireStandard, bool obfuscate) {
+Wire find_wire_by_dimension(double dimension, std::optional<WireType> wireType, std::optional<WireStandard> wireStandard, bool obfuscate, std::optional<InsulationWireCoatingType> coatingType) {
     if (wireDatabase.empty()) {
         load_wires();
     }
@@ -977,6 +1320,7 @@ Wire find_wire_by_dimension(double dimension, std::optional<WireType> wireType, 
     // call copy-constructed every Wire (large objects with strings/optionals)
     // into a fresh vector on every call. Iterate the database directly.
     double minimumDistance = DBL_MAX;
+    bool found = false;
     Wire chosenWire;
     std::vector<const Wire*> possibleWires;
 
@@ -991,6 +1335,12 @@ Wire find_wire_by_dimension(double dimension, std::optional<WireType> wireType, 
         }
         if (wireType && wire.get_type() != wireType) {
             continue;
+        }
+        if (coatingType) {
+            auto coating = Wire::resolve_coating(wire);
+            if (!coating || coating->get_type() != coatingType.value()) {
+                continue;
+            }
         }
 
         double distance = 0;
@@ -1031,6 +1381,7 @@ Wire find_wire_by_dimension(double dimension, std::optional<WireType> wireType, 
         }
 
         if (distance < minimumDistance) {
+            found = true;
             possibleWires.clear();
             minimumDistance = distance;
             chosenWire = wire;
@@ -1038,6 +1389,11 @@ Wire find_wire_by_dimension(double dimension, std::optional<WireType> wireType, 
         else if (distance == minimumDistance) {
             possibleWires.push_back(&wire);
         }
+    }
+
+    if (!found) {
+        throw WireNotFoundException("no catalogue wire matches dimension " + std::to_string(dimension) +
+                                    " under the requested type, standard and coating filters");
     }
 
     double minimumOuterDimension = DBL_MAX;
@@ -1163,7 +1519,12 @@ CoreShape find_core_shape_by_winding_window_perimeter(double desiredPerimeter, s
     double minimumError = DBL_MAX;
     CoreShape closestShape;
     for (auto [name, shape] : coreShapeDatabase) {
-        if (shape.get_family() != CoreShapeFamily::PQI && shape.get_family() != CoreShapeFamily::UI && shape.get_family() != CoreShapeFamily::UT) {
+        // UI and PQI stay out of the shape-SEARCH helpers even though both now have geometry
+        // (ABT #274/#275): these feed core SELECTION, and MAS holds 0 cores for either family, so
+        // returning one yields a shape no core can be built from. Revisit when cores are added.
+        if (shape.get_family() != CoreShapeFamily::UT && shape.get_family() != CoreShapeFamily::PQI
+            && shape.get_family() != CoreShapeFamily::UI && shape.get_family() != CoreShapeFamily::DRUM
+            && shape.get_family() != CoreShapeFamily::ROD) {
             if (family) {
                 if (family.value() != shape.get_family()) {
                     continue;
@@ -1203,7 +1564,13 @@ CoreShape find_core_shape_by_area_product(double desiredAreaProduct, std::option
     double minimumError = DBL_MAX;
     CoreShape closestShape;
     for (auto [name, shape] : coreShapeDatabase) {
-        if (shape.get_family() != CoreShapeFamily::PQI && shape.get_family() != CoreShapeFamily::UI && shape.get_family() != CoreShapeFamily::UT) {
+        // UI and PQI stay out of the shape-SEARCH helpers even though UI now has geometry
+        // (ABT #274): these feed core selection, and MAS holds 0 cores for either family, so
+        // returning one yields a shape no core can be built from. Letting UI in re-pointed
+        // Test_Find_By_Perimeter away from UR 46/21/11. Revisit when UI cores are added.
+        if (shape.get_family() != CoreShapeFamily::UT && shape.get_family() != CoreShapeFamily::PQI
+            && shape.get_family() != CoreShapeFamily::UI && shape.get_family() != CoreShapeFamily::DRUM
+            && shape.get_family() != CoreShapeFamily::ROD) {
             if (family) {
                 if (family.value() != shape.get_family()) {
                     continue;
@@ -1240,7 +1607,13 @@ CoreShape find_core_shape_by_winding_window_area(double desiredWindingWindowArea
     double minimumError = DBL_MAX;
     CoreShape closestShape;
     for (auto [name, shape] : coreShapeDatabase) {
-        if (shape.get_family() != CoreShapeFamily::PQI && shape.get_family() != CoreShapeFamily::UI && shape.get_family() != CoreShapeFamily::UT) {
+        // UI and PQI stay out of the shape-SEARCH helpers even though UI now has geometry
+        // (ABT #274): these feed core selection, and MAS holds 0 cores for either family, so
+        // returning one yields a shape no core can be built from. Letting UI in re-pointed
+        // Test_Find_By_Perimeter away from UR 46/21/11. Revisit when UI cores are added.
+        if (shape.get_family() != CoreShapeFamily::UT && shape.get_family() != CoreShapeFamily::PQI
+            && shape.get_family() != CoreShapeFamily::UI && shape.get_family() != CoreShapeFamily::DRUM
+            && shape.get_family() != CoreShapeFamily::ROD) {
             if (family) {
                 if (family.value() != shape.get_family()) {
                     continue;
@@ -1287,7 +1660,13 @@ CoreShape find_core_shape_by_winding_window_dimensions(double desiredWidthOrRadi
     double minimumError = DBL_MAX;
     CoreShape closestShape;
     for (auto [name, shape] : coreShapeDatabase) {
-        if (shape.get_family() != CoreShapeFamily::PQI && shape.get_family() != CoreShapeFamily::UI && shape.get_family() != CoreShapeFamily::UT) {
+        // UI and PQI stay out of the shape-SEARCH helpers even though UI now has geometry
+        // (ABT #274): these feed core selection, and MAS holds 0 cores for either family, so
+        // returning one yields a shape no core can be built from. Letting UI in re-pointed
+        // Test_Find_By_Perimeter away from UR 46/21/11. Revisit when UI cores are added.
+        if (shape.get_family() != CoreShapeFamily::UT && shape.get_family() != CoreShapeFamily::PQI
+            && shape.get_family() != CoreShapeFamily::UI && shape.get_family() != CoreShapeFamily::DRUM
+            && shape.get_family() != CoreShapeFamily::ROD) {
             if (family) {
                 if (family.value() != shape.get_family()) {
                     continue;
@@ -1327,7 +1706,13 @@ CoreShape find_core_shape_by_effective_parameters(double desiredEffectiveLength,
     double minimumError = DBL_MAX;
     CoreShape closestShape;
     for (auto [name, shape] : coreShapeDatabase) {
-        if (shape.get_family() != CoreShapeFamily::PQI && shape.get_family() != CoreShapeFamily::UI && shape.get_family() != CoreShapeFamily::UT) {
+        // UI and PQI stay out of the shape-SEARCH helpers even though UI now has geometry
+        // (ABT #274): these feed core selection, and MAS holds 0 cores for either family, so
+        // returning one yields a shape no core can be built from. Letting UI in re-pointed
+        // Test_Find_By_Perimeter away from UR 46/21/11. Revisit when UI cores are added.
+        if (shape.get_family() != CoreShapeFamily::UT && shape.get_family() != CoreShapeFamily::PQI
+            && shape.get_family() != CoreShapeFamily::UI && shape.get_family() != CoreShapeFamily::DRUM
+            && shape.get_family() != CoreShapeFamily::ROD) {
             if (family) {
                 if (family.value() != shape.get_family()) {
                     continue;
@@ -1346,6 +1731,19 @@ CoreShape find_core_shape_by_effective_parameters(double desiredEffectiveLength,
 
 
 bool check_requirement(DimensionWithTolerance requirement, double value){
+    // A bound is INCLUSIVE unless the requirement says otherwise: MAS carries
+    // excludeMinimum / excludeMaximum for an open bound. The one-sided branches
+    // used to be strict (value > minimum, value < maximum) while every two-sided
+    // branch was inclusive — so a value exactly AT a maximum-only requirement
+    // failed. NumberTurns aims a maximum-only turns ratio (a ceiling, e.g. the
+    // Weinberg's secondaries, "<= 0.5") exactly at that maximum, realised it
+    // exactly, and was rejected every time: "NumberTurns did not converge" for
+    // every core, and no core could be advised.
+    const bool excludeMinimum = requirement.get_exclude_minimum().value_or(false);
+    const bool excludeMaximum = requirement.get_exclude_maximum().value_or(false);
+    auto aboveMinimum = [&](double minimum) { return excludeMinimum ? value > minimum : value >= minimum; };
+    auto belowMaximum = [&](double maximum) { return excludeMaximum ? value < maximum : value <= maximum; };
+
     if (requirement.get_minimum() && requirement.get_maximum()) {
         if (requirement.get_maximum().value() < requirement.get_minimum().value()) {
             throw InvalidInputException(ErrorCode::INVALID_INPUT, "Minimum requirement cannot be larger than maximum");
@@ -1355,29 +1753,29 @@ bool check_requirement(DimensionWithTolerance requirement, double value){
                 throw InvalidInputException(ErrorCode::INVALID_INPUT, "Nominal requirement cannot be larger than maximum");
             }
         }
-        return requirement.get_minimum().value() <= value && value <= requirement.get_maximum().value();
+        return aboveMinimum(requirement.get_minimum().value()) && belowMaximum(requirement.get_maximum().value());
     }
     else if (!requirement.get_minimum() && requirement.get_nominal() && requirement.get_maximum()) {
         if (requirement.get_maximum().value() < requirement.get_nominal().value()) {
             throw InvalidInputException(ErrorCode::INVALID_INPUT, "Nominal requirement cannot be larger than maximum");
         }
-        return requirement.get_nominal().value() <= value && value <= requirement.get_maximum().value();
+        return requirement.get_nominal().value() <= value && belowMaximum(requirement.get_maximum().value());
     }
     else if (requirement.get_minimum() && requirement.get_nominal() && !requirement.get_maximum()) {
         if (requirement.get_nominal().value() < requirement.get_minimum().value()) {
             throw InvalidInputException(ErrorCode::INVALID_INPUT, "Minimum requirement cannot be larger than nominal");
         }
-        return requirement.get_minimum().value() <= value && value <= requirement.get_nominal().value();
+        return aboveMinimum(requirement.get_minimum().value()) && value <= requirement.get_nominal().value();
     }
     else if (!requirement.get_minimum() && requirement.get_nominal() && !requirement.get_maximum()) {
         return requirement.get_nominal().value() * (1 - defaults.magnetizingInductanceThresholdValidity) <= value &&
         value <= requirement.get_nominal().value() * (1 + defaults.magnetizingInductanceThresholdValidity);
     }
     else if (requirement.get_minimum() && !requirement.get_nominal() && !requirement.get_maximum()) {
-        return value > requirement.get_minimum().value();
+        return aboveMinimum(requirement.get_minimum().value());
     }
     else if (!requirement.get_minimum() && !requirement.get_nominal() && requirement.get_maximum()) {
-        return value < requirement.get_maximum().value();
+        return belowMaximum(requirement.get_maximum().value());
     }
 
     return false;
@@ -1607,23 +2005,33 @@ std::complex<double> modified_bessel_first_kind(double order, std::complex<doubl
         return std::complex<double>(0.0, 0.0);
     }
     
-    std::complex<double> sum = 0;
-    std::complex<double> inc = 0;
-    std::complex<double> aux = 0.25 * pow(z, 2);
-    size_t limitK = 1000;
+    // ABT #1130: this had the same defect as bessel_first_kind (ABT #1127). The terms were
+    // formed as pow(aux, k) / (tgammaf(k+1) * tgammaf(order+k+1)) and the loop broke as soon
+    // as that divider overflowed. tgammaf is SINGLE precision, so the PRODUCT of the two
+    // factorials passes 3.4e38 around k = 21 for order 0, REGARDLESS of the argument. Every
+    // term of I_n is positive, so the sum only grows and truncating it always returns a
+    // number that is too small. Measured against mpmath: the old code returned 97.8% of
+    // I_0(30) and 11.2% of I_0(50) -- once |z| is past ~23 the cut lands on the rising terms
+    // and the answer is not I_n(z) at all. Its one hot path was shielded by
+    // modified_bessel_ratio_I1_I0 switching to an asymptotic expansion above |z| = 20, so
+    // nothing observable was wrong -- but any new caller reaching here with a large argument
+    // got silently wrong numbers and no error.
+    //
+    // Same fix as the sibling: build each term from the previous one by recurrence, so no
+    // factorial is ever formed and nothing overflows, and gate the convergence test on
+    // k > |z| so a small early term cannot stop a sum whose terms are still growing.
+    std::complex<double> aux = 0.25 * z * z;
+    std::complex<double> term = std::complex<double>(1.0 / std::tgamma(order + 1.0), 0.0);
+    std::complex<double> sum = term;
+    size_t limitK = 10000;
     for (size_t k = 0; k < limitK; ++k)
     {
-        double divider = tgammaf(k + 1) * tgammaf(order + k + 1);
-        if (std::isinf(divider)) {
+        term *= aux / ((k + 1.0) * (order + k + 1.0));
+        if (!std::isfinite(term.real()) || !std::isfinite(term.imag())) {
             break;
         }
-        inc = pow(aux, k) / divider;
-        // Check if increment is valid
-        if (!std::isfinite(inc.real()) || !std::isfinite(inc.imag())) {
-            break;
-        }
-        sum += inc;
-        if (std::abs(inc) < std::abs(sum) * 0.0001){
+        sum += term;
+        if (k > std::abs(z) && std::abs(term) < std::abs(sum) * 0.0001){
             break;
         }
     }
@@ -1650,19 +2058,32 @@ std::complex<double> modified_bessel_first_kind(double order, std::complex<doubl
 }
 
 std::complex<double> bessel_first_kind(double order, std::complex<double> z) {
-    std::complex<double> sum = 0;
-    std::complex<double> inc = 0;
-    std::complex<double> aux = 0.25 * pow(z, 2);
-    size_t limitK = 1000;
+    // ABT #1127: the terms used to be formed as pow(aux, k) / (tgammaf(k+1) * tgammaf(order+k+1))
+    // and the loop broke as soon as that divider overflowed. tgammaf is SINGLE precision, so it
+    // reaches inf at 35! -- i.e. around k = 33..35 REGARDLESS of the argument. For |z| above
+    // roughly 23 the series is still on its rising terms there, so the sum was truncated in the
+    // middle of the peak and the returned value is not J_n(z) at all: it swings sign and then
+    // settles on a wrong small number. Through the Kelvin functions that is what produced the
+    // vertical notch in Sweeper::sweep_resistance_over_frequency (Ferreira's round-conductor
+    // proximity factor went NEGATIVE around 30 MHz). It is the same defect that was already
+    // diagnosed for the modified-Bessel sibling in modified_bessel_ratio_I1_I0 below.
+    //
+    // Build each term from the previous one by recurrence instead: no factorial is ever formed,
+    // so nothing overflows and the loop can only end on real convergence. The convergence test
+    // is additionally gated on k > |z| so that a small early term cannot stop the sum while the
+    // terms are still growing.
+    std::complex<double> aux = 0.25 * z * z;
+    std::complex<double> term = std::complex<double>(1.0 / std::tgamma(order + 1.0), 0.0);
+    std::complex<double> sum = term;
+    size_t limitK = 10000;
     for (size_t k = 0; k < limitK; ++k)
     {
-        double divider = tgammaf(k + 1) * tgammaf(order + k + 1);
-        if (std::isinf(divider)) {
+        term *= -aux / ((k + 1.0) * (order + k + 1.0));
+        if (!std::isfinite(term.real()) || !std::isfinite(term.imag())) {
             break;
         }
-        inc = pow(-1, k) * pow(aux, k) / divider;
-        sum += inc;
-        if (std::abs(inc) < std::abs(sum) * 0.0001){
+        sum += term;
+        if (k > std::abs(z) && std::abs(term) < std::abs(sum) * 0.0001){
             break;
         }
     }
@@ -1985,13 +2406,30 @@ std::string to_title_case(std::string text) {
 }
 
 std::complex<double> modified_bessel_ratio_I1_I0(std::complex<double> z) {
-    // The truncated series in modified_bessel_first_kind (float tgammaf overflow
-    // at k~21) silently diverges for |z| >~ 20-25, producing NEGATIVE skin
-    // factors. Beyond that, use the asymptotic expansion
+    // This branch was introduced to dodge the truncated series in
+    // modified_bessel_first_kind. That defect is fixed (ABT #1130), but the branch stays,
+    // for a reason that is now the real one: above |z| ~ 20 the ASCENDING SERIES is
+    // unusable for a COMPLEX argument however exactly it is summed. Its terms peak near
+    // exp(|z|) while the sum is only exp(Re z), so on the ray these callers pass --
+    // alpha = (1 + j) r / delta, arg = pi/4 -- the cancellation is exp(0.29 |z|) and eats
+    // the mantissa. The asymptotic expansion
     //   I1(z)/I0(z) = 1 - 1/(2z) - 1/(8z^2) - ...
-    // which is accurate to <0.1% at |z| = 20.
+    // is the right tool there: measured against mpmath at 30 dps on that ray it agrees to
+    // 1.7e-5 relative at |z| = 20 and 4.9e-6 at |z| = 30, which is under 0.001% on the skin
+    // factor built from it.
     if (std::abs(z) < 20.0) {
         return modified_bessel_first_kind(1, z) / modified_bessel_first_kind(0, z);
+    }
+    // ...but only inside |arg z| < pi/2. Past that the subdominant exp(-z) branch takes over
+    // and the expansion returns +1.02 where the true ratio is -0.99: plausible magnitude,
+    // wrong sign. No caller goes there today (every one passes arg = pi/4), and neither tool
+    // works there, so refuse rather than hand a future caller a number that looks fine.
+    if (std::abs(std::arg(z)) >= std::numbers::pi / 2) {
+        throw InvalidInputException(
+            ErrorCode::INVALID_INPUT,
+            "modified_bessel_ratio_I1_I0: |z| = " + std::to_string(std::abs(z)) + " with arg z = " +
+            std::to_string(std::arg(z)) + " rad lies outside the sector where either the ascending "
+            "series or the asymptotic expansion can be evaluated");
     }
     return std::complex<double>(1.0, 0) - 1.0 / (2.0 * z) - 1.0 / (8.0 * z * z);
 }
@@ -2056,7 +2494,7 @@ std::vector<size_t> get_main_harmonic_indexes(OperatingPointExcitation excitatio
         }
         double frequency = excitation.get_frequency();
         auto sampledWaveform = Inputs::calculate_sampled_waveform(signalDescriptor.get_waveform().value(), frequency);
-        signalDescriptor.set_harmonics(Inputs::calculate_harmonics_data(sampledWaveform, frequency));
+        signalDescriptor.set_harmonics(Inputs::calculate_harmonics_data(signalDescriptor.get_waveform().value(), sampledWaveform, frequency));
     }
     auto harmonics = signalDescriptor.get_harmonics().value();
     size_t maximumCommonIndex = harmonics.get_amplitudes().size();
@@ -2231,6 +2669,11 @@ std::string fix_filename(std::string filename) {
 }
 
 SignalDescriptor standardize_signal_descriptor(SignalDescriptor signalDescriptor, double frequency) {
+    // ABT #1330: autocomplete rebuilds a signal given by processed parameters only; it must not
+    // let create_waveform assume the duty cycle or dead time that the MAS did not give.
+    if (!signalDescriptor.get_waveform() && signalDescriptor.get_processed()) {
+        Inputs::throw_if_processed_cannot_define_waveform(signalDescriptor.get_processed().value(), "signal");
+    }
 
     auto standardSignalDescriptor = Inputs::standardize_waveform(signalDescriptor, frequency);
     if (standardSignalDescriptor.get_harmonics()) {
@@ -2254,11 +2697,11 @@ OperatingPointExcitation calculate_reflected_secondary(OperatingPointExcitation 
     auto currentSignalDescriptor = Inputs::reflect_waveform(primaryExcitation.get_current().value(), turnRatio, currentSignalDescriptorProcessed.get_label());
 
     auto voltageSampledWaveform = Inputs::calculate_sampled_waveform(voltageSignalDescriptor.get_waveform().value(), excitationOfThisWinding.get_frequency());
-    voltageSignalDescriptor.set_harmonics(Inputs::calculate_harmonics_data(voltageSampledWaveform, excitationOfThisWinding.get_frequency()));
+    voltageSignalDescriptor.set_harmonics(Inputs::calculate_harmonics_data(voltageSignalDescriptor.get_waveform().value(), voltageSampledWaveform, excitationOfThisWinding.get_frequency()));
     voltageSignalDescriptor.set_processed(Inputs::calculate_processed_data(voltageSignalDescriptor, voltageSampledWaveform, true));
 
     auto currentSampledWaveform = Inputs::calculate_sampled_waveform(currentSignalDescriptor.get_waveform().value(), excitationOfThisWinding.get_frequency());
-    currentSignalDescriptor.set_harmonics(Inputs::calculate_harmonics_data(currentSampledWaveform, excitationOfThisWinding.get_frequency()));
+    currentSignalDescriptor.set_harmonics(Inputs::calculate_harmonics_data(currentSignalDescriptor.get_waveform().value(), currentSampledWaveform, excitationOfThisWinding.get_frequency()));
     currentSignalDescriptor.set_processed(Inputs::calculate_processed_data(currentSignalDescriptor, currentSampledWaveform, true));
 
     excitationOfThisWinding.set_voltage(voltageSignalDescriptor);
@@ -2269,7 +2712,11 @@ OperatingPointExcitation calculate_reflected_secondary(OperatingPointExcitation 
 
 Mas mas_autocomplete(Mas mas, bool simulate, json configuration) {
 
-    auto magnetic = magnetic_autocomplete(mas.get_magnetic(), configuration);
+    // ABT #620: thread the design's own requirements into the coil so a re-wind here
+    // (the common case for a file that only carries functionalDescription + bobbin)
+    // honours the declared insulation standard instead of falling back to bare
+    // mechanical spacing.
+    auto magnetic = magnetic_autocomplete(mas.get_magnetic(), configuration, mas.get_inputs());
     mas.set_magnetic(magnetic);
     auto inputs = inputs_autocomplete(mas.get_inputs(), mas.get_magnetic(), configuration);
     mas.set_inputs(inputs);
@@ -2283,7 +2730,7 @@ Mas mas_autocomplete(Mas mas, bool simulate, json configuration) {
     MagnetizingInductance magnetizingInductanceObj;
     // Because Simulation may remove some processed data, and we are in no rush here
     for (size_t operatingPointIndex = 0; operatingPointIndex < mas.get_inputs().get_operating_points().size(); operatingPointIndex++) {
-        double magnetizingInductance = magnetizingInductanceObj.calculate_inductance_from_number_turns_and_gapping(mas.get_magnetic().get_core(), mas.get_magnetic().get_coil(), &mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex]).get_magnetizing_inductance().get_nominal().value();
+        double magnetizingInductance = magnetizingInductanceObj.calculate_inductance_from_number_turns_and_gapping(mas.get_magnetic(), &mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex]).get_magnetizing_inductance().get_nominal().value();
         mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex] = Inputs::process_operating_point(mas.get_inputs().get_operating_points()[operatingPointIndex], magnetizingInductance);
         for (size_t windingIndex = 0; windingIndex < numberWindings; windingIndex++) {
             auto excitation = mas.get_inputs().get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex];
@@ -2333,7 +2780,7 @@ Inputs inputs_autocomplete(Inputs inputs, std::optional<Magnetic> magnetic, json
                 }
                 if (!current.get_harmonics()) {
                     auto sampledCurrentWaveform = Inputs::calculate_sampled_waveform(current.get_waveform().value(), inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].get_frequency());
-                    auto harmonics = Inputs::calculate_harmonics_data(sampledCurrentWaveform, inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].get_frequency());
+                    auto harmonics = Inputs::calculate_harmonics_data(current.get_waveform().value(), sampledCurrentWaveform, inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].get_frequency());
                     current.set_harmonics(harmonics);
                 }
                 inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].set_current(current);
@@ -2346,7 +2793,7 @@ Inputs inputs_autocomplete(Inputs inputs, std::optional<Magnetic> magnetic, json
                 }
                 if (!voltage.get_harmonics()) {
                     auto sampledvoltageWaveform = Inputs::calculate_sampled_waveform(voltage.get_waveform().value(), inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].get_frequency());
-                    auto harmonics = Inputs::calculate_harmonics_data(sampledvoltageWaveform, inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].get_frequency());
+                    auto harmonics = Inputs::calculate_harmonics_data(voltage.get_waveform().value(), sampledvoltageWaveform, inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].get_frequency());
                     voltage.set_harmonics(harmonics);
                 }
                 inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].set_voltage(voltage);
@@ -2399,7 +2846,14 @@ Inputs inputs_autocomplete(Inputs inputs, std::optional<Magnetic> magnetic, json
     return inputs;
 }
 
-Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
+Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optional<Inputs> inputs) {
+    // A datasheet-only catalogue part (neither core nor coil, see Magnetic.h) has no construction
+    // to complete: it is returned as it is, so a catalogue mixing such parts with constructed ones
+    // can be loaded with expansion on. A part with only one of the two is still refused below.
+    if (!magnetic.has_core() && !magnetic.has_coil()) {
+        return magnetic;
+    }
+
     // Core
     auto shape = magnetic.get_mutable_core().resolve_shape();
 
@@ -2407,6 +2861,33 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
         magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::TOROIDAL);
         shape.set_magnetic_circuit(MagneticCircuit::CLOSED);
         magnetic.get_mutable_core().get_mutable_functional_description().get_mutable_gapping().clear();
+    }
+    else if (magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::DRUM ||
+             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::ROD) {
+        // Open-circuit single piece (drum ABT #331, rod ABT #933): honest type, and gapping is
+        // meaningless — the return path is already air. Drop it like the toroid branch does:
+        // a core carried over from a gapped two-piece set (the web builder swaps the shape and
+        // keeps the rest) otherwise reaches the inductance model with that stale gap and is
+        // refused as "an open-circuit core cannot be gapped" (ABT #1071).
+        magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::OPEN_SHAPE);
+        shape.set_magnetic_circuit(MagneticCircuit::OPEN);
+        magnetic.get_mutable_core().get_mutable_functional_description().get_mutable_gapping().clear();
+    }
+    else if (magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::MOLDED) {
+        // Molded composite body (ABT #357): single pressed solid, closed in-material —
+        // the distributed gap lives in the material law, so discrete gapping is meaningless.
+        magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::CLOSED_SHAPE);
+        shape.set_magnetic_circuit(MagneticCircuit::CLOSED);
+    }
+    else if (magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::UI ||
+             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::PQI ||
+             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::DRUM_RING ||
+             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::DRUM_SEMISHIELDED) {
+        // Piece-and-plate: the record already describes the whole assembly, so it is "closed" in
+        // the MAS sense of having to be used by itself (ABT #274/#275; drumRing per ABT #366 —
+        // its two structural annular gaps are synthesized by Core::process_gap, not listed here).
+        magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::PIECE_AND_PLATE);
+        shape.set_magnetic_circuit(MagneticCircuit::CLOSED);
     }
     else {
         magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::TWO_PIECE_SET);
@@ -2426,7 +2907,7 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
 
     if (!magnetic.get_core().get_processed_description()) {
         magnetic.get_mutable_core().process_data();
-        magnetic.get_mutable_core().process_gap();
+        magnetic.get_mutable_core().process_gap_or_throw();
     }
 
     if (!magnetic.get_core().get_geometrical_description()) {
@@ -2473,6 +2954,68 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
             insulationWireCoating = wire.resolve_coating().value();
         }
         else {
+            // A FOIL FIRST (2026-09-04; moved ahead of the ABT #902 check below 2026-09-23). "No coating stated" reads as BARE for a wire whose
+            // insulation is a coating ON the conductor -- enamel, serving, extrusion -- because
+            // then the record would have said so. A foil's insulation is not on the foil: it is
+            // a separate film wound in with it, one per turn interval, and no foil record states
+            // it (all 35 in the database carry no coating). Stamping BARE on a foil therefore
+            // asserts something no source supports and something that cannot be built: a stack
+            // of bare sheets touching each other is a shorted winding. Leave the coating unset
+            // and let the foil's own rule apply (Wire::get_foil_interlayer_insulation, which
+            // uses the standard polyester unless the wire declares otherwise). A foil that
+            // really is bare -- anodised aluminium carries its own oxide -- says so explicitly,
+            // and that declaration is still honoured.
+            // It must come BEFORE the outer-vs-conductor check: autocomplete itself gives a foil
+            // outerWidth = thickness + film (0.2 mm "Foil 0.2" -> 0.225 mm) and no coating, so a
+            // second autocomplete of its own output tripped that check on the 25 um film and threw
+            // INVALID_WIRE_DATA (two_switch_forward_transformer_complete, OMFEM corpus C1). For a
+            // foil that difference IS the film, not an unstated coating.
+            if (wire.get_type() == WireType::FOIL) {
+                magnetic.get_mutable_coil().get_mutable_functional_description()[i].set_wire(wire);
+                continue;
+            }
+            // ABT #902: "no coating stated" may be read as BARE only while the wire's own
+            // geometry agrees with it. A wire whose outer size EXCEEDS its conductor has a
+            // dielectric between those two surfaces by construction; stamping BARE on it is
+            // not completing the wire, it is overwriting what the geometry says with a guess,
+            // and a wrong one. That guess is how ABT #898's uncoated wire reached the netlist
+            // wearing an insulation MATERIAL (the block below hands every coating one) while
+            // still reporting zero thickness -- self-contradictory data that surfaced far
+            // downstream as an infinite turn-to-turn capacitance, or worse, as a finite
+            // capacitance computed with no dielectric at all.
+            double conductorToOuterGap = std::numeric_limits<double>::lowest();
+            if (wire.get_type() == WireType::ROUND || wire.get_type() == WireType::LITZ) {
+                if (wire.get_outer_diameter() && wire.get_conducting_diameter()) {
+                    conductorToOuterGap = resolve_dimensional_values(wire.get_outer_diameter().value()) -
+                                          resolve_dimensional_values(wire.get_conducting_diameter().value());
+                }
+            }
+            else {
+                if (wire.get_outer_width() && wire.get_conducting_width()) {
+                    conductorToOuterGap = std::max(conductorToOuterGap,
+                                                   resolve_dimensional_values(wire.get_outer_width().value()) -
+                                                       resolve_dimensional_values(wire.get_conducting_width().value()));
+                }
+                if (wire.get_outer_height() && wire.get_conducting_height()) {
+                    conductorToOuterGap = std::max(conductorToOuterGap,
+                                                   resolve_dimensional_values(wire.get_outer_height().value()) -
+                                                       resolve_dimensional_values(wire.get_conducting_height().value()));
+                }
+            }
+            // One nanometre: the same contact tolerance StrayCapacitance's shorted-turns guard
+            // uses, far below any real dielectric and far above the rounding of millimetre-scale
+            // dimensions.
+            if (conductorToOuterGap > 1e-9) {
+                std::string windingName = magnetic.get_coil().get_functional_description()[i].get_name();
+                throw InvalidInputException(
+                    ErrorCode::INVALID_WIRE_DATA,
+                    "The wire on winding " + std::to_string(i) + " ('" + windingName + "') states no coating, but its"
+                    " outer size exceeds its conductor by " + std::to_string(conductorToOuterGap) + " m, so it is not"
+                    " bare: something insulates those two surfaces and the wire does not say what. Give the coating"
+                    " (a type with a thickness, or a grade the standard's table can resolve); it cannot be inferred"
+                    " from the outer size alone, and calling the wire bare would delete the only dielectric its"
+                    " turns have.");
+            }
             insulationWireCoating.set_type(InsulationWireCoatingType::BARE);
         }
 
@@ -2486,8 +3029,15 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
             }
         }
 
-        wire.set_coating(insulationWireCoating);
-        auto insulationWireCoatingMaterial = wire.resolve_coating_insulation_material();
+        // Resolve THIS coating's own material, not the wire's "insulating" coating. Since
+        // 749296b3 Wire::resolve_coating_insulation_material(wire) answers with the STRAND's
+        // coating for litz (the enamel between strands, correct for thermal/dielectric use).
+        // Writing that answer here replaced a litz's outer jacket material with its strands'
+        // enamel -- an FEP-insulated litz came back as "insulated / Polyurethane 155", which
+        // the Painter then rejected ("Unknown insulated wire material") and every plot of the
+        // imported design went blank (ABT #1483). A named material that is not in the
+        // database still throws from find_insulation_material_by_name.
+        auto insulationWireCoatingMaterial = Wire::resolve_coating_insulation_material(insulationWireCoating);
         insulationWireCoating.set_material(insulationWireCoatingMaterial);
         wire.set_coating(insulationWireCoating);
 
@@ -2496,17 +3046,93 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
             wire.set_strand(strand);
         }
 
+        // ABT #823: complete the outer dimensions before the coil is wound. A wire
+        // given inline carries the conductor and its coating but often no outer size,
+        // and its name ("Round 1 - Grade 1") need not exist in the wire database, so
+        // nothing filled them in. wind() below then read the empty optional and the
+        // whole load died with a bare "bad optional access" that named neither the
+        // part, the winding, nor the field — 49 of asgard's 236 common-mode chokes,
+        // and the first one killed the batch.
+        //
+        // The conductor plus its coating IS the outer size, and MKF already computes
+        // it, so derive it here rather than demanding the caller precompute geometry.
+        // If a wire genuinely cannot be completed, fail naming the winding and what
+        // is missing — never an anonymous optional access.
+        auto describe_winding = [&](size_t windingIndex) {
+            std::string windingName = magnetic.get_coil().get_functional_description()[windingIndex].get_name();
+            std::string reference;
+            if (magnetic.get_manufacturer_info() && magnetic.get_manufacturer_info()->get_reference()) {
+                reference = " of magnetic '" + magnetic.get_manufacturer_info()->get_reference().value() + "'";
+            }
+            return "winding " + std::to_string(windingIndex) + " ('" + windingName + "')" + reference;
+        };
+
+        auto as_dimension = [](double value) {
+            DimensionWithTolerance dimensionWithTolerance;
+            dimensionWithTolerance.set_nominal(value);
+            return dimensionWithTolerance;
+        };
+
+        try {
+            switch (wire.get_type()) {
+                case WireType::ROUND:
+                case WireType::LITZ: {
+                    if (!wire.get_outer_diameter()) {
+                        wire.set_outer_diameter(as_dimension(wire.calculate_outer_diameter()));
+                    }
+                    break;
+                }
+                case WireType::RECTANGULAR: {
+                    if (!wire.get_outer_width()) {
+                        wire.set_outer_width(as_dimension(wire.calculate_outer_width()));
+                    }
+                    if (!wire.get_outer_height()) {
+                        wire.set_outer_height(as_dimension(wire.calculate_outer_height()));
+                    }
+                    break;
+                }
+                case WireType::FOIL:
+                case WireType::PLANAR: {
+                    // ABT #967: a database FOIL carries only its thickness (conductingWidth) --
+                    // the turn is as tall as its section and wind() cuts it to that height
+                    // (Wire::cut_foil_wire_to_section), which is when conductingHeight and the
+                    // outer sizes appear. A PLANAR is the mirror case (its width is cut to the
+                    // section). So derive here only the dimension the wire already states;
+                    // asking for the other one before winding dereferenced an empty optional and
+                    // refused every design that names a database foil ("Foil 0.2").
+                    if (!wire.get_outer_width() && wire.get_conducting_width()) {
+                        wire.set_outer_width(as_dimension(wire.calculate_outer_width()));
+                    }
+                    if (!wire.get_outer_height() && wire.get_conducting_height()) {
+                        wire.set_outer_height(as_dimension(wire.calculate_outer_height()));
+                    }
+                    break;
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA,
+                                        "Cannot determine the outer dimensions of the wire on " + describe_winding(i) +
+                                        ": the wire gives no outer size and one cannot be derived from its conductor and"
+                                        " coating (" + std::string(e.what()) + ")");
+        }
+
         magnetic.get_mutable_coil().get_mutable_functional_description()[i].set_wire(wire);
     }
 
     Bobbin bobbin;
+    // ABT #1220: a quick bobbin built here carries synthesised pins only when the setting asks.
+    std::optional<OrientationEnum> quickBobbinPins;
+    if (settings.get_coil_quick_bobbin_generate_pins()) {
+        quickBobbinPins = settings.get_coil_quick_bobbin_pins_orientation();
+    }
 
     if (std::holds_alternative<std::string>(magnetic.get_mutable_coil().get_bobbin())) {
         if (std::get<std::string>(magnetic.get_mutable_coil().get_bobbin()) == "Basic") {
-            bobbin = Bobbin::create_quick_bobbin(magnetic.get_mutable_core(), false);
+            bobbin = Bobbin::create_quick_bobbin(magnetic.get_mutable_core(), false, quickBobbinPins);
         }
         else if (std::get<std::string>(magnetic.get_mutable_coil().get_bobbin()) == "Dummy" || std::get<std::string>(magnetic.get_mutable_coil().get_bobbin()) == "None") {
-            bobbin = Bobbin::create_quick_bobbin(magnetic.get_mutable_core(), true);
+            bobbin = Bobbin::create_quick_bobbin(magnetic.get_mutable_core(), true, quickBobbinPins);
         }
         else {
             bobbin = magnetic.get_mutable_coil().resolve_bobbin();
@@ -2518,10 +3144,10 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
 
     if (!bobbin.get_functional_description() && !bobbin.get_processed_description()) {
         if (magnetic.get_mutable_core().get_type() == CoreType::TWO_PIECE_SET && magnetic.get_wire(0).get_type() != WireType::RECTANGULAR && magnetic.get_wire(0).get_type() != WireType::PLANAR) {
-            bobbin = Bobbin::create_quick_bobbin(magnetic.get_mutable_core(), false);
+            bobbin = Bobbin::create_quick_bobbin(magnetic.get_mutable_core(), false, quickBobbinPins);
         }
         else {
-            bobbin = Bobbin::create_quick_bobbin(magnetic.get_mutable_core(), true);
+            bobbin = Bobbin::create_quick_bobbin(magnetic.get_mutable_core(), true, quickBobbinPins);
         }
 
     }
@@ -2533,18 +3159,38 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
             to_json(configuration["windingOrientation"], windingOrientation);
             processedDescription.get_mutable_winding_windows()[0].set_sections_orientation(windingOrientation);
         }
+        else if (magnetic.get_mutable_coil().is_edge_wound_coil()) {
+            // An edge-wound coil is a flat spiral: its turns advance RADIALLY, which is what
+            // CONTIGUOUS means. That is a property of the winding, not of the core, so it is
+            // asked first and holds whatever the core is.
+            processedDescription.get_mutable_winding_windows()[0].set_sections_orientation(WindingOrientation::CONTIGUOUS);
+        }
         else {
-            if (magnetic.get_mutable_core().get_type() == CoreType::TWO_PIECE_SET) {
-                if (magnetic.get_mutable_coil().is_edge_wound_coil()) {
-                    processedDescription.get_mutable_winding_windows()[0].set_sections_orientation(WindingOrientation::CONTIGUOUS);
-                }
-                else {
-                    processedDescription.get_mutable_winding_windows()[0].set_sections_orientation(WindingOrientation::OVERLAPPING);
-                }
-            }
-            else {
-                processedDescription.get_mutable_winding_windows()[0].set_sections_orientation(WindingOrientation::CONTIGUOUS);
-            }
+            // ABT #998: this used to switch on the CORE TYPE -- TWO_PIECE_SET got OVERLAPPING
+            // and EVERYTHING ELSE fell through to CONTIGUOUS. Core type does not decide which way
+            // a coil is wound; the WINDOW does. A round window (a toroid) is wound contiguously
+            // because its turns really do advance around the bore, and a rectangular window is
+            // wound overlapping because its layers build radially off the former.
+            //
+            // The old rule swept up every non-two-piece core: drums, rods, molded parts, and the
+            // whole PIECE_AND_PLATE family (UI, UT, PQI, drum-ring, drum-semishielded) are all
+            // bobbin-wound in a rectangular window and were all being told to wind as spirals.
+            // Downstream that seats the winding by the TURN-axis alignment instead of on the
+            // former, so a narrow winding floated in the middle of its window -- visible in the
+            // browser, and the reason this was found (a 0,191 mm layer centred in a 0,3 mm window
+            // at 0,7045 mm instead of resting on the former at 0,650 mm).
+            //
+            // It is also a latent trap for reclassification: any core moved out of TWO_PIECE_SET
+            // silently changed winding orientation as a side effect. Measured, UT and EI do NOT
+            // reach this branch today (their catalogue bobbins already carry an orientation, so
+            // the guard above skips it) — but that is luck of the data, not a property of the
+            // rule, and it is why the rule should not depend on core type at all.
+            //
+            // Bobbin::get_winding_window_sections_orientation already IS this rule, backed by
+            // defaultRoundWindowSectionsOrientation / defaultRectangularWindowSectionsOrientation.
+            // Call it rather than restate it.
+            processedDescription.get_mutable_winding_windows()[0].set_sections_orientation(
+                bobbin.get_winding_window_sections_orientation(0));
         }
 
         if (configuration.contains("sectionAlignment")) {
@@ -2575,7 +3221,40 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
         magnetic.get_mutable_coil().set_core_columns(magnetic.get_mutable_core().get_processed_description()->get_columns());
     }
 
-    if (!magnetic.get_mutable_coil().get_turns_description()) {
+    // ABT #646: real winding is a LAYOUT setting, not a drawing one — wind() reserves the
+    // slots the connection leads route through and shortens every layer they cross. A coil
+    // that arrives already wound was laid out WITHOUT those corridors, and this function used
+    // to keep it verbatim, so switching real winding on changed nothing: the stored layout
+    // still put a turn in the corridor, and everything downstream (the Painter's connection
+    // views, MVB++'s conductor router) worked from geometry that had never reserved anything.
+    // Measured on a 12-turn 2-layer litz design: as stored, layer 1 spans the full 10.2 mm
+    // window and turn 6 sits EXACTLY on the input connection's reserved rectangle (100%
+    // penetration); re-wound with the flag on, layer 1 is one wire slot shorter at the bottom
+    // (9.345 mm) and the turns clear the corridor. Downstream, that stale layout is what made
+    // the entrance lead and a dragback coincident and unroutable.
+    //
+    // So re-wind when real winding is asked for. This CHANGES turn coordinates for a coil that
+    // already had them — deliberately: with the flag on, a layout that ignores the corridors is
+    // not the design being asked for.
+    //
+    // NOT for planar: real winding (leads, blocking, connection routing) is not implemented for
+    // PCB constructions and MKF refuses it at the machinery that would engage — wind(), the
+    // connection-resistance path. There are no lead corridors to reserve on a planar layout, so
+    // re-winding one would buy nothing and would turn the refusal into a hard failure of
+    // autocomplete itself, i.e. a global display setting would stop every planar design from
+    // rendering at all. The gates that own the ruling still fire wherever routing is attempted.
+    const bool rewindForRealWinding = settings.get_coil_use_real_winding_geometry()
+                                   && !magnetic.get_mutable_coil().is_planar();
+    if (!magnetic.get_mutable_coil().get_turns_description() || rewindForRealWinding) {
+        // ABT #620: without this, wind() below has no design requirements to check
+        // and falls back to calculate_mechanical_insulation() (0 margin, a single
+        // bare mechanical layer) even when the design declares an insulation
+        // standard — a file that carries only functionalDescription + bobbin (no
+        // sectionsDescription) re-wound here for painter/3D/simulation otherwise
+        // silently loses its declared creepage/clearance/DTI requirements.
+        if (inputs) {
+            magnetic.get_mutable_coil().set_inputs(inputs.value());
+        }
         if (configuration.contains("interleavingLevel")) {
             uint8_t interleavingLevel = configuration["interleavingLevel"];
             magnetic.get_mutable_coil().set_interleaving_level(interleavingLevel);
@@ -2604,17 +3283,102 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration) {
             magnetic.get_mutable_coil().wind(pattern);
         }
         else {
-            magnetic.get_mutable_coil().wind();
+            // ABT #610: a MAS file that carries a sectionsDescription has already SAID its winding
+            // pattern — the conduction sections' winding sequence IS the interleaving (P,S,P,S =
+            // pattern {0,1} x 2). MAS has no other field for it (deliberately: the sections are
+            // the description), and winding with the default pattern here silently UN-interleaved
+            // such files: 09_planar declares P,S,P,S,P,S and was rebuilt P,S. Derive the pattern
+            // from the given sections — the smallest repeating unit and its count map onto wind's
+            // (pattern, repetitions) form — and fall back to the default wind for anything the
+            // derivation cannot express (sections sharing partial windings, unknown winding
+            // names). Data first, never invented: this reads the file's own structure.
+            std::vector<size_t> sequence;
+            bool derivable = false;
+            if (magnetic.get_coil().get_sections_description()) {
+                derivable = true;
+                auto sections = magnetic.get_coil().get_sections_description().value();
+                auto windings = magnetic.get_coil().get_functional_description();
+                for (const auto& section : sections) {
+                    if (section.get_type() != ElectricalType::CONDUCTION) {
+                        continue;
+                    }
+                    if (section.get_partial_windings().size() != 1) {
+                        derivable = false;
+                        break;
+                    }
+                    auto name = section.get_partial_windings()[0].get_winding();
+                    size_t index = windings.size();
+                    for (size_t w = 0; w < windings.size(); ++w) {
+                        if (windings[w].get_name() == name) {
+                            index = w;
+                            break;
+                        }
+                    }
+                    if (index == windings.size()) {
+                        derivable = false;
+                        break;
+                    }
+                    sequence.push_back(index);
+                }
+            }
+            if (derivable && !sequence.empty()) {
+                // Smallest repeating unit: sequence = unit repeated k times.
+                size_t unitLength = sequence.size();
+                for (size_t u = 1; u <= sequence.size() / 2; ++u) {
+                    if (sequence.size() % u != 0) {
+                        continue;
+                    }
+                    bool repeats = true;
+                    for (size_t i = u; i < sequence.size() && repeats; ++i) {
+                        repeats = sequence[i] == sequence[i % u];
+                    }
+                    if (repeats) {
+                        unitLength = u;
+                        break;
+                    }
+                }
+                std::vector<size_t> pattern(sequence.begin(), sequence.begin() + unitLength);
+                magnetic.get_mutable_coil().wind(pattern, sequence.size() / unitLength);
+            }
+            else {
+                magnetic.get_mutable_coil().wind();
+            }
         }
     }
 
-    if (magnetic.get_mutable_coil().get_layers_description()) {
-        auto layers = magnetic.get_mutable_coil().get_layers_description().value();
-        for (size_t layerIndex = 0; layerIndex < layers.size(); ++layerIndex) {
-            auto insulationMaterial = Coil::resolve_insulation_layer_insulation_material(magnetic.get_mutable_coil(), layers[layerIndex].get_name());
-            layers[layerIndex].set_insulation_material(insulationMaterial);
+    // ABT #930: autocompleting ONE magnetic and getting a coil with no turns back, silently, is
+    // how "Turns not created" reached a reporter with no way to tell a broken winder from a
+    // conductor that cannot fit its window. Deliberately a loud warning and not a throw: the
+    // per-candidate wind() callers (CoilAdviser, Impedance, StrayCapacitance) legitimately cull
+    // on a failed wind, and a throw here would turn their culls into aborts.
+    if (!magnetic.get_mutable_coil().get_turns_description()) {
+        const auto& reason = magnetic.get_mutable_coil().get_last_fit_failure();
+        OM_WARNING_M("Utils", "Autocomplete produced no turns for this magnetic"
+                              + (reason.empty()
+                                 ? std::string(": the winding does not fit its window, and the reason could not "
+                                               "be narrowed further.")
+                                 : ". " + reason));
+    }
+
+    // ABT #1172 (WP3, MAS RFC 0013): winding ends terminate on the bobbin's pins. After winding,
+    // when the turn positions are final, and before anything reads a connection length; only
+    // when the bobbin carries pins[] and some winding end is not on a pin yet. A bobbin without
+    // pins keeps today's behaviour (leads end at the window border). assign_pins never overrides
+    // a pinName the design gave, and throws on a plan that breaks the rows or the creepage.
+    // `bobbin` is the one set on the coil above; winding does not move its pins.
+    // ABT #1237: only when Settings coil_connect_leads_to_pins asks for it (off by default).
+    if (settings.get_coil_connect_leads_to_pins() &&
+        magnetic.get_mutable_coil().get_turns_description() && bobbin.get_processed_description() &&
+        bobbin.get_processed_description()->get_pins() && !bobbin.get_processed_description()->get_pins()->empty() &&
+        !magnetic.get_mutable_coil().has_complete_pin_connections()) {
+        if (inputs) {
+            magnetic.get_mutable_coil().set_inputs(inputs.value());
         }
-        magnetic.get_mutable_coil().set_layers_description(layers);
+        magnetic.get_mutable_coil().assign_pins(bobbin, magnetic.get_mutable_core());
+    }
+
+    if (magnetic.get_mutable_coil().get_layers_description()) {
+        magnetic.get_mutable_coil().resolve_layers_insulation_materials();
     }
 
     return magnetic;
@@ -2965,7 +3729,7 @@ std::vector<MAS::CoreGap> extract_core_gapping(OpenMagnetics::Core ungappedCore,
     if (ungappedCore.get_shape_family() != CoreShapeFamily::T) {
         auto gapping =  magnetizingInductanceModel.calculate_gapping_from_number_turns_and_inductance(ungappedCore, coil, &inputs, OpenMagnetics::GappingType::GROUND);
         ungappedCore.get_mutable_functional_description().set_gapping(gapping);
-        ungappedCore.process_gap();
+        ungappedCore.process_gap_or_throw();
     }
 
     return ungappedCore.get_functional_description().get_gapping();

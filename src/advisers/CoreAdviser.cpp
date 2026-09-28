@@ -1,4 +1,5 @@
 #include "advisers/CoreAdviser.h"
+#include "support/StableSortByIndex.h"
 #include "advisers/CoreMaterialCrossReferencer.h"
 #include "advisers/MagneticFilter.h"
 #include "advisers/MagneticFilterInternal.h"  // for is_energy_storing_topology()
@@ -123,7 +124,7 @@ std::vector<double> normalize_scoring(std::vector<std::pair<Magnetic, double>>* 
 }
 
 void sort_magnetics_by_scoring(std::vector<std::pair<Magnetic, double>>* magneticsWithScoring) {
-    stable_sort((*magneticsWithScoring).begin(), (*magneticsWithScoring).end(), [](const std::pair<Magnetic, double>& b1, const std::pair<Magnetic, double>& b2) {
+    stable_sort_by_index(*magneticsWithScoring, [](const std::pair<Magnetic, double>& b1, const std::pair<Magnetic, double>& b2) {
         return b1.second > b2.second;
     }); // F12 FIX: stable_sort for reproducible results
 }
@@ -281,7 +282,47 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
     return get_advised_core(inputs, weights, cores, maximumNumberResults, maximumNumberCores);
 }
 
+// The adviser pipeline needs each excitation's DERIVED current data — effectiveFrequency drives
+// the wire adviser's skin-depth work, rms its current density. Those are computed by
+// Inputs::process(), which the json constructor runs by default; an Inputs assembled field by
+// field carries only what the caller filled in, and nothing derives the rest until process() is
+// called. Without this check the omission surfaced several layers down, as
+// "[INVALID_WIRE_DATA] Current is missing effective frequency" out of Wire — naming neither the
+// winding, nor the operating point, nor the thing the caller actually needed to do.
+static void throw_if_inputs_are_not_processed(Inputs& inputs) {
+    auto operatingPoints = inputs.get_operating_points();
+    for (size_t operatingPointIndex = 0; operatingPointIndex < operatingPoints.size(); ++operatingPointIndex) {
+        auto excitations = operatingPoints[operatingPointIndex].get_excitations_per_winding();
+        for (size_t windingIndex = 0; windingIndex < excitations.size(); ++windingIndex) {
+            auto& excitation = excitations[windingIndex];
+            if (!excitation.get_current()) {
+                continue;  // a voltage-only excitation is completed later, from the inductance
+            }
+            std::string where = "operating point " + std::to_string(operatingPointIndex) +
+                                ", winding " + std::to_string(windingIndex) +
+                                " ('" + excitation.get_name().value_or("<unnamed>") + "')";
+            auto missing = [&](const std::string& field) {
+                return InvalidInputException(ErrorCode::MISSING_DATA,
+                    "CoreAdviser needs the processed current data for " + where + ", but " + field +
+                    " is missing. These values are derived, not supplied: call Inputs::process() "
+                    "before advising (the json Inputs constructor does this for you).");
+            };
+            if (!excitation.get_current()->get_processed()) {
+                throw missing("the whole processed block");
+            }
+            if (!excitation.get_current()->get_processed()->get_effective_frequency()) {
+                throw missing("effectiveFrequency");
+            }
+            if (!excitation.get_current()->get_processed()->get_rms()) {
+                throw missing("rms");
+            }
+        }
+    }
+}
+
 std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs, std::map<CoreAdviserFilters, double> weights, std::vector<Core>* cores, size_t maximumNumberResults, size_t maximumNumberCores) {
+
+    throw_if_inputs_are_not_processed(inputs);
 
     std::vector<std::pair<Mas, double>> results;
 
@@ -304,7 +345,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
         std::move(partialResult.begin(), partialResult.end(), std::back_inserter(results));
     }
 
-    stable_sort(results.begin(), results.end(), [](const std::pair<Mas, double>& b1, const std::pair<Mas, double>& b2) {
+    stable_sort_by_index(results, [](const std::pair<Mas, double>& b1, const std::pair<Mas, double>& b2) {
         return b1.second > b2.second;
     });
 
@@ -320,7 +361,9 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
     size_t maximumMagneticsAfterFiltering = settings.get_core_adviser_maximum_magnetics_after_filtering();
     std::vector<std::pair<Magnetic, double>> magnetics;
 
+    log_probe("entering create_magnetic_dataset", cores->size());
     magnetics = create_magnetic_dataset(inputs, cores, false);
+    log_probe("create_magnetic_dataset", magnetics.size());
 
     // logEntry("We start the search with " + std::to_string(magnetics.size()) + " magnetics for the first filter, culling to " + std::to_string(maximumMagneticsAfterFiltering) + " for the remaining filters.", "CoreAdviser");
     // logEntry("We don't include stacks of cores in our search.", "CoreAdviser");
@@ -338,7 +381,14 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
         }
 
         logEntry("First attempt produced not enough results, so now we are searching again with " + std::to_string(magnetics.size()) + " magnetics, including up to " + std::to_string(defaults.coreAdviserMaximumNumberStacks) + " cores stacked when possible.", "CoreAdviser");
-        maximumMagneticsAfterFiltering = magnetics.size();
+        // The stacked pool is up to coreAdviserMaximumNumberStacks times the single-core
+        // one, so scale the score-cull by the same factor. This used to be the WHOLE pool
+        // (maximumMagneticsAfterFiltering = magnetics.size()), which disabled the cull
+        // altogether: every candidate (8514 single cores on a Weinberg transformer, 60887
+        // with stacks) was gapped, sized and saturation-checked, which took minutes, peaked
+        // near 8 GB natively and ran the browser engine out of memory (std::bad_alloc).
+        maximumMagneticsAfterFiltering = std::min<size_t>(magnetics.size(),
+            maximumMagneticsAfterFiltering * defaults.coreAdviserMaximumNumberStacks);
         filteredMagnetics = filter_available_cores_power_application(&magnetics, inputs, weights, maximumMagneticsAfterFiltering, maximumNumberResults);
         return filteredMagnetics;
     }
@@ -349,6 +399,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
 }
 
 std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs, std::vector<CoreShape>* shapes, size_t maximumNumberResults) {
+    throw_if_inputs_are_not_processed(inputs);
     auto globalIncludeStacks = settings.get_core_adviser_include_stacks();
     auto magnetics = create_magnetic_dataset(inputs, shapes, globalIncludeStacks);
 
