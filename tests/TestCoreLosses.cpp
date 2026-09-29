@@ -7,6 +7,7 @@
 #include "processors/Inputs.h"
 #include "physical_models/MagnetizingInductance.h"
 #include "processors/CircuitSimulatorInterface.h"
+#include "processors/Sweeper.h"
 #include "physical_models/Reluctance.h"
 #include "support/MaterialValidator.h"
 #include "TestingUtils.h"
@@ -2432,7 +2433,9 @@ TEST_CASE("Test_Manufacturer_Magnetec", "[physical-model][core-losses][smoke-tes
     // core MASS instead of its volume (the old pinned 3.09 W captured the
     // volume-multiplied bug; the absolute number is a plumbing check only —
     // the 1-turn setup drives B far beyond saturation)
-    REQUIRE_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinAbs(29685.6, 29685.6 * maxError));
+    // ABT #1491: 29685.6 -> 7421.39 (exactly 1/4): the Magnetec formula now reads its 0.3 T anchor
+    // against the PEAK flux density instead of the peak-to-peak.
+    REQUIRE_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinAbs(7421.39, 7421.39 * maxError));
 }
 
 TEST_CASE("Test_Manufacturer_Magnetec_Obfuscated_Manufacturer", "[physical-model][core-losses][smoke-test]") {
@@ -2468,7 +2471,9 @@ TEST_CASE("Test_Manufacturer_Magnetec_Obfuscated_Manufacturer", "[physical-model
     auto coreLosses = coreLossesModel->get_core_losses(core, excitation, temperature);
 
     // Identical to Test_Manufacturer_Magnetec: obfuscating the manufacturer must not change the physics.
-    REQUIRE_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinAbs(29685.6, 29685.6 * maxError));
+    // ABT #1491: 29685.6 -> 7421.39 (exactly 1/4): the Magnetec formula now reads its 0.3 T anchor
+    // against the PEAK flux density instead of the peak-to-peak.
+    REQUIRE_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinAbs(7421.39, 7421.39 * maxError));
 }
 
 TEST_CASE("Test_XFlux_19", "[physical-model][core-losses][smoke-test]") {
@@ -2828,6 +2833,41 @@ TEST_CASE("Test_CoreLosses_Model_Nanoperm_8000", "[physical-model][core-losses][
     REQUIRE(coreLossesModel != nullptr);
 }
 
+TEST_CASE("Test_CoreLosses_Above_Curie_Temperature_Throws", "[physical-model][core-losses][smoke-test][abt-1485]") {
+    // ABT #1485: a thermal loop that overshoots Curie (240 C on a badly wound first cut) read a
+    // near-zero loss there. Above Curie the ferrite is paramagnetic; no loss model applies.
+    Core core = OpenMagneticsTesting::get_quick_core("T 20/10/7", json::array(), 1, "PC95");
+    double curieTemperature = core.resolve_material().get_curie_temperature().value();
+    auto excitation = OperatingPointExcitation(json::parse(R"({"frequency": 200000, "magneticFluxDensity": {"processed": {"label": "Sinusoidal", "peak": 0.05, "peakToPeak": 0.1, "offset": 0}}})"));
+    CoreLosses coreLosses;
+    CHECK_THROWS_AS(coreLosses.calculate_core_losses(core, excitation, curieTemperature + 1), MaterialAboveCurieTemperatureException);
+    CHECK_THROWS_AS(coreLosses.get_core_volumetric_losses(core.resolve_material(), excitation, curieTemperature), MaterialAboveCurieTemperatureException);
+    try {
+        coreLosses.get_core_volumetric_losses(core.resolve_material(), excitation, curieTemperature + 25);
+    }
+    catch (const MaterialAboveCurieTemperatureException& exception) {
+        CHECK(exception.code() == ErrorCode::MATERIAL_ABOVE_CURIE_TEMPERATURE);
+        CHECK(exception.curie_temperature() == curieTemperature);
+    }
+}
+
+TEST_CASE("Test_CoreLosses_Nanoperm_Data_Sheet_Bound_Is_Peak", "[physical-model][core-losses][smoke-test][abt-1491]") {
+    // Magnetec's NANOPERM data sheet: "Material Losses (0,3 T / 100 kHz / sinus) < 110 W/kg". 0.3 T is a
+    // PEAK amplitude, as every nanocrystalline data sheet quotes it (VAC VP 800 F <= 80 W/kg, Proterial
+    // FT-3 at Bm = 0.2 T). Reading the anchor against 2*Bpk gave 320 W/kg at this very point (ABT #1491).
+    auto material = find_core_material_by_name("Nanoperm 8000");
+    auto excitation = OperatingPointExcitation(json::parse(R"({"frequency": 100000, "magneticFluxDensity": {"processed": {"label": "Sinusoidal", "peak": 0.3, "peakToPeak": 0.6, "offset": 0}}})"));
+
+    CoreLossesProprietaryModel model;
+    double massLosses = model.get_core_mass_losses(material, excitation, 25);
+    CHECK(massLosses < 110);
+    CHECK_THAT(massLosses, Catch::Matchers::WithinRel(80.0, 1e-9));
+
+    // Quadratic in the PEAK flux density: half the peak, a quarter of the loss.
+    auto halfExcitation = OperatingPointExcitation(json::parse(R"({"frequency": 100000, "magneticFluxDensity": {"processed": {"label": "Sinusoidal", "peak": 0.15, "peakToPeak": 0.3, "offset": 0}}})"));
+    CHECK_THAT(model.get_core_mass_losses(material, halfExcitation, 25), Catch::Matchers::WithinRel(20.0, 1e-9));
+}
+
 TEST_CASE("Test_Core_Losses_Nanoperm_8000", "[physical-model][core-losses][smoke-test]") {
     auto models = json::parse("{\"coreLosses\": \"PROPRIETARY\", \"gapReluctance\": \"BALAKRISHNAN\"}");
     auto core = Core(json::parse(R"({"distributorsInfo": [], "functionalDescription": {"coating": null, "gapping": [{"area": 0.000078, "coordinates": [0, 0.0003, 0 ], "distanceClosestNormalSurface": 0.00865, "distanceClosestParallelSurface": 0.005325, "length": 0.0006, "sectionDimensions": [0.00725, 0.01075 ], "shape": "rectangular", "type": "subtractive" }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "distanceClosestNormalSurface": 0.00895, "distanceClosestParallelSurface": 0.005325, "length": 0.000005, "sectionDimensions": [0.003575, 0.01075 ], "shape": "rectangular", "type": "residual" } ], "material": "Nanoperm 8000", "numberStacks": 1, "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "twoPieceSet", "magneticCircuit": "open" }, "geometricalDescription": [{"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": [{"coordinates": [0, 0.0003, 0 ], "length": 0.0006 } ], "material": "A07", "rotation": [3.141592653589793, 3.141592653589793, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" }, {"coordinates": [0, 0, 0 ], "dimensions": null, "insulationMaterial": null, "machining": null, "material": "A07", "rotation": [0, 0, 0 ], "shape": {"aliases": [], "dimensions": {"A": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0258, "minimum": 0.0243, "nominal": null }, "B": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0128, "minimum": 0.0123, "nominal": null }, "C": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.011, "minimum": 0.0105, "nominal": null }, "D": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0092, "minimum": 0.0087, "nominal": null }, "E": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0183, "minimum": 0.0175, "nominal": null }, "F": {"excludeMaximum": null, "excludeMinimum": null, "maximum": 0.0075, "minimum": 0.007, "nominal": null } }, "family": "e", "familySubtype": null, "magneticCircuit": "open", "name": "E 25/13/11", "type": "standard" }, "type": "halfSet" } ], "manufacturerInfo": null, "name": "custom", "processedDescription": {"columns": [{"area": 0.000078, "coordinates": [0, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "central", "width": 0.00725 }, {"area": 0.000039, "coordinates": [0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 }, {"area": 0.000039, "coordinates": [-0.010738, 0, 0 ], "depth": 0.01075, "height": 0.0179, "minimumDepth": null, "minimumWidth": null, "shape": "rectangular", "type": "lateral", "width": 0.003575 } ], "depth": 0.01075, "effectiveParameters": {"effectiveArea": 0.00007739519022938956, "effectiveLength": 0.05775787070464925, "effectiveVolume": 0.000004470181390430815, "minimumArea": 0.00007686249999999999 }, "height": 0.0251, "width": 0.02505, "windingWindows": [{"angle": null, "area": 0.00009531749999999999, "coordinates": [0.0036249999999999998, 0 ], "height": 0.0179, "radialHeight": null, "sectionsAlignment": null, "sectionsOrientation": null, "shape": null, "width": 0.005325 } ] } })"));
@@ -2850,7 +2890,8 @@ TEST_CASE("Test_Core_Losses_Nanoperm_8000", "[physical-model][core-losses][smoke
     auto calculatedMassCoreLosses = coreLosses.get_mass_losses().value();
 
     REQUIRE_THAT(magneticFluxDensity.get_processed().value().get_offset(), Catch::Matchers::WithinAbs(0, 0.0001));
-    REQUIRE_THAT(calculatedMassCoreLosses, Catch::Matchers::WithinAbs(869, 869 * 0.05));
+    // ABT #1491: 869 -> 217.29 W/kg (exactly 1/4): 0.3 T anchor read against the PEAK flux density.
+    REQUIRE_THAT(calculatedMassCoreLosses, Catch::Matchers::WithinAbs(217.29, 217.29 * 0.05));
 }
 
 TEST_CASE("Test_Core_Losses_Web_1", "[physical-model][core-losses][bug][smoke-test]") {
@@ -3459,6 +3500,76 @@ TEST_CASE("Calculate_Steinmetz_Coefficients_Synthetic", "[physical-model][core-l
     }
 }
 
+// ABT #1517: fits with temperature dependence must return a usable ct(T). The
+// fitter used to drop the temperature term wherever ct(T) < 0, in the objective
+// AND in its best-of selection, so an all-negative ct scored as a good fit and
+// was returned: on MagNet 3C94 (25/50/70/90 C) it gave ct0 = -27285, which
+// get_temperature_factor then refuses at every temperature.
+TEST_CASE("Calculate_Steinmetz_Coefficients_Temperature", "[physical-model][core-losses][steinmetz-fit][abt-1517]") {
+    const double k = 2.0, alpha = 1.5, beta = 2.7;
+    // ct(T) = ct2*T^2 - ct1*T + ct0, minimum 1.0 at 100 C (a typical MnZn shape).
+    const double ct0 = 2.5, ct1 = 0.03, ct2 = 0.00015;
+    auto trueTemperatureFactor = [&](double temperature) { return ct2 * temperature * temperature - ct1 * temperature + ct0; };
+    // Deterministic +-scatter so the MagNet-shaped case is repeatable.
+    uint32_t lcgState = 12345;
+    auto scatter = [&lcgState](double relative) {
+        lcgState = lcgState * 1664525u + 1013904223u;
+        return 1.0 + relative * (2.0 * (lcgState / 4294967296.0) - 1.0);
+    };
+    auto makePoint = [&](double frequency, double peak, double temperature, double factor) {
+        json pointJson;
+        pointJson["temperature"] = temperature;
+        pointJson["value"] = k * pow(frequency, alpha) * pow(peak, beta) * trueTemperatureFactor(temperature) * factor;
+        pointJson["origin"] = "manufacturer";
+        pointJson["magneticFluxDensity"]["frequency"] = frequency;
+        pointJson["magneticFluxDensity"]["magneticFluxDensity"]["processed"]["label"] = "sinusoidal";
+        pointJson["magneticFluxDensity"]["magneticFluxDensity"]["processed"]["offset"] = 0;
+        pointJson["magneticFluxDensity"]["magneticFluxDensity"]["processed"]["peak"] = peak;
+        pointJson["magneticFluxDensity"]["magneticFluxDensity"]["processed"]["peakToPeak"] = 2 * peak;
+        return VolumetricLossesPoint(pointJson);
+    };
+    auto grid = [&](std::vector<double> temperatures, double relativeScatter) {
+        std::vector<VolumetricLossesPoint> data;
+        for (auto temperature : temperatures) {
+            for (auto frequency : {50000.0, 70000.0, 100000.0, 140000.0, 200000.0}) {
+                for (auto peak : {0.02, 0.05, 0.1, 0.2, 0.3}) {
+                    data.push_back(makePoint(frequency, peak, temperature, relativeScatter > 0 ? scatter(relativeScatter) : 1.0));
+                }
+            }
+        }
+        return data;
+    };
+    // Every fitted temperature must get a positive factor, and the fitted law
+    // must reproduce the noiseless truth at every point of the grid.
+    auto checkFit = [&](const std::vector<VolumetricLossesPoint>& data, double tolerance) {
+        auto [coefficientsPerRange, errorPerRange] = OpenMagnetics::CoreLossesSteinmetzModel::calculate_steinmetz_coefficients(data, {{10000, 1000000}});
+        REQUIRE(coefficientsPerRange.size() == 1);
+        auto fitted = coefficientsPerRange[0];
+        REQUIRE(fitted.get_ct0());
+        REQUIRE(fitted.get_ct1());
+        REQUIRE(fitted.get_ct2());
+        for (auto& point : data) {
+            double temperature = point.get_temperature();
+            double frequency = point.get_magnetic_flux_density().get_frequency();
+            double peak = point.get_magnetic_flux_density().get_magnetic_flux_density()->get_processed()->get_peak().value();
+            double factor = OpenMagnetics::CoreLossesSteinmetzModel::get_temperature_factor(fitted, temperature);
+            double modeled = fitted.get_k() * pow(frequency, fitted.get_alpha()) * pow(peak, fitted.get_beta()) * factor;
+            double truth = k * pow(frequency, alpha) * pow(peak, beta) * trueTemperatureFactor(temperature);
+            CHECK_THAT(modeled, Catch::Matchers::WithinRel(truth, tolerance));
+        }
+    };
+
+    SECTION("Points at 90-110 C: k/alpha/beta fitted there, then ct") {
+        checkFit(grid({25, 50, 70, 90, 100, 120}, 0), 0.03);
+    }
+    SECTION("No points near 100 C: joint fit of all six") {
+        checkFit(grid({25, 50, 70}, 0), 0.03);
+    }
+    SECTION("MagNet-shaped temperatures (25/50/70/90 C) with +-10% scatter") {
+        checkFit(grid({25, 50, 70, 90}, 0.10), 0.15);
+    }
+}
+
 TEST_CASE("Calculate_Steinmetz_Coefficients", "[physical-model][core-losses]") {
     SKIP("Test needs investigation");
     load_core_materials();
@@ -3784,7 +3895,9 @@ TEST_CASE("Test_Core_Losses_Drum_Semishielded_Per_Material_Split", "[physical-mo
     };
 
     json excitationJson = json();
-    excitationJson["frequency"] = 500000;
+    // 3C90's published loss data ends at 446.69 kHz (MagNet); since ABT #1456 MKF refuses to evaluate
+    // outside it, so the split is exercised at 200 kHz. The invariants below are ratios, not values.
+    excitationJson["frequency"] = 200000;
     excitationJson["magneticFluxDensity"]["processed"]["dutyCycle"] = 0.5;
     excitationJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
     excitationJson["magneticFluxDensity"]["processed"]["offset"] = 0;
@@ -4196,24 +4309,42 @@ TEST_CASE("Test_Material_Validator_Abt1456_Out_Of_Range_Grades", "[material-vali
     }
 }
 
-TEST_CASE("Test_Material_Validator_Abt1456_P63_Below_Envelope", "[material-validator]") {
-    // P63's first range claims 1 kHz..1 MHz; at 100 kHz / 200 mT / 100 C it gives far less than
-    // the best published MnZn power grade (PC47 250 kW/m3).
+TEST_CASE("Test_Material_Validator_Abt1456_P63_Out_Of_Range", "[material-validator]") {
+    // P63's first range used to claim 1 kHz..1 MHz because its points were stored in Hz instead of kHz,
+    // which put 100 kHz / 200 mT / 100 C far below the best published MnZn power grade. With the points
+    // corrected (ACME "40 P63.xlsx", ABT #1456) its span starts at 300 kHz, so the class primary point
+    // is simply outside the data: an out-of-range finding, not an envelope one.
     settings.reset();
     auto verdict = MaterialValidator().validate(material_record("P63"));
     INFO(describe(verdict));
-    CHECK(count_findings(verdict, "MAT_LOSS_ENVELOPE", MaterialFindingSeverity::SUSPICIOUS) >= 1);
+    CHECK(count_findings(verdict, "MAT_LOSS_OUT_OF_RANGE", MaterialFindingSeverity::SUSPICIOUS) == 1);
+    CHECK(count_findings(verdict, "MAT_LOSS_ENVELOPE", MaterialFindingSeverity::SUSPICIOUS) == 0);
 }
 
 TEST_CASE("Test_Material_Validator_Abt1456_Temperature_Coefficients_Missing", "[material-validator]") {
-    // KL11F / KL7F / KL9F carry ct0/ct1 but no ct2: MKF drops the temperature dependence.
+    // KL11F / KL7F / KL9F carry ct0/ct1 but no ct2. MKF used to drop the temperature dependence of such
+    // ranges; since ABT #1456 a missing ct term takes its schema default, so the three grades now have
+    // one and are clean. A copy of KL11F stripped of every ct term has no temperature dependence at all,
+    // and the rule must still catch that.
     settings.reset();
     MaterialValidator validator;
     for (std::string name : {"KL11F", "KL7F", "KL9F"}) {
         auto verdict = validator.validate(material_record(name));
         INFO(name << "\n" << describe(verdict));
-        CHECK(count_findings(verdict, "MAT_LOSS_TEMPERATURE", MaterialFindingSeverity::SUSPICIOUS) == 1);
+        CHECK(count_findings(verdict, "MAT_LOSS_TEMPERATURE", MaterialFindingSeverity::SUSPICIOUS) == 0);
     }
+    auto flat = material_record("KL11F");
+    for (auto& method : flat["volumetricLosses"]["default"]) {
+        if (!method.is_object() || !method.contains("ranges")) continue;
+        for (auto& range : method["ranges"]) {
+            range.erase("ct0");
+            range.erase("ct1");
+            range.erase("ct2");
+        }
+    }
+    auto verdict = validator.validate(flat);
+    INFO("KL11F without ct\n" << describe(verdict));
+    CHECK(count_findings(verdict, "MAT_LOSS_TEMPERATURE", MaterialFindingSeverity::SUSPICIOUS) == 1);
 }
 
 TEST_CASE("Test_Material_Validator_Hysteresis_Bound_P63_Points", "[material-validator]") {
@@ -4396,4 +4527,147 @@ TEST_CASE("Test_Material_Validator_Loss_Not_Positive_Inside_Span", "[material-va
     INFO(describe(verdict));
     CHECK(count_findings(verdict, "MAT_LOSS_EVAL", MaterialFindingSeverity::IMPOSSIBLE) >= 1);
     CHECK_FALSE(verdict.valid);
+}
+
+// ABT #1456: nine 0.5-5 MHz MnZn grades evaluated at 100 kHz read 2-18 % of 3C95's loss, because
+// get_steinmetz_coefficients silently returned the nearest range for a frequency outside every range,
+// i.e. extrapolated a MHz power law a decade down. Outside the fitted span it now throws, on both sides.
+TEST_CASE("Steinmetz coefficients outside the fitted span throw, below and above", "[physical-model][core-losses][abt-1456]") {
+    settings.reset();
+    clear_databases();
+
+    // TP5H: MAS fits 1-5 MHz only.
+    auto [tp5hMinimum, tp5hMaximum] = CoreLossesModel::get_steinmetz_fitted_span("TP5H");
+    REQUIRE(tp5hMinimum > 100000);
+    CHECK_THROWS_AS(CoreLossesModel::get_steinmetz_coefficients("TP5H", 100000), MaterialFrequencyOutOfSpanException);
+    CHECK_THROWS_WITH(CoreLossesModel::get_steinmetz_coefficients("TP5H", 100000),
+                      Catch::Matchers::ContainsSubstring("TP5H") && Catch::Matchers::ContainsSubstring("below"));
+    CHECK_NOTHROW(CoreLossesModel::get_steinmetz_coefficients("TP5H", tp5hMinimum));
+    CHECK_NOTHROW(CoreLossesModel::get_steinmetz_coefficients("TP5H", tp5hMaximum));
+
+    // Whole volumetric-loss path, not just the lookup.
+    auto coreLossesModel = CoreLossesModel::factory(CoreLossesModels::STEINMETZ);
+    CHECK_THROWS_AS(coreLossesModel->get_core_volumetric_losses(Core::resolve_material("TP5H"), build_sinusoidal_flux_excitation(100000, 0.2), 100),
+                    MaterialFrequencyOutOfSpanException);
+
+    // Above the highest range: 3C95 is fitted up to 3 MHz.
+    auto [c95Minimum, c95Maximum] = CoreLossesModel::get_steinmetz_fitted_span("3C95");
+    CHECK_THROWS_AS(CoreLossesModel::get_steinmetz_coefficients("3C95", 2 * c95Maximum), MaterialFrequencyOutOfSpanException);
+    CHECK_THROWS_WITH(CoreLossesModel::get_steinmetz_coefficients("3C95", 2 * c95Maximum),
+                      Catch::Matchers::ContainsSubstring("3C95") && Catch::Matchers::ContainsSubstring("above"));
+    CHECK_NOTHROW(CoreLossesModel::get_steinmetz_coefficients("3C95", 100000));
+}
+
+// ABT #1456: the temperature factor used to be applied only when ct0, ct1 AND ct2 were all present, and
+// dropped silently when it came out <= 0. The schema defaults a missing ct0/ct1/ct2 to 1/0/0; 25 ranges in
+// 17 materials carry only ct0/ct1 (Huoh Yow KL7F/KL9F/KL11F among them) and lost their temperature
+// dependence. Huoh Yow's KL11F datasheet table: 1 MHz/50 mT is 100 kW/m3 at 20 C and 180 kW/m3 at 100 C.
+TEST_CASE("Steinmetz ct terms take their schema defaults; a non-positive factor throws", "[physical-model][core-losses][abt-1456]") {
+    settings.reset();
+    clear_databases();
+
+    auto coreLossesModel = CoreLossesModel::factory(CoreLossesModels::STEINMETZ);
+    auto kl11f = Core::resolve_material("KL11F");
+    auto excitation = build_sinusoidal_flux_excitation(1e6, 0.05);
+    double lossesAt20 = coreLossesModel->get_core_volumetric_losses(kl11f, excitation, 20);
+    double lossesAt100 = coreLossesModel->get_core_volumetric_losses(kl11f, excitation, 100);
+    CHECK(lossesAt100 > 1.3 * lossesAt20);
+
+    SteinmetzCoreLossesMethodRangeDatum datum;
+    datum.set_k(1);
+    datum.set_alpha(1.5);
+    datum.set_beta(2.5);
+    datum.set_minimum_frequency(1e4);
+    datum.set_maximum_frequency(1e6);
+    datum.set_ct0(2.0);
+    CHECK(CoreLossesModel::apply_temperature_coefficients(1.0, datum, 25) == 2.0);  // ct1 = ct2 = 0 by default
+
+    datum.set_ct0(-1.0);
+    CHECK_THROWS_AS(CoreLossesModel::apply_temperature_coefficients(1.0, datum, 25), CalculationException);
+    datum.set_ct1(0.0);
+    datum.set_ct2(0.0);
+    CHECK_THROWS_AS(CoreLossesModel::apply_temperature_coefficients(1.0, datum, 25), CalculationException);
+}
+
+// ABT #1456: P63's loss points at 1/3/5 MHz were stored as 1/3/5 kHz (ACME's workbook columns are in kHz),
+// which is why its Steinmetz fit claimed to start at 1 kHz. Corrected in MAS, the fit starts at ACME's
+// lowest measured frequency, 300 kHz ("40 P63.xlsx", sheet 4data). At 1 MHz/50 mT/100 C the workbook gives
+// 80 kW/m3 (sheet 5data; sheet 4data says 67); the refit range 300 kHz-1 MHz has a mean |error| of 34.7 %
+// over its 46 points (scripts/refit-steinmetz.py), so that is the tolerance.
+TEST_CASE("P63 is fitted from 300 kHz and matches ACME's 1 MHz point", "[physical-model][core-losses][abt-1456]") {
+    settings.reset();
+    clear_databases();
+
+    auto [p63Minimum, p63Maximum] = CoreLossesModel::get_steinmetz_fitted_span("P63");
+    CHECK(p63Minimum == 300000);
+    CHECK(p63Maximum == 5000000);
+    CHECK(CoreLossesModel::is_frequency_in_steinmetz_span("P63", 1e6));
+    CHECK_FALSE(CoreLossesModel::is_frequency_in_steinmetz_span("P63", 1e5));
+
+    auto coreLossesModel = CoreLossesModel::factory(CoreLossesModels::STEINMETZ);
+    double volumetricLosses = coreLossesModel->get_core_volumetric_losses(Core::resolve_material("P63"),
+                                                                          build_sinusoidal_flux_excitation(1e6, 0.05), 100);
+    CHECK_THAT(volumetricLosses, Catch::Matchers::WithinRel(80e3, 0.347));
+}
+
+// ABT #1456: the subcircuit core-loss network was fitted over 1 kHz-300 kHz whatever the material, so it
+// evaluated the Steinmetz fit outside its span (1 kHz for N87, fitted from 25 kHz; the whole band for the MHz
+// grades). Alf's decision: fit over the material's own fitted span, so every Steinmetz material exports, and
+// state that window in the netlist.
+TEST_CASE("Subcircuit core-loss network is fitted over the material's span", "[circuit][core-losses][export][abt-1456]") {
+    settings.reset();
+    clear_databases();
+
+    std::vector<int64_t> numberTurns = {20};
+    for (std::string materialName : {"N87", "TP5H", "P63"}) {
+        INFO(materialName);
+        auto magnetic = OpenMagnetics::magnetic_autocomplete(OpenMagneticsTesting::get_quick_magnetic(
+            "E 42/21/15", OpenMagneticsTesting::get_ground_gap(0.001), numberTurns, 1, materialName));
+        auto [spanMinimum, spanMaximum] = CoreLossesModel::get_steinmetz_fitted_span(materialName);
+        auto [windowStart, windowStop] = CircuitSimulatorExporter::core_resistance_fit_window(magnetic);
+        CHECK(windowStart == spanMinimum);
+        CHECK(windowStop == spanMaximum);
+        CHECK_FALSE(CircuitSimulatorExporter::calculate_core_resistance_coefficients(magnetic, 25).empty());
+
+        auto network = CircuitSimulatorExporter::calculate_core_fracpole_network(magnetic, 25);
+        REQUIRE(network.fittedSpan);
+        CHECK(network.fittedSpan->first >= spanMinimum);
+        CHECK(network.fittedSpan->second <= spanMaximum);
+
+        for (auto model : {CircuitSimulatorExporterModels::LTSPICE, CircuitSimulatorExporterModels::NL5}) {
+            std::string subcircuit = CircuitSimulatorExporter(model).export_magnetic_as_subcircuit(magnetic, 100000, 25);
+            CHECK_THAT(subcircuit, Catch::Matchers::ContainsSubstring("Core-loss network fitted over " + std::to_string(spanMinimum)));
+        }
+    }
+
+    // A sweep asked for outside the span is clipped to it, and its title says so.
+    std::vector<int64_t> n87Turns = {20};
+    auto n87 = OpenMagnetics::magnetic_autocomplete(OpenMagneticsTesting::get_quick_magnetic(
+        "E 42/21/15", OpenMagneticsTesting::get_ground_gap(0.001), n87Turns, 1, "N87"));
+    auto [n87Minimum, n87Maximum] = CoreLossesModel::get_steinmetz_fitted_span("N87");
+    auto sweep = Sweeper::sweep_core_resistance_over_frequency(n87, 1000, 300000, 20);
+    CHECK(sweep.get_x_points().front() >= n87Minimum);
+    CHECK_THAT(sweep.get_title(), Catch::Matchers::ContainsSubstring("fitted Steinmetz span"));
+}
+
+// ABT #1456 (decision 4): the core-loss sweep evaluates Steinmetz, so it is clipped to the fitted span and the
+// title states it, like the core resistance sweep.
+TEST_CASE("Core-loss frequency sweep is clipped to the material's fitted span", "[sweeper][core-losses][abt-1456]") {
+    settings.reset();
+    clear_databases();
+    std::vector<int64_t> numberTurns = {20};
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(OpenMagneticsTesting::get_quick_magnetic(
+        "E 42/21/15", OpenMagneticsTesting::get_ground_gap(0.001), numberTurns, 1, "P63"));
+    auto inputs = OpenMagneticsTesting::create_quick_test_inputs();
+    auto [spanMinimum, spanMaximum] = CoreLossesModel::get_steinmetz_fitted_span("P63");
+    REQUIRE(spanMinimum > 10000);
+    auto sweep = Sweeper::sweep_core_losses_over_frequency(magnetic, inputs.get_operating_points()[0], 10000, 1200000, 10);
+    CHECK_THAT(sweep.get_x_points().front(), Catch::Matchers::WithinRel(spanMinimum, 1e-9));
+    CHECK_THAT(sweep.get_x_points().back(), Catch::Matchers::WithinRel(1200000.0, 1e-9));
+    CHECK_THAT(sweep.get_title(), Catch::Matchers::ContainsSubstring("fitted Steinmetz span"));
+    auto [inSpanStart, inSpanStop] = Sweeper::core_resistance_frequency_window(magnetic, 400000, 1000000);
+    CHECK(inSpanStart == 400000);
+    CHECK(inSpanStop == 1000000);
+    CHECK_THROWS_AS(Sweeper::sweep_core_losses_over_frequency(magnetic, inputs.get_operating_points()[0], 10000, 100000, 10),
+                    MaterialFrequencyOutOfSpanException);
 }

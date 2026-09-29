@@ -167,6 +167,16 @@ std::shared_ptr<CoreLossesModel> CoreLosses::get_core_losses_model(std::string m
 }
 
 
+// Above its Curie point a ferrite is paramagnetic: every loss model here describes the
+// ferromagnetic material, so a loss asked there is not a small number, it is no number (ABT #1485).
+// A material that carries no Curie temperature cannot be checked; it is evaluated as before.
+static void throw_if_above_curie_temperature(const CoreMaterial& coreMaterial, double temperature) {
+    auto curieTemperature = coreMaterial.get_curie_temperature();
+    if (curieTemperature && temperature >= curieTemperature.value()) {
+        throw MaterialAboveCurieTemperatureException(coreMaterial.get_name(), temperature, curieTemperature.value());
+    }
+}
+
 // DC Permeability Loss Estimator (DPLE) — Mühlethaler et al. (APEC 2025)
 // Corrects Steinmetz-family core losses for DC bias by scaling with the
 // permeability ratio: P_v(H_DC) = P_v(0) × [μ'(0) / μ'(H_DC)]
@@ -414,6 +424,7 @@ CoreLossesOutput CoreLosses::calculate_core_losses(Core core, OperatingPointExci
         return calculate_molded_core_losses(core, excitation, temperature);
     }
 
+    throw_if_above_curie_temperature(core.resolve_material(), temperature);
     auto coreLossesModelForMaterial = get_core_losses_model(core.get_material_name());
 
     CoreLossesOutput coreLossesOutput = coreLossesModelForMaterial->get_core_losses(core, excitation, temperature);
@@ -451,6 +462,7 @@ CoreLossesOutput CoreLosses::calculate_core_losses(Core core, OperatingPointExci
     return coreLossesOutput;
 }
 double CoreLosses::get_core_volumetric_losses(CoreMaterial coreMaterial, OperatingPointExcitation excitation, double temperature){
+    throw_if_above_curie_temperature(coreMaterial, temperature);
     auto coreLossesModelForMaterial = get_core_losses_model(coreMaterial.get_name());
 
     double coreVolumetricLosses = coreLossesModelForMaterial->get_core_volumetric_losses(coreMaterial, excitation, temperature);
@@ -564,76 +576,108 @@ CoreLossesMethodData CoreLossesModel::get_method_data(CoreMaterial materialData,
     throw MaterialException(ErrorCode::MATERIAL_DATA_MISSING, "Material " + materialData.get_name() + " does not have method: " + method);
 }
 
-SteinmetzCoreLossesMethodRangeDatum CoreLossesModel::get_steinmetz_coefficients(CoreMaterialDataOrNameUnion material, double frequency) {
-    CoreMaterial materialData;
+static CoreMaterial resolve_core_material_for_losses(const CoreMaterialDataOrNameUnion& material) {
     // If the material is a string, we have to load its data from the database, unless it is dummy (in order to avoid
     // long loading operatings)
     if (std::holds_alternative<std::string>(material) && std::get<std::string>(material) != "dummy") {
-        materialData = find_core_material_by_name(std::get<std::string>(material));
+        return find_core_material_by_name(std::get<std::string>(material));
     }
-    else {
-        materialData = std::get<CoreMaterial>(material);
-    }
+    return std::get<CoreMaterial>(material);
+}
 
-    auto volumetricLossesMethodsVariants = materialData.get_volumetric_losses();
+std::pair<double, double> CoreLossesModel::get_steinmetz_fitted_span(CoreMaterialDataOrNameUnion material) {
+    CoreMaterial materialData = resolve_core_material_for_losses(material);
+    auto steinmetzData = CoreLossesModel::get_method_data(materialData, "Steinmetz");
+    if (!steinmetzData.get_ranges() || steinmetzData.get_ranges()->empty()) {
+        throw MaterialException(ErrorCode::MATERIAL_DATA_MISSING, "Material " + materialData.get_name() + " has a Steinmetz method with no ranges");
+    }
+    double minimumMaterialFrequency = std::numeric_limits<double>::max();
+    double maximumMaterialFrequency = std::numeric_limits<double>::lowest();
+    auto ranges = steinmetzData.get_ranges().value();  // bind a local: range-for over .value() of a temporary dangles
+    for (auto& range : ranges) {
+        if (!range.get_minimum_frequency()) {
+            throw MaterialException(ErrorCode::MATERIAL_DATA_MISSING, "Missing minimum frequency in material " + materialData.get_name());
+        }
+        if (!range.get_maximum_frequency()) {
+            throw MaterialException(ErrorCode::MATERIAL_DATA_MISSING, "Missing maximum frequency in material " + materialData.get_name());
+        }
+        minimumMaterialFrequency = std::min(minimumMaterialFrequency, range.get_minimum_frequency().value());
+        maximumMaterialFrequency = std::max(maximumMaterialFrequency, range.get_maximum_frequency().value());
+    }
+    return {minimumMaterialFrequency, maximumMaterialFrequency};
+}
+
+bool CoreLossesModel::evaluates_steinmetz_ranges(const CoreLossesModel* model) {
+    if (model == nullptr) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "evaluates_steinmetz_ranges: null core losses model");
+    }
+    return dynamic_cast<const CoreLossesSteinmetzModel*>(model) != nullptr &&
+           dynamic_cast<const CoreLossesProprietaryModel*>(model) == nullptr;
+}
+
+bool CoreLossesModel::is_frequency_in_steinmetz_span(CoreMaterialDataOrNameUnion material, double frequency) {
+    auto [minimumMaterialFrequency, maximumMaterialFrequency] = get_steinmetz_fitted_span(material);
+    return frequency >= minimumMaterialFrequency && frequency <= maximumMaterialFrequency;
+}
+
+SteinmetzCoreLossesMethodRangeDatum CoreLossesModel::get_steinmetz_coefficients(CoreMaterialDataOrNameUnion material, double frequency) {
+    CoreMaterial materialData = resolve_core_material_for_losses(material);
 
     auto steinmetzData = CoreLossesModel::get_method_data(materialData, "Steinmetz");
+    if (!steinmetzData.get_ranges() || steinmetzData.get_ranges()->empty()) {
+        throw MaterialException(ErrorCode::MATERIAL_DATA_MISSING, "Material " + materialData.get_name() + " has a Steinmetz method with no ranges");
+    }
     auto ranges = steinmetzData.get_ranges().value();
-    double minimumMaterialFrequency = 100000000;
-    int minimumMaterialFrequencyIndex = -1;
-    double maximumMaterialFrequency = 0;
-    int maximumMaterialFrequencyIndex = -1;
     for (size_t i = 0; i < ranges.size(); ++i) {
         if (!ranges[i].get_minimum_frequency()) {
-            throw MaterialException(ErrorCode::MATERIAL_DATA_MISSING, "Missing minimum frequency in material");
+            throw MaterialException(ErrorCode::MATERIAL_DATA_MISSING, "Missing minimum frequency in material " + materialData.get_name());
         }
         if (!ranges[i].get_maximum_frequency()) {
-            throw MaterialException(ErrorCode::MATERIAL_DATA_MISSING, "Missing maximum frequency in material");
+            throw MaterialException(ErrorCode::MATERIAL_DATA_MISSING, "Missing maximum frequency in material " + materialData.get_name());
         }
 
         if (frequency >= ranges[i].get_minimum_frequency().value() &&
             frequency <= ranges[i].get_maximum_frequency().value()) {
             return ranges[i];
         }
-
-        if (minimumMaterialFrequency > ranges[i].get_minimum_frequency().value()) {
-            minimumMaterialFrequency = ranges[i].get_minimum_frequency().value();
-            minimumMaterialFrequencyIndex = i;
-        }
-        if (maximumMaterialFrequency < ranges[i].get_maximum_frequency().value()) {
-            maximumMaterialFrequency = ranges[i].get_maximum_frequency().value();
-            maximumMaterialFrequencyIndex = i;
-        }
     }
 
-    if (frequency < minimumMaterialFrequency && minimumMaterialFrequencyIndex >= 0) {
-        return ranges[minimumMaterialFrequencyIndex];
-    }
-    if (frequency > maximumMaterialFrequency && maximumMaterialFrequencyIndex >= 0) {
-        return ranges[maximumMaterialFrequencyIndex];
+    // ABT #1456: no range contains f. Below the lowest or above the highest fitted frequency this used to
+    // return the nearest range, i.e. extrapolate a power law the data never constrained (a 1-5 MHz fit read
+    // at 100 kHz gave 2-18 % of 3C95's loss). Both sides now throw, naming the material and its span.
+    auto [minimumMaterialFrequency, maximumMaterialFrequency] = get_steinmetz_fitted_span(materialData);
+    if (frequency < minimumMaterialFrequency || frequency > maximumMaterialFrequency) {
+        throw MaterialFrequencyOutOfSpanException(materialData.get_name(), "Steinmetz", frequency,
+                                                  minimumMaterialFrequency, maximumMaterialFrequency);
     }
 
-    throw CalculationException(ErrorCode::CALCULATION_INVALID_INPUT, "Error getting Steinmetz coefficients");
+    throw CalculationException(ErrorCode::CALCULATION_INVALID_INPUT,
+                               "Material " + materialData.get_name() + ": " + std::to_string(frequency) +
+                               " Hz falls in a gap between its Steinmetz ranges");
 }
 
+
+// ABT #1517: a temperature factor ct(T) <= 0 is not a loss scale, so it must
+// never score as a fit. These used to drop the temperature term there instead,
+// which made an all-negative ct look like a good temperature-free fit — in the
+// optimizer and in the best-of-restarts selection alike — and it was returned.
+// The optimizer now sees a residual far larger than any real one (log10 units)
+// and retreats; calculate_steinmetz_coefficients throws if no restart ends valid.
+constexpr double invalidTemperatureFactorPenalty = 1e3;
 
 double steinmetz_equation_with_temperature_and_log(double x[], double frequency, double magneticFluxDensityAcPeak, double temperature) {
     double temperatureCoefficient = x[3] - x[4] * temperature + x[5] * pow(temperature, 2);
-    if (temperatureCoefficient < 0) {
-        return x[0] + frequency * x[1] + magneticFluxDensityAcPeak * x[2];
+    if (!(temperatureCoefficient > 0)) {
+        return invalidTemperatureFactorPenalty;
     }
-    else {
-        return x[0] + frequency * x[1] + magneticFluxDensityAcPeak * x[2] + log10(temperatureCoefficient);
-    }
+    return x[0] + frequency * x[1] + magneticFluxDensityAcPeak * x[2] + log10(temperatureCoefficient);
 }
 double steinmetz_equation_with_temperature_and_log(double x[], double logK, double alpha, double beta, double frequency, double magneticFluxDensityAcPeak, double temperature) {
     double temperatureCoefficient = x[0] - x[1] * temperature + x[2] * pow(temperature, 2);
-    if (temperatureCoefficient < 0) {
-        return logK + frequency * alpha + magneticFluxDensityAcPeak * beta;
+    if (!(temperatureCoefficient > 0)) {
+        return invalidTemperatureFactorPenalty;
     }
-    else {
-        return logK + frequency * alpha + magneticFluxDensityAcPeak * beta + log10(temperatureCoefficient);
-    }
+    return logK + frequency * alpha + magneticFluxDensityAcPeak * beta + log10(temperatureCoefficient);
 }
 
 
@@ -891,9 +935,10 @@ std::pair<std::vector<SteinmetzCoreLossesMethodRangeDatum>, std::vector<double>>
                 volumetricLossesInputs[1] = tempCoefficients[1];
                 volumetricLossesInputs[2] = tempCoefficients[2];
 
-                for (size_t index = 0; index < 3; ++index) {
-                    tempCoefficients[index] = initialState;
-                }
+                // Start ct at 1 (ct0 = 1, ct1 = ct2 = 0): k/alpha/beta were just
+                // fitted near 100 C, so "no temperature dependence" is the exact
+                // starting model, and it is valid (ct > 0) at every temperature.
+                tempCoefficients = {1.0, 0.0, 0.0};
                 OpenMagnetics::eigen_levmar_dif(steinmetz_equation_first_only_temperature_func, tempCoefficients.data(), volumetricLossesArray.data(), 3, numberElements, 10000, opts, info, NULL, NULL, static_cast<void*>(volumetricLossesInputs.data()));
                 coefficients[3] = tempCoefficients[0];
                 coefficients[4] = tempCoefficients[1];
@@ -930,6 +975,24 @@ std::pair<std::vector<SteinmetzCoreLossesMethodRangeDatum>, std::vector<double>>
                     bestCoefficients.push_back(coefficients[index]);
                 }
                 bestCoefficients[0] = pow(10, std::max(bestCoefficients[0], -15.0));
+            }
+        }
+        if (bestCoefficients.empty()) {
+            throw CalculationException(ErrorCode::CALCULATION_INVALID_INPUT,
+                "Cannot fit Steinmetz coefficients for range [" + std::to_string(ranges[chunkIndex].first) + ", " +
+                std::to_string(ranges[chunkIndex].second) + "] Hz: no restart produced a finite fit error.");
+        }
+        if (numberInputs == 3) {
+            for (auto& point : volumetricLossesChunk) {
+                double temperature = point.get_temperature();
+                double factor = bestCoefficients[3] - bestCoefficients[4] * temperature + bestCoefficients[5] * pow(temperature, 2);
+                if (!(factor > 0)) {
+                    throw CalculationException(ErrorCode::CALCULATION_INVALID_INPUT,
+                        "Cannot fit Steinmetz temperature coefficients for range [" + std::to_string(ranges[chunkIndex].first) + ", " +
+                        std::to_string(ranges[chunkIndex].second) + "] Hz: no restart gives ct(T) > 0 at " + std::to_string(temperature) +
+                        " C (ct0=" + std::to_string(bestCoefficients[3]) + ", ct1=" + std::to_string(bestCoefficients[4]) +
+                        ", ct2=" + std::to_string(bestCoefficients[5]) + ").");
+                }
             }
         }
         SteinmetzCoreLossesMethodRangeDatum steinmetzCoreLossesMethodRangeDatum;
@@ -2712,7 +2775,11 @@ double CoreLossesProprietaryModel::get_core_mass_losses(CoreMaterial coreMateria
     double massLosses = -1;
 
     if (has_magnetec_mass_method(coreMaterial)) {
-        massLosses = 80 * pow(frequency / 100000, 1.8) * pow(magneticFluxDensityAcPeak * 2 / 0.3, 2);
+        // Anchored at 0.3 T PEAK / 100 kHz / sine, the point Magnetec's NANOPERM data sheet bounds at
+        // < 110 W/kg. The old 2*Bpk (peak-to-peak) against that peak anchor read every Nanoperm loss 4x
+        // high: 320 W/kg at the data sheet's own point (ABT #1491). The 80 W/kg constant and the 1.8 / 2
+        // exponents are not stated by any Magnetec document found.
+        massLosses = 80 * pow(frequency / 100000, 1.8) * pow(magneticFluxDensityAcPeak / 0.3, 2);
     }
     else {
         // -1 was an in-band sentinel that propagated as negative losses
@@ -2729,7 +2796,14 @@ double CoreLossesSteinmetzModel::get_frequency_from_core_losses(Core core,
     double effectiveVolume = core.get_processed_description().value().get_effective_parameters().get_effective_volume();
 
     SteinmetzCoreLossesMethodRangeDatum steinmetzDatum;
+    // Initial guess of the fixed-point iteration: 100 kHz when the material's Steinmetz fit covers it,
+    // otherwise the geometric middle of the fitted span (ABT #1456: the coefficients are only defined
+    // there; a frequency the iteration drives out of the span throws MaterialFrequencyOutOfSpanException).
+    auto [spanMinimum, spanMaximum] = get_steinmetz_fitted_span(core.resolve_material());
     double frequency = 100000;
+    if (frequency < spanMinimum || frequency > spanMaximum) {
+        frequency = sqrt(spanMinimum * spanMaximum);
+    }
 
     steinmetzDatum = get_steinmetz_coefficients(core.resolve_material(), frequency);
     double alpha = steinmetzDatum.get_alpha();
@@ -3040,7 +3114,8 @@ double CoreLossesProprietaryModel::get_frequency_from_core_losses(Core core,
     if (!volumetricMethod && has_magnetec_mass_method(materialData)) {
         double mass = core.get_mass();
         double massLosses = coreLosses / mass;
-        frequency = pow(massLosses / 80 / pow(magneticFluxDensityAcPeak * 2 / 0.3, 2), 1.0 / 1.8) * 100000;
+        // Inverse of get_core_mass_losses: peak anchor (ABT #1491)
+        frequency = pow(massLosses / 80 / pow(magneticFluxDensityAcPeak / 0.3, 2), 1.0 / 1.8) * 100000;
     }
 
     if (frequency < 0) {
@@ -3061,7 +3136,23 @@ double CoreLossesModel::_get_frequency_from_core_losses(Core core,
     operatingPointExcitation.set_magnetic_flux_density(magneticFluxDensity);
 
 
-    for (int frequency = 10000; frequency < 2000000; frequency+=5000)
+    // Brute-force sweep 10 kHz..2 MHz in 5 kHz steps. Models built on the Steinmetz ranges are only defined
+    // over the material's fitted span, so for them the sweep is restricted to it (ABT #1456) and it
+    // throws when fewer than two sweep points remain.
+    double sweepMinimum = 10000;
+    double sweepMaximum = 2000000;
+    if (dynamic_cast<const CoreLossesSteinmetzModel*>(this) != nullptr) {
+        auto [spanMinimum, spanMaximum] = CoreLossesModel::get_steinmetz_fitted_span(core.resolve_material());
+        sweepMinimum = std::max(sweepMinimum, 5000 * ceil(spanMinimum / 5000));
+        sweepMaximum = std::min(sweepMaximum, spanMaximum + 1);
+        if (sweepMaximum - sweepMinimum < 5000) {
+            throw CalculationException(ErrorCode::MATERIAL_FREQUENCY_OUT_OF_SPAN,
+                "Material " + core.resolve_material().get_name() + ": its Steinmetz span [" + std::to_string(spanMinimum) +
+                ", " + std::to_string(spanMaximum) + "] Hz leaves no point of the 10 kHz-2 MHz frequency search");
+        }
+    }
+
+    for (double frequency = sweepMinimum; frequency < sweepMaximum; frequency += 5000)
     {
         operatingPointExcitation.set_frequency(frequency);
 
