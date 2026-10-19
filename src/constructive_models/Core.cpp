@@ -70,6 +70,17 @@ Core::Core(const MagneticCore core) {
     }
 }
 
+bool Core::is_piece_and_plate_family(CoreShapeFamily family) {
+    // A shaped piece closed by a plate, ring, or shell -- not by a mirrored half.
+    // One list, one place: it was spelled inline at two call sites, and WebLibMKF
+    // called this helper before any definition existed -- the wasm link demoted
+    // that to a runtime abort (ERROR_ON_UNDEFINED_SYMBOLS=0). Family-by-family
+    // reasoning stays with the constructor cascade below.
+    return family == CoreShapeFamily::UI || family == CoreShapeFamily::PQI ||
+           family == CoreShapeFamily::UT || family == CoreShapeFamily::EI ||
+           family == CoreShapeFamily::DRUM_RING || family == CoreShapeFamily::DRUM_SEMISHIELDED;
+}
+
 Core::Core(const CoreShape shape, std::optional<CoreMaterial> material) {
     get_mutable_functional_description().set_gapping(std::vector<CoreGap>({}));
     get_mutable_functional_description().set_number_stacks(1);
@@ -89,9 +100,7 @@ Core::Core(const CoreShape shape, std::optional<CoreMaterial> material) {
     if (shapeFamily == CoreShapeFamily::T) {
         get_mutable_functional_description().set_type(CoreType::TOROIDAL);
     }
-    else if (shapeFamily == CoreShapeFamily::UI || shapeFamily == CoreShapeFamily::PQI ||
-             shapeFamily == CoreShapeFamily::UT || shapeFamily == CoreShapeFamily::EI ||
-             shapeFamily == CoreShapeFamily::DRUM_RING || shapeFamily == CoreShapeFamily::DRUM_SEMISHIELDED) {
+    else if (is_piece_and_plate_family(shapeFamily)) {
         // DRUM_RING (ABT #366) / DRUM_SEMISHIELDED (ABT #362): a drum closed by its shield
         // ring / magnetic-epoxy shell — same piece-plus-closer semantics as UI/PQI (nothing
         // doubled, the piece class reports the whole assembly).
@@ -276,7 +285,6 @@ std::optional<std::vector<CoreGeometricalDescriptionElement>> Core::create_geome
     auto gapping = get_functional_description().get_gapping();
 
     auto corePiece = CorePiece::factory(std::get<CoreShape>(get_functional_description().get_shape()));
-    auto corePieceHeight = corePiece->get_height();
     auto corePieceDepth = corePiece->get_depth();
 
     CoreGeometricalDescriptionElement spacer;
@@ -2605,10 +2613,7 @@ Core Core::create_quick_core(std::string coreShapeName, std::string coreMaterial
     if (coreShape.get_family() == CoreShapeFamily::T) {
         core.set_type(CoreType::TOROIDAL);
     }
-    else if (coreShape.get_family() == CoreShapeFamily::UI || coreShape.get_family() == CoreShapeFamily::PQI ||
-             coreShape.get_family() == CoreShapeFamily::UT || coreShape.get_family() == CoreShapeFamily::EI ||
-             coreShape.get_family() == CoreShapeFamily::DRUM_RING ||
-             coreShape.get_family() == CoreShapeFamily::DRUM_SEMISHIELDED) {
+    else if (Core::is_piece_and_plate_family(coreShape.get_family())) {
         // UT joins UI here (ABT #995), replacing a TWO_PIECE_SET branch labelled "UT cores are
         // U-type assembled, not toroidal" — which corrected a wrong TOROIDAL classification and
         // then stopped one step short. U-type assembled is right; two-piece-SET is not, because
