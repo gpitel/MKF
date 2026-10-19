@@ -54,7 +54,13 @@ using Catch::Matchers::WithinRel;
 namespace {
 
 constexpr bool kRegenerateBaselines = false;
-constexpr double kRelTol = 1e-6;
+// 1e-4, NOT 1e-6: clean-rebuild reproducibility of these scores is ~3e-5 relative
+// (measured 2026-08-02 at the cbb622a4 re-pin commit itself: identical source,
+// clean ninja rebuild, top-5 identities identical, every score off by ~2.7e-5 —
+// the 1e-6 pins only ever matched the exact binary that generated them). 1e-4
+// sits 3x above that floor and 100x below the ~1e-2 shift a real physics change
+// produces, so identity flips and real drift still fail loudly.
+constexpr double kRelTol = 1e-4;
 
 // --- Fixture loader ---------------------------------------------------------
 std::vector<Core> load_test_cores_fixture() {
@@ -198,12 +204,27 @@ void check_top_n(const std::string& label,
 // MagneticEnergy min/max interval fix (energy target at L_max -> 1.5x gap energy).
 // Same top core; 3C96/3C94 swap in slots 1-2; scores -1.4%. Regenerated with
 // kRegenerateBaselines on main 17e1f850.
+// Refreshed 2026-08-02 (ABT #551): root cause = ABT #378 restored in 7f50d4dc
+// (clean-build identity bisect over cbb622a4..HEAD). Zhang's fringing 'h' is the
+// adjacent core-limb segment per the paper, not max(h, column width); the old
+// substitution over-predicted gapped inductance, worst on short-window cores.
+// Under the corrected model the EFD 25/13/9 pair overtakes EP 20 (slot 0 -> 2)
+// and the PQ 20/20 tail compresses; scores shift ~1-2%. All five remain sane
+// small/mid gapped power ferrites for the 100 uH / 100 kHz / 600 Vpp fixture.
+// Refreshed 2026-08-20 (ABT #834, user-approved). NOT physics: the #832/#835/#837
+// winding-loss fixes were reverted in isolation and every value below is byte-identical
+// with and without them (slot-0 score 3.85020807577381152 both ways). Root cause is
+// catalogue growth: 135 MAS data/ commits since the 2026-06-16 refresh (DMEGC d44b2e7
+// 483 cores, CSC 9c9a18f 630, Sinomag 6a97c76, Nicera 25f7961, plus the ABT #745/#754/
+// #756/#764 shape corrections) moved the min-max normalization pool (ABT #398). Same
+// slot-0 core; EP 20/PQ 20/20 3C96 climb past the EFD 3C95, and a second EP 20 gap
+// variant (0.598 mm) displaces the PQ 20/20 3C94 from the tail. Scores -2.4%.
 const std::vector<TopEntry> kTopAvailablePower = {
-    {"EP 20 - 3C96 - Gapped 0.375 mm",             3.8966756636009796},
-    {"PQ 20/20 - 3C96 - Gapped 0.46900000000000003 mm", 3.854716197272996},
-    {"PQ 20/20 - 3C94 - Gapped 0.472 mm",          3.8494928517386233},
-    {"PQ 20/20 - 3C90 - Gapped 0.472 mm",          3.8341659260385046},
-    {"PQ 20/20 - 3C97 - Gapped 0.477 mm",          3.8233252319348403},
+    {"EFD 25/13/9 - 3C96 - Gapped 0.43 mm",        3.8502080757738115},
+    {"EP 20 - 3C96 - Gapped 0.375 mm",             3.7771608347344783},
+    {"PQ 20/20 - 3C96 - Gapped 0.46900000000000003 mm", 3.7642990791044353},
+    {"EFD 25/13/9 - 3C95 - Gapped 0.44 mm",        3.7354355592417958},
+    {"EP 20 - 3C96 - Gapped 0.598 mm",             3.7094997930199556},
 };
 
 // STANDARD_CORES x POWER: top-5 unique standard-shape ferrite candidates.
@@ -232,12 +253,22 @@ const std::vector<TopEntry> kTopAvailablePower = {
 // displaces EQ 25/6 and seats RM 10/ILP at slot 1; the paralleled dummy coil
 // admits the 3/4-stack E 16/E 19 variants (physically sane for 100 uH /
 // 100 kHz / 600 Vpp). Regenerated on main 17e1f850, user-approved.
+// Refreshed 2026-08-02 (ABT #551): same root cause as kTopAvailablePower —
+// ABT #378 restored in 7f50d4dc. RM 10/ILP keeps slot 0 (score +1.3%); the
+// corrected fringing re-solves the stacked-E gaps, promoting the 2-stack
+// E 19/8/9 over the 3/4-stack variants and admitting RM 10/13.
+// Refreshed 2026-08-20 (ABT #834, user-approved): same root cause and same
+// physics-reverted byte-identity check as kTopAvailablePower above. The 2-stack
+// E 19/8/9 overtakes RM 10/ILP on a 0.15% margin (3.8288 vs 3.8230 — a near-tie
+// reshuffled by the normalization pool, not a re-ranking of substance), RM 10LP
+// enters at slot 2 and the 4-stack E 16/7/5 at slot 3, displacing PQ 27/15 and
+// the 95-material RM 10/ILP from the five.
 const std::vector<TopEntry> kTopStandardPower = {
-    {"98 RM 10/ILP gapped 0.32 mm",                3.8624574793397786},
-    {"98 PQ 27/15 gapped 0.25 mm",                 3.7835392946594726},
-    {"98 E 16/7/5 4 stacks gapped 0.09 mm",        3.7500041208232733},
-    {"95 RM 10/ILP gapped 0.32 mm",                3.6867104806869007},
-    {"98 E 19/8/9 3 stacks gapped 0.08 mm",        3.6749555384431662},
+    {"98 E 19/8/9 2 stacks gapped 0.17 mm",        3.8288484389587505},
+    {"98 RM 10/ILP gapped 0.32 mm",                3.8230493952667546},
+    {"98 RM 10LP gapped 0.32 mm",                  3.7313683903739983},
+    {"98 E 16/7/5 4 stacks gapped 0.09 mm",        3.6953925508982479},
+    {"98 RM 10/13 gapped 0.32 mm",                 3.6220437125629177},
 };
 
 // Refreshed 2026-06-16 (ABT #10) after landing the suppression returns-0 fix
@@ -253,10 +284,29 @@ const std::vector<TopEntry> kTopStandardPower = {
 // Changsung/Ferroxcube/TDK/VAC materials entered the interference-suppression
 // normalization pool, nudging slots 1-2 by ~1e-5 (min-max scores are pool-relative).
 // Identical cores + order; slot 0 unchanged.
+// Re-pin 2026-08-23 (ABT #845/#846/#848): the OneLayer stray-capacitance path the adviser scores
+// impedance with was corrected after the 2026-08-20 pin (pi fix, toroid turn length from the
+// core cross-section, floating-core network that grows with turn count -- validated on 107 WE
+// CMCs), and MnZn/NiZn candidates now carry the core dimensional attenuation from real
+// permittivity. Slots 0-1 keep their identities (+0.26 % / +0.11 %); slot 2 is now the thinner
+// T 134/77/27 (1.5967) ahead of T 167/87/27 (previously 1.5057): a 27 mm-tall XFlux toroid
+// with the same OD wins on the composite once its impedance is scored with the corrected
+// capacitance. No measurement arbitrates a third-place swap between two XFlux 26 toroids; the
+// pin records the corrected engine, not a new truth.
+// Re-pin 2026-08-28 (ABT #927): the coil-geometry work since the 2026-08-23 pin -- spread
+// winding on every layer and ring (25069e00), U links reserving nothing in the receiving layer
+// (602d2241), a single-turn winding no longer treated as a full circle (0296ad20), and foreign
+// copper as a corridor (85c42e65) -- moves the turn positions this scenario's stray capacitance
+// is computed from, and the suppression rank is scored through that capacitance. Slots 0-1 keep
+// their identities and order (+0.51 % / -0.20 %). Slot 2 stays the same core, T 134/77/27, but
+// swaps material from XFlux 26 to Edge 26 -- both Magnetics powders at mu_i = 26, so this is the
+// same kind of unarbitrated near-tie as the 2026-08-23 third-place swap: no measurement decides
+// between them, and the pin records the engine, not a new truth. Scores are pool-relative
+// min-max, so they are not comparable across pins in absolute terms.
 const std::vector<TopEntry> kTopAvailableInterference = {
-    {"T 134/77/155 - XFlux 26 - Ungapped",         1.9451312382492831},
-    {"T 134/77/78 - XFlux 26 - Ungapped",          1.8562803208704106},
-    {"T 167/87/27 - XFlux 26 - Ungapped",          1.5056616982902709},
+    {"T 134/77/155 - XFlux 26 - Ungapped",         1.96010195480288},
+    {"T 134/77/78 - XFlux 26 - Ungapped",          1.8544802939152827},
+    {"T 134/77/27 - Edge 26 - Ungapped",           1.5364767289418393},
 };
 
 } // namespace
@@ -344,7 +394,7 @@ TEST_CASE("CoreAdviser AVAILABLE_CORES x INTERFERENCE_SUPPRESSION top-3 snapshot
 //
 
 TEST_CASE("Benchmark CoreAdviser AVAILABLE_CORES x POWER (full DB, top-50)",
-          "[adviser][core-adviser][!benchmark][benchmark-available-power]") {
+          "[!benchmark][benchmark-available-power]") {
     clear_databases();
     settings.reset();
     settings.set_use_only_cores_in_stock(false);
@@ -365,7 +415,7 @@ TEST_CASE("Benchmark CoreAdviser AVAILABLE_CORES x POWER (full DB, top-50)",
 }
 
 TEST_CASE("Benchmark CoreAdviser STANDARD_CORES x POWER (top-50)",
-          "[adviser][core-adviser][!benchmark][benchmark-standard-power]") {
+          "[!benchmark][benchmark-standard-power]") {
     clear_databases();
     settings.reset();
     settings.set_use_only_cores_in_stock(false);
@@ -385,7 +435,7 @@ TEST_CASE("Benchmark CoreAdviser STANDARD_CORES x POWER (top-50)",
 }
 
 TEST_CASE("Benchmark CoreAdviser AVAILABLE_CORES x INTERFERENCE_SUPPRESSION (full DB, top-10)",
-          "[adviser][core-adviser][!benchmark][benchmark-available-interference]") {
+          "[!benchmark][benchmark-available-interference]") {
     clear_databases();
     settings.reset();
     settings.set_use_concentric_cores(false);

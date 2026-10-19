@@ -236,6 +236,14 @@ struct TemperatureConfig {
     // Thermal model configuration
     double convergenceTolerance = 0.1;  // Temperature convergence criterion (°C)
     size_t maxIterations = 100;         // Maximum solver iterations
+    // ABT #837: a solve that did not converge returns whatever the last relaxed iterate
+    // happened to be, which is not an estimate of anything — so by default the solver now
+    // REFUSES rather than handing a diverged number to callers that publish it (datasheet
+    // temperature rise, rated currents, the adviser's temperature gate). Set this false ONLY
+    // when you are not asking for a temperature at all: the schematic exporters cap
+    // maxIterations to build the resistance network and draw it, and legitimately never
+    // intend to solve it.
+    bool requireConvergence = true;
     double coreThermalConductivity = 4.0;  // Ferrite thermal conductivity (W/m·K)
     
     // Inter-turn insulation (electrical insulation tape between turns)
@@ -276,6 +284,17 @@ struct TemperatureConfig {
     // Factory method to create config from MAS inputs
     static TemperatureConfig fromMasOperatingConditions(
         const MAS::OperatingConditions& conditions);
+
+    // THE one way to configure a full-network solve from a simulated operating
+    // point (ABT #906): ambient + cooling from the operating point's conditions,
+    // core losses and the per-turn winding-loss distribution from the simulated
+    // output, no schematic side effect. MagneticSimulator (outputs[].temperature,
+    // datasheet thermal block) and the temperature-field plot wrappers (WASM,
+    // PyOM) must all build their config through here, so the exported MAS and
+    // the UI temperature map can never disagree again.
+    static TemperatureConfig fromSimulatedOutput(
+        const MAS::OperatingPoint& operatingPoint,
+        const MAS::Outputs& output);
 };
 
 /**
@@ -376,6 +395,18 @@ public:
      * @brief Get the list of thermal resistances
      */
     const std::vector<ThermalResistanceElement>& getResistances() const { return _resistances; }
+
+    /**
+     * @brief Nodes with no path over the resistances to any of `roots` (ambient, cold plates).
+     *
+     * CONNECTIVITY, not degree: a node whose only edges lead to other stranded nodes has a
+     * non-zero conductance diagonal and passed the old G(i,i) test, yet the whole island floats
+     * and the solve is singular. Static and public so the rule is testable on a bare graph.
+     * Returns the stranded node indices in index order.
+     */
+    static std::vector<size_t> nodesWithoutPathToRoots(size_t nodeCount,
+                                                       const std::vector<ThermalResistanceElement>& resistances,
+                                                       const std::vector<size_t>& roots);
     
     /**
      * @brief Get configuration

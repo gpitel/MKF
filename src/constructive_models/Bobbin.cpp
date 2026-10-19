@@ -47,6 +47,12 @@ class BobbinEDataProcessor : public BobbinDataProcessor{
             windingWindowElement.set_width(windowWidth);
             windingWindowElement.set_area(windingWindowElement.get_height().value() * windingWindowElement.get_width().value());
             processedDescription.get_mutable_winding_windows().push_back(windingWindowElement);
+            // ABT #685 (Alf, 2026-08-16): store the column width — innerEdge IS the
+            // column surface half-extent including the bobbin wall, the same convention
+            // create_quick_bobbin uses (core half-width + columnThickness). Every family
+            // processor computed it and threw it away, and paint_bobbin (among others)
+            // then died on the empty optional for every database bobbin.
+            processedDescription.set_column_width(innerEdge);
             processedDescription.set_coordinates(std::vector<double>({0, 0, 0}));
             return processedDescription;
         }
@@ -71,6 +77,14 @@ class BobbinRmDataProcessor : public BobbinDataProcessor{
             windingWindowElement.set_width(windowWidth);
             windingWindowElement.set_area(windingWindowElement.get_height().value() * windingWindowElement.get_width().value());
             processedDescription.get_mutable_winding_windows().push_back(windingWindowElement);
+            // ABT #685 (Alf, 2026-08-16): store the column width — innerEdge IS the
+            // column surface half-extent including the bobbin wall, the same convention
+            // create_quick_bobbin uses (core half-width + columnThickness). Every family
+            // processor computed it and threw it away, and paint_bobbin (among others)
+            // then died on the empty optional for every database bobbin.
+            processedDescription.set_column_width(innerEdge);
+            // Round column: the depth equals the width (both are the tube radius).
+            processedDescription.set_column_depth(innerEdge);
             processedDescription.set_coordinates(std::vector<double>({0, 0, 0}));
             return processedDescription;
         }
@@ -94,6 +108,14 @@ class BobbinEpDataProcessor : public BobbinDataProcessor{
             windingWindowElement.set_width(windowWidth);
             windingWindowElement.set_area(windingWindowElement.get_height().value() * windingWindowElement.get_width().value());
             processedDescription.get_mutable_winding_windows().push_back(windingWindowElement);
+            // ABT #685 (Alf, 2026-08-16): store the column width — innerEdge IS the
+            // column surface half-extent including the bobbin wall, the same convention
+            // create_quick_bobbin uses (core half-width + columnThickness). Every family
+            // processor computed it and threw it away, and paint_bobbin (among others)
+            // then died on the empty optional for every database bobbin.
+            processedDescription.set_column_width(innerEdge);
+            // Round column: the depth equals the width (both are the tube radius).
+            processedDescription.set_column_depth(innerEdge);
 
             processedDescription.set_coordinates(std::vector<double>({0, 0, 0}));
             return processedDescription;
@@ -121,6 +143,14 @@ class BobbinEtdDataProcessor : public BobbinDataProcessor{
             windingWindowElement.set_width(windowWidth);
             windingWindowElement.set_area(windingWindowElement.get_height().value() * windingWindowElement.get_width().value());
             processedDescription.get_mutable_winding_windows().push_back(windingWindowElement);
+            // ABT #685 (Alf, 2026-08-16): store the column width — innerEdge IS the
+            // column surface half-extent including the bobbin wall, the same convention
+            // create_quick_bobbin uses (core half-width + columnThickness). Every family
+            // processor computed it and threw it away, and paint_bobbin (among others)
+            // then died on the empty optional for every database bobbin.
+            processedDescription.set_column_width(innerEdge);
+            // Round column: the depth equals the width (both are the tube radius).
+            processedDescription.set_column_depth(innerEdge);
 
             processedDescription.set_coordinates(std::vector<double>({0, 0, 0}));
             return processedDescription;
@@ -145,6 +175,14 @@ class BobbinPmDataProcessor : public BobbinDataProcessor{
             windingWindowElement.set_width(windowWidth);
             windingWindowElement.set_area(windingWindowElement.get_height().value() * windingWindowElement.get_width().value());
             processedDescription.get_mutable_winding_windows().push_back(windingWindowElement);
+            // ABT #685 (Alf, 2026-08-16): store the column width — innerEdge IS the
+            // column surface half-extent including the bobbin wall, the same convention
+            // create_quick_bobbin uses (core half-width + columnThickness). Every family
+            // processor computed it and threw it away, and paint_bobbin (among others)
+            // then died on the empty optional for every database bobbin.
+            processedDescription.set_column_width(innerEdge);
+            // Round column: the depth equals the width (both are the tube radius).
+            processedDescription.set_column_depth(innerEdge);
             processedDescription.set_coordinates(std::vector<double>({0, 0, 0}));
             return processedDescription;
         }
@@ -169,6 +207,14 @@ class BobbinPqDataProcessor : public BobbinDataProcessor{
             windingWindowElement.set_width(windowWidth);
             windingWindowElement.set_area(windingWindowElement.get_height().value() * windingWindowElement.get_width().value());
             processedDescription.get_mutable_winding_windows().push_back(windingWindowElement);
+            // ABT #685 (Alf, 2026-08-16): store the column width — innerEdge IS the
+            // column surface half-extent including the bobbin wall, the same convention
+            // create_quick_bobbin uses (core half-width + columnThickness). Every family
+            // processor computed it and threw it away, and paint_bobbin (among others)
+            // then died on the empty optional for every database bobbin.
+            processedDescription.set_column_width(innerEdge);
+            // Round column: the depth equals the width (both are the tube radius).
+            processedDescription.set_column_depth(innerEdge);
             processedDescription.set_coordinates(std::vector<double>({0, 0, 0}));
             return processedDescription;
         }
@@ -193,6 +239,14 @@ class BobbinEcDataProcessor : public BobbinDataProcessor{
             windingWindowElement.set_width(windowWidth);
             windingWindowElement.set_area(windingWindowElement.get_height().value() * windingWindowElement.get_width().value());
             processedDescription.get_mutable_winding_windows().push_back(windingWindowElement);
+            // ABT #685 (Alf, 2026-08-16): store the column width — innerEdge IS the
+            // column surface half-extent including the bobbin wall, the same convention
+            // create_quick_bobbin uses (core half-width + columnThickness). Every family
+            // processor computed it and threw it away, and paint_bobbin (among others)
+            // then died on the empty optional for every database bobbin.
+            processedDescription.set_column_width(innerEdge);
+            // Round column: the depth equals the width (both are the tube radius).
+            processedDescription.set_column_depth(innerEdge);
             processedDescription.set_coordinates(std::vector<double>({0, 0, 0}));
             return processedDescription;
         }
@@ -216,6 +270,12 @@ class BobbinEfdDataProcessor : public BobbinDataProcessor{
             windingWindowElement.set_width(windowWidth);
             windingWindowElement.set_area(windingWindowElement.get_height().value() * windingWindowElement.get_width().value());
             processedDescription.get_mutable_winding_windows().push_back(windingWindowElement);
+            // ABT #685 (Alf, 2026-08-16): store the column width — innerEdge IS the
+            // column surface half-extent including the bobbin wall, the same convention
+            // create_quick_bobbin uses (core half-width + columnThickness). Every family
+            // processor computed it and threw it away, and paint_bobbin (among others)
+            // then died on the empty optional for every database bobbin.
+            processedDescription.set_column_width(innerEdge);
             processedDescription.set_coordinates(std::vector<double>({0, 0, 0}));
             return processedDescription;
         }
@@ -249,6 +309,24 @@ class BobbinTDataProcessor : public BobbinDataProcessor{
 };
 
 std::shared_ptr<BobbinDataProcessor> BobbinDataProcessor::factory(Bobbin bobbin) {
+
+    // ABT #763: same undefined behaviour ABT #631 removed from get_winding_window_shape,
+    // still live here. get_functional_description() returns the optional BY VALUE; when it
+    // is disengaged, `->get_family()` reads the optional's *uninitialised* storage as a
+    // BobbinFamily. That is not an exception, it is UB: the byte that comes back is
+    // whatever the stack happened to hold, so the same input decides its own fate at
+    // runtime. Observed on PyOpenMagnetics 1.7.0 with a bobbin json that carries no
+    // functionalDescription (e.g. a caller passing json.dumps(row) — a json *string* —
+    // instead of the object): most runs land on a value matching no enumerator and report
+    // the misleading "Unknown bobbin family"; some land on E/ER and go on to read the
+    // equally uninitialised dimensions map, yielding either a SEGFAULT or a silent
+    // 0.0 x 0.0 winding window. Ask the question before dereferencing.
+    if (!bobbin.get_functional_description()) {
+        throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+            "Bobbin has no functionalDescription, so its family is unknown and it cannot be "
+            "processed. A bobbin to be processed must be a json OBJECT carrying "
+            "functionalDescription.family and functionalDescription.dimensions.");
+    }
 
     auto family = bobbin.get_functional_description()->get_family();
     if (family == BobbinFamily::E) {
@@ -290,7 +368,9 @@ std::shared_ptr<BobbinDataProcessor> BobbinDataProcessor::factory(Bobbin bobbin)
         return std::make_shared<BobbinEDataProcessor>();
     }
     else
-        throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA, "Unknown bobbin family, available options are: {E, EC, EFD, EL, EP, ER, ETD, P, PM, PQ, RM, T, U}");
+        throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+            "Unknown bobbin family (enumerator value " + std::to_string(static_cast<int>(family)) +
+            "), available options are: {E, EC, EFD, EL, EP, ER, ETD, P, PM, PQ, RM, T, U}");
 }
 
 void load_interpolators() {
@@ -334,11 +414,49 @@ void load_interpolators() {
         minBobbinWallThickness = std::numeric_limits<double>::infinity();
         minBobbinColumnThickness = std::numeric_limits<double>::infinity();
 
+        // ABT #631: rows this scan cannot use, reported once at the end instead of
+        // vanishing into a bare `continue` — 34 of MAS's 504 bobbins point at core
+        // shapes MAS does not ship (10 "EI …", 24 "M …"), and nobody knew because the
+        // skip was silent.
+        std::vector<std::string> unusableBobbins;
+
         for (auto& datum : bobbinDatabase) {
+            // ABT #631: these skips must NOT be spelled as throw-and-catch. Wherever the
+            // engine is compiled with exception catching disabled — the Emscripten
+            // default, and how MVB++'s WASM module builds MKF (not one of its 92 objects
+            // carries a __cxa_begin_catch) — the catch below is deleted and the first
+            // unresolvable row escapes this loop, taking down every design whose bobbin
+            // or shape is given by NAME in the browser. Ask whether the row is usable.
+            if (!datum.second.get_functional_description()) {
+                unusableBobbins.push_back(datum.first + " (no functionalDescription)");
+                continue;
+            }
+            auto coreShapeName = datum.second.get_functional_description()->get_shape();
+            auto coreShapeOrNone = try_find_core_shape_by_name(coreShapeName);
+            if (!coreShapeOrNone) {
+                unusableBobbins.push_back(datum.first + " -> core shape '" + coreShapeName + "' is not in the shape database");
+                continue;
+            }
+            if (!datum.second.get_processed_description() ||
+                datum.second.get_processed_description()->get_winding_windows().empty()) {
+                unusableBobbins.push_back(datum.first + " (no processed winding window)");
+                continue;
+            }
+            auto bobbinWindingWindow = datum.second.get_processed_description()->get_winding_windows()[0];
+            if (!bobbinWindingWindow.get_area() || !bobbinWindingWindow.get_width() || !bobbinWindingWindow.get_height()) {
+                unusableBobbins.push_back(datum.first + " (winding window has no area/width/height)");
+                continue;
+            }
             try {
-                auto coreShapeName = datum.second.get_functional_description()->get_shape();
-                auto coreShape = find_core_shape_by_name(coreShapeName);
+                auto coreShape = coreShapeOrNone.value();
                 auto corePiece = CorePiece::factory(coreShape);
+                auto coreWindingWindow = corePiece->get_winding_window();
+                if (!coreWindingWindow.get_area() || !coreWindingWindow.get_width() || !coreWindingWindow.get_height()) {
+                    // Same reason as the checks above: a bad_optional_access here would be a
+                    // throw where a skip is meant, and would escape in an exceptionless build.
+                    unusableBobbins.push_back(datum.first + " -> core shape '" + coreShapeName + "' has no processed winding window");
+                    continue;
+                }
 
                 auto bobbinWindingWindowArea = datum.second.get_processed_description()->get_winding_windows()[0].get_area().value();
                 auto coreShapeWindingWindowArea = corePiece->get_winding_window().get_area().value() * 2; // Because if we are using a bobbin we have a two piece set
@@ -379,9 +497,21 @@ void load_interpolators() {
             }
             catch (const std::exception &e)
             {
-                (void)e; // Suppress unused variable warning
+                // Backstop for the one step left that can still only report failure by
+                // throwing (CorePiece::factory, for a family it does not implement).
+                unusableBobbins.push_back(datum.first + " (" + std::string(e.what()) + ")");
                 continue;
             }
+        }
+
+        if (!unusableBobbins.empty()) {
+            std::string entry = std::to_string(unusableBobbins.size()) + " of " +
+                                std::to_string(bobbinDatabase.size()) +
+                                " catalogue bobbins could not be used to fit the bobbin interpolators:";
+            for (const auto& unusableBobbin : unusableBobbins) {
+                entry += "\n  - " + unusableBobbin;
+            }
+            logEntry(entry, "Bobbin", 1);
         }
 
         {
@@ -676,6 +806,11 @@ Bobbin Bobbin::create_quick_bobbin(Core core, double wallThickness, double colum
         if (coreWindingWindow.get_column()) {
             windingWindowElement.set_column(coreWindingWindow.get_column());
         }
+        // Carry a windingOrder set on the core's window (U serpentine vs Z dragback) so
+        // Coil::get_winding_order finds it on the autocompleted bobbin (ABT #352).
+        if (coreWindingWindow.get_winding_order()) {
+            windingWindowElement.set_winding_order(coreWindingWindow.get_winding_order());
+        }
 
         if (bobbinWindingWindowShape == WindingWindowShape::RECTANGULAR) {
             if ((windingWindowElement.get_width().value() < 0) || (windingWindowElement.get_width().value() > 1)) {
@@ -711,6 +846,44 @@ Bobbin Bobbin::create_quick_bobbin(Core core, double wallThickness, double colum
         // Toroid: no bobbin plastic, but carry the coating folded into columnThickness above so
         // the coated-OD outer wrap is preserved (and cancels out of get_air_cored_reluctance).
         coreBobbinProcessedDescription.set_column_thickness(columnThickness);
+
+        // THE EDGE THE WIRE IS PULLED OVER. A turn on a toroid is a closed loop around the ring
+        // cross-section, so it bends at that section's edges and nowhere else -- there is no
+        // moulded former corner here, and the injection-moulding fallback in
+        // get_column_corner_radius() (half the wall thickness) is the wrong rule for a part that
+        // has no wall. MAS names this case directly: cornerRadius is "the radius of the core
+        // cross-section edges (or of its coating, when coated), which is what the wire is pulled
+        // over".
+        //
+        // What that radius is, from the sources: NOTHING publishes the bare ferrite edge as a
+        // number. IEC 62317-12 dimensions a ring core as A/B/C and admits the chamfer only
+        // through the effective height; the MMPA/IMA "Standard Specification for Ferrite Toroid
+        // Cores" says only that "the toroid corners shall not be sharp or rough" (4.2.4-4.2.5);
+        // Fair-Rite states its toroids are "supplied burnished to break sharp edges"; TDK gives
+        // the treatment by size tier (small = edges rounded by tumbling, medium/large = chamfer)
+        // and no dimension. The one quantity that IS dimensioned on the winding surface is the
+        // COATING: Ferroxcube draws PA11 at ~0.3 mm on its TN ring cores, TDK specifies epoxy
+        // < 0.4 mm and parylene at 12.7 or 25 um, and Magnetics' coated-vs-uncoated limits imply
+        // ~0.3-0.4 mm of epoxy buildup per surface.
+        //
+        // So the jacket is what we can source, and it is also what the wire actually touches: a
+        // conformal coating cannot reproduce an edge sharper than itself, and the tumbled or
+        // chamfered ferrite underneath only adds to it. Core::get_toroid_edge_radius() carries
+        // that resolution -- the drawn ring-core value, floored at this part's own coating and
+        // clamped to what the ring section can geometrically carry.
+        //
+        // It is deliberately NOT get_coating_thickness(). That datum is the dielectric path
+        // normal to the flat faces, which is what StrayCapacitance integrates over and what the
+        // outer-wrap fold above uses; this one is the curvature at the corner. Reusing a single
+        // number for both would tie the windability verdict to a capacitance constant, and moving
+        // either would silently move the other.
+        //
+        // Unlike that OUTER-WRAP fold -- which takes only an EXPLICIT coating, because inflating
+        // the wound OD from a jacket the catalogue never claimed would move mean turn length and
+        // reluctance -- the edge radius resolves for every toroid, defaults and all: a toroid
+        // ships jacketed even when the catalogue omits it, and a bare-ferrite toroid wound with
+        // bare wire is not a real part.
+        coreBobbinProcessedDescription.set_column_corner_radius(core.get_toroid_edge_radius());
     }
 
     // NOTE: column_depth/column_shape/column_width describe the centre/main
@@ -815,6 +988,18 @@ WindingWindowShape Bobbin::get_winding_window_shape(size_t windingWindowIndex) {
         throw InvalidInputException(ErrorCode::INVALID_INPUT, "Invalid windingWindowIndex: " + std::to_string(windingWindowIndex) + ", bobbin only has" + std::to_string(get_processed_description()->get_winding_windows().size()) + " winding windows.");
     }
     if (!get_processed_description()) {
+        // ABT #631: find_bobbin_by_name returns a bobbin with NEITHER description for the
+        // documented placeholder names ("basic"/"Basic"/"Dummy"/"None"), and Coil::resolve_bobbin
+        // hands that straight to callers. Dereferencing the disengaged optional here is undefined
+        // behaviour, not an exception: it reads whatever the returned-by-value optional's storage
+        // happens to contain as a std::string. Say what is actually wrong instead.
+        if (!get_functional_description()) {
+            throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+                "Bobbin has neither a processedDescription nor a functionalDescription: it is an "
+                "unresolved placeholder ('basic'/'Dummy'/'None') and must be resolved against the "
+                "core (magnetic_autocomplete, or Bobbin::create_quick_bobbin) before its winding "
+                "window can be queried.");
+        }
         auto coreShapeName = get_functional_description()->get_shape();
         auto coreShape = find_core_shape_by_name(coreShapeName);
         if (coreShape.get_family() == CoreShapeFamily::T) {
@@ -831,8 +1016,55 @@ WindingWindowShape Bobbin::get_winding_window_shape(size_t windingWindowIndex) {
 }
 
 void Bobbin::process_data() {
+    // ABT #763: guard before the factory too. factory() takes its Bobbin BY VALUE, so a
+    // guard there protects its own copy only if it is reached; this is the public entry
+    // point every binding calls, and it must not be able to hand a description-less bobbin
+    // any further down.
+    if (!get_functional_description()) {
+        throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+            "Bobbin has no functionalDescription, so there is nothing to process. "
+            "process_data expects a bobbin json OBJECT with functionalDescription.family and "
+            "functionalDescription.dimensions; a json string, an array, a number or an empty "
+            "object all arrive here as an empty bobbin.");
+    }
+
     auto processor = BobbinDataProcessor::factory(*this);
-    set_processed_description((*processor).process_data(*this));
+    auto processedDescription = (*processor).process_data(*this);
+
+    // ABT #763 / ABT #634: a processed bobbin whose winding window has no area, or an area
+    // of zero, is never a valid answer — it is the signature of a family whose processor
+    // read dimension keys the bobbin does not declare (flatten_dimensions returns 0 for a
+    // missing key without complaining; that is exactly how the 10 "Bobbin EI …" rows
+    // declaring family "etd" while carrying the E dimension set processed to zero area,
+    // silently, for as long as they did). Refuse to return a plausible zero.
+    if (processedDescription.get_winding_windows().empty()) {
+        throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+            "Processing bobbin '" + (get_name() ? get_name().value() : std::string("<unnamed>")) +
+            "' produced no winding window at all.");
+    }
+    auto windingWindow = processedDescription.get_winding_windows()[0];
+    if (!windingWindow.get_area() || !(windingWindow.get_area().value() > 0)) {
+        // get_functional_description() returns the optional BY VALUE; holding the
+        // description in a named local is what keeps the dimensions map alive while it is
+        // iterated (binding the range-for to `...->get_dimensions()` directly walks a map
+        // owned by a temporary that is already gone — gcc's -Wdangling-pointer catches it).
+        auto functionalDescription = get_functional_description().value();
+        std::string declaredDimensions;
+        for (const auto& [key, _] : functionalDescription.get_dimensions()) {
+            if (!declaredDimensions.empty()) {
+                declaredDimensions += ", ";
+            }
+            declaredDimensions += key;
+        }
+        throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+            "Processing bobbin '" + (get_name() ? get_name().value() : std::string("<unnamed>")) +
+            "' as family '" + to_string(functionalDescription.get_family()) +
+            "' produced a winding window of zero area. The family's processor did not find the "
+            "dimensions it reads; the bobbin declares {" + declaredDimensions + "}. Either the "
+            "declared family does not match the declared dimension set, or a dimension is missing.");
+    }
+
+    set_processed_description(processedDescription);
 }
 
 bool Bobbin::check_if_fits(double dimension, bool isHorizontalOrRadial, size_t windingWindowIndex) {
@@ -1052,6 +1284,62 @@ double Bobbin::get_column_depth() {
         throw CoilNotProcessedException("Bobbin not processed");
     }
     return get_processed_description()->get_column_depth();
+}
+
+double Bobbin::get_column_corner_radius() {
+    if (!get_processed_description()) {
+        throw CoilNotProcessedException("Bobbin not processed");
+    }
+    auto processedDescription = get_processed_description().value();
+
+    switch (processedDescription.get_column_shape()) {
+        case ColumnShape::ROUND:
+            // column_width IS the radius for a round column (see get_column_right_face_area),
+            // and a cylinder is nothing but corner, so that radius is the bend radius.
+            if (!processedDescription.get_column_width()) {
+                throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+                                            "Bobbin: a round column has no column width, so its "
+                                            "radius -- which is what a turn bends around -- is "
+                                            "not defined");
+            }
+            return processedDescription.get_column_width().value();
+        case ColumnShape::OBLONG:
+            // A stadium's ends are semicircles of half the depth, and column_depth is already
+            // the half-dimension. This has always been derivable and was simply never used.
+            return processedDescription.get_column_depth();
+        case ColumnShape::RECTANGULAR:
+        case ColumnShape::IRREGULAR:
+            if (processedDescription.get_column_corner_radius()) {
+                return processedDescription.get_column_corner_radius().value();
+            }
+            // No datum: a moulded bobbin still cannot have a sharp corner. The injection-moulding
+            // rule puts the inside radius at half the wall thickness, which is a sourced design
+            // rule rather than a tuned constant, and it is the same treatment the wall thickness
+            // itself gets in create_quick_bobbin when a real bobbin is not available. A catalogue
+            // bobbin should carry the radius off its drawing instead.
+            return 0.5 * processedDescription.get_column_thickness();
+    }
+    throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+                                "Bobbin: unknown column shape, cannot resolve its corner radius");
+}
+
+double Bobbin::get_column_corner_half_angle() {
+    if (!get_processed_description()) {
+        throw CoilNotProcessedException("Bobbin not processed");
+    }
+    switch (get_processed_description()->get_column_shape()) {
+        case ColumnShape::RECTANGULAR:
+        case ColumnShape::IRREGULAR:
+            // Two perpendicular faces meet at each corner of the racetrack.
+            return 0.25 * std::numbers::pi;
+        case ColumnShape::ROUND:
+        case ColumnShape::OBLONG:
+            // Nothing meets at an angle: the wire never leaves the curve, so there is no
+            // lift-off term to apply.
+            return 0.5 * std::numbers::pi;
+    }
+    throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+                                "Bobbin: unknown column shape, cannot resolve its corner angle");
 }
 
 

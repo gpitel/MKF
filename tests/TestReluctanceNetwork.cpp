@@ -415,3 +415,58 @@ TEST_CASE("ReluctanceNetwork_SectionLevelPlacement_MatchesWindingLevel", "[physi
         }
     }
 }
+
+// MAS indexes winding.windingWindow into the windingWindows list of the GOVERNING bobbin,
+// which need not be the core's list: a split bobbin has one chamber per leg while the core
+// reports a single shared window. Resolving the index against the core rejected such a coil
+// outright ("references winding window 1 but the core has 1 winding windows"), from a
+// function whose only job is to say which column each winding sits on.
+TEST_CASE("ReluctanceNetwork_SplitBobbin_WindowIndexIsBobbinRelative", "[physical-model][magnetic-circuit][multi-column][smoke-test]") {
+    auto& settings = Settings::GetInstance();
+    settings.set_core_per_column_winding_windows(false);
+    auto core = OpenMagneticsTesting::get_quick_core("U 15/11/6", json::parse("[]"), 1, "Dummy");
+    auto columns = core.get_processed_description()->get_columns();
+    REQUIRE(columns.size() == 2);
+    REQUIRE(core.get_processed_description()->get_winding_windows().size() == 1);
+
+    // One two-chamber bobbin: a window per leg, each naming the column it wraps.
+    size_t mainColumnIndex = core.get_main_column_index();
+    size_t otherColumnIndex = (mainColumnIndex == 0) ? 1 : 0;
+    auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.001, 0.001);
+    auto processedDescription = bobbin.get_processed_description().value();
+    auto chamber = processedDescription.get_winding_windows()[0];
+    auto mainChamber = chamber;
+    mainChamber.set_column(static_cast<int64_t>(mainColumnIndex));
+    auto otherChamber = chamber;
+    otherChamber.set_column(static_cast<int64_t>(otherColumnIndex));
+    processedDescription.set_winding_windows({mainChamber, otherChamber});
+    bobbin.set_processed_description(processedDescription);
+
+    json bobbinJson;
+    to_json(bobbinJson, bobbin);
+    json coilJson;
+    coilJson["bobbin"] = bobbinJson;
+    coilJson["functionalDescription"] = json::array();
+    coilJson["functionalDescription"].push_back(json{{"name", "Primary"}, {"numberTurns", 20}, {"numberParallels", 1},
+                                                     {"isolationSide", "primary"}, {"wire", "Round 0.475 - Grade 1"}});
+    coilJson["functionalDescription"].push_back(json{{"name", "Secondary"}, {"numberTurns", 10}, {"numberParallels", 1},
+                                                     {"isolationSide", "secondary"}, {"wire", "Round 0.475 - Grade 1"}});
+    OpenMagnetics::Coil coil(coilJson, false);
+    coil.get_mutable_functional_description()[1].set_winding_window(1);
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(coil);
+
+    REQUIRE_NOTHROW(ReluctanceNetwork::resolve_winding_column_indexes(magnetic));
+    auto columnIndexes = ReluctanceNetwork::resolve_winding_column_indexes(magnetic);
+    REQUIRE(columnIndexes.size() == 2);
+    CHECK(columnIndexes[0] == mainColumnIndex);
+    CHECK(columnIndexes[1] == otherColumnIndex);
+    CHECK(ReluctanceNetwork::has_non_main_placement(magnetic));
+
+    // An index past the bobbin's own list is still an error, and the message says which
+    // list was consulted.
+    coil.get_mutable_functional_description()[1].set_winding_window(2);
+    magnetic.set_coil(coil);
+    CHECK_THROWS(ReluctanceNetwork::resolve_winding_column_indexes(magnetic));
+}

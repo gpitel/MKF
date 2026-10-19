@@ -1,6 +1,7 @@
 #include <source_location>
 #include "support/Painter.h"
 #include "support/Utils.h"
+#include "physical_models/MagnetizingInductance.h"
 #include "support/Settings.h"
 #include "TestingUtils.h"
 #include "json.hpp"
@@ -13,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <magic_enum.hpp>
+#include <set>
 #include <vector>
 using json = nlohmann::json;
 #include <typeinfo>
@@ -46,6 +48,47 @@ namespace {
         REQUIRE_THAT(expectedValue, Catch::Matchers::WithinAbs(calculatedValue, expectedValue * 0.001));
     }
 
+    // ABT #1130: modified_bessel_first_kind carried the same defect as its sibling
+    // bessel_first_kind (ABT #1127) — each term was divided by tgammaf(k+1)*tgammaf(order+k+1)
+    // and the loop broke as soon as that SINGLE-precision product reached inf, which happens
+    // around k = 21 for order 0 whatever the argument. Every term of I_n is positive, so a
+    // truncated sum is always too SMALL, and past |z| ~ 23 the cut lands on the rising terms:
+    // measured against mpmath, the old code returned 97.8% of I_0(30) and 11.2% of I_0(50).
+    // Nothing observable was wrong because the one hot path,
+    // modified_bessel_ratio_I1_I0, switches to an asymptotic expansion above |z| = 20 — this
+    // pins the function itself so a new caller cannot inherit the defect.
+    //
+    // Reference values from mpmath at 25 dps. z = 30 and 50 are past the old break point,
+    // z = 1 and 5 are controls that were always right.
+    TEST_CASE("Modified Bessel of a large argument", "[support][utils][smoke-test][abt1130]") {
+        struct Reference { double z; double i0; double i1; };
+        const std::vector<Reference> references = {
+            {1.0,  1.2660658777520083,  0.56515910399248503},
+            {5.0,  27.239871823604447,  24.335642142450527},
+            {20.0, 43558282.559553533,  42454973.385127770},
+            {25.0, 5774560606.4663103,  5657865129.8787014},
+            {30.0, 781672297823.97749,  768532038938.95700},
+            {50.0, 2.9325537838493363e20, 2.9030785901035568e20},
+        };
+
+        for (const auto& reference : references) {
+            INFO("z = " << reference.z);
+            auto i0 = modified_bessel_first_kind(0.0, std::complex<double>{reference.z, 0.0});
+            auto i1 = modified_bessel_first_kind(1.0, std::complex<double>{reference.z, 0.0});
+            // 1e-5 relative, not tighter: the series stops when a term falls below 1e-4 of
+            // the running sum, which leaves about six significant digits (measured: I_1(1)
+            // lands 1.2e-6 low). That is the pre-existing convergence criterion, shared with
+            // bessel_first_kind, and this test is not the place to change it. It is still
+            // far tighter than the defect, which was an 89% shortfall at z = 50.
+            REQUIRE_THAT(i0.real(), Catch::Matchers::WithinRel(reference.i0, 1e-5));
+            REQUIRE_THAT(i1.real(), Catch::Matchers::WithinRel(reference.i1, 1e-5));
+            // I_n of a real argument is real and strictly positive; the truncated series
+            // stayed positive but shrank, so the magnitude check above is what catches it.
+            REQUIRE(i0.imag() == 0.0);
+            REQUIRE(i0.real() > i1.real());
+        }
+    }
+
     TEST_CASE("Bessel", "[support][utils][smoke-test]") {
         double calculatedValue = bessel_first_kind(0.0, std::complex<double>{1.0, 0.0}).real();
         double expectedValue = 0.7651976865579666;
@@ -66,6 +109,42 @@ namespace {
         double calculatedBeipValue = derivative_kelvin_function_imaginary(0.0, 1.0);
         double expectedBeipValue = 0.49739651146809727;
         REQUIRE_THAT(expectedBeipValue, Catch::Matchers::WithinAbs(calculatedBeipValue, expectedBeipValue * 0.001));
+    }
+
+    // ABT #605: Ferreira's ROUND-wire proximity factor is built from ORDER-2 Kelvin
+    // functions — kelvin_function_real(2, gamma) and kelvin_function_imaginary(2, gamma) —
+    // and until now only ORDER 0 was pinned anywhere. That gap mattered: the #605
+    // investigation named order-2 as the most likely locus of a 10000x disagreement
+    // between proximity models, specifically because bessel_first_kind divides by
+    // tgammaf (the FLOAT gamma function), which is the same 'float truncating a Bessel
+    // series' class that has bitten this codebase before.
+    //
+    // Measured, not assumed: a faithful port of bessel_first_kind including tgammaf,
+    // compared against J_n(x*e^{i3pi/4}) at 30 significant digits, agrees to 3e-6
+    // relative or better for orders 0 and 2 over x = 0.5..5. The float gamma costs
+    // about a part in 1e6 and nothing more, so order-2 was NOT the bug. Pinning it so
+    // that stays true, and so the next person does not have to re-derive it.
+    //
+    // Reference values from mpmath at 30 dps via ber_n(x) + i*bei_n(x) = J_n(x*e^{i3pi/4}),
+    // the identity checked against Abramowitz & Stegun's order-0 pair at x = 1
+    // (0.98438178 / 0.24956604) before being trusted at order 2.
+    TEST_CASE("Kelvin functions of order 2", "[support][utils][smoke-test]") {
+        struct Reference { double x; double ber2; double bei2; };
+        const std::vector<Reference> references = {
+            {1.0,  0.0104112417231, -0.124674535679},
+            {2.0,  0.16527943067,   -0.479224502597},
+            {3.5,  1.44233885257,   -0.948359035325},
+        };
+
+        for (const auto& reference : references) {
+            INFO("x = " << reference.x);
+            double calculatedBer2 = kelvin_function_real(2.0, reference.x);
+            double calculatedBei2 = kelvin_function_imaginary(2.0, reference.x);
+            // 1e-5 relative: tight enough to catch a wrong recurrence, a sign error or a
+            // dropped term, loose enough for the tgammaf precision measured above.
+            REQUIRE_THAT(calculatedBer2, Catch::Matchers::WithinRel(reference.ber2, 1e-5));
+            REQUIRE_THAT(calculatedBei2, Catch::Matchers::WithinRel(reference.bei2, 1e-5));
+        }
     }
 
     TEST_CASE("Test_Complete_Ellipitical_1_0", "[support][utils][smoke-test]") {
@@ -145,14 +224,47 @@ namespace {
         REQUIRE("PQ 35/35" == shape.get_name().value());
     }
 
+    // ABT #334: these used to pin the RESULT NAME ("UR 46/21/11", "T 22/12.4/12.8"). Those pins
+    // captured whatever the catalogue happened to contain at the time and broke the moment MAS
+    // commit 3f8bd6f added 207 shapes, because the search then found genuinely closer matches.
+    // Re-pinning would only defer the same break to the next data batch, so what is asserted now
+    // is the PROPERTY the function actually promises: it returns the CLOSEST eligible shape.
+    // That is stable under catalogue growth and is a stronger statement than any single name.
+    // The search scans coreShapeDatabase, and get_shapes(true) returns exactly that database, so
+    // the two see the same candidate set. clear_databases() plus the toroidal/concentric settings
+    // filter it at load time, which is why no family filtering is needed here beyond the search's
+    // own exclusions.
+    static void require_closest_shape_by_perimeter(double desiredPerimeter) {
+        auto shape = find_core_shape_by_winding_window_perimeter(desiredPerimeter);
+        REQUIRE(shape.get_name());
+        double returnedError = get_error_by_winding_window_perimeter(shape, desiredPerimeter);
+
+        size_t candidatesChecked = 0;
+        for (const auto& candidate : get_shapes(true)) {
+            // Mirror the search's own exclusions: families with no cores to build from.
+            if (candidate.get_family() == CoreShapeFamily::UT
+                || candidate.get_family() == CoreShapeFamily::UI
+                || candidate.get_family() == CoreShapeFamily::PQI) {
+                continue;
+            }
+            double candidateError = get_error_by_winding_window_perimeter(candidate, desiredPerimeter);
+            if (candidateError < returnedError - 1e-12) {
+                UNSCOPED_INFO("returned " << shape.get_name().value() << " (error " << returnedError
+                              << ") but " << candidate.get_name().value_or("?")
+                              << " is closer at " << candidateError);
+            }
+            CHECK(candidateError >= returnedError - 1e-12);
+            candidatesChecked++;
+        }
+        REQUIRE(candidatesChecked > 0);
+    }
+
     TEST_CASE("Test_Find_By_Perimeter", "[support][utils][smoke-test]") {
         clear_databases();
         settings.set_use_toroidal_cores(true);
         settings.set_use_concentric_cores(true);
 
-        auto shape = find_core_shape_by_winding_window_perimeter(0.03487);
-
-        REQUIRE("UR 46/21/11" == shape.get_name().value());
+        require_closest_shape_by_perimeter(0.03487);
     }
 
     TEST_CASE("Test_Find_By_Perimeter_Only_Toroids", "[support][utils][smoke-test]") {
@@ -160,9 +272,11 @@ namespace {
         settings.set_use_toroidal_cores(true);
         settings.set_use_concentric_cores(false);
 
+        // With concentric cores disabled the answer must be a toroid, and still the closest one.
         auto shape = find_core_shape_by_winding_window_perimeter(0.03487);
-
-        REQUIRE("T 22/12.4/12.8" == shape.get_name().value());
+        REQUIRE(shape.get_name());
+        REQUIRE(shape.get_family() == CoreShapeFamily::T);
+        require_closest_shape_by_perimeter(0.03487);
     }
 
     TEST_CASE("Test_Get_Shapes", "[support][utils][smoke-test]") {
@@ -182,6 +296,67 @@ namespace {
 
         REQUIRE(allShapeNames.size() > magneticsShapeNames.size());
         REQUIRE(allShapeNames.size() > ferroxcubeShapeNames.size());
+    }
+
+    // ABT #924: the shape listing is a CATALOG, the shape database is an alias INDEX.
+    // Listing the index's keys put every aliased shape in the UI dropdown twice — once as
+    // "EFD 25", once as "EFD 25/13/9" — and picking the alias row re-labelled itself to the
+    // canonical name, which reads as the tool silently choosing a different core size.
+    TEST_CASE("Test_Get_Shapes_Lists_Canonical_Names_Only", "[support][utils][smoke-test]") {
+        clear_databases();
+        settings.reset();
+        auto allShapeNames = get_core_shape_names();
+
+        std::set<std::string> listed(allShapeNames.begin(), allShapeNames.end());
+        REQUIRE(listed.size() == allShapeNames.size());  // no name listed twice
+
+        for (const auto& name : allShapeNames) {
+            auto shape = find_core_shape_by_name(name);
+            REQUIRE(shape.get_name());
+            // Every listed name is the name the engine echoes back for that shape, so the
+            // selection the user makes is the selection the UI keeps showing.
+            REQUIRE(shape.get_name().value() == name);
+        }
+
+        // Aliases stay resolvable — they are just not offered as separate catalog entries.
+        REQUIRE(listed.count("EFD 25/13/9") == 1);
+        REQUIRE(listed.count("EFD 25") == 0);
+        REQUIRE(find_core_shape_by_name("EFD 25").get_name().value() == "EFD 25/13/9");
+    }
+
+    // ABT #1070: get_shapes() iterated the alias index too, so a shape with N aliases came
+    // back N+1 times (the web shape table showed "E 22/6/16" five times) and bulk consumers
+    // such as calculate_all_core_data_from_shapes processed every aliased shape repeatedly.
+    TEST_CASE("Test_Get_Shapes_Returns_Each_Shape_Once", "[support][utils][smoke-test]") {
+        clear_databases();
+        settings.reset();
+        auto shapes = get_shapes(true);
+        auto listedNames = get_core_shape_names();
+
+        std::set<std::string> seen;
+        for (const auto& shape : shapes) {
+            REQUIRE(shape.get_name());
+            REQUIRE(seen.insert(shape.get_name().value()).second);  // no shape twice
+        }
+        // Same catalogue as the name listing: every listed name, nothing but listed names.
+        std::set<std::string> listed(listedNames.begin(), listedNames.end());
+        REQUIRE(seen == listed);
+        REQUIRE(seen.count("EFD 25/13/9") == 1);
+        REQUIRE(seen.count("EFD 25") == 0);  // an alias, still resolvable, not a catalogue entry
+    }
+
+    // ABT #924: "RM 6-S" is the real name of one shape AND an alias of "RM 6/I". The alias
+    // used to overwrite the canonical entry, so asking for RM 6-S handed back RM 6/I —
+    // a part without the centre hole.
+    TEST_CASE("Test_Core_Shape_Alias_Never_Shadows_A_Real_Shape", "[support][utils][smoke-test]") {
+        clear_databases();
+        settings.reset();
+
+        REQUIRE(find_core_shape_by_name("RM 6-S").get_name().value() == "RM 6-S");
+        REQUIRE(find_core_shape_by_name("RM 6/I").get_name().value() == "RM 6/I");
+        REQUIRE(find_core_shape_by_name("RM 6").get_name().value() == "RM 6");
+        REQUIRE(find_core_shape_by_name("ER 28L").get_name().value() == "ER 28L");
+        REQUIRE(find_core_shape_by_name("EER 35/21/11").get_name().value() == "EER 35/21/11");
     }
 
     TEST_CASE("Test_Wire_Names_With_Types", "[support][utils][smoke-test]") {
@@ -573,6 +748,47 @@ namespace {
         REQUIRE(autocompletedMas.get_outputs()[0].get_inductance());
     }
 
+    // ABT #1071: the web builder swaps the SHAPE of an existing core and keeps everything else,
+    // so a drum picked after a gapped PQ arrives with that PQ's subtractive gap. Autocomplete
+    // must drop it (as it does for toroids), not hand the inductance model a gapped open core.
+    TEST_CASE("Test_Magnetic_Autocomplete_Drum_Drops_Stale_Gap", "[support][utils][drum][open-core][smoke-test]") {
+        settings.reset();
+        clear_databases();
+
+        auto staleGap = json::array();
+        staleGap.push_back(json{{"type", "subtractive"}, {"length", 0.0005}});
+        auto core = OpenMagneticsTesting::get_quick_core("Bobbin 9677182209", staleGap, 1, "77");
+        // Mimic the builder: the type is still the previous core's.
+        core.get_mutable_functional_description().set_type(CoreType::TWO_PIECE_SET);
+
+        OpenMagnetics::Coil coil;
+        OpenMagnetics::Winding winding;
+        winding.set_name("Primary");
+        winding.set_number_turns(95);
+        winding.set_number_parallels(1);
+        winding.set_wire("Round 0.5 - Grade 1");
+        coil.get_mutable_functional_description().push_back(winding);
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(coil);
+
+        auto autocompleted = OpenMagnetics::magnetic_autocomplete(magnetic);
+        auto& functionalDescription = autocompleted.get_core().get_functional_description();
+        REQUIRE(functionalDescription.get_type() == CoreType::OPEN_SHAPE);
+        for (auto& gap : functionalDescription.get_gapping()) {
+            // Only residual bookkeeping entries may remain (process_gap adds them to every
+            // non-toroidal core); the stale 0.5 mm subtractive gap must be gone.
+            REQUIRE(gap.get_type() == GapType::RESIDUAL);
+        }
+
+        // And the inductance model accepts the result (this is the call the builder makes).
+        OpenMagnetics::MagnetizingInductance magnetizingInductance;
+        double inductance = magnetizingInductance.calculate_inductance_from_number_turns_and_gapping(
+            autocompleted.get_mutable_core(), autocompleted.get_mutable_coil()).get_magnetizing_inductance().get_nominal().value();
+        REQUIRE(inductance > 0);
+        settings.reset();
+    }
+
     TEST_CASE("Test_Mas_Autocomplete_Json", "[support][utils][bug][smoke-test]") {
         std::string masString = R"({"outputs": [], "inputs": {"designRequirements": {"isolationSides": ["primary" ], "magnetizingInductance": {"nominal": 0.00039999999999999996 }, "name": "My Design Requirements", "turnsRatios": [{"nominal": 1} ] }, "operatingPoints": [{"conditions": {"ambientTemperature": 42 }, "excitationsPerWinding": [{"frequency": 100000, "current": {"processed": {"label": "triangular", "peakToPeak": 0.5, "offset": 0, "dutyCycle": 0.5 } }, "voltage": {"processed": {"label": "rectangular", "peakToPeak": 20, "offset": 0, "dutyCycle": 0.5 } } } ], "name": "Operating Point No. 1" } ] }, "magnetic": {"coil": {"bobbin": "basic", "functionalDescription":[{"name": "Primary", "numberTurns": 4, "numberParallels": 1, "isolationSide": "primary", "wire": "Round 1.00 - Grade 1" }, {"name": "Secondary", "numberTurns": 4, "numberParallels": 1, "isolationSide": "secondary", "wire": "Round 1.00 - Grade 1" } ] }, "core": {"name": "core_E_19_8_5_N87_substractive", "functionalDescription": {"type": "twoPieceSet", "material": "N87", "shape": "PQ 32/20", "gapping": [{"type": "residual", "length": 0.000005 }], "numberStacks": 1 } }, "manufacturerInfo": {"name": "", "reference": "Example" } } })";
         json masJson = json::parse(masString);
@@ -688,11 +904,22 @@ namespace {
             OpenMagnetics::Wire wire;
             wire.set_nominal_value_conducting_width(0.0048);
             wire.set_nominal_value_conducting_height(0.00076);
-            wire.set_nominal_value_outer_width(0.0049);
+            wire.set_nominal_value_outer_width(0.0048076);
             wire.set_nominal_value_outer_height(0.0007676);
             wire.set_number_conductors(1);
             wire.set_material("copper");
             wire.set_type(WireType::RECTANGULAR);
+            // ABT #908: since ABT #902 a wire whose outer size exceeds its conductor must
+            // state what insulates those surfaces. These fixtures are enamelled rectangular
+            // wire: 3.8 um of enamel per face, so the outer sizes are exactly
+            // conducting + 2 x 3.8 um on both axes (the previous outer widths carried an
+            // arbitrary 100 um of undeclared margin, which the guard rightly rejected).
+            InsulationWireCoating coating;
+            coating.set_type(InsulationWireCoatingType::ENAMELLED);
+            DimensionWithTolerance coatingThickness;
+            coatingThickness.set_nominal(3.8e-6);
+            coating.set_thickness(coatingThickness);
+            wire.set_coating(coating);
             winding.set_wire(wire);
             coil.get_mutable_functional_description().push_back(winding);
         }
@@ -704,11 +931,18 @@ namespace {
             OpenMagnetics::Wire wire;
             wire.set_nominal_value_conducting_width(0.0038);
             wire.set_nominal_value_conducting_height(0.00076);
-            wire.set_nominal_value_outer_width(0.0039);
+            wire.set_nominal_value_outer_width(0.0038076);
             wire.set_nominal_value_outer_height(0.0007676);
             wire.set_number_conductors(1);
             wire.set_material("copper");
             wire.set_type(WireType::RECTANGULAR);
+            // ABT #908: enamelled, 3.8 um per face — see the first fixture wire above.
+            InsulationWireCoating coating;
+            coating.set_type(InsulationWireCoatingType::ENAMELLED);
+            DimensionWithTolerance coatingThickness;
+            coatingThickness.set_nominal(3.8e-6);
+            coating.set_thickness(coatingThickness);
+            wire.set_coating(coating);
             winding.set_wire(wire);
             coil.get_mutable_functional_description().push_back(winding);
         }
@@ -752,11 +986,18 @@ namespace {
             OpenMagnetics::Wire wire;
             wire.set_nominal_value_conducting_width(0.0048);
             wire.set_nominal_value_conducting_height(0.00056);
-            wire.set_nominal_value_outer_width(0.0049);
+            wire.set_nominal_value_outer_width(0.0048076);
             wire.set_nominal_value_outer_height(0.0005676);
             wire.set_number_conductors(1);
             wire.set_material("copper");
             wire.set_type(WireType::RECTANGULAR);
+            // ABT #908: enamelled, 3.8 um per face — see the first fixture wire above.
+            InsulationWireCoating coating;
+            coating.set_type(InsulationWireCoatingType::ENAMELLED);
+            DimensionWithTolerance coatingThickness;
+            coatingThickness.set_nominal(3.8e-6);
+            coating.set_thickness(coatingThickness);
+            wire.set_coating(coating);
             winding.set_wire(wire);
             coil.get_mutable_functional_description().push_back(winding);
         }
@@ -768,11 +1009,18 @@ namespace {
             OpenMagnetics::Wire wire;
             wire.set_nominal_value_conducting_width(0.0038);
             wire.set_nominal_value_conducting_height(0.00056);
-            wire.set_nominal_value_outer_width(0.0039);
+            wire.set_nominal_value_outer_width(0.0038076);
             wire.set_nominal_value_outer_height(0.0005676);
             wire.set_number_conductors(1);
             wire.set_material("copper");
             wire.set_type(WireType::RECTANGULAR);
+            // ABT #908: enamelled, 3.8 um per face — see the first fixture wire above.
+            InsulationWireCoating coating;
+            coating.set_type(InsulationWireCoatingType::ENAMELLED);
+            DimensionWithTolerance coatingThickness;
+            coatingThickness.set_nominal(3.8e-6);
+            coating.set_thickness(coatingThickness);
+            wire.set_coating(coating);
             winding.set_wire(wire);
             coil.get_mutable_functional_description().push_back(winding);
         }
@@ -823,4 +1071,114 @@ namespace {
         REQUIRE(!autocompletedMagnetic.get_core().get_geometrical_description().value()[1].get_machining());
     }
 
+    TEST_CASE("Test_Mas_Autocomplete_Inline_Wire_Without_Outer_Diameter", "[support][utils][bug][smoke-test]") {
+        // ABT #823: a wire given inline carries its conductor and coating but often no outer
+        // size, and its name ("Round 1 - Grade 1") need not exist in the wire database. The
+        // coil here is not pre-wound, so autocomplete winds it — and wind() used to read the
+        // absent outer diameter straight out of the optional, killing the load with a bare
+        // "bad optional access" that named neither the part, the winding, nor the field.
+        // 49 of the 236 common-mode chokes in asgard's catalogue were exactly this shape, and
+        // because the loader stops at the first bad record, the first one took the batch with it.
+        //
+        // The failing population is precisely "inline wire without an outer size AND coil not
+        // pre-wound": the other 58 inline-wire records arrive already wound, so nothing ever
+        // asks for the outer size. That is why it looked like a bobbin or shape problem.
+        std::string magneticString = R"({"manufacturerInfo": {"name": "Test", "reference": "ABT823_CMC"}, "core": {"functionalDescription": {"type": "toroidal", "material": "3C90", "gapping": [], "numberStacks": 1, "shape": {"name": "T 36.0/23.45/15.0", "family": "t", "type": "custom", "magneticCircuit": "closed", "aliases": [], "dimensions": {"A": {"nominal": 0.036}, "B": {"nominal": 0.02345}, "C": {"nominal": 0.015}}}}}, "coil": {"bobbin": "Basic", "functionalDescription": [{"name": "primary", "numberTurns": 27, "numberParallels": 1, "isolationSide": "primary", "wire": {"type": "round", "name": "Round 1 - Grade 1", "conductingDiameter": {"nominal": 0.001}, "coating": {"type": "enamelled", "grade": 1}, "material": "copper"}}, {"name": "secondary", "numberTurns": 27, "numberParallels": 1, "isolationSide": "secondary", "wire": {"type": "round", "name": "Round 1 - Grade 1", "conductingDiameter": {"nominal": 0.001}, "coating": {"type": "enamelled", "grade": 1}, "material": "copper"}}]}})";
+        json magneticJson = json::parse(magneticString);
+        OpenMagnetics::Magnetic magnetic(magneticJson);
+
+        auto autocompletedMagnetic = magnetic_autocomplete(magnetic);
+
+        // Every winding's wire must come out with an outer size, and it must be the size MKF
+        // itself derives from the conductor and its coating — not a placeholder.
+        for (size_t windingIndex = 0; windingIndex < autocompletedMagnetic.get_coil().get_functional_description().size(); ++windingIndex) {
+            auto wire = autocompletedMagnetic.get_mutable_coil().resolve_wire(windingIndex);
+            REQUIRE(wire.get_outer_diameter());
+            double outerDiameter = resolve_dimensional_values(wire.get_outer_diameter().value());
+            double conductingDiameter = resolve_dimensional_values(wire.get_conducting_diameter().value());
+            REQUIRE_THAT(outerDiameter, Catch::Matchers::WithinRel(wire.calculate_outer_diameter(), 1e-9));
+            // Enamel adds thickness: strictly larger than the conductor, and grade 1 on a
+            // 1 mm conductor is 1.062 mm in IEC 60317, so nothing pathological either way.
+            REQUIRE(outerDiameter > conductingDiameter);
+            REQUIRE(outerDiameter < conductingDiameter * 1.2);
+        }
+
+        // And the coil actually winds now, which is the thing that used to throw.
+        REQUIRE(autocompletedMagnetic.get_coil().get_sections_description());
+        REQUIRE(autocompletedMagnetic.get_coil().get_layers_description());
+        REQUIRE(autocompletedMagnetic.get_coil().get_turns_description());
+    }
+
+    TEST_CASE("Test_Mas_Autocomplete_Wire_Outer_Diameter_Underivable_Names_The_Winding", "[support][utils][bug][smoke-test]") {
+        // ABT #823: when the outer size genuinely cannot be derived — here a round wire with
+        // no conductor diameter to derive it from — the failure must say which winding and
+        // why, instead of the anonymous "bad optional access" this used to be.
+        std::string magneticString = R"({"manufacturerInfo": {"name": "Test", "reference": "ABT823_UNDERIVABLE"}, "core": {"functionalDescription": {"type": "toroidal", "material": "3C90", "gapping": [], "numberStacks": 1, "shape": {"name": "T 36.0/23.45/15.0", "family": "t", "type": "custom", "magneticCircuit": "closed", "aliases": [], "dimensions": {"A": {"nominal": 0.036}, "B": {"nominal": 0.02345}, "C": {"nominal": 0.015}}}}}, "coil": {"bobbin": "Basic", "functionalDescription": [{"name": "primary", "numberTurns": 27, "numberParallels": 1, "isolationSide": "primary", "wire": {"type": "round", "coating": {"type": "enamelled", "grade": 1}, "material": "copper"}}]}})";
+        json magneticJson = json::parse(magneticString);
+        OpenMagnetics::Magnetic magnetic(magneticJson);
+
+        bool threw = false;
+        std::string message;
+        try {
+            magnetic_autocomplete(magnetic);
+        }
+        catch (const std::exception& e) {
+            threw = true;
+            message = e.what();
+        }
+
+        REQUIRE(threw);
+        // Names the winding, the part, and what could not be determined. The underlying
+        // cause may still appear in parentheses — that is detail, not the whole message;
+        // what must never happen again is the bare optional access on its own.
+        REQUIRE(message.find("winding 0 ('primary')") != std::string::npos);
+        REQUIRE(message.find("ABT823_UNDERIVABLE") != std::string::npos);
+        REQUIRE(message.find("outer dimensions") != std::string::npos);
+        REQUIRE(message != "bad optional access");
+    }
+
 }  // namespace
+
+TEST_CASE("Autocomplete picks the winding orientation from the WINDOW, not the core type", "[support][utils][abt998]") {
+    // ABT #998. magnetic_autocomplete used to choose the sections orientation by CORE TYPE:
+    // TWO_PIECE_SET got OVERLAPPING and everything else fell through to CONTIGUOUS. Core type
+    // does not decide how a coil is wound — the window does. A round window (a toroid) is wound
+    // contiguously because its turns really do advance around the bore; a rectangular window is
+    // wound overlapping because its layers build radially off the former.
+    //
+    // The old rule swept up drums, rods, molded parts and the whole PIECE_AND_PLATE family, all
+    // of which are bobbin-wound in a rectangular window, and told them to wind as flat spirals.
+    // Downstream that seats the winding by the TURN-axis alignment rather than on the former, so
+    // a narrow winding floats in the middle of its window instead of resting on the bobbin.
+    //
+    // It is also a latent trap for reclassification: moving a core OUT of TWO_PIECE_SET flipped
+    // its orientation as a side effect. UT and ET below pass BOTH before and after this fix —
+    // their catalogue bobbins already carry an orientation so the guard skips them — and they are
+    // kept as the cores that would have been caught had the data not shielded them.
+    auto orientationAfterAutocomplete = [](const std::string& shapeName) {
+        json coilJson;
+        coilJson["bobbin"] = "Dummy";
+        coilJson["functionalDescription"] = json::array({{
+            {"name", "winding 0"}, {"numberTurns", 12}, {"numberParallels", 1},
+            {"isolationSide", "primary"}, {"wire", "Round 0.1 - Grade 1"}}});
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(OpenMagnetics::Core(OpenMagnetics::find_core_shape_by_name(shapeName),
+                                              OpenMagnetics::find_core_material_by_name("3C95")));
+        magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
+        auto completed = OpenMagnetics::magnetic_autocomplete(magnetic);
+        auto bobbin = completed.get_mutable_coil().resolve_bobbin();
+        auto processed = bobbin.get_processed_description().value();
+        return processed.get_winding_windows()[0].get_sections_orientation().value();
+    };
+
+    // Round window: turns advance around the bore, so contiguous is right and must not change.
+    CHECK(orientationAfterAutocomplete("T 25/15/10") == WindingOrientation::CONTIGUOUS);
+
+    // Rectangular windows, all bobbin-wound, all previously told to wind as spirals.
+    CHECK(orientationAfterAutocomplete("DR 2.3 + SRI 3.0") == WindingOrientation::OVERLAPPING);  // drumRing
+    CHECK(orientationAfterAutocomplete("UT 20") == WindingOrientation::OVERLAPPING);             // pieceAndPlate
+    CHECK(orientationAfterAutocomplete("ET 20") == WindingOrientation::OVERLAPPING);             // EI
+
+    // The two-piece case this rule always got right, as a control: it must not have moved.
+    CHECK(orientationAfterAutocomplete("E 55/28/21") == WindingOrientation::OVERLAPPING);
+}

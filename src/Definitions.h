@@ -66,7 +66,8 @@ enum class CoreCrossReferencerFilters : int {
     SATURATION, 
     WINDING_WINDOW_AREA, 
     ENVELOPING_VOLUME, 
-    EFFECTIVE_AREA
+    EFFECTIVE_AREA,
+    IMPEDANCE
 };
 
 void from_json(const json & j, CoreCrossReferencerFilters & x);
@@ -79,6 +80,7 @@ inline void from_json(const json & j, CoreCrossReferencerFilters & x) {
     else if (j == "WindingWindowArea" || j == "windingwindowarea" || j == "WINDINGWINDOWAREA") x = CoreCrossReferencerFilters::WINDING_WINDOW_AREA;
     else if (j == "EnvelopingVolume" || j == "envelopingvolume" || j == "ENVELOPINGVOLUME") x = CoreCrossReferencerFilters::ENVELOPING_VOLUME;
     else if (j == "EffectiveArea" || j == "effectivearea" || j == "EFFECTIVEAREA") x = CoreCrossReferencerFilters::EFFECTIVE_AREA;
+    else if (j == "Impedance" || j == "impedance" || j == "IMPEDANCE") x = CoreCrossReferencerFilters::IMPEDANCE;
     else { throw std::runtime_error("Input JSON does not conform to CoreCrossReferencerFilters schema: " + to_string(j)); }
 }
 
@@ -90,6 +92,7 @@ inline void to_json(json & j, const CoreCrossReferencerFilters & x) {
         case CoreCrossReferencerFilters::WINDING_WINDOW_AREA: j = "WindingWindowArea"; break;
         case CoreCrossReferencerFilters::ENVELOPING_VOLUME: j = "EnvelopingVolume"; break;
         case CoreCrossReferencerFilters::EFFECTIVE_AREA: j = "EffectiveArea"; break;
+        case CoreCrossReferencerFilters::IMPEDANCE: j = "Impedance"; break;
         default: throw std::runtime_error("Unexpected value in enumeration \"CoreCrossReferencerFilters\": " + std::to_string(static_cast<int>(x)));
     }
 }
@@ -530,7 +533,8 @@ enum class MagneticFilters : int {
     LEAKAGE_INDUCTANCE,  // For CMC optimization - minimize leakage for tight coupling
     TEMPERATURE,         // Node-network core temperature (Temperature.cpp, coreOnly mode)
     TURN_COUNT,       // Total turns across all windings — fewer turns preferred (CMC/DMC ranking)
-    DATASHEET_LIMITS  // Gate catalogue parts by their own datasheet electrical limits; no-op when datasheetInfo absent (ABT #19)
+    DATASHEET_LIMITS,  // Gate catalogue parts by their own datasheet electrical limits; no-op when datasheetInfo absent (ABT #19)
+    WINDABILITY       // Can each wire actually be bent around the former it is wound on? IEC 60317 bend radius (ABT #959)
 };
 
 class MagneticFilterOperation {
@@ -613,6 +617,7 @@ inline void from_json(const json & j, MagneticFilters & x) {
     else if (j == "Temperature") x = MagneticFilters::TEMPERATURE;
     else if (j == "Turn Count") x = MagneticFilters::TURN_COUNT;
     else if (j == "Datasheet Limits") x = MagneticFilters::DATASHEET_LIMITS;
+    else if (j == "Windability") x = MagneticFilters::WINDABILITY;
     else { throw std::runtime_error("Input JSON does not conform to MagneticFilters schema!"); }
 }
 
@@ -656,6 +661,7 @@ inline void to_json(json & j, const MagneticFilters & x) {
         case MagneticFilters::TEMPERATURE: j = "Temperature"; break;
         case MagneticFilters::TURN_COUNT: j = "Turn Count"; break;
         case MagneticFilters::DATASHEET_LIMITS: j = "Datasheet Limits"; break;
+        case MagneticFilters::WINDABILITY: j = "Windability"; break;
         default: throw std::runtime_error("Unexpected value in enumeration \"MagneticFilters\": " + std::to_string(static_cast<int>(x)));
     }
 }

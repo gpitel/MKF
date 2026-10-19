@@ -3,6 +3,7 @@
 #include "support/Utils.h"
 
 #include <cmath>
+#include <limits>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -63,11 +64,14 @@ double ReluctanceModel::get_ungapped_core_reluctance(Core core, std::optional<Op
     if (operatingPoint) {
         double temperature = operatingPoint->get_conditions().get_ambient_temperature(); // TODO: Use a future calculated temperature
         _magneticFluxDensitySaturation = core.get_magnetic_flux_density_saturation(temperature, true);
-        initialPermeabilityValue = initialPermeability.get_initial_permeability(coreMaterial, operatingPoint.value());
+        // ABT #358: the shape family selects the vendor's per-family DC-bias fit when the
+        // material carries one (powder E/ER/U, EQ/LP, PQ, ... keys); without it every shape
+        // silently used the default fit.
+        initialPermeabilityValue = initialPermeability.get_initial_permeability(coreMaterial, operatingPoint.value(), core.get_shape_family());
     }
     else {
         _magneticFluxDensitySaturation = core.get_magnetic_flux_density_saturation(true);
-        initialPermeabilityValue = initialPermeability.get_initial_permeability(coreMaterial);
+        initialPermeabilityValue = initialPermeability.get_initial_permeability(coreMaterial, std::nullopt, std::nullopt, std::nullopt, std::nullopt, core.get_shape_family());
     }
 
     return get_ungapped_core_reluctance(core, initialPermeabilityValue);
@@ -107,6 +111,66 @@ MagnetizingInductanceOutput ReluctanceModel::get_core_reluctance(Core core, doub
     return magnetizingInductanceOutput;
 }
 
+
+// ABT #368: see the header comment. The clearance is unrolled to a strip of width tf (the
+// flange thickness on this gap's side), length = mean circumference, gap length a = (K-A)/2.
+// Only the two AXIAL edges fringe; their escape walls are the ring bore itself:
+//   groove side: the bore continues past the flange by (B+L)/2 - tf
+//   outer side:  any bore overhang plus the escape over the ring's radial thickness (J-K)/2
+AirGapReluctanceOutput ReluctanceModel::get_annular_clearance_gap_reluctance(Core& core, CoreGap gapInfo) {
+    auto constants = Constants();
+    auto shape = core.resolve_shape();
+    auto dimensions = flatten_dimensions(shape.get_dimensions().value());
+    double A = dimensions["A"];
+    double B = dimensions["B"];
+    double J = dimensions["J"];
+    double K = dimensions["K"];
+    double L = dimensions["L"];
+    double gapLength = gapInfo.get_length();  // (K - A) / 2, synthesized by process_gap
+    if (!gapInfo.get_area() || !gapInfo.get_coordinates()) {
+        throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS,
+                           "Annular clearance gap is missing area or coordinates");
+    }
+    // The top clearance faces the D flange, the bottom one the F flange.
+    bool topGap = (*gapInfo.get_coordinates())[1] >= 0;
+    double flangeThickness = topGap ? dimensions["D"] : dimensions["F"];
+
+    double halfGap = gapLength / 2;
+    double escapeGroove = (B + L) / 2 - flangeThickness;
+    double escapeOuter = std::max((L - B) / 2, 0.0) + (J - K) / 2;
+
+    // Muehlethaler basic block (ECCE Asia 2011, eq. 8), per unit length. The bracket is
+    // clamped at the direct term alone (no negative fringing permeance) for degenerate
+    // escape walls shorter than the gap itself.
+    auto basicReluctance = [&](double h) {
+        double fringeTerm = 2 / std::numbers::pi * (1 + log(std::numbers::pi * h / (4 * halfGap)));
+        if (fringeTerm < 0) {
+            fringeTerm = 0;
+        }
+        return 1 / constants.vacuumPermeability / (flangeThickness / (2 * halfGap) + fringeTerm);
+    };
+    // Asymmetric type-1 network: the two half-length blocks of each edge in series, the two
+    // edges in parallel. Symmetric case reduces to the plain basic block.
+    double branchGroove = 2 * basicReluctance(escapeGroove);
+    double branchOuter = 2 * basicReluctance(escapeOuter);
+    double perUnitLength = 1 / (1 / branchGroove + 1 / branchOuter);
+    double sigma = perUnitLength / (gapLength / (constants.vacuumPermeability * flangeThickness));
+
+    double meanCircumference = std::numbers::pi * (A + K) / 2;
+    double reluctance = sigma * gapLength /
+                        (constants.vacuumPermeability * meanCircumference * flangeThickness);
+    double fringingFactor = 1 / sigma;
+
+    AirGapReluctanceOutput airGapReluctanceOutput;
+    airGapReluctanceOutput.set_maximum_storable_magnetic_energy(
+        get_gap_maximum_storable_energy(gapInfo, fringingFactor));
+    airGapReluctanceOutput.set_reluctance(reluctance);
+    airGapReluctanceOutput.set_method_used("AnnularClearance");
+    airGapReluctanceOutput.set_origin(ResultOrigin::SIMULATION);
+    airGapReluctanceOutput.set_fringing_factor(fringingFactor);
+    return airGapReluctanceOutput;
+}
+
 MagnetizingInductanceOutput ReluctanceModel::get_gapping_reluctance(Core core) {
     double calculatedReluctance = 0;
     double calculatedCentralReluctance = 0;
@@ -119,7 +183,7 @@ MagnetizingInductanceOutput ReluctanceModel::get_gapping_reluctance(Core core) {
         // We recompute all gaps in case some is missing coordinates
         for (const auto& gap : gapping) {
             if (!gap.get_coordinates()) {
-                core.process_gap();
+                core.process_gap_or_throw();
                 gapping = core.get_functional_description().get_gapping();
                 break;
             }
@@ -132,8 +196,13 @@ MagnetizingInductanceOutput ReluctanceModel::get_gapping_reluctance(Core core) {
         // columns lateral) previously landed every gap — including the wound leg's —
         // in the parallel term.
         auto mainColumnIndex = core.get_main_column_index();
+        bool isDrumRing = core.get_shape_family() == CoreShapeFamily::DRUM_RING;
         for (const auto& gap : gapping) {
-            auto gapReluctance = get_gap_reluctance(gap);
+            // ABT #368: drumRing structural clearances get the dedicated annular model — the
+            // generic ones assume winding-window escape walls and (rectangular branch) fringe
+            // the circumferential ends of a section that is actually a closed loop.
+            auto gapReluctance = isDrumRing ? get_annular_clearance_gap_reluctance(core, gap)
+                                            : get_gap_reluctance(gap);
             auto gapColumnIndex = core.find_closest_column_index_by_coordinates(gap.get_coordinates().value());
             reluctancePerGap.push_back(gapReluctance);
             if (static_cast<size_t>(gapColumnIndex) != mainColumnIndex) {
@@ -213,7 +282,30 @@ AirGapReluctanceOutput ReluctanceZhangModel::get_gap_reluctance(CoreGap gapInfo)
     auto gapSectionDimensions = *(gapInfo.get_section_dimensions());
     auto gapSectionWidth = gapSectionDimensions[0];
     auto gapSectionDepth = gapSectionDimensions[1];
-    auto distanceClosestNormalSurface = std::max(*(gapInfo.get_distance_closest_normal_surface()), gapSectionWidth);
+    // ABT #378. Zhang's fringing reluctance (eq. 10) is
+    //     Rfr = pi / (mu0 * C * ln((2h + di) / di))
+    // and Fig. 7's caption defines the symbols exactly: "2h is the height of a segment of core
+    // limb; di is the height of an air gap". So h is HALF AN ADJACENT CORE-LIMB SEGMENT — a
+    // distance along the limb axis. It is never the column WIDTH, so the previous
+    // std::max(distanceClosestNormalSurface, gapSectionWidth) had no basis in the paper; it
+    // arrived incidentally in e4102ca5 with no comment, and where it fired it substituted a
+    // larger h, inflating the fringing permeance and over-predicting inductance (worst on
+    // short-window/planar cores, catastrophic on unrolled sections where sectionDimensions[0]
+    // is a mean circumference).
+    //
+    // distanceClosestNormalSurface — the core left between this gap and the nearest normal
+    // surface — IS the paper's h for the single-gap case that dominates MKF's usage: the whole
+    // segment belongs to this gap, there being no neighbouring gap to share it with. For
+    // DISTRIBUTED gaps the segment is shared between adjacent gaps, so the paper's h is half the
+    // inter-gap core, while MKF still measures to the limb end and thus over-estimates h; that
+    // refinement needs the neighbouring gap's position, which this per-gap signature does not
+    // receive, and is tracked on ABT #378 rather than guessed at here.
+    auto distanceClosestNormalSurface = *(gapInfo.get_distance_closest_normal_surface());
+    if (distanceClosestNormalSurface < 0) {
+        throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS,
+            "Gap Distance Closest Normal Surface cannot be negative; got " +
+            std::to_string(distanceClosestNormalSurface));
+    }
     auto reluctanceInternal = gapLength / (constants.vacuumPermeability * gapArea);
     double reluctanceFringing = 0;
     double fringingFactor = 1;
@@ -831,33 +923,82 @@ double ReluctanceModel::get_gapping_by_fringing_factor(Core core, double fringin
     if (centralColumns.size() == 0) {
         throw CoreNotProcessedException("No columns found in core");
     }
-    double gapLength = centralColumns[0].get_height();
-    double gapIncrease = gapLength / 2;
-    size_t timeout = 100;
-    while (true) {
-        core.set_gap_length(gapLength);
-        auto calculatedFringingFactor = get_core_reluctance(core).get_maximum_fringing_factor().value();
-        if ((fabs(calculatedFringingFactor - fringingFactor) / fringingFactor) < 0.001) {
-            break;
-        }
-        if (calculatedFringingFactor < fringingFactor) {
-            gapLength += gapIncrease;
-            if (gapLength > centralColumns[0].get_height()) {
-                return centralColumns[0].get_height() / 2;
-            }
-        }
-        else {
-            gapLength -= gapIncrease;
-        }
-        gapLength = roundFloat(gapLength, 6);
-        gapIncrease = std::max(gapIncrease / 2, constants.residualGap);
-        timeout--;
-        if (timeout <= 0) {
-            break;
-        }
+    // ABT #378: this used to seed at gapLength = the FULL column height and step outward,
+    // assuming the fringing factor rises monotonically with gap length. With Zhang's h read as
+    // the paper defines it (half an adjacent core-limb SEGMENT, Fig. 7), it does not: as the gap
+    // grows to fill the limb the segments shrink, h -> 0, ln((2h + di)/di) -> 0, the fringing
+    // reluctance diverges and the factor falls back towards 1. The map is therefore NOT
+    // injective, and the old seed sat exactly on its degenerate end — it overshot immediately and
+    // returned the hard-coded columnHeight/2 for every request.
+    //
+    // Two consequences, both handled here: scan the physical range instead of assuming a
+    // direction, and when several gap lengths reproduce the requested factor return the SMALLEST.
+    // The small root is the physically intended one — Zhang's derivation assumes gaps short
+    // against the limb (the fringing field spans a core segment), so the large root lives outside
+    // the model's validity domain and no caller wants a gap that fills the limb.
+    double columnHeight = centralColumns[0].get_height();
+    double minimumGapLength = constants.residualGap;
+    if (columnHeight <= minimumGapLength) {
+        return minimumGapLength;
     }
 
-    return gapLength;
+    auto factorAt = [&](double candidateGapLength) {
+        core.set_gap_length(candidateGapLength);
+        return get_core_reluctance(core).get_maximum_fringing_factor().value();
+    };
+
+    // Log-spaced scan: gap lengths of interest span microns to millimetres.
+    const size_t numberScanPoints = 64;
+    std::vector<std::pair<double, double>> scanned;
+    scanned.reserve(numberScanPoints + 1);
+    for (size_t scanIndex = 0; scanIndex <= numberScanPoints; ++scanIndex) {
+        double fraction = double(scanIndex) / numberScanPoints;
+        double scannedGapLength = minimumGapLength * pow(columnHeight / minimumGapLength, fraction);
+        scanned.emplace_back(scannedGapLength, factorAt(scannedGapLength));
+    }
+
+    // First bracket in which the requested factor is crossed — walking from the smallest gap up
+    // gives the smallest root without needing to know where the curve turns over.
+    for (size_t scanIndex = 0; scanIndex + 1 < scanned.size(); ++scanIndex) {
+        double lowerGapLength = scanned[scanIndex].first;
+        double upperGapLength = scanned[scanIndex + 1].first;
+        double lowerFactor = scanned[scanIndex].second;
+        double upperFactor = scanned[scanIndex + 1].second;
+        if ((lowerFactor - fringingFactor) * (upperFactor - fringingFactor) > 0) {
+            continue;
+        }
+        size_t timeout = 100;
+        while (timeout-- > 0 && (upperGapLength - lowerGapLength) > minimumGapLength / 10) {
+            double midGapLength = (lowerGapLength + upperGapLength) / 2;
+            double midFactor = factorAt(midGapLength);
+            if (fabs(midFactor - fringingFactor) / fringingFactor < 0.001) {
+                return midGapLength;
+            }
+            if ((lowerFactor - fringingFactor) * (midFactor - fringingFactor) <= 0) {
+                upperGapLength = midGapLength;
+                upperFactor = midFactor;
+            }
+            else {
+                lowerGapLength = midGapLength;
+                lowerFactor = midFactor;
+            }
+        }
+        return (lowerGapLength + upperGapLength) / 2;
+    }
+
+    // No crossing: the requested factor is unreachable for this core (e.g. below the factor of a
+    // residual gap). Return the closest scanned point rather than a hard-coded fraction of the
+    // column, so the caller gets the best available answer instead of an invented one.
+    double bestGapLength = scanned.front().first;
+    double bestFactorError = std::numeric_limits<double>::max();
+    for (auto& [scannedGapLength, scannedFactor] : scanned) {
+        double factorError = fabs(scannedFactor - fringingFactor);
+        if (factorError < bestFactorError) {
+            bestFactorError = factorError;
+            bestGapLength = scannedGapLength;
+        }
+    }
+    return bestGapLength;
 }
 
 } // namespace OpenMagnetics

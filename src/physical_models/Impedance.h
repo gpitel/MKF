@@ -55,6 +55,10 @@ struct ImpedanceTank {
 // evaluated cheaply at each frequency by impedance_from_model().
 struct WidebandImpedanceModel {
     std::optional<CoreMaterial> coreMaterial;   // complex permeability µ(f) for the magnetizing tank
+    // ABT #848: the core's cross-section (column width, depth) for the dimensional / eddy-
+    // dielectric attenuation of the magnetizing permeability. Only acts when the material
+    // carries permittivity data; empty or missing data means no correction, never a guess.
+    std::vector<double> coreCrossSectionDimensions;
     double permeabilityScaling = 1.0;           // DC-bias rolloff factor µ(Hdc)/µ(0)
     std::vector<ImpedanceTank> tanks;           // [0] magnetizing; the rest leakage resonances
     // Per-winding frequency-dependent resistance data, indexed by winding, used to
@@ -70,6 +74,10 @@ struct WidebandImpedanceModel {
     double temperature = Defaults().ambientTemperature;
 };
 
+// Log-log interpolation of a MAS permittivity table at a frequency (clamped to the table ends).
+// Shared by the core dimensional attenuation here and StrayCapacitance::core_image_factor.
+double interpolate_permittivity_points(const MAS::Permittivity& data, double frequency);
+
 class Impedance {
     private:
         bool _fastCapacitance;
@@ -77,13 +85,34 @@ class Impedance {
         // The magnetizing tank (air-cored inductance ∥ winding self-capacitance),
         // the first resonance shared by calculate_impedance and the wideband model.
         ImpedanceTank build_magnetizing_tank(Core& core, Coil& coil);
+        // Resonance of (air-cored inductance x initial permeability) with a capacitance: the
+        // frequency the stray-capacitance core image factor is evaluated at (ABT #848).
+        static double estimate_resonance_frequency(Core& core, double airCoredInductance, double capacitance);
     protected:
     public:
-    Impedance(bool fastCapacitance=true) {
+    // DEFAULT: the FULL energy-based StrayCapacitance model (owner decision, 2026-08-23): per-pair
+    // statics from Settings (Albach by default), floating-core self term, mirrored-winding SRF
+    // factor, wound on demand. Measured on 107 WE common-mode chokes with real geometry and real
+    // material data (no calibration): full+Albach 95% peak / 56% frequency within 2x,
+    // full+Massarini 99% / 63%, fast OneLayer path 98% / 64% — parity overall, and the full model
+    // is ahead on every MnZn family (A07 93% vs 72%); the nanocrystalline cased families are
+    // the open item for both (ABT #848). The fast Massarini-based OneLayer path remains
+    // available with fastCapacitance=true -- and the advisers' candidate scoring
+    // (MagneticFilterImpedance) opts into it explicitly: the full model's per-turn energy sum
+    // costs seconds per candidate, which turned the DMC default-wizard adviser run from < 10 s
+    // into 28 minutes when this default flipped. Analyse the chosen design with the full model;
+    // rank the catalogue with the fast one.
+    Impedance(bool fastCapacitance=false) {
         _fastCapacitance = fastCapacitance;
     } 
 
     virtual ~Impedance() = default;
+
+        // ABT #848: complex factor mu_eff/mu for the EM wave crossing the core cross-section,
+        // tan(k d/2)/(k d/2) per dimension (Snelling, Soft Ferrites, dimensional resonance), with
+        // k = w*sqrt(mu0*mu*eps0*eps) from the material's complex permittivity. Returns 1 when the
+        // material has no permittivity data.
+        static std::complex<double> core_dimensional_attenuation(const CoreMaterial& material, double frequency, std::complex<double> complexPermeability, const std::vector<double>& crossSectionDimensions);
 
     std::complex<double> calculate_impedance(Magnetic magnetic, double frequency, double temperature = Defaults().ambientTemperature);
     std::complex<double> calculate_impedance(Core core, Coil coil, double frequency, double temperature = Defaults().ambientTemperature);

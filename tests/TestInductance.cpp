@@ -837,7 +837,7 @@ TEST_CASE("Test mutual inductance relationships for three windings", "[physical-
 // Benchmark Tests
 // ============================================================================
 
-TEST_CASE("Benchmark inductance matrix calculation for two windings", "[physical-model][inductance][!benchmark]") {
+TEST_CASE("Benchmark inductance matrix calculation for two windings", "[!benchmark]") {
     BENCHMARK_ADVANCED("two winding inductance matrix")(Catch::Benchmark::Chronometer meter) {
         settings.reset();
         clear_databases();
@@ -869,7 +869,7 @@ TEST_CASE("Benchmark inductance matrix calculation for two windings", "[physical
     };
 }
 
-TEST_CASE("Benchmark inductance matrix calculation for three windings", "[physical-model][inductance][!benchmark]") {
+TEST_CASE("Benchmark inductance matrix calculation for three windings", "[!benchmark]") {
     BENCHMARK_ADVANCED("three winding inductance matrix")(Catch::Benchmark::Chronometer meter) {
         settings.reset();
         clear_databases();
@@ -902,7 +902,7 @@ TEST_CASE("Benchmark inductance matrix calculation for three windings", "[physic
     };
 }
 
-TEST_CASE("Benchmark inductance matrix calculation for four windings", "[physical-model][inductance][!benchmark]") {
+TEST_CASE("Benchmark inductance matrix calculation for four windings", "[!benchmark]") {
     BENCHMARK_ADVANCED("four winding inductance matrix")(Catch::Benchmark::Chronometer meter) {
         settings.reset();
         clear_databases();
@@ -936,7 +936,7 @@ TEST_CASE("Benchmark inductance matrix calculation for four windings", "[physica
     };
 }
 
-TEST_CASE("Benchmark self inductance calculation", "[physical-model][inductance][!benchmark]") {
+TEST_CASE("Benchmark self inductance calculation", "[!benchmark]") {
     BENCHMARK_ADVANCED("self inductance")(Catch::Benchmark::Chronometer meter) {
         settings.reset();
         clear_databases();
@@ -968,7 +968,7 @@ TEST_CASE("Benchmark self inductance calculation", "[physical-model][inductance]
     };
 }
 
-TEST_CASE("Benchmark coupling coefficient calculation", "[physical-model][inductance][!benchmark]") {
+TEST_CASE("Benchmark coupling coefficient calculation", "[!benchmark]") {
     BENCHMARK_ADVANCED("coupling coefficient")(Catch::Benchmark::Chronometer meter) {
         settings.reset();
         clear_databases();
@@ -1001,3 +1001,173 @@ TEST_CASE("Benchmark coupling coefficient calculation", "[physical-model][induct
 }
 
 } // anonymous namespace
+
+// ABT #396: calculate_mutual_inductance returned sqrt(Lm_source * Lm_dest) unconditionally — ideal
+// coupling by construction, k = 1 — and never consulted the reluctance network that
+// calculate_inductance_matrix has used for leg-separated windings since the multi-column work. So
+// the same magnetic reported two different couplings depending on which entry point you asked:
+// 0.999 from calculate_coupling_coefficient against 0.624 from the matrix, on a 3-column E 42 with
+// the primary on the centre leg and the secondary on an outer leg. The matrix was right — the
+// secondary only links the share of primary flux that returns through ITS leg — so the two paths
+// now share one source of truth. This pins that they agree.
+TEST_CASE("Test_Coupling_Coefficient_Agrees_With_Inductance_Matrix", "[physical-model][inductance][multi-column]") {
+    settings.reset();
+    auto path = std::filesystem::path{std::source_location::current().file_name()}
+                    .parent_path().append("testData").append("multicolumn_e42_transformer.json");
+    std::ifstream masFile(path);
+    REQUIRE(masFile.good());
+    json masJson = json::parse(masFile);
+    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+    double frequency = 100000;
+
+    Inductance inductance;
+    auto matrix = inductance.calculate_inductance_matrix(magnetic, frequency).get_magnitude();
+    double selfPrimary = matrix["Primary"]["Primary"].get_nominal().value();
+    double selfSecondary = matrix["Secondary"]["Secondary"].get_nominal().value();
+    double mutualFromMatrix = matrix["Primary"]["Secondary"].get_nominal().value();
+    double couplingFromMatrix = std::abs(mutualFromMatrix) / std::sqrt(selfPrimary * selfSecondary);
+
+    double couplingFromCoefficient = inductance.calculate_coupling_coefficient(magnetic, 0, 1, frequency);
+    UNSCOPED_INFO("matrix says " << couplingFromMatrix << ", calculate_coupling_coefficient says "
+                  << couplingFromCoefficient);
+    // Same physical quantity, so the same number — this is what used to differ (0.624 vs 0.999).
+    CHECK_THAT(std::abs(couplingFromCoefficient), WithinRel(couplingFromMatrix, 1e-9));
+    // ...and it must be the real flux divider, not ideal coupling.
+    CHECK(std::abs(couplingFromCoefficient) < 0.9);
+    CHECK(std::abs(couplingFromCoefficient) > 0.1);
+
+    // The sign the network reports is meaningful and must survive: the old clamp to [0, 1] turned a
+    // legitimately negative coupling into a flat zero, i.e. "these windings do not couple".
+    double mutualFromPair = inductance.calculate_mutual_inductance(magnetic, 0, 1);
+    UNSCOPED_INFO("mutual inductance " << mutualFromPair);
+    CHECK(std::isfinite(mutualFromPair));
+    CHECK(std::abs(mutualFromPair) > 0);
+
+    settings.reset();
+}
+
+// The same coupling on a single-window magnetic, where every winding shares the main column: there
+// the network reproduces the rank-1 closed form exactly, so routing through it must not move the
+// answer, and a well-coupled transformer must still report a coupling near 1.
+TEST_CASE("Test_Coupling_Coefficient_Unchanged_For_Main_Column_Windings", "[physical-model][inductance][smoke-test]") {
+    settings.reset();
+    clear_databases();
+    std::vector<int64_t> numberTurns({40, 20});
+    std::vector<int64_t> numberParallels({1, 1});
+    auto magnetic = create_two_winding_magnetic("ETD 39", "3C97", numberTurns, numberParallels);
+
+    Inductance inductance;
+    double mutualInductance = inductance.calculate_mutual_inductance(magnetic, 0, 1);
+    MagnetizingInductance magnetizingModel("ZHANG");
+    double magnetizingPrimary = magnetizingModel.calculate_inductance_from_number_turns_and_gapping(magnetic)
+                                    .get_magnetizing_inductance().get_nominal().value();
+    double turnsRatio = double(numberTurns[1]) / double(numberTurns[0]);
+    CHECK_THAT(mutualInductance, WithinRel(magnetizingPrimary * turnsRatio, maximumError));
+
+    double coupling = inductance.calculate_coupling_coefficient(magnetic, 0, 1, 100000);
+    UNSCOPED_INFO("single-window coupling " << coupling);
+    CHECK(coupling > 0.9);
+    CHECK(coupling <= 1.0);
+    settings.reset();
+}
+
+// ABT #1057 asked for a "coupling term" in the inductance model because sector-wound common-mode
+// chokes (the two windings on opposite halves of one ring) were reading 2.5x their datasheet
+// inductance. There is no such term to add. The self inductance of one winding on a closed ring
+// is set by Ampere's law around the core path: the MMF is N·I whether the turns sit on one
+// sector or all the way round, and with a 10 000-permeability path the air route between the
+// winding's two ends carries three orders of magnitude less flux than the ring — so L_ii is
+// mu0·mu·N²·Ae/le to well under 1 % for ANY placement. What placement does change is the
+// coupling to the OTHER winding, and MKF already computes that (inductance matrix, k, leakage);
+// on a sector-wound ring it moves the parallel-connected common-mode inductance (L+M)/2 by
+// (1-k)/2, a fraction of a percent. The 2.5x was a data fault on five WE-SL5 rows (their
+// sector-wound siblings on WE-SL1 sit at 1.0), and the 0.47x "two-chamber" group was the
+// residual mating gap of a two-piece UU core. This pins the physics so the question stays answered.
+TEST_CASE("Test_Toroid_Sector_Winding_Self_Inductance_Is_Placement_Independent", "[physical-model][inductance][toroidal][smoke-test]") {
+    settings.reset();
+    clear_databases();
+    settings.set_use_toroidal_cores(true);
+    settings.set_coil_delimit_and_compact(false);
+    settings.set_coil_try_rewind(false);
+
+    std::vector<int64_t> numberTurns = {19, 19};
+    std::vector<int64_t> numberParallels = {1, 1};
+    std::string coreShape = "T 20/10/7";
+    std::string coreMaterial = "3E6";   // 10 000-permeability MnZn, the common-mode-choke grade class
+    auto emptyGapping = json::array();
+    auto core = OpenMagneticsTesting::get_quick_core(coreShape, emptyGapping, 1, coreMaterial);
+
+    // Sector-wound: contiguous sections, each winding on its own half of the ring.
+    auto sectorCoil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, coreShape, 1,
+                                                          WindingOrientation::CONTIGUOUS, WindingOrientation::OVERLAPPING,
+                                                          CoilAlignment::CENTERED, CoilAlignment::CENTERED);
+    // Layered: the second winding wound over the first, the closest a winder gets to bifilar.
+    auto layeredCoil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, coreShape, 1,
+                                                           WindingOrientation::OVERLAPPING, WindingOrientation::OVERLAPPING,
+                                                           CoilAlignment::CENTERED, CoilAlignment::CENTERED);
+
+    // Prove the sector coil IS sector-wound: two conduction sections a half-turn apart.
+    auto sectorSections = sectorCoil.get_sections_description().value();
+    std::vector<double> sectionAngles;
+    for (auto& section : sectorSections) {
+        if (section.get_type() == ElectricalType::CONDUCTION) {
+            sectionAngles.push_back(section.get_coordinates()[1]);
+        }
+    }
+    REQUIRE(sectionAngles.size() == 2);
+    double angularSeparation = std::fmod(std::abs(sectionAngles[1] - sectionAngles[0]), 360.0);
+    UNSCOPED_INFO("sector centres at " << sectionAngles[0] << " and " << sectionAngles[1] << " deg");
+    CHECK_THAT(angularSeparation, WithinAbs(180.0, 10.0));
+
+    MagnetizingInductance magnetizingModel;
+    double closedForm = magnetizingModel.calculate_inductance_from_number_turns_and_gapping(core, sectorCoil)
+                            .get_magnetizing_inductance().get_nominal().value();
+    REQUIRE(closedForm > 0);
+
+    double frequency = 10000;
+    Inductance inductance;
+    auto firstName = sectorCoil.get_functional_description()[0].get_name();
+    auto secondName = sectorCoil.get_functional_description()[1].get_name();
+
+    double sectorLeakage = 0;
+    double layeredLeakage = 0;
+    for (auto* coil : {&sectorCoil, &layeredCoil}) {
+        bool isSector = (coil == &sectorCoil);
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(*coil);
+
+        auto matrix = inductance.calculate_inductance_matrix(magnetic, frequency).get_magnitude();
+        double selfFirst = matrix[firstName][firstName].get_nominal().value();
+        double selfSecond = matrix[secondName][secondName].get_nominal().value();
+        double mutual = matrix[firstName][secondName].get_nominal().value();
+        double coupling = inductance.calculate_coupling_coefficient(magnetic, 0, 1, frequency);
+        auto leakageMatrix = inductance.calculate_leakage_inductance_matrix(magnetic, frequency).get_magnitude();
+        double leakage = leakageMatrix[firstName][secondName].get_nominal().value();
+        double commonModeParallel = (selfFirst + mutual) / 2;
+        UNSCOPED_INFO((isSector ? "sector" : "layered") << ": closed form " << closedForm << " H, L11 " << selfFirst
+                      << " H, L22 " << selfSecond << " H, M " << mutual << " H, k " << coupling
+                      << ", leakage " << leakage << " H");
+
+        // Self inductance of either winding is the closed form, regardless of where its turns sit.
+        CHECK_THAT(selfFirst, WithinRel(closedForm, 1e-3));
+        CHECK_THAT(selfSecond, WithinRel(closedForm, 1e-3));
+        // The other winding links the same core flux: mutual is the closed form too, k is ~1.
+        CHECK_THAT(mutual, WithinRel(closedForm, 1e-3));
+        CHECK(coupling > 0.999);
+        CHECK(coupling <= 1.0);
+        // And the parallel-connected common-mode inductance a choke datasheet states is (L+M)/2,
+        // which the coupling moves by (1-k)/2 — nowhere near the 2.5x the ticket attributed to it.
+        CHECK_THAT(commonModeParallel, WithinRel(closedForm, 1e-3));
+
+        (isSector ? sectorLeakage : layeredLeakage) = leakage;
+    }
+
+    // The coupling term the ticket asked for is the leakage MKF already resolves from the turn
+    // layout: it exists, it is larger for the sector layout, and it is small against the core term.
+    CHECK(sectorLeakage > 0);
+    CHECK(sectorLeakage > layeredLeakage);
+    CHECK(sectorLeakage < 0.01 * closedForm);
+
+    settings.reset();
+}

@@ -1183,6 +1183,16 @@ namespace {
     }
 
     TEST_CASE("Test_Simulator_Web_1", "[processor][magnetic-simulator][bug]") {
+    // ABT #840: the captured payload carried MORE excitations than the magnetic has windings —
+    // op0 held 12 (resp. 6) for a 2-winding magnetic, the surplus being duplicate,
+    // under-specified copies (waveform + a partial processed block, no peak/rms/harmonics),
+    // and in the web_1 case at the WRONG frequency for an operating point named "25kHz".
+    // MKF never read them: every consumer indexes excitationsPerWinding[windingIndex] for
+    // windingIndex < numberWindings, so the surplus was dead weight the old code silently
+    // ignored. The 0d388fa6 guard now refuses it, correctly — an operating point that supplies
+    // an ambiguous number of excitations cannot be simulated without guessing which ones count.
+    // The fixtures are trimmed to the excitations MKF actually consumed, so these repros are
+    // byte-for-byte the same simulation they always were; only the ignored padding is gone.
 
         auto json_path_1095 = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "test_simulator_web_1_1095.json");
         std::ifstream json_file_1095(json_path_1095);
@@ -1200,6 +1210,16 @@ namespace {
     }
 
     TEST_CASE("Test_Simulator_Web_2", "[processor][magnetic-simulator][bug]") {
+    // ABT #840: the captured payload carried MORE excitations than the magnetic has windings —
+    // op0 held 12 (resp. 6) for a 2-winding magnetic, the surplus being duplicate,
+    // under-specified copies (waveform + a partial processed block, no peak/rms/harmonics),
+    // and in the web_1 case at the WRONG frequency for an operating point named "25kHz".
+    // MKF never read them: every consumer indexes excitationsPerWinding[windingIndex] for
+    // windingIndex < numberWindings, so the surplus was dead weight the old code silently
+    // ignored. The 0d388fa6 guard now refuses it, correctly — an operating point that supplies
+    // an ambiguous number of excitations cannot be simulated without guessing which ones count.
+    // The fixtures are trimmed to the excitations MKF actually consumed, so these repros are
+    // byte-for-byte the same simulation they always were; only the ignored padding is gone.
 
         auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "bug_contiguous.json");
         auto mas = OpenMagneticsTesting::mas_loader(path);
@@ -1473,4 +1493,96 @@ namespace {
         REQUIRE_THROWS(simulator.build_datasheet(mas));
     }
 
-}  // namespace
+}
+
+// ABT #366/#362/#357: the FULL simulate path over all four new families. Individual models were
+// pinned family by family (inductance, saturation, losses, capacitance, leakage, impedance,
+// temperature), but MagneticSimulator is what a real caller actually invokes — it runs the whole
+// chain together and cross-feeds results (core losses -> temperature -> permeability -> losses).
+// An integration that works model-by-model can still fall over here, and nothing had checked it.
+TEST_CASE("Test_Magnetic_Simulator_New_Core_Families",
+          "[processor][magnetic-simulator][drum][drum-ring][drum-semishielded][molded]") {
+    settings.reset();
+    clear_databases();
+
+    auto buildCustomCore = [](json shapeJson, const std::string& coreType, json coating = json(),
+                              const std::string& materialName = "3C90") {
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", coreType}, {"material", materialName}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1}};
+        if (!coating.is_null()) {
+            coreJson["functionalDescription"]["coating"] = coating;
+        }
+        OpenMagnetics::Core core(coreJson);
+        core.process_data();
+        core.process_gap();
+        return core;
+    };
+
+    json drumDimensions = {
+        {"A", {{"nominal", 0.0038}}}, {"B", {{"nominal", 0.0018}}}, {"C", {{"nominal", 0.0015}}},
+        {"D", {{"nominal", 0.0004}}}, {"E", {{"nominal", 0.0010}}}, {"F", {{"nominal", 0.0004}}}};
+    json semishieldedDimensions = drumDimensions;
+    semishieldedDimensions["J"] = {{"nominal", 0.0040}};
+    semishieldedDimensions["K"] = {{"nominal", 0.0040}};
+    semishieldedDimensions["L"] = {{"nominal", 0.0018}};
+
+    std::vector<std::pair<std::string, OpenMagnetics::Core>> cores;
+    cores.emplace_back("drum", OpenMagneticsTesting::get_quick_core("DRH-14X20-4C", json::array(), 1, "3C90"));
+    cores.emplace_back("drumRing", OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "3C90"));
+    cores.emplace_back("drumSemishielded", buildCustomCore(
+        {{"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "drumSemishielded"},
+         {"aliases", json::array()}, {"name", "LQS-like 4018"}, {"dimensions", semishieldedDimensions}},
+        "pieceAndPlate", {{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", "Kool M\u00b5 26"}}));
+    // Molded bodies are a low-permeability metal composite, NOT ferrite: building this fixture
+    // with a mu_i~2000 ferrite drove B (and hence core loss) an order of magnitude high for a
+    // 4 mm part. Use a powder grade in the family's real permeability class instead.
+    cores.emplace_back("molded", buildCustomCore(
+        {{"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+         {"aliases", json::array()}, {"name", "MAPI-like 4020"},
+         {"dimensions", {
+             {"A", {{"nominal", 0.0041}}}, {"B", {{"nominal", 0.0021}}}, {"C", {{"nominal", 0.0041}}},
+             {"D", {{"nominal", 0.0014}}}, {"E", {{"nominal", 0.0030}}}, {"F", {{"nominal", 0.0012}}}}}},
+        "closedShape", json(), "Kool M\u00b5 26"));
+
+    for (auto& [label, core] : cores) {
+        json coilJson;
+        coilJson["bobbin"] = "Dummy";
+        coilJson["functionalDescription"] = json::array({{
+            {"name", "winding 0"}, {"numberTurns", 8}, {"numberParallels", 1},
+            {"isolationSide", "primary"}, {"wire", "Round 0.1 - Grade 1"}}});
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
+        auto completed = OpenMagnetics::magnetic_autocomplete(magnetic);
+
+        auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+            500000, 5e-6, 25, WaveformLabel::TRIANGULAR, 0.2, 0.5, 0.2);
+        auto completedInputs = OpenMagnetics::inputs_autocomplete(inputs, completed);
+
+        OpenMagnetics::MagneticSimulator simulator;
+        OpenMagnetics::Mas mas;
+        REQUIRE_NOTHROW(mas = simulator.simulate(completedInputs, completed));
+        REQUIRE(mas.get_outputs().size() > 0);
+        auto& output = mas.get_outputs()[0];
+
+        REQUIRE(output.get_inductance());
+        double inductance = OpenMagnetics::resolve_dimensional_values(
+            output.get_inductance()->get_magnetizing_inductance().get_magnetizing_inductance());
+        REQUIRE(output.get_core_losses());
+        double coreLosses = output.get_core_losses()->get_core_losses();
+        REQUIRE(output.get_winding_losses());
+        double windingLosses = output.get_winding_losses()->get_winding_losses();
+
+        UNSCOPED_INFO(label << ": L " << inductance * 1e6 << " uH, core losses " << coreLosses * 1e3
+                      << " mW, winding losses " << windingLosses * 1e3 << " mW");
+        CHECK(std::isfinite(inductance));
+        CHECK(inductance > 0);
+        CHECK(std::isfinite(coreLosses));
+        CHECK(coreLosses >= 0);
+        CHECK(std::isfinite(windingLosses));
+        CHECK(windingLosses > 0);
+    }
+    settings.reset();
+}

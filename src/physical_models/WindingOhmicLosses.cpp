@@ -1,5 +1,6 @@
 #include "physical_models/WindingOhmicLosses.h"
 #include "physical_models/Resistivity.h"
+#include "processors/Inputs.h"
 #include "Constants.h"
 
 #include <cmath>
@@ -14,20 +15,31 @@
 
 namespace OpenMagnetics {
 
-std::vector<std::vector<double>> WindingOhmicLosses::calculate_connection_resistance_per_winding_per_parallel(Coil coil, double temperature) {
+std::vector<std::vector<double>> WindingOhmicLosses::calculate_connection_length_per_winding_per_parallel(Coil coil) {
     auto windings = coil.get_functional_description();
-    std::vector<std::vector<double>> connectionResistance;
+    std::vector<std::vector<double>> connectionLength;
     for (size_t windingIndex = 0; windingIndex < windings.size(); ++windingIndex) {
-        connectionResistance.push_back(std::vector<double>(coil.get_number_parallels(windingIndex), 0.0));
+        connectionLength.push_back(std::vector<double>(coil.get_number_parallels(windingIndex), 0.0));
     }
 
     // Connections only contribute when real winding geometry is enabled (otherwise ideal mode keeps
     // historical results untouched).
     if (!Settings::GetInstance().get_coil_use_real_winding_geometry()) {
-        return connectionResistance;
+        return connectionLength;
     }
 
     auto wirePerWinding = coil.get_wires();
+
+    // ABT #492 owner ruling: planar wires are PCBs — the real-winding connection model is for WOUND
+    // magnetics only. wind() already throws on this combination, but a coil deserialized from JSON
+    // reaches this entry without ever winding, so the gate must live here too.
+    for (const auto& wire : wirePerWinding) {
+        if (wire.get_type() == WireType::PLANAR) {
+            throw std::runtime_error(
+                "Real winding geometry (connection/lead routing) is not implemented for planar "
+                "(PCB) constructions; disable coilUseRealWindingGeometry for planar magnetics");
+        }
+    }
 
     // Provided terminal-lead lengths from the design requirements apply to the winding as a whole;
     // split evenly across its parallels (each parallel reaches the same terminal).
@@ -52,23 +64,38 @@ std::vector<std::vector<double>> WindingOhmicLosses::calculate_connection_resist
         crossingLength.push_back(std::vector<double>(coil.get_number_parallels(windingIndex), 0.0));
         geometricTerminalLength.push_back(std::vector<double>(coil.get_number_parallels(windingIndex), 0.0));
     }
+    // ABT #492 loss-reader audit: every marker carries its centerline copper length EXPLICITLY in
+    // routedLength, set by its emitter from its own geometry — nothing is inferred from the
+    // rectangle here any more. The old inference was structurally wrong in two ways: an
+    // orientation-derived index misread every segment running along the OTHER axis (a U-route
+    // vertical stub counted as one wire width instead of its climb), and any shape-based rule
+    // (long-axis, per-plane index) misreads a radial climb of a tall RECTANGULAR/FOIL wire whose
+    // height exceeds the climb's run. Space-only squeeze markers carry 0 — their copper is the
+    // DRAWN segments of the same route. An unset routedLength is an emitter bug (markers are
+    // always freshly emitted at runtime) and throws per the no-fallback rule.
     for (const auto& space : coil.get_connection_reserved_spaces()) {
         auto windingIndex = coil.get_winding_index_by_name(space.winding);
         int64_t parallelIndex = space.parallel;
         if (parallelIndex < 0 || parallelIndex >= int64_t(coil.get_number_parallels(windingIndex))) {
             continue;  // a winding-level lead with no parallel; cannot attribute to a branch
         }
+        if (!space.routedLength) {
+            throw std::runtime_error(
+                "Connection marker without routedLength (winding '" + space.winding + "', section '" +
+                space.section + "'): every emitter in Coil::get_connection_reserved_spaces must set "
+                "the centerline copper length it charges — this is an emitter bug");
+        }
+        double runLength = space.routedLength.value();
         if (space.isTerminal) {
-            geometricTerminalLength[windingIndex][parallelIndex] += space.dimensions[0];
+            geometricTerminalLength[windingIndex][parallelIndex] += runLength;
         }
         else {
-            crossingLength[windingIndex][parallelIndex] += space.dimensions[0];
+            crossingLength[windingIndex][parallelIndex] += runLength;
         }
     }
 
     for (size_t windingIndex = 0; windingIndex < windings.size(); ++windingIndex) {
         int64_t numberParallels = int64_t(coil.get_number_parallels(windingIndex));
-        double resistancePerMeter = calculate_dc_resistance_per_meter(wirePerWinding[windingIndex], temperature);
         for (int64_t parallelIndex = 0; parallelIndex < numberParallels; ++parallelIndex) {
             // The terminal-lead length is taken from the design requirements when provided (shared
             // across the parallels), otherwise from the per-parallel geometric routing to the window
@@ -76,10 +103,35 @@ std::vector<std::vector<double>> WindingOhmicLosses::calculate_connection_resist
             double terminalLength = providedTerminalLength[windingIndex] > 0
                 ? providedTerminalLength[windingIndex] / double(numberParallels)
                 : geometricTerminalLength[windingIndex][parallelIndex];
-            double leadLength = crossingLength[windingIndex][parallelIndex] + terminalLength;
-            if (leadLength > 0) {
-                connectionResistance[windingIndex][parallelIndex] += resistancePerMeter * leadLength;
+            connectionLength[windingIndex][parallelIndex] = crossingLength[windingIndex][parallelIndex] + terminalLength;
+        }
+    }
+
+    return connectionLength;
+}
+
+std::vector<std::vector<double>> WindingOhmicLosses::calculate_connection_resistance_per_winding_per_parallel(Coil coil, double temperature) {
+    // DC resistance of the connection copper. The AC (skin) increment of the same lengths is added
+    // by WindingSkinEffectLosses::calculate_skin_effect_losses from the SAME length source, so the
+    // DC and AC stages can never disagree about what copper exists.
+    auto connectionLength = calculate_connection_length_per_winding_per_parallel(coil);
+    auto wirePerWinding = coil.get_wires();
+    std::vector<std::vector<double>> connectionResistance;
+    for (size_t windingIndex = 0; windingIndex < connectionLength.size(); ++windingIndex) {
+        connectionResistance.push_back(std::vector<double>(connectionLength[windingIndex].size(), 0.0));
+        bool anyLength = false;
+        for (double length : connectionLength[windingIndex]) {
+            if (length > 0) {
+                anyLength = true;
             }
+        }
+        if (!anyLength) {
+            continue;
+        }
+        double resistancePerMeter = calculate_dc_resistance_per_meter(wirePerWinding[windingIndex], temperature);
+        for (size_t parallelIndex = 0; parallelIndex < connectionLength[windingIndex].size(); ++parallelIndex) {
+            connectionResistance[windingIndex][parallelIndex] =
+                resistancePerMeter * connectionLength[windingIndex][parallelIndex];
         }
     }
 
@@ -239,15 +291,37 @@ WindingLossesOutput WindingOhmicLosses::calculate_ohmic_losses(Coil coil, Operat
         }
         
         auto& exc = operatingPoint.get_excitations_per_winding()[windingIndex];
-        if (!exc.get_current() || !exc.get_current()->get_processed() || !exc.get_current()->get_processed()->get_rms()) {
-            // Missing RMS is handled the same way as a missing current spec (the guard
-            // used to stop at get_processed() and then .value() the RMS — a raw
-            // bad_optional_access instead of the documented absent-data path).
+        if (!exc.get_current()) {
+            // No current specified for this winding: genuinely zero current.
             dcCurrentPerWinding.push_back(0);
             continue;
         }
-
-        double currentRms = exc.get_current()->get_processed()->get_rms().value();
+        auto current = exc.get_current().value();
+        double currentRms;
+        if (current.get_processed() && current.get_processed()->get_rms()) {
+            currentRms = current.get_processed()->get_rms().value();
+        }
+        else if (current.get_waveform() && !current.get_waveform()->get_data().empty()) {
+            // A missing RMS is derivable from the caller's own waveform
+            // (ABT #598: it used to be silently read as 0 A, returning
+            // windingLosses=0.0 labelled "Ohm").
+            auto waveform = current.get_waveform().value();
+            if (!Inputs::is_waveform_sampled(waveform)) {
+                waveform = Inputs::calculate_sampled_waveform(waveform, exc.get_frequency());
+            }
+            // includeAdvancedData=true: the RMS is only computed on that path.
+            auto processed = Inputs::calculate_processed_data(waveform, exc.get_frequency(), true);
+            if (!processed.get_rms()) {
+                throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                    "Could not derive RMS from the waveform of winding " + std::to_string(windingIndex));
+            }
+            currentRms = processed.get_rms().value();
+        }
+        else {
+            throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                "Current for winding " + std::to_string(windingIndex) +
+                " has neither a processed RMS nor a waveform to derive it from");
+        }
         dcCurrentPerWinding.push_back(currentRms);
     }
 

@@ -197,26 +197,94 @@ WindingLossesOutput WindingProximityEffectLosses::calculate_proximity_effect_los
         auto wire = coil.resolve_wire(windingIndex);
         double wireLength = turn.get_length();
 
-        std::vector<ComplexField> fields;
+        // ABT #227.2: a turn with a genuine second plane crossing (CoilMesher samples the
+        // field at BOTH crossings for these -- see CoilMesherCenterModel::generate_mesh_
+        // induced_turn) sits in a materially different proximity environment at each: the
+        // in-window half and the out-of-core/other-window half of a lateral multi-column
+        // turn. Classify each solved field point by which crossing coordinate it matches
+        // -- NOT by label or turn_length, since not every MagneticFieldStrengthModel
+        // implementation propagates those onto its ComplexFieldPoint output, while every
+        // one of them propagates `point` (the field's own location, load-bearing for the
+        // model itself) -- and weight each crossing's per-meter loss by its own length
+        // share instead of billing the whole loop length at one crossing's density. If no
+        // point actually matches the secondary coordinate (single-crossing turns, and any
+        // wire/model combination that does not emit a second sample), every point stays
+        // "primary" and primaryLength stays the full wireLength: byte-identical to the
+        // pre-fix behavior.
+        // Bind once: the MAS getter returns the nested vectors BY VALUE (repo memory:
+        // never chain .value() calls off it), and it used to be called four times here.
+        const auto additionalCoordinatesOpt = turn.get_additional_coordinates();
+        bool turnHasSecondCrossing = additionalCoordinatesOpt.has_value() &&
+            !additionalCoordinatesOpt->empty() &&
+            (*additionalCoordinatesOpt)[0].size() >= 2;
+        std::vector<double> secondaryCoordinates;
+        if (turnHasSecondCrossing) {
+            secondaryCoordinates = (*additionalCoordinatesOpt)[0];
+        }
+
+        std::vector<ComplexField> primaryFields;
+        std::vector<ComplexField> secondaryFields;
+        bool hasSecondaryCrossing = false;
+
         for (auto& fieldPerHarmonic : windingWindowMagneticStrengthFieldOutput.get_field_per_frequency()) {
-            std::vector<ComplexFieldPoint> data;
+            std::vector<ComplexFieldPoint> primaryData;
+            std::vector<ComplexFieldPoint> secondaryData;
             for (auto& fieldPoint : fieldPerHarmonic.get_data()) {
                 if (!fieldPoint.get_turn_index()) {
                     throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION, "Missing turn index in field point");
                 }
-                if (fieldPoint.get_turn_index().value() == int(turnIndex)) {
-                    data.push_back(fieldPoint);
+                if (fieldPoint.get_turn_index().value() != int(turnIndex)) {
+                    continue;
+                }
+                // Nearest-crossing classification. The CenterModel emits the secondary
+                // sample exactly AT the secondary coordinate, but the WangModel (ABT
+                // #227.2 parity) emits a whole surface cluster OFFSET around each
+                // crossing, so an exact-match test would file its secondary points under
+                // the primary crossing. Comparing the distance to each crossing centre
+                // classifies both models' points correctly and is byte-identical for the
+                // exact-match case (distance 0 beats anything).
+                bool isSecondaryPoint = turnHasSecondCrossing && fieldPoint.get_point().size() >= 2 &&
+                    std::hypot(fieldPoint.get_point()[0] - secondaryCoordinates[0],
+                               fieldPoint.get_point()[1] - secondaryCoordinates[1]) <
+                    std::hypot(fieldPoint.get_point()[0] - turn.get_coordinates()[0],
+                               fieldPoint.get_point()[1] - turn.get_coordinates()[1]);
+                if (isSecondaryPoint) {
+                    secondaryData.push_back(fieldPoint);
+                    hasSecondaryCrossing = true;
+                }
+                else {
+                    primaryData.push_back(fieldPoint);
                 }
             }
-            
-            ComplexField complexField;
-            complexField.set_data(data);
-            complexField.set_frequency(fieldPerHarmonic.get_frequency());
-            fields.push_back(complexField);
+
+            ComplexField primaryComplexField;
+            primaryComplexField.set_data(primaryData);
+            primaryComplexField.set_frequency(fieldPerHarmonic.get_frequency());
+            primaryFields.push_back(primaryComplexField);
+
+            // Only assembled when this turn can actually have secondary points — the
+            // common single-crossing case used to build an empty ComplexField per
+            // harmonic for nothing.
+            if (turnHasSecondCrossing) {
+                ComplexField secondaryComplexField;
+                secondaryComplexField.set_data(secondaryData);
+                secondaryComplexField.set_frequency(fieldPerHarmonic.get_frequency());
+                secondaryFields.push_back(secondaryComplexField);
+            }
         }
 
-        auto lossesPerHarmonicThisTurn = calculate_proximity_effect_losses_per_meter(wire, temperature, fields, modelOverride).second;
+        double primaryLength = hasSecondaryCrossing ? wireLength / 2 : wireLength;
+        double secondaryLength = hasSecondaryCrossing ? wireLength / 2 : 0;
 
+        auto primaryLossesPerHarmonic = calculate_proximity_effect_losses_per_meter(wire, temperature, primaryFields, modelOverride).second;
+        std::vector<std::pair<double, double>> secondaryLossesPerHarmonic;
+        if (hasSecondaryCrossing) {
+            secondaryLossesPerHarmonic = calculate_proximity_effect_losses_per_meter(wire, temperature, secondaryFields, modelOverride).second;
+            if (secondaryLossesPerHarmonic.size() != primaryLossesPerHarmonic.size()) {
+                throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                    "Primary and secondary crossing harmonics do not match for turn " + std::to_string(turnIndex));
+            }
+        }
 
         LossElementPerHarmonic proximityEffectLossesThisTurn;
         auto model = get_model(coil.get_wire_type(windingIndex), modelOverride);
@@ -225,15 +293,24 @@ WindingLossesOutput WindingProximityEffectLosses::calculate_proximity_effect_los
         proximityEffectLossesThisTurn.get_mutable_harmonic_frequencies().push_back(0);
         proximityEffectLossesThisTurn.get_mutable_losses_per_harmonic().push_back(0);
 
-        for (auto& lossesThisHarmonic : lossesPerHarmonicThisTurn) {
-            if (std::isnan(lossesThisHarmonic.first)) {
+        for (size_t harmonicIndex = 0; harmonicIndex < primaryLossesPerHarmonic.size(); ++harmonicIndex) {
+            auto& primaryThisHarmonic = primaryLossesPerHarmonic[harmonicIndex];
+            if (std::isnan(primaryThisHarmonic.first)) {
                 throw NaNResultException("NaN found in proximity effect losses");
             }
-            proximityEffectLossesThisTurn.get_mutable_harmonic_frequencies().push_back(lossesThisHarmonic.second);
-            proximityEffectLossesThisTurn.get_mutable_losses_per_harmonic().push_back(lossesThisHarmonic.first * wireLength);
+            double lossThisHarmonic = primaryThisHarmonic.first * primaryLength;
+            if (hasSecondaryCrossing) {
+                auto& secondaryThisHarmonic = secondaryLossesPerHarmonic[harmonicIndex];
+                if (std::isnan(secondaryThisHarmonic.first)) {
+                    throw NaNResultException("NaN found in proximity effect losses");
+                }
+                lossThisHarmonic += secondaryThisHarmonic.first * secondaryLength;
+            }
 
-            totalProximityEffectLosses += lossesThisHarmonic.first * wireLength;
+            proximityEffectLossesThisTurn.get_mutable_harmonic_frequencies().push_back(primaryThisHarmonic.second);
+            proximityEffectLossesThisTurn.get_mutable_losses_per_harmonic().push_back(lossThisHarmonic);
 
+            totalProximityEffectLosses += lossThisHarmonic;
         }
 
         windingLossesPerTurn[turnIndex].set_proximity_effect_losses(proximityEffectLossesThisTurn);
@@ -285,9 +362,24 @@ double WindingProximityEffectLossesRossmanithModel::calculate_proximity_factor(W
         double wireWidth = resolve_dimensional_values(wire.get_conducting_width().value());
         double wireHeight = resolve_dimensional_values(wire.get_conducting_height().value());
 
-        // FEM-validated height*width/delta prefactor — do NOT rewrite to
-        // 2*height/delta (June 2026 planar/foil over-prediction regression, reverted).
-        factor = wireHeight * wireWidth / skinDepth * (sinh(wireWidth / skinDepth) - sin(wireWidth / skinDepth)) / (cosh(wireWidth / skinDepth) + cos(wireWidth / skinDepth));
+        if (wire.get_type() == WireType::PLANAR) {
+            // PLANAR keeps the legacy form: it is entangled with the C=8 FEM-calibrated width
+            // integral in the Wang model and needs the OMFEM planar suite to untangle (ABT #139).
+            factor = wireHeight * wireWidth / skinDepth * (sinh(wireWidth / skinDepth) - sin(wireWidth / skinDepth)) / (cosh(wireWidth / skinDepth) + cos(wireWidth / skinDepth));
+        }
+        else {
+            // RECTANGULAR / FOIL. ABT #837, two errors in one expression:
+            //  1. height*width is a CROSS-SECTION prefactor; the slab form takes the BREADTH
+            //     alone (same defect class as ABT #182 for foil and ABT #832 for rectangular).
+            //  2. the kernel was evaluated at width/delta — the WIDE dimension — when the field
+            //     penetrates the THIN one. For a 4 x 0.9 mm conductor that is the difference
+            //     between G(19) = 1 (saturated) and G(4.3).
+            // The June 2026 revert this comment used to cite (de156755) backed out a fix that
+            // was itself wrong (it carried a spurious factor 2 and broke PLANAR); the correct
+            // slab form has since been FEM-arbitrated twice.
+            const double penetrated = std::min(wireHeight, wireWidth) / skinDepth;
+            factor = wireWidth / skinDepth * (sinh(penetrated) - sin(penetrated)) / (cosh(penetrated) + cos(penetrated));
+        }
     }
     else if (wire.get_type() == WireType::ROUND ) {
         double wireRadius;
@@ -463,10 +555,32 @@ double WindingProximityEffectLossesWangModel::calculate_turn_losses(Wire wire, d
         // symmetric window (a signed average silently cancels them).
         turnLosses += c * resistivity / skinDepth * (pow(Hx1, 2) + pow(Hx2, 2)) / 2 * (sinh(hTerm) - sin(hTerm)) / (cosh(hTerm) + cos(hTerm));
     }
+    else if (wire.get_type() == WireType::RECTANGULAR) {
+        // RECTANGULAR (wide dimension c across x, thin dimension h along y).
+        // Same literature slab form as the FOIL branch (Dowell 1966; Lammeraner &
+        // Stafl 1966; ABT #182 arbitration): per-unit-length proximity of a slab in
+        // a tangential field is  P/l = breadth * rho / delta * Ha^2 * G(Delta) --
+        // NO cross-section prefactor. The former c*h prefactor under-predicted by
+        // 1/h resp. 1/c (a 4 x 0.9 mm conductor read ~1000x low: proximity 2e-6 W
+        // against 6e-4 W of skin where OMFEM put R_ac/R_dc at 6.0 vs MKF's 2.3 —
+        // ABT #832, FEM-arbitrated 2026-08-20).
+
+        // Parallel field (Hx along the wide face, from the top/bottom points),
+        // penetrating the thin dimension h.
+        turnLosses += c * resistivity / skinDepth * pow((Hx2 + Hx1) / 2, 2) * (sinh(hTerm) - sin(hTerm)) / (cosh(hTerm) + cos(hTerm));
+        if (widthSamplesHPerpendicular.empty()) {
+            // Perpendicular field (Hy, normal to the wide face): rotated-slab form
+            // from the left/right edge points, penetrating the wide dimension c.
+            // Mean of squares, not square of the mean — the two edges dissipate
+            // independently and their Hy carry opposite signs in a symmetric
+            // window (same rule as the FOIL end term).
+            turnLosses += h * resistivity / skinDepth * (pow(Hy1, 2) + pow(Hy2, 2)) / 2 * (sinh(cTerm) - sin(cTerm)) / (cosh(cTerm) + cos(cTerm));
+        }
+    }
     else {
-    // Wang 1D slab proximity per turn (PLANAR/RECTANGULAR). NOTE: the c*h
+    // Wang 1D slab proximity per turn (PLANAR). NOTE: the c*h
     // prefactor here is dimensionally inconsistent with the slab literature (see
-    // the FOIL branch above and ABT #182) but is entangled with the C=8
+    // the FOIL and RECTANGULAR branches above and ABT #182) but is entangled with the C=8
     // FEM-calibrated width integral below (single-turn planar benchmark, June
     // 2026); correcting it requires re-running the OMFEM planar suite — ABT #139.
     turnLosses += c * h * resistivity / skinDepth * pow((Hx2 + Hx1) / 2, 2) * (sinh(hTerm) - sin(hTerm)) / (cosh(hTerm) + cos(hTerm));
@@ -530,10 +644,17 @@ double WindingProximityEffectLossesWangModel::calculate_turn_losses(Wire wire, d
 
     // BUG-003 FIX: Normalize nonPlanarHe by the lumped surface-point count
     // (width samples do not contribute to it and must not dilute the average)
-    // FOIL is excluded: its cross components (Hy at the ends, Hx at the faces)
-    // are already covered by the parallel/perpendicular slab terms above
-    // (ABT #182), so routing them through the Ferreira factor double-counts.
-    if (wire.get_type() != WireType::FOIL && nonPlanarHe != 0 && lumpedPointCount > 0) {
+    // FOIL and RECTANGULAR are excluded: their cross components (Hy at the ends,
+    // Hx at the faces) are already covered by the parallel/perpendicular slab terms
+    // above, so routing them through the Ferreira factor double-counts. FOIL got
+    // those two terms in ABT #182; RECTANGULAR got the identical pair in ABT #832,
+    // so the same exclusion now applies to it — it was only harmless before because
+    // the Ferreira rectangular factor was ~1000x too small (see below) and the term
+    // it contributed was indistinguishable from zero. PLANAR still routes through
+    // here: its slab branch keeps the legacy c*h prefactor and the C=8 width
+    // integral, and untangling that needs the OMFEM planar suite (ABT #139).
+    if (wire.get_type() != WireType::FOIL && wire.get_type() != WireType::RECTANGULAR &&
+        nonPlanarHe != 0 && lumpedPointCount > 0) {
         nonPlanarHe /= lumpedPointCount;
         double proximityFactor = WindingProximityEffectLossesFerreiraModel::calculate_proximity_factor(wire, frequency, temperature);
         turnLosses += proximityFactor * pow(nonPlanarHe, 2);
@@ -589,11 +710,28 @@ double WindingProximityEffectLossesFerreiraModel::calculate_proximity_factor(Wir
         double h = resolve_dimensional_values(wire.get_conducting_height().value());
 
         double xi = std::min(h, w) / skinDepth;
+        double slabKernel = (sinh(xi) - sin(xi)) / (cosh(xi) + cos(xi));
 
-        // FEM-validated planar/foil/rectangular proximity factor (w*xi form).
-        // Do NOT rewrite to 2*max(h,w)/delta: that over-predicts planar/foil
-        // proximity by 1-2 orders of magnitude (June 2026 regression, reverted).
-        factor = w * xi * resistivity * (sinh(xi) - sin(xi)) / (cosh(xi) + cos(xi));
+        if (wire.get_type() == WireType::PLANAR) {
+            // PLANAR keeps the legacy w*xi form. It is dimensionally wrong in the same
+            // way as the branch below, but it is entangled with the C=8 FEM-calibrated
+            // width integral in the Wang model, and correcting it needs the OMFEM planar
+            // suite re-run — ABT #139. Do NOT "fix" this in isolation: the June 2026
+            // attempt (de156755) reverted precisely because the planar case blew up.
+            factor = w * xi * resistivity * slabKernel;
+        }
+        else {
+            // RECTANGULAR / FOIL. ABT #837: the w*xi form carries a CROSS-SECTION
+            // prefactor -- w * (min(h,w)/delta) * rho has units of Ohm*m^2, so multiplied
+            // by H^2 [A^2/m^2] it yields W, not the W/m every caller then multiplies by a
+            // length. The literature slab form (Dowell 1966; Lammeraner & Stafl 1966; the
+            // same arbitration as ABT #182 for foil and ABT #832 for rectangular) is
+            //     P/l = breadth * rho/delta * H^2 * G(t/delta)
+            // i.e. exactly this expression with 1/delta in place of xi. The difference is
+            // a factor min(h,w) -- 0.9 mm on a 4x0.9 mm conductor, so the old factor was
+            // ~1100x LOW and the term it produced read as zero.
+            factor = w * resistivity / skinDepth * slabKernel;
+        }
         if (std::isnan(factor)) {
             throw NaNResultException("NaN found in Ferreira's proximity factor");
         }
@@ -608,10 +746,32 @@ double WindingProximityEffectLossesFerreiraModel::calculate_proximity_factor(Wir
             wireDiameter = resolve_dimensional_values(strand.get_conducting_diameter());
         }
         double gamma = wireDiameter / (skinDepth * sqrt(2));
-        // Eq. A8: G = -2*PI*gamma * [...] — the pi was missing, underestimating
-        // round/litz proximity losses by exactly pi (numerically verified against
-        // the modified-Bessel form 2*pi*rho*Re[alpha*I1(alpha)/I0(alpha)])
-        factor = - 2 * std::numbers::pi * gamma * resistivity * (kelvin_function_real(2, gamma) * derivative_kelvin_function_real(0, gamma) + kelvin_function_imaginary(2, gamma) * derivative_kelvin_function_imaginary(0, gamma)) / (pow(kelvin_function_real(0, gamma), 2) + pow(kelvin_function_imaginary(0, gamma), 2));
+        // ABT #1127: Eq. A8 is a ratio of Kelvin functions, and ber/bei grow like
+        // exp(gamma/sqrt(2)) while the power series that evaluates them has terms as
+        // large as exp(gamma). Above gamma ~ 20 the ratio is a difference of huge
+        // nearly-cancelling numbers and no double-precision series survives it: the
+        // proximity factor first overshoots, then crosses ZERO and goes negative
+        // (a negative loss), which is what put the vertical notch in the
+        // resistance-over-frequency sweep. The strong-skin-effect limit of Eq. A8 is
+        // the exact closed form
+        //     G -> pi * rho * (sqrt(2) * gamma - 1)
+        // which is already within 1.3e-3 of the exact value at gamma = 10, 3e-4 at
+        // gamma = 20 and improves as 1/gamma (verified against 60-digit ber/bei).
+        // Same treatment, and the same threshold, as modified_bessel_ratio_I1_I0 uses
+        // for the Albach skin factor.
+        constexpr double gammaAsymptoticThreshold = 20.0;
+        if (gamma >= gammaAsymptoticThreshold) {
+            factor = std::numbers::pi * resistivity * (sqrt(2) * gamma - 1);
+        }
+        else {
+            // Eq. A8: G = -2*PI*gamma * [...] — the pi was missing, underestimating
+            // round/litz proximity losses by exactly pi (numerically verified against
+            // the modified-Bessel form 2*pi*rho*Re[alpha*I1(alpha)/I0(alpha)])
+            factor = - 2 * std::numbers::pi * gamma * resistivity * (kelvin_function_real(2, gamma) * derivative_kelvin_function_real(0, gamma) + kelvin_function_imaginary(2, gamma) * derivative_kelvin_function_imaginary(0, gamma)) / (pow(kelvin_function_real(0, gamma), 2) + pow(kelvin_function_imaginary(0, gamma), 2));
+        }
+        if (std::isnan(factor)) {
+            throw NaNResultException("NaN found in Ferreira's round/litz proximity factor");
+        }
 
 
     }
@@ -743,9 +903,16 @@ double WindingProximityEffectLossesAlbachModel::calculate_turn_losses(Wire wire,
         He2_sum += pow(datum.get_real(), 2) + pow(datum.get_imaginary(), 2);
     }
     double He2_rms = He2_sum / data.size();
-    // FEM-validated form with the cross-section factor d — do NOT drop d
-    // (June 2026 planar/foil over-prediction regression, reverted).
-    double turnLosses = c * resistivity * He2_rms * (alpha * d * tanh(alpha * d / 2.0)).real();
+    // ABT #837: the leading `c` is a second length that does not belong. Every other model
+    // here returns W/m — the aggregator multiplies by the turn length — but c * rho * H^2 *
+    // Re[...] has units of W, so this model was under by a factor of one conductor dimension
+    // (~1e-3 for a sub-millimetre wire), i.e. it reported essentially zero for every wire
+    // type INCLUDING round. Without it the low-frequency limit is rho*d^4/(6*delta^4), which
+    // is 1.70x the exact cylinder result pi*rho*d^4/(32*delta^4) — the model's own plate
+    // approximation applied to a round wire, and a documented over-estimate rather than a
+    // silent zero. (The June 2026 revert cited here backed out a fix that also broke PLANAR
+    // for an unrelated reason; see the Rossmanith note above.)
+    double turnLosses = resistivity * He2_rms * (alpha * d * tanh(alpha * d / 2.0)).real();
 
     // Solid round/foil/rect wires carry no explicit number_conductors — default to 1
     // (was an unguarded .value()); litz supplies its strand count.
@@ -826,7 +993,14 @@ double WindingProximityEffectLossesLammeranerModel::calculate_proximity_factor(W
             ". Use a different proximity model (e.g., WANG or FERREIRA) for high frequencies.");
     }
 
-    factor = 2.0 * std::numbers::pi * resistivity * pow((wireConductingDimension / 2) / skinDepth, 4) / 4;
+    // ABT #837: wireConductingDimension is ALREADY the half-dimension for round/litz (the
+    // radius, set above as diameter/2), so dividing by 2 again here halved it twice and the
+    // fourth power turned that into a factor 1/16 — the model read 16x LOW everywhere inside
+    // its own validity window. With the stray /2 gone this is
+    //     2*pi*rho*(r/delta)^4/4 = pi*rho*d^4/(32*delta^4)
+    // which is EXACTLY the low-frequency limit of the Kelvin-function proximity factor that
+    // Ferreira/Rossmanith evaluate (verified against an independent radial-mode solve).
+    factor = 2.0 * std::numbers::pi * resistivity * pow(wireConductingDimension / skinDepth, 4) / 4;
 
     return factor;
 }
@@ -1089,30 +1263,56 @@ double WindingProximityEffectLossesWojdaModel::calculate_proximity_factor(Wire w
         // R_pe/l = ηh²·μ₀²·ω²·h / (12·ρ·b)  where ηh = h/p ≈ 1 for dense foil
         double h = resolve_dimensional_values(wire.get_conducting_height().value());
         double bw = resolve_dimensional_values(wire.get_conducting_width().value());
-        // Eq. 42 lamination form (b in the DENOMINATOR, per the comment above).
-        // Do NOT move bw to the numerator (June 2026 planar/foil regression, reverted).
-        factor = std::pow(mu0, 2) * std::pow(omega, 2) * std::pow(h, 3)
-               / (12.0 * resistivity * bw);
+        // ABT #837: the breadth belongs in the NUMERATOR and the constant is 24, not 12.
+        // Dimensions settle it: mu0^2*omega^2*h^3/(rho*bw) is Ohm/m, so multiplied by H^2 it
+        // gives W/m^3 where the aggregator needs W/m — the factor was out by 1/bw^2. The
+        // standard thin-slab low-frequency eddy result, with the PEAK-amplitude convention
+        // MKF uses throughout, is
+        //     P/l = bw * h^3 * mu0^2 * omega^2 * H^2 / (24 * rho)
+        // For a 4 x 0.9 mm conductor the old expression read ~2.7e5x HIGH.
+        factor = std::pow(mu0, 2) * std::pow(omega, 2) * std::pow(h, 3) * bw
+               / (24.0 * resistivity);
     }
     else if (wt == WireType::RECTANGULAR) {
-        // Same form as foil (Eq. 42/45):
+        // Same form as foil (Eq. 42/45), same ABT #837 correction:
         double h  = resolve_dimensional_values(wire.get_conducting_height().value());
         double bw = resolve_dimensional_values(wire.get_conducting_width().value());
-        factor = std::pow(mu0, 2) * std::pow(omega, 2) * std::pow(h, 3)
-               / (12.0 * resistivity * bw);
+        factor = std::pow(mu0, 2) * std::pow(omega, 2) * std::pow(h, 3) * bw
+               / (24.0 * resistivity);
     }
-    else if (wt == WireType::ROUND) {
+    else if (wt == WireType::ROUND || wt == WireType::LITZ) {
         // Eq. 70: R_pe = ηb²·π²·μ₀²·ω²·Nl²·lT·d² / (576·ρ)
         // Per-conductor per-metre, single layer (Nl=1):
         //   factor = π·μ₀²·ω²·d⁴ / (128·ρ)  (consistent with Sullivan SFD at low
         //   freq, which matches the exact LF cylinder result — π² was π too high)
-        double d = resolve_dimensional_values(wire.get_conducting_diameter().value());
-        factor = std::numbers::pi * std::pow(mu0, 2) * std::pow(omega, 2) * std::pow(d, 4)
-               / (128.0 * resistivity);
+        double d;
+        if (wt == WireType::ROUND) {
+            d = resolve_dimensional_values(wire.get_conducting_diameter().value());
+        }
+        else {
+            auto strand = wire.resolve_strand();
+            d = resolve_dimensional_values(strand.get_conducting_diameter());
+        }
+
+    // ABT #837: the SFD form is a LOW-FREQUENCY asymptote — it grows as omega^2 forever, while
+    // true proximity loss saturates towards sqrt(f) once the field stops penetrating. Outside
+    // d << delta the over-prediction runs away as (r/delta)^3: ~25% at r/delta = 1, but 119x by
+    // r/delta ~ 7.6 (d = 1 mm at 1 MHz), which the model used to report silently. Refuse beyond
+    // the same r/delta <= 1 bound the Lammeraner proximity model uses, and say "only valid for"
+    // so the model sweeps record it as a declined combination rather than a crash
+    // (TestWindingLosses.cpp, ABT #376/#116).
+    {
+        const double skinDepthForBound = WindingSkinEffectLosses::calculate_skin_depth(wire, frequency, temperature);
+        const double normalisedRadius = (d / 2) / skinDepthForBound;
+        if (normalisedRadius > 1.0) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "Wojda proximity model is only valid for low frequencies where the conductor is "
+                "small against the skin depth (radius/skin_depth <= 1); here it is " +
+                std::to_string(normalisedRadius) + ", where this squared-field-derivative form "
+                "over-predicts by roughly (radius/skin_depth)^3. Use FERREIRA or ROSSMANITH, which "
+                "evaluate the exact Kelvin-function factor at any frequency.");
+        }
     }
-    else if (wt == WireType::LITZ) {
-        auto strand = wire.resolve_strand();
-        double d = resolve_dimensional_values(strand.get_conducting_diameter());
         factor = std::numbers::pi * std::pow(mu0, 2) * std::pow(omega, 2) * std::pow(d, 4)
                / (128.0 * resistivity);
     }
@@ -1171,6 +1371,26 @@ double WindingProximityEffectLossesSullivanModel::calculate_proximity_factor(Wir
             "Sullivan SFD model only supports ROUND and LITZ wire");
     }
 
+
+    // ABT #837: the SFD form is a LOW-FREQUENCY asymptote — it grows as omega^2 forever, while
+    // true proximity loss saturates towards sqrt(f) once the field stops penetrating. Outside
+    // d << delta the over-prediction runs away as (r/delta)^3: ~25% at r/delta = 1, but 119x by
+    // r/delta ~ 7.6 (d = 1 mm at 1 MHz), which the model used to report silently. Refuse beyond
+    // the same r/delta <= 1 bound the Lammeraner proximity model uses, and say "only valid for"
+    // so the model sweeps record it as a declined combination rather than a crash
+    // (TestWindingLosses.cpp, ABT #376/#116).
+    {
+        const double skinDepthForBound = WindingSkinEffectLosses::calculate_skin_depth(wire, frequency, temperature);
+        const double normalisedRadius = (d / 2) / skinDepthForBound;
+        if (normalisedRadius > 1.0) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "Sullivan SFD proximity model is only valid for low frequencies where the conductor is "
+                "small against the skin depth (radius/skin_depth <= 1); here it is " +
+                std::to_string(normalisedRadius) + ", where this squared-field-derivative form "
+                "over-predicts by roughly (radius/skin_depth)^3. Use FERREIRA or ROSSMANITH, which "
+                "evaluate the exact Kelvin-function factor at any frequency.");
+        }
+    }
     // Appendix A, Eq. (1): P_inst/l = (π·d⁴)/(128·ρ) · |dB/dt|²
     // For sinusoidal B=μ₀·H·sin(ωt): <|dB/dt|²> = μ₀²·ω²·H²_rms
     // → factor [Ω·m] = π·μ₀²·ω²·d⁴ / (128·ρ)

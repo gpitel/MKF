@@ -115,7 +115,21 @@ inline std::map<std::string, OpenMagnetics::Bobbin> bobbinDatabase;
 inline std::map<std::string, OpenMagnetics::InsulationMaterial> insulationMaterialDatabase;
 inline std::map<std::string, MAS::WireMaterial> wireMaterialDatabase;
 
-inline thread_local OpenMagnetics::MagneticsCache magneticsCache;  // thread_local: see memo-cache note above (ABT #113)
+// The loaded part catalogue. SHARED between threads, under the same contract
+// as the catalogues above: load it before the parallel region (or freeze it
+// with set_databases_frozen(true)), then read from as many threads as you
+// like. It used to be thread_local, which meant every thread that wanted to
+// search had to load its own copy — for the 5130-part Midcom catalogue that is
+// ~1.9 GB and ~20 s each, so a service could only scale by processes, and a
+// request served by the "wrong" threadpool thread saw an empty cache and
+// reported "No magnetics found in cache" (ABT #817). Its per-operating-point
+// energy memo stays thread_local; see MagneticsCache in Cache.h.
+//
+// Advising is still a serialised operation: MagneticAdviser mutates the global
+// `settings` singleton and clears the shared core databases mid-run, so two
+// concurrent advises corrupt each other regardless of this cache. Concurrent
+// SIMULATION and catalogue reads are what this makes safe.
+inline OpenMagnetics::MagneticsCache magneticsCache;
 
 void add_scoring(std::string name, OpenMagnetics::MagneticFilters filter, double scoring);
 void clear_scoring();
@@ -135,6 +149,12 @@ bool check_requirement(DimensionWithTolerance requirement, double value);
 Core find_core_by_name(std::string name);
 CoreMaterial find_core_material_by_name(std::string name);
 CoreShape find_core_shape_by_name(std::string name);
+// Non-throwing lookup / existence check (ABT #631). Use these instead of
+// find_core_shape_by_name-in-a-try when a miss is an expected outcome of a catalogue
+// scan: a try/catch is compiled away wherever exception catching is disabled (the
+// Emscripten default), and the throw then escapes the scan instead of skipping a row.
+std::optional<CoreShape> try_find_core_shape_by_name(std::string name);
+bool core_shape_exists(std::string name);
 Wire find_wire_by_name(std::string name);
 Wire find_wire_by_dimension(double dimension, std::optional<WireType> wireType=std::nullopt, std::optional<WireStandard> wireStandard=std::nullopt, bool obfuscate=true);
 Bobbin find_bobbin_by_name(std::string name);
@@ -254,7 +274,14 @@ double amplitude_to_decibels(double amplitude);
 
 std::string fix_filename(std::string filename);
 Inputs inputs_autocomplete(Inputs inputs, std::optional<Magnetic> magnetic = std::nullopt, json configuration = {});
-Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration = {});
+// inputs, when provided, carries the design's declared insulation/environmental
+// requirements into the coil BEFORE it winds (ABT #620): without it, wind() has no
+// way to know an insulation standard applies and falls back to
+// calculate_mechanical_insulation() — a bare single mechanical layer, zero margin —
+// even for a design that declares reinforced insulation. Every caller that has an
+// Inputs available (mas_autocomplete, any consumer re-winding a functionalDescription-
+// only file for painter/3D/simulation) should pass it through.
+Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration = {}, std::optional<Inputs> inputs = std::nullopt);
 Mas mas_autocomplete(Mas mas, bool simulate = true, json configuration = {});
 
 std::map<std::string, double> normalize_scoring(std::map<std::string, double> scoring, double weight, std::map<std::string, bool> filterConfiguration);
