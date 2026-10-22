@@ -16,6 +16,91 @@
 
 
 namespace OpenMagnetics {
+// ABT #1496: the lead conductor a winding end is given as a connection: START and FINISH, every
+// parallel, leaving radially. An end the user already stated (a lead conductor or an exit, for any
+// parallel) is the user's and is left as it is.
+static void write_lead_conductor(Winding& winding, const Wire& leadConductor) {
+    std::vector<ConnectionElement> connections;
+    if (winding.get_connections()) {
+        connections = winding.get_connections().value();
+    }
+    for (End end : {End::START, End::FINISH}) {
+        bool stated = false;
+        for (const auto& connection : connections) {
+            if (connection.get_end() && connection.get_end().value() == end &&
+                (connection.get_lead_conductor() || connection.get_exit())) {
+                stated = true;
+                break;
+            }
+        }
+        if (stated) {
+            continue;
+        }
+        bool written = false;
+        for (auto& connection : connections) {
+            if (connection.get_end() && connection.get_end().value() == end && !connection.get_parallel()) {
+                connection.set_lead_conductor(MAS::WireDataOrNameUnion(MAS::Wire(leadConductor)));
+                connection.set_exit(LeadExit::RADIAL);
+                written = true;
+                break;
+            }
+        }
+        if (!written) {
+            ConnectionElement connection;
+            connection.set_end(end);
+            connection.set_lead_conductor(MAS::WireDataOrNameUnion(MAS::Wire(leadConductor)));
+            connection.set_exit(LeadExit::RADIAL);
+            connections.push_back(connection);
+        }
+    }
+    winding.set_connections(connections);
+}
+
+void WireAdviser::copy_lead_conductors(const Winding& from, Winding& to) {
+    // The ends' all-parallel entries carry the lead the adviser chose; parallel-specific entries are
+    // the user's and stay.
+    std::vector<ConnectionElement> fromConnections;
+    if (from.get_connections()) {
+        fromConnections = from.get_connections().value();
+    }
+    std::vector<ConnectionElement> toConnections;
+    if (to.get_connections()) {
+        toConnections = to.get_connections().value();
+    }
+    for (End end : {End::START, End::FINISH}) {
+        std::optional<MAS::WireDataOrNameUnion> leadConductor;
+        std::optional<LeadExit> exit;
+        for (const auto& connection : fromConnections) {
+            if (connection.get_end() && connection.get_end().value() == end && !connection.get_parallel()) {
+                leadConductor = connection.get_lead_conductor();
+                exit = connection.get_exit();
+                break;
+            }
+        }
+        bool written = false;
+        for (auto& connection : toConnections) {
+            if (connection.get_end() && connection.get_end().value() == end && !connection.get_parallel()) {
+                connection.set_lead_conductor(leadConductor);
+                connection.set_exit(exit);
+                written = true;
+                break;
+            }
+        }
+        if (!written && (leadConductor || exit)) {
+            ConnectionElement connection;
+            connection.set_end(end);
+            connection.set_lead_conductor(leadConductor);
+            connection.set_exit(exit);
+            toConnections.push_back(connection);
+        }
+    }
+    if (toConnections.empty()) {
+        to.set_connections(std::nullopt);
+    }
+    else {
+        to.set_connections(toConnections);
+    }
+}
 
 // Phase 1 tie-break: when two candidates end up with strictly-equal final
 // scores (e.g. "Round 16.5 - Single Build" vs "Round 16.5 - Heavy Build"
@@ -195,6 +280,12 @@ std::vector<std::pair<Winding, double>>  WireAdviser::filter_by_area_with_parall
         else {
             listOfIndexesToErase.push_back(coilIndex);
         }
+    }
+    if (filter.get_real_winding_refusals() > 0) {
+        if (_realWindingPackingRefusals == 0) {
+            _firstRealWindingPackingRefusal = filter.get_first_real_winding_refusal();
+        }
+        _realWindingPackingRefusals += filter.get_real_winding_refusals();
     }
 
     for (size_t i = 0; i < (*unfilteredCoils).size(); ++i) {
@@ -474,88 +565,6 @@ std::vector<std::pair<Winding, double>> WireAdviser::get_advised_wire(
                             numberSections, maximumNumberResults);
 }
 
-/**
- * @brief Calculate copper thickness penalty for planar wires (progressive).
- *
- * Penalizes thicker copper (higher oz) progressively based on real PCB industry
- * cost and manufacturing factors:
- * 
- * 1. Material cost: Scales with thickness
- * 2. Etching time: Heavy copper requires longer etch cycles
- * 3. Feature resolution: Thick copper has worse minimum trace/space
- * 4. Lead time: Heavy copper boards often have longer lead times
- * 5. Supplier availability: Fewer fabs handle 3+ oz, very few handle 6+ oz
- *
- * Industry standard copper weights and approximate cost multipliers:
- * - 0.5 oz =  17.5 µm : 1.0x (baseline)
- * - 1 oz   =  35 µm   : 1.0x (standard, still baseline)
- * - 2 oz   =  70 µm   : 1.3-1.5x cost
- * - 3 oz   = 105 µm   : 1.8-2.2x cost (heavy copper threshold)
- * - 4 oz   = 140 µm   : 2.5-3.0x cost
- * - 6 oz   = 210 µm   : 4-5x cost (specialized fabs only)
- * - 10 oz  = 350 µm   : 8-10x cost (very specialized, few suppliers)
- *
- * The penalty does NOT prevent selection of thick copper when required for
- * current density - it only makes thinner copper preferred when multiple
- * options would satisfy the electrical requirements.
- *
- * @param conductingHeight Copper thickness in meters
- * @return Penalty value (0 = best, higher = worse). Range 0 to ~1.0.
- */
-double calculate_planar_thickness_penalty(double conductingHeight) {
-    // Standard copper thicknesses (in meters)
-    // 1 oz = 35 µm = 1.37 mil
-    const double oz_1   =  35.0e-6;   // 1 oz (baseline - no penalty)
-    const double oz_2   =  70.0e-6;   // 2 oz
-    const double oz_3   = 105.0e-6;   // 3 oz (heavy copper threshold)
-    const double oz_4   = 140.0e-6;   // 4 oz
-    const double oz_6   = 210.0e-6;   // 6 oz (specialized)
-    const double oz_10  = 350.0e-6;   // 10 oz (very specialized)
-    
-    // No penalty for standard 0.5-1 oz copper
-    if (conductingHeight <= oz_1) {
-        return 0.0;
-    }
-    
-    // Progressive penalty based on PCB industry cost scaling
-    // Penalty values chosen to reflect relative cost increases
-    double penalty;
-    
-    if (conductingHeight <= oz_2) {
-        // 1-2 oz: mild penalty (linear interpolation)
-        // 2 oz is ~1.3-1.5x cost -> penalty ~0.08
-        double ratio = (conductingHeight - oz_1) / (oz_2 - oz_1);
-        penalty = 0.08 * ratio;
-    }
-    else if (conductingHeight <= oz_3) {
-        // 2-3 oz: moderate penalty (entering heavy copper territory)
-        // 3 oz is ~1.8-2.2x cost -> penalty ~0.18
-        double ratio = (conductingHeight - oz_2) / (oz_3 - oz_2);
-        penalty = 0.08 + 0.10 * ratio;
-    }
-    else if (conductingHeight <= oz_4) {
-        // 3-4 oz: significant penalty (heavy copper)
-        // 4 oz is ~2.5-3x cost -> penalty ~0.30
-        double ratio = (conductingHeight - oz_3) / (oz_4 - oz_3);
-        penalty = 0.18 + 0.12 * ratio;
-    }
-    else if (conductingHeight <= oz_6) {
-        // 4-6 oz: steep penalty (specialized fabrication)
-        // 6 oz is ~4-5x cost -> penalty ~0.50
-        double ratio = (conductingHeight - oz_4) / (oz_6 - oz_4);
-        penalty = 0.30 + 0.20 * ratio;
-    }
-    else {
-        // 6-10+ oz: very steep penalty (very specialized, few suppliers)
-        // 10 oz is ~8-10x cost -> penalty ~1.0
-        double ratio = (conductingHeight - oz_6) / (oz_10 - oz_6);
-        ratio = std::min(1.0, ratio);  // Cap at 10 oz equivalent
-        penalty = 0.50 + 0.50 * ratio * ratio;  // Quadratic for extreme copper
-    }
-    
-    return penalty;
-}
-
 std::vector<std::pair<Winding, double>> WireAdviser::create_planar_dataset(Winding winding,
                                                                                        Section section,
                                                                                        SignalDescriptor current,
@@ -602,9 +611,8 @@ std::vector<std::pair<Winding, double>> WireAdviser::create_planar_dataset(Windi
                     winding.set_wire(wire);
                     winding.set_number_parallels(numberParallels);
 
-                    // Apply thickness penalty (negative because higher score = better)
-                    double thicknessPenalty = -calculate_planar_thickness_penalty(conductingHeight);
-                    windings.push_back(std::pair<Winding, double>{winding, thicknessPenalty});
+                    // No copper-thickness penalty: heavier copper is not ranked below its electrical merit.
+                    windings.push_back(std::pair<Winding, double>{winding, 0});
                 }
             }
         }
@@ -633,9 +641,8 @@ std::vector<std::pair<Winding, double>> WireAdviser::create_planar_dataset(Windi
                     winding.set_wire(wire);
                     winding.set_number_parallels(1);
                     
-                    // Apply thickness penalty (negative because higher score = better)
-                    double thicknessPenalty = -calculate_planar_thickness_penalty(conductingHeight);
-                    windings.push_back(std::pair<Winding, double>{winding, thicknessPenalty});
+                    // No copper-thickness penalty: heavier copper is not ranked below its electrical merit.
+                    windings.push_back(std::pair<Winding, double>{winding, 0});
                 }
             }
         }
@@ -726,6 +733,57 @@ std::vector<std::pair<Winding, double>> WireAdviser::create_dataset(Winding wind
     // its scores are normalised over the wires it keeps, which are the same wires either way.
     auto solidInsulationFilter = MagneticFilterSolidInsulationRequirements();
 
+    // ABT #1496: with real winding geometry on, a foil end that leaves across the layers wound over
+    // it is taken out by a separate conductor joined to the sheet (the real winder throws for a foil
+    // end with none). The adviser chooses it by its own rules: a round or rectangular wire of this
+    // same catalogue that the include settings allow here and that passes the solid insulation
+    // requirement, carrying one parallel's current alone within the maximum effective current
+    // density; the smallest outer section wins. Ranked once per call, and only if a foil candidate
+    // turns up; each wire's effective current density (it scales with the current) is computed when
+    // first needed.
+    const bool adviseLeads = settings.get_coil_use_real_winding_geometry();
+    std::optional<std::vector<std::pair<double, Wire>>> leadCandidates;
+    std::vector<std::optional<double>> leadCurrentDensities;
+    auto choose_lead_conductor = [&](int64_t numberParallels) -> std::optional<Wire> {
+        if (!leadCandidates) {
+            leadCandidates.emplace();
+            for (auto& catalogueWire : *wires) {
+                if (catalogueWire.get_type() == WireType::ROUND) {
+                    if (!settings.get_wire_adviser_include_round()) {
+                        continue;
+                    }
+                }
+                else if (catalogueWire.get_type() == WireType::RECTANGULAR) {
+                    if (!(settings.get_wire_adviser_include_rectangular() &&
+                          (settings.get_wire_adviser_allow_rectangular_in_toroidal_cores() || section.get_coordinate_system() == CoordinateSystem::CARTESIAN))) {
+                        continue;
+                    }
+                }
+                else {
+                    continue;
+                }
+                if (_wireSolidInsulationRequirements && !solidInsulationFilter.evaluate_wire(catalogueWire, _wireSolidInsulationRequirements.value()).first) {
+                    continue;
+                }
+                Wire leadWire = catalogueWire;
+                double outerSection = leadWire.get_maximum_outer_width() * leadWire.get_maximum_outer_height();
+                leadCandidates->push_back({outerSection, leadWire});
+            }
+            std::stable_sort(leadCandidates->begin(), leadCandidates->end(),
+                             [](const auto& a, const auto& b) { return a.first < b.first; });
+            leadCurrentDensities.assign(leadCandidates->size(), std::nullopt);
+        }
+        for (size_t index = 0; index < leadCandidates->size(); ++index) {
+            if (!leadCurrentDensities[index]) {
+                leadCurrentDensities[index] = (*leadCandidates)[index].second.calculate_effective_current_density(current, temperature);
+            }
+            if (leadCurrentDensities[index].value() <= numberParallels * _maximumEffectiveCurrentDensity) {
+                return (*leadCandidates)[index].second;
+            }
+        }
+        return std::nullopt;
+    };
+
     auto add_candidates = [&](Wire& catalogueWire) {
         if ((!settings.get_wire_adviser_include_foil() && catalogueWire.get_type() == WireType::FOIL) ||
             (!settings.get_wire_adviser_include_planar() &&  catalogueWire.get_type() == WireType::PLANAR) ||
@@ -781,14 +839,27 @@ std::vector<std::pair<Winding, double>> WireAdviser::create_dataset(Winding wind
         if (needsPreparation && _wireSolidInsulationRequirements && !solidInsulationFilter.evaluate_wire(wire, _wireSolidInsulationRequirements.value()).first) {
             return;
         }
+        const bool needsLead = adviseLeads && wire.get_type() == WireType::FOIL;
         winding.set_wire(std::move(wire));
+        // A foil candidate keeps its lead only in its own copy: the caller's winding is reused for
+        // every catalogue wire.
+        auto push_candidate = [&](int64_t numberParallels) {
+            Winding candidate = winding;
+            candidate.set_number_parallels(numberParallels);
+            if (needsLead) {
+                auto leadConductor = choose_lead_conductor(numberParallels);
+                if (!leadConductor) {
+                    return;
+                }
+                write_lead_conductor(candidate, leadConductor.value());
+            }
+            windings.push_back(std::pair<Winding, double>{std::move(candidate), 0});
+        };
         if (fits) {
-            winding.set_number_parallels(numberParallelsNeeded);
-            windings.push_back(std::pair<Winding, double>{winding, 0});
+            push_candidate(numberParallelsNeeded);
         }
         if (fitsWithAnotherParallel) {
-            winding.set_number_parallels(numberParallelsNeeded + 1);
-            windings.push_back(std::pair<Winding, double>{winding, 0});
+            push_candidate(numberParallelsNeeded + 1);
         }
     };
 

@@ -2,6 +2,7 @@
 #include "advisers/MagneticFilterInternal.h"
 #include "physical_models/MagnetizingInductance.h"
 #include "processors/Inputs.h"
+#include "processors/ResultsAnalyzer.h"
 #include "support/Exceptions.h"
 #include "support/Settings.h"
 
@@ -42,7 +43,7 @@ std::pair<bool, double> MagneticFilterSaturation::evaluate_magnetic(Magnetic* ma
     // Inductors / energy-storing: B from current with permeability rolloff.
     bool isTransformer = !is_inductor(*inputs);
 
-    const std::string magneticRef = magnetic->get_reference();
+    const std::string magneticRef = inductance_flux_cache_key(*magnetic);
     size_t opIndex = 0;
     for (auto operatingPoint : inputs->get_operating_points()) {
         double magneticFluxDensityPeak;
@@ -69,6 +70,9 @@ std::pair<bool, double> MagneticFilterSaturation::evaluate_magnetic(Magnetic* ma
             saturation_derating_temperature(operatingPoint.get_conditions().get_ambient_temperature()),
             /*proportion=*/false);
         
+        // The DC point of the magnetizing model, where it ran one: the saturation check's second criterion
+        // (the bias collapsed the permeability to mu_r = 1, Alf 2026-10-14).
+        std::optional<DcBiasPoint> dcBiasPoint;
         if (isTransformer) {
             // For transformers, calculate B from voltage using MagnetizingInductance method
             // This avoids the permeability iteration issue with current-based calculation
@@ -97,8 +101,11 @@ std::pair<bool, double> MagneticFilterSaturation::evaluate_magnetic(Magnetic* ma
             } else if (hasCurrentWaveform) {
                 // Derive voltage from V = L·di/dt using the actual gapped-core inductance
                 OpenMagnetics::MagnetizingInductance magnetizingInductanceCalc;
-                auto inductanceOutput = magnetizingInductanceCalc.calculate_inductance_from_number_turns_and_gapping(
+                // The model gives its numbers for a saturated core too (ABT #1855); the saturation verdict is the
+                // B check below, on the flux density these volt-seconds give.
+                MagnetizingInductanceOutput inductanceOutput = magnetizingInductanceCalc.calculate_inductance_from_number_turns_and_gapping(
                     *magnetic, &operatingPoint);
+                dcBiasPoint = magnetizingInductanceCalc.get_last_dc_bias_point();
 
                 if (inductanceOutput.get_magnetizing_inductance().get_nominal()) {
                     actualInductance = inductanceOutput.get_magnetizing_inductance().get_nominal().value();
@@ -130,9 +137,14 @@ std::pair<bool, double> MagneticFilterSaturation::evaluate_magnetic(Magnetic* ma
             // For inductors/energy-storing converters, use the standard calculation
             OpenMagnetics::MagnetizingInductance magnetizingInductanceObj;
             
-            auto result = magnetizingInductanceObj.calculate_inductance_and_magnetic_flux_density(
-                magnetic->get_core(), magnetic->get_coil(), &operatingPoint);
+            magnetizingInductanceObj.set_topology(inputs->get_design_requirements().get_topology());
+            // The model gives its numbers for a saturated core too (ABT #1855): the verdict is the saturation
+            // check below on the flux density it returns, as analyze_results makes it.
+            std::pair<MagnetizingInductanceOutput, SignalDescriptor> result =
+                magnetizingInductanceObj.calculate_inductance_and_magnetic_flux_density(
+                    magnetic->get_core(), magnetic->get_coil(), &operatingPoint);
             auto magneticFluxDensity = result.second;
+            dcBiasPoint = magnetizingInductanceObj.get_last_dc_bias_point();
 
             // Phase 8 (perf): seed the per-adviser-invocation cache so
             // downstream filters (TEMPERATURE) that need the same B for
@@ -199,10 +211,15 @@ std::pair<bool, double> MagneticFilterSaturation::evaluate_magnetic(Magnetic* ma
             // margin == 1.0 (default) reproduces the historical bare comparison.
             // Set via Settings::set_core_adviser_saturation_margin() — Maniktala
             // Ch.5 recommends ≥1.2 for ferrite designs to leave headroom for
-            // tolerance, temperature, and DC-bias swing.
-            bool isSaturated = magneticFluxDensityPeak * margin > magneticFluxDensitySaturation;
+            // tolerance, temperature, and DC-bias swing. The check is the one
+            // analyze_results makes (ResultsAnalyzer::check_saturation, ABT #1855),
+            // here with the adviser's margin and derating temperature.
+            auto saturation = ResultsAnalyzer::check_saturation(
+                magnetic->get_mutable_core().resolve_material(), magneticFluxDensityPeak,
+                saturation_derating_temperature(operatingPoint.get_conditions().get_ambient_temperature()), margin, dcBiasPoint);
 
-            if (isSaturated) {
+            if (saturation.saturates) {
+                logEntry(std::string("Saturation filter: rejecting candidate: ") + saturation.message, "MagneticFilter", 2);
                 return {false, 0.0};
             }
         }

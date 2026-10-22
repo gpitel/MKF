@@ -8,6 +8,7 @@
 #include <algorithm>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 using json = nlohmann::json;
@@ -267,6 +268,8 @@ TEST_CASE("LibraryContext: wire advising inside a scope never lazily reloads the
     Section section;
     section.set_dimensions({0.005, 0.015});
     section.set_coordinate_system(CoordinateSystem::CARTESIAN);
+    // layersOrientation is required by MAS; unset it is an uninitialised enum (read by ABT #1446).
+    section.set_layers_orientation(WindingOrientation::OVERLAPPING);
 
     SignalDescriptor current;
     ProcessedWaveform processed;

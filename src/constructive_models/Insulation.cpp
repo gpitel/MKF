@@ -37,7 +37,23 @@ double linear_table_interpolation(std::vector<std::pair<double, double>> table, 
     return DBL_MAX;
 }
 
+// ABT #1228: a coordinator distance is only defined for a design that states an insulation
+// requirement. Answering 0 for "no requirement" made a missing input indistinguishable from a
+// computed "no separation needed"; callers that have no requirement must not ask.
+void InsulationCoordinator::require_insulation_requirement(Inputs& inputs, const std::string& quantity) {
+    if (!inputs.get_design_requirements().get_insulation()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA,
+            "Cannot calculate the " + quantity + ": designRequirements.insulation is missing, so no "
+            "insulation standard, class, overvoltage category or pollution degree is known");
+    }
+    // Throws when the design names no standard (Inputs::get_standards).
+    inputs.get_standards();
+}
+
 InsulationCoordination InsulationCoordinator::calculate_insulation_coordination(Inputs& inputs) {
+    // ABT #1228: every distance below is a safety distance; a design without an insulation
+    // requirement has none to report, so this throws (via require_insulation_requirement)
+    // rather than publishing 0 mm / 0 V as if the standards had asked for nothing.
     InsulationCoordination insulationCoordinationOutput;
     insulationCoordinationOutput.set_clearance(calculate_clearance(inputs));
     insulationCoordinationOutput.set_creepage_distance(calculate_creepage_distance(inputs, true));
@@ -377,7 +393,17 @@ double InsulationCoordinator::lead_sleeve_required_temperature(Inputs& inputs, W
         anyTemperature = true;
     }
     for (auto& operatingPoint : inputs.get_operating_points()) {
-        requiredTemperature = std::max(requiredTemperature, operatingPoint.get_conditions().get_ambient_temperature());
+        // ABT #1299: MAS::OperatingConditions leaves ambient_temperature uninitialised when an
+        // operating point is built in code without conditions (it is required in MAS, minimum
+        // -273.15 C). Reading it chose sleeves from stack garbage (5.4e150 C). A value outside the
+        // schema's own range is refused by name; the callers must set the ambient.
+        double ambientTemperature = operatingPoint.get_conditions().get_ambient_temperature();
+        if (!std::isfinite(ambientTemperature) || ambientTemperature < -273.15) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "Operating point '" + operatingPoint.get_name().value_or("unnamed") + "' has no valid ambient temperature (" +
+                std::to_string(ambientTemperature) + " C); conditions.ambientTemperature is required to rate a lead sleeve");
+        }
+        requiredTemperature = std::max(requiredTemperature, ambientTemperature);
         anyTemperature = true;
     }
     auto coating = wire.resolve_coating();
@@ -426,7 +452,7 @@ double InsulationCoordinator::lead_sleeve_overlap_into_winding(Wire& wire) {
 }
 
 std::optional<ConnectionSleeve> InsulationCoordinator::calculate_lead_sleeve_requirements(Inputs& inputs, Wire wire, bool crossesMargin) {
-    if (!inputs.get_design_requirements().get_insulation()) {
+    if (!inputs.has_insulation_coordination_requirements()) {
         return std::nullopt;
     }
     auto insulationType = inputs.get_insulation_type();
@@ -521,9 +547,7 @@ std::optional<ConnectionSleeve> InsulationCoordinator::calculate_lead_sleeve_req
 }
 
 double InsulationCoordinator::calculate_withstand_voltage(Inputs& inputs) {
-    if (!inputs.get_design_requirements().get_insulation()) {
-        return 0;
-    }
+    require_insulation_requirement(inputs, "withstand voltage");
     double solidInsulation = 0;
     for (auto standard : inputs.get_standards()) {
         switch (standard) {
@@ -549,9 +573,7 @@ double InsulationCoordinator::calculate_withstand_voltage(Inputs& inputs) {
 }
 
 double InsulationCoordinator::calculate_clearance(Inputs& inputs) {
-    if (!inputs.get_design_requirements().get_insulation()) {
-        return 0;
-    }
+    require_insulation_requirement(inputs, "clearance");
 
     double clearance = 0;
     for (auto standard : inputs.get_standards()) {
@@ -578,9 +600,7 @@ double InsulationCoordinator::calculate_clearance(Inputs& inputs) {
 }
 
 double InsulationCoordinator::calculate_creepage_distance(Inputs& inputs, bool includeClearance) {
-    if (!inputs.get_design_requirements().get_insulation()) {
-        return 0;
-    }
+    require_insulation_requirement(inputs, "creepage distance");
     double creepageDistance = 0;
     for (auto standard : inputs.get_standards()) {
         switch (standard) {
@@ -606,9 +626,7 @@ double InsulationCoordinator::calculate_creepage_distance(Inputs& inputs, bool i
 }
 
 double InsulationCoordinator::calculate_distance_through_insulation(Inputs& inputs) {
-    if (!inputs.get_design_requirements().get_insulation()) {
-        return 0;
-    }
+    require_insulation_requirement(inputs, "distance through insulation");
     double dti = 0;
     for (auto standard : inputs.get_standards()) {
         switch (standard) {
@@ -2028,11 +2046,10 @@ std::vector<std::vector<WireSolidInsulationRequirements>> remove_combination_tha
 std::vector<std::vector<WireSolidInsulationRequirements>> InsulationCoordinator::get_solid_insulation_requirements_for_wires(Inputs& inputs, std::vector<size_t> pattern, size_t repetitions) {
 
     auto isolationSidesRequired = inputs.get_isolation_sides_used();
-    auto withstandVoltage = InsulationCoordinator().calculate_withstand_voltage(inputs);
     size_t numberWindings = inputs.get_design_requirements().get_turns_ratios().size() + 1;
     std::vector<std::vector<WireSolidInsulationRequirements>> combinationsSolidInsulationRequirementsForWires;
 
-    if (!inputs.get_design_requirements().get_insulation()) {
+    if (!inputs.has_insulation_coordination_requirements()) {
         std::vector<WireSolidInsulationRequirements> solidInsulationForWires;
         for(size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
             solidInsulationForWires.push_back(get_requirements_for_functional());
@@ -2040,7 +2057,7 @@ std::vector<std::vector<WireSolidInsulationRequirements>> InsulationCoordinator:
         combinationsSolidInsulationRequirementsForWires.push_back(solidInsulationForWires);
     }
     else {
-
+        auto withstandVoltage = InsulationCoordinator().calculate_withstand_voltage(inputs);
         auto insulationType = inputs.get_insulation_type();
         bool canFullyInsulatedWireBeUsed = InsulationCoordinator::can_fully_insulated_wire_be_used(inputs);
         auto isolationSidePerWinding = inputs.get_design_requirements().get_isolation_sides().value();

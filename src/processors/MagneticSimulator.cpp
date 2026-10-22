@@ -1,15 +1,22 @@
 #include "processors/MagneticSimulator.h"
 #include "physical_models/LeakageInductance.h"
 #include "physical_models/WindingOhmicLosses.h"
+#include "physical_models/WindingSkinEffectLosses.h"
 #include "physical_models/Impedance.h"
+#include "physical_models/ComplexPermeability.h"
 #include "physical_models/Temperature.h"
+#include "physical_models/InitialPermeability.h"
 #include "support/Settings.h"
 #include <MAS.hpp>
 #include "support/Exceptions.h"
 
+#include <algorithm>
+#include <memory>
+#include <unordered_map>
 #include <cmath>
 #include <complex>
 #include <limits>
+#include <sstream>
 #include <string>
 
 
@@ -19,6 +26,7 @@ Mas MagneticSimulator::simulate(Mas mas, bool fastMode){
     return simulate(mas.get_mutable_inputs(), mas.get_mutable_magnetic(), fastMode);
 }
 Mas MagneticSimulator::simulate(const Inputs& inputs, const Magnetic& magnetic, bool fastMode){
+    set_topology(inputs.get_design_requirements().get_topology());
     Mas mas;
     std::vector<Outputs> outputs;
     std::vector<OperatingPoint> simulatedOperatingPoints;
@@ -56,20 +64,30 @@ Mas MagneticSimulator::simulate(const Inputs& inputs, const Magnetic& magnetic, 
             }
         }
         output.set_inductance(inductanceOutput);
-        output.set_core_losses(calculate_core_losses(operatingPoint, magnetic));
-        output.set_winding_losses(calculate_winding_losses(operatingPoint, magnetic, operatingPoint.get_conditions().get_ambient_temperature()));
-        if (!fastMode) {
-            // ABT #838: one corrective pass. The core-loss loop above ran before any winding
-            // result existed, so it converged the core's temperature on core losses alone; now
-            // that the winding's losses are known, re-run it with them and let the core losses
-            // settle at the temperature the whole part actually reaches. Skipped in fast mode,
-            // where the advisers call this per candidate and pay for every extra network solve.
-            output.set_core_losses(calculate_core_losses(operatingPoint, magnetic, output.get_winding_losses()));
+        // ABT #838: core and winding losses together, each at the temperature the COMBINED
+        // dissipation produces (calculate_core_losses iterates both on one network). Fast mode
+        // runs the same solve: the published core temperature is the same quantity in both.
+        // The full network needs turn nodes; wind a local copy if the coil is bare (as
+        // calculate_temperature does).
+        Magnetic woundMagnetic = magnetic;
+        if (!woundMagnetic.get_coil().get_turns_description()) {
+            woundMagnetic.get_mutable_coil().wind();
         }
-        if (!fastMode) {
-            // Full-network hot-spot from the losses just simulated, so the exported MAS
-            // carries the same temperature the UI's temperature map shows (ABT #906).
-            output.set_temperature(calculate_temperature(operatingPoint, magnetic, output));
+        // ABT #1876 (Alf, 2026-10-14): a point with no thermal operating point (the network did not converge on
+        // its losses, or its winding runs away) affects only itself: calculate_core_losses returns its core and
+        // winding losses evaluated at ambient, as before ABT #838, and leaves temperatureOutput EMPTY, so it gets
+        // NO temperature output. ResultsAnalyzer::analyze_results names it (NO_THERMAL_OPERATING_POINT). Any
+        // other error refuses the whole design.
+        std::optional<WindingLossesOutput> windingLossesOutput;
+        std::optional<TemperatureOutput> temperatureOutput;
+        output.set_core_losses(calculate_core_losses(operatingPoint, woundMagnetic, &windingLossesOutput, &temperatureOutput,
+                                                     WindingLossesScope::FULL, NoThermalOperatingPointPolicy::LOSSES_AT_AMBIENT));
+        output.set_winding_losses(windingLossesOutput.value());
+        if (!fastMode && temperatureOutput) {
+            // Full-network hot-spot from exactly the losses published above -- the same config
+            // TemperatureConfig::fromSimulatedOutput builds, so the exported MAS carries the
+            // temperature the UI's temperature map shows (ABT #906).
+            output.set_temperature(temperatureOutput.value());
         }
 
         outputs.push_back(output);
@@ -99,6 +117,19 @@ LeakageInductanceOutput MagneticSimulator::calculate_leakage_inductance(Magnetic
     return OpenMagnetics::LeakageInductance().calculate_leakage_inductance_all_windings(magnetic, frequency);
 }
 
+namespace {
+    // ABT #1886: a coil described by its sections and turns but not its layers (the web Magnetic Builder keeps an
+    // advised coil's sections and turns and drops its layers) has its layers rebuilt before the losses and the thermal
+    // network read them: the winding losses group the turns by layer, and the network takes the insulation between
+    // turns from the layers. Coil::rebuild_layers_description_from_turns throws when they cannot match the turns.
+    void rebuild_layers_if_missing(Magnetic& magnetic) {
+        const auto& coil = magnetic.get_coil();
+        if (coil.get_turns_description() && coil.get_sections_description() && !coil.get_layers_description()) {
+            magnetic.get_mutable_coil().rebuild_layers_description_from_turns();
+        }
+    }
+}
+
 WindingLossesOutput MagneticSimulator::calculate_winding_losses(OperatingPoint& operatingPoint, Magnetic magnetic, std::optional<double> temperature){
     auto& settings = OpenMagnetics::Settings::GetInstance();
     // RAII: if calculate_losses throws, the manual restore below never ran and the
@@ -112,6 +143,7 @@ WindingLossesOutput MagneticSimulator::calculate_winding_losses(OperatingPoint& 
     else {
         simulationTemperature = temperature.value();
     }
+    rebuild_layers_if_missing(magnetic);
     WindingLosses windingLosses;
     // windingLosses.set_winding_losses_harmonic_amplitude_threshold(0.01);
     auto losses = windingLosses.calculate_losses(magnetic, operatingPoint, simulationTemperature);
@@ -123,6 +155,7 @@ TemperatureOutput MagneticSimulator::calculate_temperature(OperatingPoint& opera
     if (!magnetic.get_coil().get_turns_description()) {
         magnetic.get_mutable_coil().wind();
     }
+    rebuild_layers_if_missing(magnetic);
     auto config = TemperatureConfig::fromSimulatedOutput(operatingPoint, output);
     auto thermalResult = Temperature(magnetic, config).calculateTemperatures();
 
@@ -139,55 +172,620 @@ TemperatureOutput MagneticSimulator::calculate_temperature(OperatingPoint& opera
     return temperatureOutput;
 }
 
+namespace {
+    struct LossSolveMemo {
+        std::unordered_map<std::string, SolvedLosses> entries;
+        size_t hits = 0;
+        size_t misses = 0;
+    };
+    thread_local std::unique_ptr<LossSolveMemo> activeLossSolveMemo;
+}
+
+LossSolveMemoScope::LossSolveMemoScope() {
+    if (!activeLossSolveMemo) {
+        activeLossSolveMemo = std::make_unique<LossSolveMemo>();
+        _owner = true;
+    }
+}
+
+LossSolveMemoScope::~LossSolveMemoScope() {
+    if (_owner) {
+        activeLossSolveMemo.reset();
+    }
+}
+
+LossSolveMemoScope::Statistics LossSolveMemoScope::get_statistics() {
+    if (!activeLossSolveMemo) {
+        return {};
+    }
+    return {activeLossSolveMemo->hits, activeLossSolveMemo->misses, activeLossSolveMemo->entries.size()};
+}
+
+std::string MagneticSimulator::loss_solve_key(const OperatingPoint& operatingPoint, const Magnetic& magnetic,
+                                              WindingLossesScope windingLossesScope) const {
+    json magneticJson;
+    to_json(magneticJson, magnetic);
+    json operatingPointJson;
+    to_json(operatingPointJson, operatingPoint);
+    json modelsJson;
+    modelsJson["windingLossesScope"] = static_cast<int>(windingLossesScope);
+    modelsJson["magnetizingInductance"] = _magnetizingInductanceModel.get_models();
+    std::vector<int> coreLossesModels;
+    for (auto model : _coreLossesModel.get_core_losses_model_names()) {
+        coreLossesModels.push_back(static_cast<int>(model));
+    }
+    modelsJson["coreLosses"] = coreLossesModels;
+    auto requestedModel = _coreLossesModel.get_core_losses_requested_model_name();
+    modelsJson["coreLossesRequested"] = requestedModel ? static_cast<int>(requestedModel.value()) : -1;
+    return magneticJson.dump() + "\n" + operatingPointJson.dump() + "\n" + modelsJson.dump() + "\n" +
+           Settings::GetInstance().fingerprint();
+}
+
 CoreLossesOutput MagneticSimulator::calculate_core_losses(OperatingPoint& operatingPoint, Magnetic magnetic,
-                                                          std::optional<WindingLossesOutput> knownWindingLosses) {
-    OperatingPointExcitation excitation = operatingPoint.get_excitations_per_winding()[0];
-    if (!excitation.get_current()) {
+                                                          std::optional<WindingLossesOutput>* windingLossesOutput,
+                                                          std::optional<TemperatureOutput>* temperatureOutput,
+                                                          WindingLossesScope windingLossesScope,
+                                                          NoThermalOperatingPointPolicy noThermalOperatingPointPolicy) {
+    if (!operatingPoint.get_excitations_per_winding()[0].get_current()) {
         throw InvalidInputException(ErrorCode::MISSING_DATA, "Missing current in operating point");
     }
+    if (windingLossesOutput != nullptr && !magnetic.get_coil().get_turns_description()) {
+        throw CoilNotProcessedException("Winding losses asked of '" + magnetic.get_reference() +
+                                        "', whose coil has no turns: wind it first");
+    }
+    rebuild_layers_if_missing(magnetic);
 
-    double temperature = operatingPoint.get_conditions().get_ambient_temperature();
-    double temperatureAfterLosses = temperature;
-    SignalDescriptor magneticFluxDensity;
-    CoreLossesOutput coreLossesOutput;
-
-    do {
-        temperature = temperatureAfterLosses;
-
-        excitation = operatingPoint.get_excitations_per_winding()[0];
-        operatingPoint.get_mutable_conditions().set_ambient_temperature(temperature);
-
-        magneticFluxDensity = _magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(magnetic, &operatingPoint).second;
-        excitation.set_magnetic_flux_density(magneticFluxDensity);
-        operatingPoint.get_mutable_excitations_per_winding()[0] = excitation;
-
-        coreLossesOutput = _coreLossesModel.calculate_core_losses(magnetic.get_core(), excitation, temperature);
-
-        // Core temperature from the full Temperature thermal-network model in core-only mode
-        // (core nodes + convection/radiation, no turn/bobbin nodes) — more principled than the
-        // legacy closed-form CoreTemperatureModel and still cheap (~0.07 ms/call).
-        TemperatureConfig temperatureConfig;
-        temperatureConfig.ambientTemperature = operatingPoint.get_conditions().get_ambient_temperature();
-        temperatureConfig.coreLosses = coreLossesOutput.get_core_losses();
-        // ABT #838: with the winding's losses in hand, solve the FULL network — the winding is
-        // typically as large a heat source as the core, and it warms the core through the bobbin.
-        // Core-only with core losses alone is the first pass, before any winding result exists.
-        if (knownWindingLosses) {
-            temperatureConfig.windingLosses = knownWindingLosses->get_winding_losses();
-            temperatureConfig.windingLossesOutput = knownWindingLosses;
-            temperatureConfig.coreOnly = false;
+    _lastDcBiasPoint.reset();
+    _lastLowestFixedPointSearchEvaluations = 0;
+    SolvedLosses solved;
+    try {
+        if (activeLossSolveMemo) {
+            std::string key = loss_solve_key(operatingPoint, magnetic, windingLossesScope);
+            auto found = activeLossSolveMemo->entries.find(key);
+            if (found != activeLossSolveMemo->entries.end()) {
+                ++activeLossSolveMemo->hits;
+                solved = found->second;
+            }
+            else {
+                ++activeLossSolveMemo->misses;
+                solved = solve_losses_at_operating_temperature(operatingPoint, magnetic, windingLossesScope);
+                activeLossSolveMemo->entries.emplace(std::move(key), solved);
+            }
         }
         else {
-            temperatureConfig.coreOnly = true;
+            solved = solve_losses_at_operating_temperature(operatingPoint, magnetic, windingLossesScope);
         }
-        temperatureConfig.plotSchematic = false;
-        temperatureConfig.masCooling = operatingPoint.get_conditions().get_cooling();
-        temperatureAfterLosses = Temperature(magnetic, temperatureConfig).calculateTemperatures().maximumTemperature;
-        coreLossesOutput.set_temperature(temperatureAfterLosses);
-    } while (fabs((temperature - temperatureAfterLosses) / temperatureAfterLosses) >= 0.05 && _enableTemperatureConvergence);
+    }
+    catch (const NoThermalOperatingPointException& noThermalOperatingPoint) {
+        if (noThermalOperatingPointPolicy == NoThermalOperatingPointPolicy::THROW) {
+            throw;
+        }
+        // ABT #1876 (Alf, 2026-10-14): this point has no thermal operating point. Its losses are those evaluated
+        // at ambient (the solve's first iterate) and it has NO temperature: temperatureOutput is left empty.
+        const auto& lossesAtAmbient = noThermalOperatingPoint.get_losses_at_ambient();
+        operatingPoint.get_mutable_excitations_per_winding()[0] = lossesAtAmbient.excitation;
+        if (windingLossesOutput != nullptr) {
+            *windingLossesOutput = lossesAtAmbient.windingLosses;
+        }
+        if (temperatureOutput != nullptr) {
+            *temperatureOutput = std::nullopt;
+        }
+        return lossesAtAmbient.coreLosses;
+    }
 
+    // Publish exactly the set that was solved.
+    _lastDcBiasPoint = solved.dcBiasPoint;
+    _lastLowestFixedPointSearchEvaluations = solved.lowestFixedPointSearchEvaluations;
+    operatingPoint.get_mutable_excitations_per_winding()[0] = solved.excitation;
+    if (windingLossesOutput != nullptr) {
+        *windingLossesOutput = solved.windingLosses;
+    }
+    if (temperatureOutput != nullptr) {
+        *temperatureOutput = solved.temperature;
+    }
+    return solved.coreLosses;
+}
 
-    return coreLossesOutput;
+Magnetic MagneticSimulator::make_paramagnetic_magnetic(const Magnetic& magnetic) {
+    // The magnetic with its core material made paramagnetic, mu_r = 1 (ABT #1855, Alf 2026-10-14): what the
+    // magnetizing model sees of a core held at its Curie temperature (see solve_losses_at_operating_temperature).
+    // Only the permeability changes: geometry, gaps and the saturation data stay; the core losses are still
+    // evaluated on the real material.
+    if (std::holds_alternative<std::vector<MaterialElement>>(magnetic.get_core().get_functional_description().get_material())) {
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+            "Losses of '" + magnetic.get_reference() + "': the losses drive its core past the temperatures its material data "
+            "covers, and a core of more than one grade cannot be held there as a paramagnetic core");
+    }
+    Magnetic paramagnetic = magnetic;
+    auto coreMaterial = paramagnetic.get_core().resolve_material();
+    PermeabilityPoint vacuumPermeability;
+    vacuumPermeability.set_value(1);
+    auto permeabilities = coreMaterial.get_permeability();
+    permeabilities.set_initial(vacuumPermeability);
+    permeabilities.set_amplitude(std::nullopt);
+    permeabilities.set_complex(std::nullopt);
+    permeabilities.set_incremental(std::nullopt);
+    coreMaterial.set_permeability(permeabilities);
+    // Its own name: caches keyed by a material's name must not mix it with the ferromagnetic record.
+    coreMaterial.set_name(coreMaterial.get_name() + " (paramagnetic, mu_r = 1)");
+    paramagnetic.get_mutable_core().get_mutable_functional_description().set_material(coreMaterial);
+    return paramagnetic;
+}
+
+bool MagneticSimulator::is_core_held_at_data_ceiling(const CoreMaterial& coreMaterial, double coreLossesTemperature, double maximumTemperature) {
+    return is_core_held_at_data_ceiling(get_ferromagnetic_data_ceiling(coreMaterial), coreLossesTemperature, maximumTemperature);
+}
+
+bool MagneticSimulator::is_core_held_at_data_ceiling(const std::optional<CoreDataCeiling>& ceiling, double coreLossesTemperature,
+                                                     double maximumTemperature) {
+    return ceiling && coreLossesTemperature > ceiling->temperature - kOperatingTemperatureTolerance &&
+           coreLossesTemperature <= ceiling->temperature && maximumTemperature > ceiling->temperature;
+}
+
+std::optional<CoreDataCeiling> MagneticSimulator::get_ferromagnetic_data_ceiling(const CoreMaterial& coreMaterial) {
+    const auto ceiling = InitialPermeability::get_maximum_ferromagnetic_data_temperature(coreMaterial);
+    if (!ceiling) {
+        return std::nullopt;
+    }
+    const auto curieTemperature = coreMaterial.get_curie_temperature();
+    const bool isCurie = curieTemperature && ceiling.value() == curieTemperature.value();
+    return CoreDataCeiling{ceiling.value(), isCurie ? CoreDataCeilingSource::CURIE_TEMPERATURE
+                                                    : CoreDataCeilingSource::PERMEABILITY_TABLE_END};
+}
+
+std::optional<CoreDataCeiling> MagneticSimulator::get_core_data_ceiling(const Core& core, const OperatingPointExcitation& excitation,
+                                                                        double ambientTemperature, CoreLosses& coreLossesModel) {
+    const auto coreMaterial = core.resolve_material();
+    auto ceiling = get_ferromagnetic_data_ceiling(coreMaterial);
+    auto keepLower = [&](std::optional<double> end, CoreDataCeilingSource source) {
+        if (end && (!ceiling || end.value() < ceiling->temperature)) {
+            ceiling = CoreDataCeiling{end.value(), source};
+        }
+    };
+    // H_sat(T) needs no part of its own: past its data it goes linearly to zero at the Curie temperature
+    // (Core::get_magnetic_field_strength_saturation, Alf 2026-10-17), so it is positive below the Curie part.
+    keepLower(coreLossesModel.get_temperature_factor_data_end(core, excitation, ambientTemperature),
+              CoreDataCeilingSource::STEINMETZ_TEMPERATURE_FACTOR_END);
+    return ceiling;
+}
+
+SolvedLosses MagneticSimulator::solve_losses_at_operating_temperature(const OperatingPoint& operatingPoint,
+                                                                                         Magnetic& magnetic,
+                                                                                         WindingLossesScope windingLossesScope) {
+    // ABT #838: a wound coil heats the core, and the core's temperature sets the winding's: both
+    // losses are evaluated at the temperatures their COMBINED dissipation produces, on the full
+    // network (turn nodes carry the winding power). Without turns there are no winding losses to
+    // compute and no turn nodes to put them in (the core advisers' sentinel-coil candidates): the
+    // core is then solved on the core-only network with its own losses.
+    const bool withWinding = magnetic.get_coil().get_turns_description().has_value();
+
+    const double ambientTemperature = operatingPoint.get_conditions().get_ambient_temperature();
+    double coreTemperature = ambientTemperature;
+    double windingTemperature = ambientTemperature;
+    std::string history;
+    double coreRelaxation = 1.0;
+    double windingRelaxation = 1.0;
+    std::optional<double> previousCoreResidual;
+    std::optional<double> previousWindingResidual;
+    // The loop's ceiling (get_core_data_ceiling): the highest temperature where the material is
+    // ferromagnetic, its mu_i(T) has data (the last table point when the table ends below Curie, else
+    // Curie), and the Steinmetz ranges its losses evaluate have a positive ct(T) (ABT #1908). Above it the magnetizing model or the core-loss model refuses
+    // (ABT #1739), so no iterate may land there. It is taken on the first iterate's excitation, once
+    // its losses have been evaluated (so a material or frequency the losses cannot price throws there,
+    // as it always did); the frequencies it reads do not change between iterates.
+    std::optional<CoreDataCeiling> dataCeiling;
+    bool dataCeilingTaken = false;
+    // The winding losses' field step (H at every turn, and the current split between a winding's
+    // parallels that feeds it, ABT #1314) is computed ONCE, at ambient, and every iterate runs only
+    // the per-turn kernels at its own winding temperature (the architecture's two steps): the
+    // conductors' resistance follows the iterate, the field and the split do not (decided by Alf
+    // 2026-10-13). Without parallels H does not depend on the temperature at all; with parallels
+    // the losses differ from a field redone at the solved temperature by about 1e-5 relative.
+    WindingLosses windingLossesModel;
+    std::optional<WindingLosses::WindingLossesField> windingLossesField;
+    // Set once the losses drive the core to that ceiling (see below): from then on the core is held at
+    // the last temperature its material's data covers and only the winding temperature is iterated.
+    // When that ceiling is the Curie temperature the held core is magnetized as the paramagnetic core it
+    // is above it (mu_r = 1, paramagneticMagnetic); when it is the end of a mu_i(T) table that stops
+    // below Curie, the core is still ferromagnetic there and keeps its last tabulated permeability.
+    bool coreHeldAtCeiling = false;
+    std::optional<Magnetic> paramagneticMagnetic;
+    // The previous iterate of the winding-only loop (core held), for the runaway check below.
+    struct HeldWindingIterate {
+        double windingTemperature;
+        double nextWindingTemperature;
+        double windingLosses;
+    };
+    std::optional<HeldWindingIterate> heldWindingIterate;
+    // The first iterate's losses: core and winding at ambient (ABT #1876), what a point with no thermal
+    // operating point publishes.
+    std::optional<LossesAtAmbient> lossesAtAmbient;
+
+    // One evaluation of the loop's map: the losses with the core at coreAt and the winding at windingAt, and the
+    // network they drive. The iteration below and the search for its lowest stable fixed point (ABT #1840) both
+    // read it, so they evaluate the same map.
+    struct LoopEvaluation {
+        MAS::SignalDescriptor magneticFluxDensity;
+        std::optional<DcBiasPoint> dcBiasPoint;
+        OperatingPointExcitation excitation;
+        CoreLossesOutput coreLossesOutput;
+        std::optional<WindingLossesOutput> windingLosses;
+        TemperatureConfig config;
+    };
+    auto evaluateLosses = [&](double coreAt, double windingAt) {
+        LoopEvaluation evaluation;
+        // Core losses at the core's temperature. The magnetizing model reads the core temperature
+        // from the operating point's conditions (permeability vs T sets B for a current-driven
+        // part), so it gets a COPY at T_core; the caller's operating point keeps its real ambient.
+        OperatingPoint operatingPointAtCoreTemperature = operatingPoint;
+        operatingPointAtCoreTemperature.get_mutable_conditions().set_ambient_temperature(coreAt);
+        evaluation.magneticFluxDensity = _magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(
+            paramagneticMagnetic ? paramagneticMagnetic.value() : magnetic, &operatingPointAtCoreTemperature).second;
+        // A paramagnetic core has no knee for a bias to drive it past.
+        if (!paramagneticMagnetic) {
+            evaluation.dcBiasPoint = _magnetizingInductanceModel.get_last_dc_bias_point();
+        }
+        // Read the excitation after the inductance model: it stamps the magnetizing current it
+        // derived (a CMC's common-mode current, a voltage's integral) into the operating point it
+        // was given. A copy taken before it lacked that current whenever the operating point
+        // arrived without one, and the loss-factor model then refused it ("Missing magnetizing current").
+        evaluation.excitation = operatingPointAtCoreTemperature.get_excitations_per_winding()[0];
+        evaluation.excitation.set_magnetic_flux_density(evaluation.magneticFluxDensity);
+        evaluation.coreLossesOutput = _coreLossesModel.calculate_core_losses(magnetic.get_core(), evaluation.excitation, coreAt);
+        evaluation.coreLossesOutput.set_temperature(coreAt);
+        if (!dataCeilingTaken) {
+            dataCeiling = get_core_data_ceiling(magnetic.get_core(), evaluation.excitation, ambientTemperature, _coreLossesModel);
+            dataCeilingTaken = true;
+        }
+
+        // One network, every heat source that is modelled.
+        if (withWinding) {
+            switch (windingLossesScope) {
+                case WindingLossesScope::FULL: {
+                    // As calculate_winding_losses: the field mirrored in one dimension.
+                    auto& settings = Settings::GetInstance();
+                    SettingsGuard<int> mirroringGuard(settings, &Settings::get_magnetic_field_mirroring_dimension,
+                                                      &Settings::set_magnetic_field_mirroring_dimension, 1);
+                    if (!windingLossesField) {
+                        windingLossesField = windingLossesModel.calculate_magnetic_field(magnetic, operatingPoint, ambientTemperature);
+                    }
+                    evaluation.windingLosses = windingLossesModel.calculate_losses(magnetic, windingLossesField.value(), windingAt);
+                    break;
+                }
+                case WindingLossesScope::OHMIC_AND_SKIN_EFFECT:
+                    evaluation.windingLosses = WindingSkinEffectLosses::calculate_skin_effect_losses(
+                        magnetic.get_coil(), windingAt,
+                        WindingOhmicLosses::calculate_ohmic_losses(magnetic.get_coil(), operatingPoint, windingAt),
+                        0.5);
+                    break;
+                case WindingLossesScope::OHMIC:
+                    evaluation.windingLosses = WindingOhmicLosses::calculate_ohmic_losses(magnetic.get_coil(), operatingPoint, windingAt);
+                    break;
+            }
+            Outputs losses;
+            losses.set_core_losses(evaluation.coreLossesOutput);
+            losses.set_winding_losses(evaluation.windingLosses.value());
+            evaluation.config = TemperatureConfig::fromSimulatedOutput(operatingPoint, losses);
+        }
+        else {
+            evaluation.config = TemperatureConfig::fromMasOperatingConditions(operatingPoint.get_conditions());
+            evaluation.config.plotSchematic = false;
+            evaluation.config.coreLosses = evaluation.coreLossesOutput.get_core_losses();
+            evaluation.config.coreOnly = true;
+        }
+        return evaluation;
+    };
+    // Whether the search below has run: once per solve, and the evaluations it made (SolvedLosses).
+    bool lowestFixedPointSearched = false;
+    size_t lowestFixedPointSearchEvaluations = 0;
+    // h at ambient, from the first iterate: its core and winding losses are both evaluated at ambient, which is the
+    // diagonal point the search would otherwise evaluate again.
+    std::optional<std::pair<double, double>> residualAtAmbient;
+    // The loop's map along the diagonal, h(T) = g(T) - T, where g(T) is the core temperature the network returns
+    // for the core and winding losses evaluated at T, and the winding temperature it returns with it.
+    auto coreResidualAt = [&](double temperature, size_t iteration) {
+        ++lowestFixedPointSearchEvaluations;
+        auto evaluation = evaluateLosses(temperature, temperature);
+        ThermalResult thermalResult;
+        try {
+            thermalResult = Temperature(magnetic, evaluation.config).calculateTemperatures();
+        }
+        catch (const ThermalNetworkNotConvergedException& error) {
+            throw NoThermalOperatingPointException(error.code(), "No thermal operating point: " + error.message() +
+                " Loss loop at iterate " + std::to_string(iteration) + ", searching for its lowest stable fixed point (losses at " +
+                std::to_string(temperature) + " C). History:" + history, lossesAtAmbient.value());
+        }
+        if (!thermalResult.maximumCoreTemperature || (withWinding && !thermalResult.averageTurnTemperature)) {
+            throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+                "Thermal network of '" + magnetic.get_reference() + "' has no core or turn node: no temperature to search the loss loop's fixed point with");
+        }
+        const double windingAt = withWinding ? thermalResult.averageTurnTemperature.value() : ambientTemperature;
+        return std::make_pair(thermalResult.maximumCoreTemperature.value() - temperature, windingAt);
+    };
+    // The lowest T in (lowest, highest] where h falls through zero (h >= 0 below, h < 0 above: g' < 1 there, a stable
+    // fixed point), and the winding temperature the network gives there; h(lowest) is atLowest. highest is the loop's
+    // own iterate, within its tolerance of the data ceiling (the ceiling itself is where the models stop).
+    // A coarse pass walks up the bracket in n equal steps, highest included, and stops at the first point with h < 0;
+    // that sign change alone is then bisected to the loop's tolerance. n = ceil(sqrt(width / tolerance)): the spacing
+    // is the geometric mean of the bracket and the tolerance, so a part with no fixed point (the common case here)
+    // pays about the square root of a tolerance-spaced scan (ETD 29 N87, 25 C to its 210 C ceiling: 10 networks instead of the 63 of a scan refined to 2 K),
+    // and one that has a fixed point pays its coarse steps plus log2(spacing / tolerance) bisections. highest is
+    // evaluated because h can be negative there although the loop climbed to it: its iterates are not on the
+    // diagonal (their winding losses lag), and a stable point can sit within the last step below the ceiling (a
+    // 3C91 E 114 coil, 25 C: h < 0 from 209 C to its 220 C ceiling). What it cannot see is a stretch of h < 0 that
+    // lies strictly between two coarse points: a stable and an unstable fixed point closer together than the
+    // spacing, which happens only next to the load where the two merge and the stable point disappears. Nothing
+    // (std::nullopt) when no coarse point has h < 0.
+    auto findLowestStableCoreTemperature = [&](double lowest, double highest, std::pair<double, double> atLowest,
+                                               size_t iteration) -> std::optional<std::pair<double, double>> {
+        if (atLowest.first <= 0) {
+            return std::make_pair(lowest, atLowest.second);
+        }
+        if (highest - lowest <= kOperatingTemperatureTolerance) {
+            // No room above the lowest point for a fixed point the loop could tell from it.
+            return std::nullopt;
+        }
+        const size_t steps = static_cast<size_t>(std::ceil(std::sqrt((highest - lowest) / kOperatingTemperatureTolerance)));
+        const double spacing = (highest - lowest) / static_cast<double>(steps);
+        double hotBelow = lowest;
+        for (size_t index = 1; index <= steps; ++index) {
+            const double temperature = index == steps ? highest : lowest + static_cast<double>(index) * spacing;
+            auto atTemperature = coreResidualAt(temperature, iteration);
+            if (atTemperature.first >= 0) {
+                hotBelow = temperature;
+                continue;
+            }
+            double coldAbove = temperature;
+            while (coldAbove - hotBelow > kOperatingTemperatureTolerance) {
+                const double middle = (hotBelow + coldAbove) / 2;
+                auto atMiddle = coreResidualAt(middle, iteration);
+                if (atMiddle.first < 0) {
+                    coldAbove = middle;
+                    atTemperature = atMiddle;
+                }
+                else {
+                    hotBelow = middle;
+                }
+            }
+            return std::make_pair(coldAbove, atTemperature.second);
+        }
+        return std::nullopt;
+    };
+
+    for (size_t iteration = 1; iteration <= kOperatingTemperatureMaximumIterations; ++iteration) {
+        auto evaluation = evaluateLosses(coreTemperature, windingTemperature);
+        auto& magneticFluxDensity = evaluation.magneticFluxDensity;
+        const auto& dcBiasPoint = evaluation.dcBiasPoint;
+        auto& excitation = evaluation.excitation;
+        auto& coreLossesOutput = evaluation.coreLossesOutput;
+        auto& windingLosses = evaluation.windingLosses;
+        auto& config = evaluation.config;
+        if (!lossesAtAmbient) {
+            lossesAtAmbient = LossesAtAmbient{coreLossesOutput, excitation, windingLosses};
+        }
+        ThermalResult thermalResult;
+        try {
+            thermalResult = Temperature(magnetic, config).calculateTemperatures();
+        }
+        catch (const ThermalNetworkNotConvergedException& error) {
+            // No steady temperature exists on the network for this iterate's losses: the operating point has
+            // no thermal operating point (ABT #1876, Alf 2026-10-14).
+            throw NoThermalOperatingPointException(error.code(), "No thermal operating point: " + error.message() +
+                " Loss loop at iterate " + std::to_string(iteration) + " (core losses at " + std::to_string(coreTemperature) +
+                " C, winding losses at " + std::to_string(windingTemperature) + " C" +
+                (coreHeldAtCeiling ? ", core held at its data limit" : "") + "). History:" + history,
+                lossesAtAmbient.value());
+        }
+        catch (const CalculationException& error) {
+            // Not handled: the same error, with the loss loop's iterates up to it, so the losses and
+            // temperatures that drove the network there can be read.
+            throw CalculationException(error.code(), error.message() + " Loss loop at iterate " +
+                std::to_string(iteration) + " (core losses at " + std::to_string(coreTemperature) + " C, winding losses at " +
+                std::to_string(windingTemperature) + " C" + (coreHeldAtCeiling ? ", core held at its data limit" : "") +
+                "). History:" + history);
+        }
+        if (!thermalResult.maximumCoreTemperature) {
+            throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+                "Thermal network of '" + magnetic.get_reference() + "' has no core node: no core temperature to "
+                "evaluate the core losses at");
+        }
+        if (withWinding && !thermalResult.averageTurnTemperature) {
+            throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+                "Thermal network of '" + magnetic.get_reference() + "' has no turn node: no winding temperature to "
+                "evaluate the winding losses at");
+        }
+        const double nextCoreTemperature = thermalResult.maximumCoreTemperature.value();
+        const double nextWindingTemperature = withWinding ? thermalResult.averageTurnTemperature.value() : ambientTemperature;
+        if (iteration == 1) {
+            residualAtAmbient = std::make_pair(nextCoreTemperature - coreTemperature, nextWindingTemperature);
+        }
+        history += " [" + std::to_string(iteration) + "] Pcore=" + std::to_string(coreLossesOutput.get_core_losses()) +
+                   " W at " + std::to_string(coreTemperature) + " C";
+        if (magneticFluxDensity.get_processed() && magneticFluxDensity.get_processed()->get_peak()) {
+            history += " (Bpk " + std::to_string(magneticFluxDensity.get_processed()->get_peak().value()) + " T)";
+        }
+        if (withWinding) {
+            history += ", Pcu=" + std::to_string(windingLosses->get_winding_losses()) + " W at " +
+                       std::to_string(windingTemperature) + " C";
+        }
+        history += " -> core " + std::to_string(nextCoreTemperature) + " C";
+        if (withWinding) {
+            history += ", winding " + std::to_string(nextWindingTemperature) + " C";
+        }
+        history += ";";
+
+        // Held at the ceiling, the core's temperature is no longer iterated: only the winding's must settle.
+        if ((coreHeldAtCeiling || std::fabs(nextCoreTemperature - coreTemperature) < kOperatingTemperatureTolerance) &&
+            std::fabs(nextWindingTemperature - windingTemperature) < kOperatingTemperatureTolerance) {
+            // Converged: the losses were evaluated at temperatures within the tolerance of the
+            // ones these very losses produce.
+            SolvedLosses solved;
+            solved.coreLosses = coreLossesOutput;
+            solved.excitation = excitation;
+            solved.windingLosses = windingLosses;
+            solved.dcBiasPoint = dcBiasPoint;
+            solved.lowestFixedPointSearchEvaluations = lowestFixedPointSearchEvaluations;
+            solved.temperature.set_initial_temperature(config.ambientTemperature);
+            solved.temperature.set_maximum_temperature(thermalResult.maximumTemperature);
+            double totalLosses = config.coreLosses + config.windingLosses;
+            if (totalLosses > 0) {
+                solved.temperature.set_bulk_thermal_resistance(
+                    (thermalResult.maximumTemperature - config.ambientTemperature) / totalLosses);
+            }
+            solved.temperature.set_method_used("ThermalNetwork");
+            solved.temperature.set_origin(ResultOrigin::SIMULATION);
+            return solved;
+        }
+        // Winding runaway (Alf, 2026-10-14, ABT #1855). Held at the ceiling, the core's losses and
+        // temperature are fixed, and what is left is the one-dimensional map T_w -> g(T_w): the average
+        // turn temperature the network returns for the winding losses evaluated at T_w. Its iteration
+        // reaches a fixed point only where the map contracts, |g'| < 1. Two iterates of that same map give
+        // its secant slope; when the winding is pushed hotter (g(T_w) > T_w), its losses grew between the
+        // two iterates and the slope is at or above 1, the residual g(T_w) - T_w does not shrink as T_w
+        // rises: the copper's losses heat it faster than the network sheds the heat, the iteration has no
+        // fixed point ahead to settle on and the winding runs away (the 220 kW transformer: slope ~1.8,
+        // 2.8 kW at 60 C, 2.3 MW and a 549,000 C hot spot fourteen iterates later). That is refused here,
+        // from the iterates themselves, instead of iterating on until a limit or the network gives up.
+        if (withWinding && coreHeldAtCeiling) {
+            const double windingLossesAtThisIterate = windingLosses->get_winding_losses();
+            if (heldWindingIterate) {
+                const double step = windingTemperature - heldWindingIterate->windingTemperature;
+                if (step > 0 && nextWindingTemperature > windingTemperature &&
+                    windingLossesAtThisIterate > heldWindingIterate->windingLosses) {
+                    const double slope = (nextWindingTemperature - heldWindingIterate->nextWindingTemperature) / step;
+                    if (slope >= 1) {
+                        std::ostringstream reason;
+                        reason << "No thermal operating point: the winding runs away. '" << magnetic.get_reference()
+                               << "' has its core held at " << coreTemperature << " C, the last temperature its material's data "
+                               << "covers, and its winding losses grow from " << heldWindingIterate->windingLosses << " W at "
+                               << heldWindingIterate->windingTemperature << " C to " << windingLossesAtThisIterate << " W at "
+                               << windingTemperature << " C while the average turn temperature they produce grows from "
+                               << heldWindingIterate->nextWindingTemperature << " C to " << nextWindingTemperature
+                               << " C: dT_turn/dT_w = " << slope << ", at or above 1, where a fixed point needs it below 1."
+                               << " History:" << history;
+                        throw NoThermalOperatingPointException(ErrorCode::CALCULATION_DIVERGED, reason.str(),
+                                                               lossesAtAmbient.value());
+                    }
+                }
+            }
+            heldWindingIterate = HeldWindingIterate{windingTemperature, nextWindingTemperature, windingLossesAtThisIterate};
+        }
+
+        // Next iterate. Plain substitution (relaxation 1) is the fastest when the losses' feedback
+        // on temperature is weak, but a ferrite whose losses FALL steeply with temperature makes
+        // the map overshoot the fixed point and swing around it forever (seen: 3.9 W at 106 C,
+        // 2.6 W at 134 C, 0.01 W at 150 C). Each time a temperature's residual changes sign, that
+        // temperature's step is halved, which turns the swing into convergence. Core and winding
+        // keep their own step: damping the winding because the CORE swung would leave it crawling
+        // toward its own answer. The convergence test above is on the residuals themselves, so
+        // damping never makes an unsettled state look settled.
+        const double coreResidual = nextCoreTemperature - coreTemperature;
+        const double windingResidual = nextWindingTemperature - windingTemperature;
+        if (previousCoreResidual && previousCoreResidual.value() * coreResidual < 0) {
+            coreRelaxation *= 0.5;
+        }
+        if (previousWindingResidual && previousWindingResidual.value() * windingResidual < 0) {
+            windingRelaxation *= 0.5;
+        }
+        previousCoreResidual = coreResidual;
+        previousWindingResidual = windingResidual;
+        double proposedCoreTemperature = coreTemperature + coreRelaxation * coreResidual;
+        double proposedWindingTemperature = windingTemperature + windingRelaxation * windingResidual;
+
+        // The core-loss and permeability models describe the FERROMAGNETIC material and refuse a
+        // temperature at or above its Curie point; the permeability also refuses one between the end
+        // of its measured mu_i(T) table and the Curie point, the magnetisation curve one where H_sat(T)
+        // is not positive, and the Steinmetz losses one where ct(T) is not (ABT #1908). The first steps start from
+        // ambient-temperature losses and can overshoot far past where the answer lies, so the iterate
+        // is kept inside the range where the losses and the permeability exist: at most halfway from
+        // the current core temperature to that ceiling.
+        //
+        // If the iteration has been driven to within the tolerance of the ceiling and the losses there
+        // still push the core hotter, no operating point exists below it. Until ABT #1855 that was
+        // refused. EXPLICIT, USER-APPROVED EXCEPTION to the no-fallback rule (Alf, 2026-10-14, ABT #1855):
+        // the core is then held at the last temperature its material's data covers (this iterate, within
+        // the tolerance of the ceiling), its core losses are evaluated there, and the winding temperature
+        // is iterated on to its own fixed point with those core losses. Its permeability (Alf, 2026-10-14):
+        //   - ceiling = Curie temperature: the core is magnetized as the paramagnetic core it is above
+        //     its Curie point, mu_r = 1 (make_paramagnetic_magnetic);
+        //   - ceiling = end of a mu_i(T) table that stops below Curie (3C96: 180 C, Curie above 200 C):
+        //     the material is still magnetic there, so the core is held at the table's last temperature
+        //     exactly and keeps the last tabulated permeability;
+        //   - ceiling = where an evaluated Steinmetz range's ct(T) stops being positive (ABT #1908, the same hold as the mu_i(T) table's end): the
+        //     material is still magnetic, and the models refuse at that temperature itself, so the core
+        //     stays at this iterate, within the tolerance below it, with its own permeability there.
+        // The numbers are therefore those of a core at its data limit: its real temperature is higher,
+        // and ResultsAnalyzer::analyze_temperature says so for this operating point
+        // (is_core_held_at_data_ceiling).
+        if (coreHeldAtCeiling) {
+            windingTemperature = proposedWindingTemperature;
+            continue;
+        }
+        if (dataCeiling && proposedCoreTemperature >= dataCeiling->temperature) {
+            const double distanceToCeiling = dataCeiling->temperature - coreTemperature;
+            if (distanceToCeiling < kOperatingTemperatureTolerance) {
+                // ABT #1840 (Alf, 2026-10-18: "find lowest crossing"). A part heated from ambient stops at the
+                // LOWEST temperature where its losses and the network balance stably, and the iteration can miss
+                // it: its first step from the ambient-temperature losses can land past an unstable fixed point
+                // and climb to here (ETD 29 N87 at 0.44 of B_sat: g(25 C) = 186 C, stable point 97 C, unstable
+                // 172 C). Before holding the core at its data limit, the bracket [ambient, ceiling] is searched
+                // once for that point (find_lowest_stable_core_temperature below); the iteration resumes from it
+                // and its own convergence test decides. With no fixed point the core is held, as before.
+                if (!lowestFixedPointSearched) {
+                    lowestFixedPointSearched = true;
+                    auto lowestStable = findLowestStableCoreTemperature(ambientTemperature, coreTemperature,
+                                                                        residualAtAmbient.value(), iteration);
+                    if (lowestStable) {
+                        history += " [search] lowest stable fixed point near " + std::to_string(lowestStable->first) +
+                                   " C after " + std::to_string(lowestFixedPointSearchEvaluations) + " evaluations, iteration resumes there;";
+                        coreTemperature = lowestStable->first;
+                        windingTemperature = lowestStable->second;
+                        coreRelaxation = 1.0;
+                        windingRelaxation = 1.0;
+                        previousCoreResidual.reset();
+                        previousWindingResidual.reset();
+                        continue;
+                    }
+                    history += " [search] no fixed point below the data limit after " +
+                               std::to_string(lowestFixedPointSearchEvaluations) + " evaluations;";
+                }
+                coreHeldAtCeiling = true;
+                switch (dataCeiling->source) {
+                    case CoreDataCeilingSource::CURIE_TEMPERATURE:
+                        paramagneticMagnetic = make_paramagnetic_magnetic(magnetic);
+                        break;
+                    case CoreDataCeilingSource::PERMEABILITY_TABLE_END:
+                        coreTemperature = dataCeiling->temperature;
+                        break;
+                    case CoreDataCeilingSource::STEINMETZ_TEMPERATURE_FACTOR_END:
+                        // ABT #1908: at that temperature itself ct is zero and the model refuses,
+                        // so the core stays at this iterate, within the tolerance below it, the material
+                        // still magnetic and with its own permeability there.
+                        break;
+                }
+                windingTemperature = proposedWindingTemperature;
+                continue;
+            }
+            proposedCoreTemperature = coreTemperature + 0.5 * distanceToCeiling;
+        }
+        coreTemperature = proposedCoreTemperature;
+        windingTemperature = proposedWindingTemperature;
+    }
+    // ABT #1960: the loop found no temperatures within its tolerance of the ones their losses produce. That is
+    // the same answer as the network failing on an iterate's losses or the held winding running away: this
+    // point has no thermal operating point the loop can report, and it is that point's finding, under the
+    // caller's NoThermalOperatingPointPolicy (simulate: losses at ambient, no temperature; the advisers: THROW),
+    // not a refusal of the whole design. Seen: a saturating 78 EL 25/6.3 inductor whose B(T) drops 0.637 ->
+    // 0.630 T between 135.890 and 135.895 C, so its core losses jump 4.19 -> 3.81 W and the core temperature
+    // they produce 138.1 -> 131.1 C: the iterates close in on that step from both sides and never land within
+    // the tolerance.
+    throw NoThermalOperatingPointException(ErrorCode::CALCULATION_DIVERGED,
+        "No thermal operating point: the losses of '" + magnetic.get_reference() + "' and the temperatures they "
+        "produce did not settle within " + std::to_string(kOperatingTemperatureMaximumIterations) +
+        " iterations (tolerance " + std::to_string(kOperatingTemperatureTolerance) + " K): no temperature was found "
+        "within the tolerance of the one its own losses produce (thermal runaway, or losses that jump with temperature "
+        "so the iterates close in on the jump from both sides). History:" + history,
+        lossesAtAmbient.value());
 }
 
 namespace {
@@ -291,12 +889,32 @@ MagneticManufacturerInfo MagneticSimulator::build_datasheet(Mas& mas) {
         const size_t numberPoints = 51;
         double startFrequency = selfResonantFrequency / 1000;
         double stopFrequency = selfResonantFrequency * 100;
-        double logStep = std::log10(stopFrequency / startFrequency) / (numberPoints - 1);
+        // The published curve covers only the frequencies where the core material has complex
+        // permeability data: outside its table there is nothing to evaluate (get_complex_permeability
+        // throws there). This sweep is the datasheet's own choice of band, so it asks for the
+        // material's range explicitly and keeps the part of the band that lies inside it. If none
+        // of the band does, the curve cannot be computed and that is reported, not filled in.
+        {
+            auto coreMaterial = magnetic.get_core().resolve_material();
+            auto [minimumMaterialFrequency, maximumMaterialFrequency] = ComplexPermeability().get_frequency_range(coreMaterial);
+            double requestedStartFrequency = startFrequency;
+            double requestedStopFrequency = stopFrequency;
+            startFrequency = std::max(startFrequency, minimumMaterialFrequency);
+            stopFrequency = std::min(stopFrequency, maximumMaterialFrequency);
+            if (!(startFrequency < stopFrequency)) {
+                throw ComplexPermeabilityFrequencyOutOfRangeException(coreMaterial.get_name(),
+                    requestedStartFrequency < minimumMaterialFrequency ? requestedStopFrequency : requestedStartFrequency,
+                    minimumMaterialFrequency, maximumMaterialFrequency);
+            }
+        }
+        // Exact ends (logarithmic_spaced_array): start * 10^(n * step) can land one ulp past the
+        // material's last tabulated frequency, where complex permeability throws.
+        auto frequencies = logarithmic_spaced_array(startFrequency, stopFrequency, numberPoints);
 
         std::vector<DatasheetImpedancePoint> impedancePoints;
         double maximumImpedanceMagnitude = std::numeric_limits<double>::lowest();
         for (size_t pointIndex = 0; pointIndex < numberPoints; ++pointIndex) {
-            double frequency = startFrequency * std::pow(10.0, logStep * pointIndex);
+            double frequency = frequencies[pointIndex];
             auto impedance = impedanceModel.impedance_from_model(widebandModel, frequency);
 
             ImpedancePoint impedancePoint;

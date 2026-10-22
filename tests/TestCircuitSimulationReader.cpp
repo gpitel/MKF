@@ -11,8 +11,10 @@
 #include "TestingUtils.h"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <chrono>
 #include <fstream>
+#include <locale>
 #include <sstream>
 #include <cmath>
 #include <numbers>
@@ -109,6 +111,48 @@ TEST_CASE("Test_Guess_Separator_Ltspice", "[processor][circuit-simulation-reader
             REQUIRE('\t' == CircuitSimulationReader::guess_separator(line));
         }
     }
+}
+
+TEST_CASE("Test_Get_One_Period_Returns_Exactly_One_Period", "[processor][circuit-simulation-reader][abt-1467]") {
+    // A 10 ns export column accumulated in floating point: the sample meant to sit on T misses it
+    // by rounding, and the window used to take the next sample too, T plus one step (Rosano's
+    // forward_case.csv gave 502 points over 5.01 us at 200 kHz).
+    const double frequency = 200000;
+    const double period = 1.0 / frequency;
+    std::vector<double> time;
+    std::vector<double> data;
+    double t = 0;
+    for (size_t index = 0; index < 1501; ++index) {
+        time.push_back(t);
+        data.push_back(std::sin(2 * M_PI * frequency * t));
+        t += 1e-8;
+    }
+    Waveform record;
+    record.set_data(data);
+    record.set_time(time);
+    CircuitSimulationReader reader;
+    auto onePeriod = reader.get_one_period(record, frequency, false, false, "rounded");
+    REQUIRE(onePeriod.get_time());
+    CHECK(onePeriod.get_time()->front() == 0);
+    CHECK_THAT(onePeriod.get_time()->back(), Catch::Matchers::WithinRel(period, 1e-9));
+    CHECK(onePeriod.get_data().size() == 501);
+
+    // A step that does not divide the period: the window is cut at T, the last value interpolated.
+    std::vector<double> coarseTime;
+    std::vector<double> coarseData;
+    for (size_t index = 0; index < 400; ++index) {
+        coarseTime.push_back(index * 3e-8);
+        coarseData.push_back(index * 3e-8);
+    }
+    Waveform coarse;
+    coarse.set_data(coarseData);
+    coarse.set_time(coarseTime);
+    CircuitSimulationReader coarseReader;
+    auto coarsePeriod = coarseReader.get_one_period(coarse, frequency, false, false, "coarse");
+    CHECK_THAT(coarsePeriod.get_time()->back(), Catch::Matchers::WithinRel(period, 1e-12));
+    CHECK_THAT(coarsePeriod.get_data().back() - coarsePeriod.get_data().front(), Catch::Matchers::WithinRel(period, 1e-9));
+    // and the sampler takes it at its frequency
+    REQUIRE_NOTHROW(OpenMagnetics::Inputs::calculate_sampled_waveform(coarsePeriod, frequency));
 }
 
 TEST_CASE("Test_Import_Csv_Rosano_Forward", "[processor][circuit-simulation-reader]") {
@@ -414,6 +458,24 @@ TEST_CASE("Test_PFC_Only_Current", "[processor][circuit-simulation-reader]") {
 
         painter.export_svg();
 
+    }
+}
+
+TEST_CASE("Test_Process_Operating_Point_Keeps_The_Stated_Frequency", "[processor][circuit-simulation-reader][abt-1467]") {
+    // A 50 Hz PFC line-cycle record keeps its 50 Hz label: process_operating_point used to replace it
+    // with the switching harmonic, a label that did not match the 20 ms record (ABT #1467).
+    auto simulation_path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "only_pfc_current_waveform.csv");
+    auto reader = CircuitSimulationReader(simulation_path.string());
+    auto operatingPoint = reader.extract_operating_point(2, 50);
+    operatingPoint = OpenMagnetics::Inputs::process_operating_point(operatingPoint, 110e-6);
+    REQUIRE(operatingPoint.get_excitations_per_winding().size() == 1);
+    CHECK(operatingPoint.get_excitations_per_winding()[0].get_frequency() == 50);
+
+    // A missing frequency is not repaired from the waveform's harmonics: NaN, 0 and negative throw.
+    for (double frequency : {std::numeric_limits<double>::quiet_NaN(), 0.0, -50.0}) {
+        auto broken = reader.extract_operating_point(2, 50);
+        broken.get_mutable_excitations_per_winding()[0].set_frequency(frequency);
+        CHECK_THROWS_AS(OpenMagnetics::Inputs::process_operating_point(broken, 110e-6), InvalidInputException);
     }
 }
 
@@ -994,4 +1056,44 @@ TEST_CASE("Test_Import_Dense_Export_Keeps_At_Most_The_Imported_Maximum", "[proce
         auto hb = (signal == "current"? full.get_current() : full.get_voltage())->get_harmonics().value();
         CHECK_THAT(ha.get_amplitudes()[1], Catch::Matchers::WithinRel(hb.get_amplitudes()[1], 1e-3));
     }
+}
+
+TEST_CASE("Test_CircuitSimulationReader_Refuses_A_Partially_Numeric_Cell", "[processor][circuit-simulation-reader][smoke-test][abt-1624]") {
+    // ABT #1624: std::stod returned the numeric prefix of a cell and ignored the rest, so a
+    // decimal-comma "0,001" in a ';'-separated export was silently read as 0.
+    std::string decimalComma = "time;I(L1)\n0;0,001\n1e-6;0,002\n";
+    REQUIRE_THROWS_AS(CircuitSimulationReader(decimalComma, true), InvalidInputException);
+    std::string trailingJunk = "time,I(L1)\n0,1.5A\n";
+    REQUIRE_THROWS_AS(CircuitSimulationReader(trailingJunk, true), InvalidInputException);
+    // The refusal names the numeric prefix, whichever standard library parsed it.
+    REQUIRE_THROWS_WITH(CircuitSimulationReader(trailingJunk, true),
+                        Catch::Matchers::ContainsSubstring("only \"1.5\" is a number"));
+    // ABT #1695: the parse must not depend on the standard library's stream parser, so a hex
+    // float or an infinity (which libc++ streams read) is refused as on every other toolchain.
+    std::string hexCell = "time,I(L1)\n0,0x10\n";
+    REQUIRE_THROWS_AS(CircuitSimulationReader(hexCell, true), InvalidInputException);
+    std::string infinityCell = "time,I(L1)\n0,inf\n";
+    REQUIRE_THROWS_AS(CircuitSimulationReader(infinityCell, true), InvalidInputException);
+    // A plain, explicitly signed or exponent cell still parses whole.
+    std::string clean = "time,I(L1)\n0,+1.5\n1e-6,-2.5E-1\n";
+    REQUIRE_NOTHROW(CircuitSimulationReader(clean, true));
+}
+
+TEST_CASE("Test_CircuitSimulationReader_Reads_Numbers_In_The_C_Locale_Whatever_The_Global_One", "[processor][circuit-simulation-reader][smoke-test][abt-1624]") {
+    // ABT #1624: a cell is read in the classic "C" locale. Under a global locale whose decimal
+    // separator is a comma, "0.001" is still 0.001, not 0 or a refusal.
+    struct DecimalComma : std::numpunct<char> {
+        char do_decimal_point() const override { return ','; }
+    };
+    const std::locale previous = std::locale::global(std::locale(std::locale::classic(), new DecimalComma));
+    double read = -1;
+    try {
+        CircuitSimulationReader reader(std::string("time,I(L1)\n0,0.001\n1e-6,0.002\n"), true);
+        read = reader.get_columns().at(1).data.at(0);
+    } catch (...) {
+        std::locale::global(previous);
+        throw;
+    }
+    std::locale::global(previous);
+    REQUIRE(read == 0.001);
 }

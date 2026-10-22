@@ -10,6 +10,8 @@
 #include "support/Utils.h"
 #include "json.hpp"
 #include "Fixtures.h"
+#include "TestingUtils.h"
+#include <source_location>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -20,16 +22,16 @@ using namespace MAS;
 using namespace OpenMagnetics;
 
 namespace {
-constexpr auto kCorruptToroidFixture =
-    "/home/alf/OpenMagnetics/WebFrontend/tests/fixtures/toroidal_stale_pin_corrupt_t402416.json";
+// ABT #1596: copied from WebFrontend/tests/fixtures so the smoke test runs in any checkout
+// instead of skipping wherever a developer's sibling repo is absent.
+const auto kCorruptToroidFixture = OpenMagneticsTesting::get_test_data_path(
+    std::source_location::current(), "toroidal_stale_pin_corrupt_t402416.json");
 }
 
 TEST_CASE("Test_Filling_Factors_Area_Fraction_Is_Not_An_Overfill_Ratio", "[coil][filling-factor][smoke-test]") {
     settings.reset();
     std::ifstream file(kCorruptToroidFixture);
-    if (!file.good()) {
-        SKIP("WebFrontend fixture not available in this checkout");
-    }
+    REQUIRE(file.good());
     json masJson = json::parse(file);
     json magneticJson = masJson.contains("magnetic") ? masJson["magnetic"] : masJson;
 
@@ -155,4 +157,28 @@ TEST_CASE("Test_Drum_Winding_Sits_On_The_Former", "[coil][winding][smoke-test]")
     // core column half-width. The wire lies on it.
     const double formerSurface = 0.00065;
     CHECK_THAT(innermost, Catch::Matchers::WithinAbs(formerSurface, 1e-6));
+}
+
+// A spread section is laid out to the full window height, so its height equals the window's
+// up to float representation: 0.0078000000000000005 / 0.0078 = 1.0000000000000002. A strict
+// `<= 1` reported that as an overfill and the builder showed "Winding does not fit this core"
+// for a coil with 5.8 mm of copper in a 7.8 mm window (user report 2026-10-09, WE 7443634700:
+// PQ 20/13.7, 15 turns of 2.4 x 0.35 mm flat wire, no bobbin). The fixture is the coil the
+// builder computed, loaded as-is (no re-wind).
+TEST_CASE("Test_Filling_Factors_Full_Height_Spread_Section_Fits", "[coil][filling-factor][smoke-test]") {
+    settings.reset();
+    std::ifstream file(OpenMagneticsTesting::get_test_data_path(
+        std::source_location::current(), "pq2013_spread_flat_wire_full_window_height.json"));
+    REQUIRE(file.good());
+    json masJson = json::parse(file);
+    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+    auto factors = magnetic.get_mutable_coil().calculate_filling_factor();
+
+    // The stacking dimension is full to the last bit, which is the case under test...
+    CHECK(factors.contiguousFillingFactor > 1);
+    CHECK_THAT(factors.contiguousFillingFactor, Catch::Matchers::WithinRel(1.0, 1e-12));
+    // ...and the copper is nowhere near the window's limits.
+    CHECK(factors.maxLayerFillingFactor < 0.8);
+    CHECK(factors.areaFillingFactor < 0.5);
+    CHECK(factors.windingFits);
 }

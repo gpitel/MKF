@@ -24,6 +24,48 @@ class Magnetic : public MAS::Magnetic {
         std::optional<MagneticManufacturerInfo> manufacturer_info;
         std::optional<std::vector<double>> _maximumDimensions;
         std::optional<Coil> coil;
+
+        // ABT #1533: the coil needs the core it is wound on -- its columns for turns around
+        // non-main columns (Coil::set_core_columns) and the core outline for the room of the
+        // ABT #1487 outside series links (Coil::set_core_geometry). Those are transient coil state,
+        // not part of the MAS coil, so a Magnetic built any other way than magnetic_autocomplete
+        // (from JSON, from a MAS document, set_core/set_coil) used to hand the loss and simulation
+        // models a coil with no core, and real winding threw there. Whenever this Magnetic holds
+        // both, the coil gets this core. A core replaced through get_mutable_core() is not seen
+        // here: give it back with set_core (magnetic_autocomplete re-gives it after processing).
+        void give_coil_its_core() {
+            if (!coil || !core) {
+                return;
+            }
+            if (core->get_processed_description()) {
+                coil->set_core_columns(core->get_processed_description()->get_columns());
+            }
+            coil->set_core_geometry(core_outline_for_coil(core.value()));
+        }
+
+        // ABT #1785: the coil reads its core for the outline and the legs only (family, shape
+        // dimensions, processed width/depth/columns; Coil.cpp outside_link_room_geometry). Copying
+        // the whole Core gave every candidate a second inline material (its permeability and loss
+        // tables, ~30 kB) and geometrical description, which the CoreAdviser's 60 000-candidate
+        // datasets held once per candidate for nothing. The coil's copy carries the functional
+        // description with the material reduced to its NAME, the processed description and the
+        // name; nothing the coil reads is dropped.
+        static Core core_outline_for_coil(const Core& fullCore) {
+            MAS::MagneticCore outline;
+            auto functionalDescription = fullCore.get_functional_description();
+            const auto& material = functionalDescription.get_material();
+            if (std::holds_alternative<MAS::CoreMaterial>(material)) {
+                functionalDescription.set_material(std::get<MAS::CoreMaterial>(material).get_name());
+            }
+            outline.set_functional_description(functionalDescription);
+            if (fullCore.get_processed_description()) {
+                outline.set_processed_description(fullCore.get_processed_description());
+            }
+            if (fullCore.get_name()) {
+                outline.set_name(fullCore.get_name());
+            }
+            return Core(outline);
+        }
     public:
         Magnetic() = default;
         virtual ~Magnetic() = default;
@@ -42,7 +84,10 @@ class Magnetic : public MAS::Magnetic {
             if (!coil) throw std::runtime_error("Magnetic has no coil (e.g. a chip-bead datasheet entry with no winding construction)");
             return coil.value();
         }
-        void set_coil(const Coil & value) { this->coil = value; }
+        void set_coil(const Coil & value) {
+            this->coil = value;
+            give_coil_its_core();
+        }
 
         /**
          * Data describing the magnetic core.
@@ -55,7 +100,10 @@ class Magnetic : public MAS::Magnetic {
             if (!core) throw std::runtime_error("Magnetic has no core (e.g. a chip-bead datasheet entry with no core construction)");
             return core.value();
         }
-        void set_core(const Core & value) { this->core = value; }
+        void set_core(const Core & value) {
+            this->core = value;
+            give_coil_its_core();
+        }
 
         Magnetic(const MAS::Magnetic magnetic) {
             if (magnetic.get_core()) {

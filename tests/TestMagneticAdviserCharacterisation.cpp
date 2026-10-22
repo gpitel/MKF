@@ -48,7 +48,10 @@
 #include "advisers/MagneticAdviser.h"
 #include "constructive_models/Mas.h"
 #include "processors/Inputs.h"
+#include "physical_models/InitialPermeability.h"
+#include "support/Exceptions.h"
 #include "processors/MagneticSimulator.h"
+#include "processors/Sweeper.h"
 #include "support/Settings.h"
 #include "support/Utils.h"
 
@@ -212,15 +215,21 @@ const std::vector<MagneticEntry> kTopThreeWinding = {
     // all slots. Slots 0 and 1 are the same design differing only in winding order
     // (021 vs 012) with scores 0.0005% apart: a documented near-tie, not a meaningful
     // preference. Score scale moved (2.31 -> 1.70) with the normalization pool.
-    {"95 E 8/2 2 stacks gapped 0.02 mm, Turns: 13, Order: 021, Non-Interleaved, Margin Taped 01",
-     "Round 33.0 - Single Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
-     1.7000769237774718},
-    {"95 E 8/2 2 stacks gapped 0.02 mm, Turns: 13, Order: 012, Non-Interleaved, Margin Taped 01",
-     "Round 33.0 - Single Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
-     1.7},
-    {"79 E 10/3 gapped 0.04 mm, Turns: 21, Order: 021, Non-Interleaved, Margin Taped 00",
-     "Round 33.0 - Single Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
-     1},
+    // Refreshed 2026-09-30 (user-approved): the COST filter now scores the unit cost in US$ at 1000
+    // pieces (core price law + copper + winding labour) instead of numberLayers + wire relative cost, so
+    // the composite re-ranks. The 79-material E 10/3 at 21 turns returns to slot 0; the 95-material
+    // E 8/2 2-stack leaves the top 3 and a 79 E 8.3/4 2-stack at 12 turns takes slots 1-2 (the same
+    // design in two winding orders). Both 79 and 95 are priced MnZn ferrites, so no candidate was
+    // dropped by a COST throw; the old winner was out-scored. The per-design US$ were not broken down.
+    {"79 E 10/3 gapped 0.04 mm, Turns: 21, Order: 021, Non-Interleaved, Margin Taped 01",
+     "Round 35.5 - Single Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
+     2},
+    {"79 E 8.3/4 2 stacks gapped 0.01 mm, Turns: 12, Order: 021, Non-Interleaved, Margin Taped 00",
+     "Round 33.0 - Single Build || Round 38.0 - Single Build || Round 38.0 - Single Build",
+     0.85007868429843947},
+    {"79 E 8.3/4 2 stacks gapped 0.01 mm, Turns: 12, Order: 012, Non-Interleaved, Margin Taped 00",
+     "Round 33.0 - Single Build || Round 38.0 - Single Build || Round 38.0 - Single Build",
+     0.84999999999999998},
 };
 
 } // namespace
@@ -272,13 +281,38 @@ static OpenMagnetics::Inputs load_cllc_resonant_inductor_inputs() {
     return OpenMagnetics::Inputs(nlohmann::json::parse(file));
 }
 
+// The same inductor at a fraction of its measured tank current (voltage scaled with it, the
+// inductor's own V = L di/dt). At full current no standard core inside the 41 x 43 x 44 mm
+// envelope stays under the 130 C temperature gate once the copper is scored as the coil stage
+// would wind it (coolest: 95 E 41/16.5/12.5 x3, 136.7 C), so the tests below that check what
+// the adviser does with a design it can build (envelope, inductance band, loss balance) run it
+// at half current (2026-10-04, ABT #1412).
+static OpenMagnetics::Inputs load_cllc_resonant_inductor_inputs_at_current_fraction(double currentFraction) {
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "abt1410_cllc_resonant_inductor_inputs.json");
+    std::ifstream file(path);
+    REQUIRE(file.is_open());
+    auto inputsJson = nlohmann::json::parse(file);
+    for (auto& operatingPoint : inputsJson["operatingPoints"]) {
+        for (auto& excitation : operatingPoint["excitationsPerWinding"]) {
+            for (const char* signal : {"current", "voltage"}) {
+                REQUIRE(excitation[signal]["waveform"].contains("data"));
+                REQUIRE_FALSE(excitation[signal].contains("processed"));
+                for (auto& value : excitation[signal]["waveform"]["data"]) {
+                    value = value.get<double>() * currentFraction;
+                }
+            }
+        }
+    }
+    return OpenMagnetics::Inputs(inputsJson);
+}
+
 // ABT #1410: standard-cores design mode returned an ER 51/10/38 (51 mm wide) inside a
 // 41 x 43 x 44 mm envelope, because only the height was ever checked.
 TEST_CASE("MagneticAdviser standard cores keeps the wound magnetic inside the maximum dimensions",
           "[adviser][magnetic-adviser][standard-cores][abt-1410]") {
     settings.reset();
     clear_databases();
-    auto inputs = load_cllc_resonant_inductor_inputs();
+    auto inputs = load_cllc_resonant_inductor_inputs_at_current_fraction(0.5);
     REQUIRE(inputs.get_design_requirements().get_maximum_dimensions());
 
     OpenMagnetics::MagneticAdviser adviser;
@@ -303,7 +337,7 @@ TEST_CASE("MagneticAdviser available cores returns only designs inside the magne
           "[adviser][magnetic-adviser][available-cores][abt-1411]") {
     settings.reset();
     clear_databases();
-    auto inputs = load_cllc_resonant_inductor_inputs();
+    auto inputs = load_cllc_resonant_inductor_inputs_at_current_fraction(0.5);
     const auto& requirement = inputs.get_design_requirements().get_magnetizing_inductance();
     double minimum = requirement.get_minimum().value();
     double maximum = requirement.get_maximum().value();
@@ -344,7 +378,7 @@ TEST_CASE("MagneticAdviser standard cores sizes an AC-dominated inductor by loss
           "[adviser][magnetic-adviser][standard-cores][abt-1426]") {
     settings.reset();
     clear_databases();
-    auto inputs = load_cllc_resonant_inductor_inputs();
+    auto inputs = load_cllc_resonant_inductor_inputs_at_current_fraction(0.5);
 
     OpenMagnetics::MagneticAdviser adviser;
     adviser.set_core_mode(CoreAdviser::CoreAdviserModes::STANDARD_CORES);
@@ -561,6 +595,267 @@ TEST_CASE("MagneticAdviser advises a toroidal CMC for the web wizard's default d
     for (auto& [mas, scoring] : results) {
         CHECK(mas.get_mutable_magnetic().get_mutable_core().get_type() == CoreType::TOROIDAL);
         CHECK(mas.get_mutable_magnetic().get_mutable_coil().get_functional_description().size() == 2);
+    }
+    settings.reset();
+    clear_databases();
+}
+
+namespace {
+
+// Replays WebLibMKF calculate_advised_magnetics_impl for an interferenceSuppression
+// input: weights normalised to sum 1, then the explicit suppression filter flow the
+// binding builds (CORE_MINIMUM_IMPEDANCE, COST, LOSSES, DIMENSIONS, LEAKAGE_INDUCTANCE,
+// TURN_COUNT) instead of the weights map.
+std::vector<std::pair<OpenMagnetics::Mas, double>> replay_web_suppression_magnetic_adviser(const std::string& fixtureName) {
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/" + fixtureName);
+    std::ifstream file(path);
+    REQUIRE(file.is_open());
+    auto fixture = nlohmann::json::parse(file);
+    OpenMagneticsTesting::apply_web_engine_settings(fixture.at("engineSettingsAtCall"));
+    Settings::GetInstance().set_coil_delimit_and_compact(true);
+
+    OpenMagnetics::Inputs inputs(fixture.at("inputs"));
+    REQUIRE(inputs.get_design_requirements().get_application().value() == "interferenceSuppression");
+    CoreAdviser::CoreAdviserModes coreMode;
+    from_json(fixture.at("coreMode"), coreMode);
+
+    std::map<std::string, double> weightsByName = fixture.at("weights");
+    double weightSum = 0;
+    for (auto const& [name, weight] : weightsByName) {
+        weightSum += weight;
+    }
+    std::map<MagneticFilters, double> weights;
+    for (auto const& [name, weight] : weightsByName) {
+        MagneticFilters filter;
+        from_json(name, filter);
+        weights[filter] = weight / weightSum;
+    }
+    double wCost = weights.at(MagneticFilters::COST);
+    double wLosses = weights.at(MagneticFilters::LOSSES);
+    double wDims = weights.at(MagneticFilters::DIMENSIONS);
+    std::vector<MagneticFilterOperation> filterFlow{
+        MagneticFilterOperation(MagneticFilters::CORE_MINIMUM_IMPEDANCE, true, true, true, std::max(1.0, wDims * 2.0)),
+        MagneticFilterOperation(MagneticFilters::COST, true, true, false, wCost),
+        MagneticFilterOperation(MagneticFilters::LOSSES, true, true, false, wLosses),
+        MagneticFilterOperation(MagneticFilters::DIMENSIONS, true, true, false, wDims),
+        MagneticFilterOperation(MagneticFilters::LEAKAGE_INDUCTANCE, true, true, false, wDims),
+        MagneticFilterOperation(MagneticFilters::TURN_COUNT, true, false, false, std::max(wLosses, wDims)),
+    };
+
+    OpenMagnetics::MagneticAdviser adviser;
+    adviser.set_core_mode(coreMode);
+    return adviser.get_advised_magnetic(inputs, filterFlow, fixture.at("maximumNumberResults").get<size_t>());
+}
+
+}  // namespace
+
+// ABT #1699: the web's CMC wizard -> Magnetic Adviser call, captured at the engine proxy.
+// It threw "[COIL_NOT_PROCESSED] ... Missing turns description to evaluate cost filter":
+// a candidate reached the COST filter without a wound coil.
+// The fixture's inputs are Kirchhoff design_cmc's output for the wizard spec (230 V, 10 A, 50 Hz, 2
+// windings, 500 ohm at 150 kHz, C_par 10 pF, dV/dt 50 V/ns). Its "Nominal" operating point was captured
+// when Kirchhoff drove each winding with I_cm = C*dV/dt = 0.5 A as a continuous 150 kHz sinusoid, so each
+// winding saw v = L*w*(sum I_cm) = 0.5305 mH * 2pi*150 kHz * 1 A = 500 V peak (~0.7 T; no toroid stayed
+// under the adviser's 130 C gate). C*dV/dt only lasts the few-ns switching edge. The CM current at 150 kHz
+// is the switch node's 150 kHz component through C_par: V_bus = sqrt(2)*230 = 325.3 V, t_r = V_bus/(dV/dt)
+// = 6.5 ns, V_1 = (2/pi)*V_bus*sinc(pi*f*t_r) = 207.1 V, I_cm = 2pi*f*C_par*V_1 = 1.95 mA in total, i.e.
+// 0.98 mA per winding on its +-10 A line (DM) level, and the voltage on every winding is the CM drop on
+// the choke's own CM impedance, |Z|*I_cm = 500 ohm * 1.95 mA = 0.98 V peak. That "Nominal" operating point
+// was regenerated with the corrected Kirchhoff (cmc_common_mode_current_peak); the line-frequency operating
+// point and the design requirements are unchanged.
+TEST_CASE("MagneticAdviser web CMC suppression flow returns wound toroidal CMCs",
+          "[adviser][magnetic-adviser][available-cores][cmc][suppression][abt-1699]") {
+    settings.reset();
+    clear_databases();
+    std::vector<std::pair<OpenMagnetics::Mas, double>> results;
+    REQUIRE_NOTHROW(results = replay_web_suppression_magnetic_adviser("cmc_calculate_advised_magnetics.json"));
+    REQUIRE(results.size() > 0);
+    for (auto& [mas, scoring] : results) {
+        CHECK(mas.get_mutable_magnetic().get_mutable_core().get_type() == CoreType::TOROIDAL);
+        CHECK(mas.get_magnetic().get_coil().get_turns_description().has_value());
+    }
+    settings.reset();
+    clear_databases();
+}
+
+// ABT #1699: the web's DMC wizard -> Magnetic Adviser call (standard cores, 6 results).
+TEST_CASE("MagneticAdviser web DMC suppression flow returns wound chokes",
+          "[adviser][magnetic-adviser][standard-cores][dmc][suppression][abt-1699]") {
+    settings.reset();
+    clear_databases();
+    std::vector<std::pair<OpenMagnetics::Mas, double>> results;
+    REQUIRE_NOTHROW(results = replay_web_suppression_magnetic_adviser("dmc_calculate_advised_magnetics.json"));
+    REQUIRE(results.size() > 0);
+    for (auto& [mas, scoring] : results) {
+        CHECK(mas.get_magnetic().get_coil().get_turns_description().has_value());
+    }
+    settings.reset();
+    clear_databases();
+}
+
+// ABT #1794: the candidates of the DMC switching-ripple call below include Nanoperm 2000 toroids.
+// To reach 450 ohm at 150 kHz on T 25/16/10 the filter raises the turns until the line current biases
+// the core to 1554 A/m, past the knee of that material, where its permeability model gives mu_r < 1
+// (0.963) and the impedance model refuses the bias with CALCULATION_CORE_SATURATES (ABT #1740). The
+// filter caught only ModelNotAvailableException, so one saturating candidate threw out of the whole
+// adviser. It is rejected instead and the adviser goes on with the others (Alf, 2026-10-12).
+TEST_CASE("CoreMinimumImpedance filter rejects a candidate whose core saturates at its bias",
+          "[adviser][magnetic-filter][dmc][suppression][abt-1794]") {
+    settings.reset();
+    clear_databases();
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/dmc_calculate_advised_magnetics_switching_ripple.json");
+    std::ifstream file(path);
+    REQUIRE(file.is_open());
+    auto fixture = nlohmann::json::parse(file);
+    OpenMagneticsTesting::apply_web_engine_settings(fixture.at("engineSettingsAtCall"));
+    OpenMagnetics::Inputs inputs(fixture.at("inputs"));
+    REQUIRE(inputs.get_design_requirements().get_minimum_impedance().has_value());
+
+    // The premise, outside the filter: at that bias the material is saturated, and at a small one it
+    // is a material. Until ABT #1855 the permeability refused that bias (SaturationException); since then
+    // (Alf approved this rewrite 2026-10-14, ABT #1855) the saturated material takes the vacuum's
+    // permeability, 1, and the filter rejects the candidate through the shared saturation check
+    // (ResultsAnalyzer::check_saturation on B at the bias).
+    auto coreMaterial = find_core_material_by_name("Nanoperm 2000");
+    CHECK(InitialPermeability::get_initial_permeability(coreMaterial, 25, 1554.28, 150000) == 1);
+    CHECK(InitialPermeability::get_initial_permeability(coreMaterial, 25, 10, 150000) > 1);
+
+    // The adviser's standard-cores candidates: each toroid shape with the material, ungapped.
+    for (std::string shapeName : {"T 25/16/10", "T 30/20/10", "T 40/32/15"}) {
+        INFO("core " << shapeName << " - Nanoperm 2000 - Ungapped");
+        json coreJson = json::parse(R"({"functionalDescription": {"gapping": [], "material": "Nanoperm 2000", "numberStacks": 1, "shape": "", "type": "toroidal"}, "name": "candidate"})");
+        coreJson["functionalDescription"]["shape"] = shapeName;
+        OpenMagnetics::Core core(coreJson);
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(OpenMagnetics::Coil(json::parse(R"({"bobbin": "Dummy", "functionalDescription": [{"isolationSide": "primary", "name": "Primary", "numberParallels": 1, "numberTurns": 1, "wire": "Dummy"}, {"isolationSide": "primary", "name": "Secondary", "numberParallels": 1, "numberTurns": 1, "wire": "Dummy"}], "layersDescription": null, "sectionsDescription": null, "turnsDescription": null})")));
+
+        MagneticFilterCoreMinimumImpedance filter;
+        std::pair<bool, double> verdict{true, -1};
+        REQUIRE_NOTHROW(verdict = filter.evaluate_magnetic(&magnetic, &inputs));
+        CHECK_FALSE(verdict.first);
+        CHECK(verdict.second == 0);
+    }
+    settings.reset();
+    clear_databases();
+}
+
+TEST_CASE("MagneticAdviser web DMC whose switching ripple is resolved returns wound chokes",
+          "[adviser][magnetic-adviser][standard-cores][dmc][suppression][bug]") {
+    // The web's DMC wizard -> Magnetic Adviser call of 2026-10-11: two windings, each carrying the
+    // 50 Hz line current (4.8 A peak) with a 0.44 A, 100 kHz switching ripple, sampled at 16384
+    // points so the ripple is resolved (the 1024-point fixture above aliases it to 2.4 kHz).
+    // The magnetizing-inductance model took the CMC branch for it (matching winding currents on a
+    // toroid) and drove the core with a triangle of the line current's whole swing at 100 kHz:
+    // ~400 W of core losses, every candidate over the 130 C limit, no result. The DMC topology
+    // now selects the DMC magnetizing current, the sum of the winding currents as sampled.
+    settings.reset();
+    clear_databases();
+    std::vector<std::pair<OpenMagnetics::Mas, double>> results;
+    REQUIRE_NOTHROW(results = replay_web_suppression_magnetic_adviser("dmc_calculate_advised_magnetics_switching_ripple.json"));
+    REQUIRE(results.size() > 0);
+    for (auto& [mas, scoring] : results) {
+        CHECK(mas.get_magnetic().get_coil().get_turns_description().has_value());
+    }
+
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/dmc_calculate_advised_magnetics_switching_ripple.json");
+    std::ifstream file(path);
+    OpenMagnetics::Inputs inputs(nlohmann::json::parse(file).at("inputs"));
+    auto operatingPoint = inputs.get_operating_point(0);
+    const auto& excitations = operatingPoint.get_excitations_per_winding();
+    REQUIRE(excitations.size() == 2);
+    auto lineCurrent = excitations[0].get_current()->get_waveform()->get_data();
+    auto neutralCurrent = excitations[1].get_current()->get_waveform()->get_data();
+    REQUIRE(lineCurrent.size() == 16384);
+
+    MagnetizingInductance magnetizingInductance;
+    magnetizingInductance.set_topology(inputs.get_design_requirements().get_topology());
+    magnetizingInductance.calculate_inductance_and_magnetic_flux_density(results[0].first.get_magnetic(), &operatingPoint);
+    auto magnetizingCurrent = operatingPoint.get_excitations_per_winding()[0].get_magnetizing_current()->get_waveform()->get_data();
+    REQUIRE(magnetizingCurrent.size() == lineCurrent.size());
+    for (size_t index = 0; index < lineCurrent.size(); index += 1024) {
+        CHECK_THAT(magnetizingCurrent[index], Catch::Matchers::WithinAbs(lineCurrent[index] + neutralCurrent[index], 1e-9));
+    }
+
+    // The core-losses-over-frequency plot drives the core the same way (ABT #1754): at the
+    // operating frequency it must report what the simulator reports for this DMC. Without the
+    // topology the model cannot tell the DMC from a CMC and takes the CMC triangle, which is what
+    // the sweep's own copy of the branches always did: ~550 W against ~2 W.
+    auto magnetic = results[0].first.get_magnetic();
+    auto topology = inputs.get_design_requirements().get_topology();
+    double operatingFrequency = inputs.get_operating_point(0).get_excitations_per_winding()[0].get_frequency();
+    MagneticSimulator simulator;
+    simulator.set_core_losses_model_name(CoreLossesModels::STEINMETZ);
+    simulator.set_topology(topology);
+    auto simulatedOperatingPoint = inputs.get_operating_point(0);
+    auto simulatedCoreLosses = simulator.calculate_core_losses(simulatedOperatingPoint, magnetic);
+    // The simulator solves the losses with the temperature they heat the core to (ABT #838: 76.4 C
+    // here, from 25 C ambient), so the sweep is run at that solved temperature and both sides price
+    // the same core (at ambient the sweep reads 6.836 W against the simulator's 6.932 W). Approved
+    // by Alf 2026-10-13.
+    double solvedTemperature = simulatedCoreLosses.get_temperature();
+    CHECK(solvedTemperature > inputs.get_operating_point(0).get_conditions().get_ambient_temperature());
+
+    auto dmcSweep = Sweeper::sweep_core_losses_over_frequency(magnetic, inputs.get_operating_point(0), topology,
+                                                              operatingFrequency, 100 * operatingFrequency, 3, solvedTemperature);
+    auto cmcBranchSweep = Sweeper::sweep_core_losses_over_frequency(magnetic, inputs.get_operating_point(0), std::nullopt,
+                                                                    operatingFrequency, 100 * operatingFrequency, 3, solvedTemperature);
+    REQUIRE_THAT(dmcSweep.get_x_points()[0], Catch::Matchers::WithinRel(operatingFrequency, 1e-9));
+    INFO("solved core temperature " << solvedTemperature << " C");
+    INFO("f = " << operatingFrequency << " Hz: simulator " << simulatedCoreLosses.get_core_losses() << " W, DMC sweep "
+         << dmcSweep.get_y_points()[0] << " W, CMC branch " << cmcBranchSweep.get_y_points()[0] << " W");
+    CHECK_THAT(dmcSweep.get_y_points()[0], Catch::Matchers::WithinRel(simulatedCoreLosses.get_core_losses(), 0.01));
+    CHECK_FALSE(cmcBranchSweep.get_y_points()[0] < 10 * simulatedCoreLosses.get_core_losses());
+
+    // Each switching cycle swings at its own instantaneous line bias (ABT #1764): with the permeability of the
+    // line swing's peak (~104) for every cycle the ripple near the zero crossings was priced ~4x low, 1.74 W.
+    // Reference: the record split at its current's valleys, each cycle's ripple B = mu0 * mu(H of the cycle's
+    // mean current) * N * di / l_e on the material's DC-bias curve, Steinmetz per cycle at its own rate: 6.84 W
+    // (first-principles script on this magnetic, the ungapped T 48/23/19 MPP 300 with 30 + 30 turns).
+    REQUIRE(magnetic.get_core().get_shape_name() == "T 48/23/19");
+    REQUIRE(magnetic.get_core().get_material_name() == "MPP 300");
+    REQUIRE(magnetic.get_core().get_functional_description().get_gapping().empty());
+    REQUIRE(magnetic.get_coil().get_functional_description()[0].get_number_turns() == 30);
+    CHECK_THAT(simulatedCoreLosses.get_core_losses(), Catch::Matchers::WithinRel(6.84, 0.05));
+
+    // The operating point as stored (waveforms, no harmonics) is the same excitation as its processed
+    // copy, so the sweep must price it the same (ABT #1764): it read 16.3 W against 1.74 W, because
+    // the switching frequency came from the cached harmonics and fell back to 50 Hz without them,
+    // which dropped the line swing's DC-bias roll-off of the MPP 300 permeability.
+    std::ifstream storedFile(path);
+    OperatingPoint storedOperatingPoint(nlohmann::json::parse(storedFile)["inputs"]["operatingPoints"][0]);
+    REQUIRE_FALSE(storedOperatingPoint.get_excitations_per_winding()[0].get_current()->get_harmonics());
+    auto storedSweep = Sweeper::sweep_core_losses_over_frequency(magnetic, storedOperatingPoint, topology,
+                                                                 operatingFrequency, 100 * operatingFrequency, 3, solvedTemperature);
+    INFO("stored operating point: " << storedSweep.get_y_points()[0] << " W, processed: " << dmcSweep.get_y_points()[0] << " W");
+    CHECK_THAT(storedSweep.get_y_points()[0], Catch::Matchers::WithinRel(dmcSweep.get_y_points()[0], 0.01));
+
+    // Swept to 500 Hz and 5 kHz the record is the same line current with its ripple, faster: the line
+    // swing still biases the core (ABT #1764). A fixed f < 400 Hz gate on the switching-frequency
+    // detection gave those points no bias: mu 300 and 1.02 T on an MPP 300 core that saturates at
+    // 0.8 T, and 685 W / 28754 W in the plot.
+    auto fluxDensityPeakAt = [&](double lineFrequency) {
+        auto swept = inputs.get_operating_point(0);
+        OpenMagnetics::Inputs::scale_time_to_frequency(swept, lineFrequency, false, true);
+        for (auto& excitation : swept.get_mutable_excitations_per_winding()) {
+            excitation.set_magnetizing_current(std::nullopt);
+            excitation.set_magnetic_flux_density(std::nullopt);
+        }
+        MagnetizingInductance sweptModel;
+        sweptModel.set_topology(topology);
+        return sweptModel.calculate_inductance_and_magnetic_flux_density(magnetic, &swept).second.get_processed()->get_peak().value();
+    };
+    double lineFrequencyFluxDensityPeak = fluxDensityPeakAt(operatingFrequency);
+    auto saturation = magnetic.get_core().resolve_material().get_saturation();
+    REQUIRE_FALSE(saturation.empty());
+    double saturationFluxDensity = saturation[0].get_magnetic_flux_density();
+    CHECK(lineFrequencyFluxDensityPeak < saturationFluxDensity);
+    for (double lineFrequency : {10 * operatingFrequency, 100 * operatingFrequency}) {
+        double fluxDensityPeak = fluxDensityPeakAt(lineFrequency);
+        INFO("line frequency " << lineFrequency << " Hz: B peak " << fluxDensityPeak << " T, at " << operatingFrequency << " Hz "
+             << lineFrequencyFluxDensityPeak << " T, saturation " << saturationFluxDensity << " T");
+        CHECK(fluxDensityPeak < saturationFluxDensity);
+        CHECK_THAT(fluxDensityPeak, Catch::Matchers::WithinRel(lineFrequencyFluxDensityPeak, 0.02));
     }
     settings.reset();
     clear_databases();

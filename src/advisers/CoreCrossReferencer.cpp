@@ -2,6 +2,7 @@
 #include "physical_models/InitialPermeability.h"
 #include "advisers/CoreCrossReferencer.h"
 #include "physical_models/Impedance.h"
+#include "physical_models/ComplexPermeability.h"
 #include "constructive_models/Bobbin.h"
 #include "advisers/CrossReferencerCommon.h"
 #include "processors/MagneticSimulator.h"
@@ -385,7 +386,9 @@ std::pair<double, double> CoreCrossReferencer::MagneticCoreFilterCoreLosses::cal
             coil.set_functional_description({winding});
             magnetic.set_coil(coil);
             for (auto operatingPoint : inputs.get_operating_points()) {
-                auto coreLossesOutput = magneticSimulator.calculate_core_losses(operatingPoint, magnetic);
+                magneticSimulator.set_topology(inputs.get_design_requirements().get_topology());
+                auto coreLossesOutput = magneticSimulator.calculate_core_losses(operatingPoint, magnetic, nullptr, nullptr,
+                                                                                WindingLossesScope::FULL, NoThermalOperatingPointPolicy::THROW);
                 averageCoreLosses += coreLossesOutput.get_core_losses();
                 double magneticFluxDensityPeak = coreLossesOutput.get_magnetic_flux_density()->get_processed()->get_peak().value();
                 maximumMagneticFluxDensitySaturationPeak = std::max(maximumMagneticFluxDensitySaturationPeak, magneticFluxDensityPeak);
@@ -574,6 +577,10 @@ std::vector<std::pair<Core, double>> CoreCrossReferencer::MagneticCoreFilterImpe
     // ranking is unaffected.
     constexpr bool kFastCapacitanceForScoring = true;
     auto impedanceModel = Impedance(kFastCapacitanceForScoring);
+    // Candidates are compared on their materials' tabulated complex permeability only: one whose
+    // data do not cover a sampled frequency drops out of this filter (the catch below), and is never
+    // ranked on an estimate (ABT #1861, proposal D5).
+    impedanceModel.set_tabulated_complex_permeability_only(true);
     // The placeholder winding is the one MagnetizingInductance uses for its coil-less shim:
     // a quick bobbin built from the core itself and one real wire. A DUMMY_SENTINEL_NAME
     // bobbin is rejected outright by the capacitance model ("Bobbin is dummy"), and the
@@ -595,10 +602,28 @@ std::vector<std::pair<Core, double>> CoreCrossReferencer::MagneticCoreFilterImpe
         return magnetic;
     };
 
+    // The reference is compared only where its material has complex permeability: outside
+    // the tabulated span there is no data (get_complex_permeability throws), so a sampled
+    // frequency past it (e.g. 100 MHz and 1 GHz on 3C91, whose table ends at 30 MHz) cannot
+    // carry a reference value. A reference whose data covers none of the sampled
+    // frequencies cannot be cross-referenced by impedance at all.
+    std::vector<double> sampledFrequencies;
+    {
+        auto [minimumMaterialFrequency, maximumMaterialFrequency] = ComplexPermeability().get_frequency_range(referenceCore.resolve_material());
+        for (auto frequency : _frequencies) {
+            if (frequency >= minimumMaterialFrequency && frequency <= maximumMaterialFrequency) {
+                sampledFrequencies.push_back(frequency);
+            }
+        }
+        if (sampledFrequencies.empty()) {
+            throw InvalidInputException(ErrorCode::MATERIAL_FREQUENCY_OUT_OF_SPAN, "Reference core material " + referenceCore.resolve_material().get_name() + ": complex permeability (" + std::to_string(minimumMaterialFrequency) + " Hz to " +
+                                     std::to_string(maximumMaterialFrequency) + " Hz) covers none of the impedance cross-reference frequencies");
+        }
+    }
     std::vector<double> referenceImpedances;
     {
         auto referenceMagnetic = windMagnetic(referenceCore);
-        for (auto frequency : _frequencies) {
+        for (auto frequency : sampledFrequencies) {
             referenceImpedances.push_back(std::abs(impedanceModel.calculate_impedance(referenceMagnetic, frequency)));
         }
     }
@@ -634,8 +659,8 @@ std::vector<std::pair<Core, double>> CoreCrossReferencer::MagneticCoreFilterImpe
         bool usable = true;
         try {
             auto candidateMagnetic = windMagnetic(core);
-            for (size_t i = 0; i < _frequencies.size(); ++i) {
-                double candidateImpedance = std::abs(impedanceModel.calculate_impedance(candidateMagnetic, _frequencies[i]));
+            for (size_t i = 0; i < sampledFrequencies.size(); ++i) {
+                double candidateImpedance = std::abs(impedanceModel.calculate_impedance(candidateMagnetic, sampledFrequencies[i]));
                 // Skip a frequency where either side is zero rather than treating it as a
                 // perfect or infinite match: log10 of a ratio with a zero in it is not a
                 // number, and silently substituting one would invent a score.
@@ -689,6 +714,13 @@ std::vector<std::pair<Core, double>> CoreCrossReferencer::get_cross_referenced_c
 
 std::vector<std::pair<Core, double>> CoreCrossReferencer::get_cross_referenced_core(Core referenceCore, int64_t referenceNumberTurns, Inputs inputs, std::map<CoreCrossReferencerFilters, double> weights, size_t maximumNumberResults) {
     _weights = weights;
+    // ABT #1620: the scores are distances to THIS reference core. The filters reuse a candidate's
+    // valid score across the widening-limit passes below (the distance does not depend on the
+    // limit), but the maps used to survive across calls, so a second reference core was ranked by
+    // the first one's distances.
+    _scorings.clear();
+    _validScorings.clear();
+    _scoredValues.clear();
 
     if (coreDatabase.empty()) {
         load_cores();

@@ -229,6 +229,15 @@ std::string read_log() {
     return contents;
 }
 
+bool material_data_extrapolation_allowed(const std::string& what) {
+    if (!settings.get_allow_material_data_extrapolation()) {
+        return false;
+    }
+    Logger::getInstance().warning(what + " (extrapolated: allowMaterialDataExtrapolation is on)",
+                                  kMaterialDataExtrapolationModule);
+    return true;
+}
+
 void logEntry(std::string entry, std::string module, uint8_t entryVerbosity) {
     auto& logger = Logger::getInstance();
     LogLevel level = (entryVerbosity == 0) ? LogLevel::ERROR 
@@ -261,6 +270,7 @@ std::string select_embedded_cores_catalogue(bool useOnlyCoresInStock, bool stock
 
 void load_cores(std::optional<std::string> fileToLoad) {
     throw_if_databases_frozen("load_cores");
+    bump_catalogue_generation();
     bool includeToroidalCores = settings.get_use_toroidal_cores();
     bool includeConcentricCores = settings.get_use_concentric_cores();
     bool useOnlyCoresInStock = settings.get_use_only_cores_in_stock();
@@ -316,11 +326,13 @@ void load_cores(std::optional<std::string> fileToLoad) {
 
 void clear_loaded_cores() {
     throw_if_databases_frozen("clear_loaded_cores");
+    bump_catalogue_generation();
     coreDatabase.clear();
 }
 
 void clear_loaded_core_shapes() {
     throw_if_databases_frozen("clear_loaded_core_shapes");
+    bump_catalogue_generation();
     coreShapeDatabase.clear();
     coreShapeFamiliesInDatabase.clear();
 }
@@ -335,6 +347,7 @@ void clear_databases() {
     bobbinDatabase.clear();
     insulationMaterialDatabase.clear();
     wireMaterialDatabase.clear();
+    bump_catalogue_generation();
 }
 
 void load_core_materials(std::optional<std::string> fileToLoad) {
@@ -342,6 +355,7 @@ void load_core_materials(std::optional<std::string> fileToLoad) {
     if (!_addInternalData) {
         return;
     }
+    bump_catalogue_generation();
     std::string database = load_ndjson_data("MAS/data/core_materials.ndjson", fileToLoad);
     parse_ndjson(database, [](const json& jf) {
         CoreMaterial coreMaterial(jf);
@@ -519,6 +533,7 @@ void load_core_shapes(bool withAliases, std::optional<std::string> fileToLoad) {
     if (!_addInternalData) {
         return;
     }
+    bump_catalogue_generation();
     bool includeToroidalCores = settings.get_use_toroidal_cores();
     bool includeConcentricCores = settings.get_use_concentric_cores();
 
@@ -583,6 +598,7 @@ void load_wires(std::optional<std::string> fileToLoad) {
     if (!_addInternalData) {
         return;
     }
+    bump_catalogue_generation();
     std::string database = load_ndjson_data("MAS/data/wires.ndjson", fileToLoad);
     parse_ndjson(database, [](const json& jf) {
         OpenMagnetics::Wire wire(jf);
@@ -624,6 +640,7 @@ void load_bobbins() {
     if (!_addInternalData) {
         return;
     }
+    bump_catalogue_generation();
     std::string database = load_ndjson_data("MAS/data/bobbins.ndjson");
     parse_ndjson(database, [](const json& jf) {
         bobbinDatabase[jf["name"]] = load_catalogue_bobbin(jf);
@@ -635,6 +652,7 @@ void load_insulation_materials() {
     if (!_addInternalData) {
         return;
     }
+    bump_catalogue_generation();
     std::string database = load_ndjson_data("MAS/data/insulation_materials.ndjson");
     parse_ndjson(database, [](const json& jf) {
         InsulationMaterial insulationMaterial(jf);
@@ -647,6 +665,7 @@ void load_wire_materials() {
     if (!_addInternalData) {
         return;
     }
+    bump_catalogue_generation();
     std::string database = load_ndjson_data("MAS/data/wire_materials.ndjson");
     parse_ndjson(database, [](const json& jf) {
         WireMaterial wireMaterial(jf);
@@ -656,6 +675,7 @@ void load_wire_materials() {
 
 void load_databases(json data, bool withAliases, bool addInternalData) {
     throw_if_databases_frozen("load_databases");
+    bump_catalogue_generation();
     _addInternalData = addInternalData;
     if (addInternalData) {
         if (coreMaterialDatabase.empty()) {
@@ -1158,12 +1178,19 @@ std::vector<Wire> get_wires(std::optional<WireType> wireType, std::optional<Wire
     // list is safe to memoize by (type, standard).
     using CacheKey = std::pair<int, int>;
     // ABT #113: thread_local — per-thread memo over the frozen wireDatabase.
+    // ABT #1626: keyed on the catalogue generation (bumped by every clear, load and LibraryContext
+    // swap) as well as the size (a direct insertion into wireDatabase does not bump it).
     static thread_local std::map<CacheKey, std::vector<Wire>> filteredWiresCache;
     static thread_local size_t cachedDatabaseSize = 0;
-    if (cachedDatabaseSize != wireDatabase.size()) {
+    static thread_local uint64_t cachedCatalogueGeneration = 0;
+    static thread_local bool filteredWiresCacheBuilt = false;
+    const uint64_t currentCatalogueGeneration = catalogueGeneration.load(std::memory_order_relaxed);
+    if (!filteredWiresCacheBuilt || cachedDatabaseSize != wireDatabase.size() || cachedCatalogueGeneration != currentCatalogueGeneration) {
         // Database was reloaded since we last cached; invalidate.
         filteredWiresCache.clear();
         cachedDatabaseSize = wireDatabase.size();
+        cachedCatalogueGeneration = currentCatalogueGeneration;
+        filteredWiresCacheBuilt = true;
     }
     CacheKey key = {wireType.has_value() ? static_cast<int>(*wireType) : -1,
                     wireStandard.has_value() ? static_cast<int>(*wireStandard) : -1};
@@ -1230,7 +1257,8 @@ std::vector<Bobbin> find_toroid_bases_for_core(Core core, const std::vector<Bobb
         }
     }
     // The base holds the COATED ring: the coating is what touches the pocket, the boat and the limits.
-    const double coating = core.get_coating_thickness();
+    // A fit check, so the ring is taken at its largest coated envelope (MAXIMUM).
+    const double coating = core.get_coating_thickness(DimensionalValues::MAXIMUM);
     const double ringOuterDiameter = shapeDimensions.at("A") + 2 * coating;
     const double ringHeight = shapeDimensions.at("C") * static_cast<double>(core.get_number_stacks()) + 2 * coating;
 
@@ -2639,16 +2667,22 @@ std::vector<double> linear_spaced_array(double a, double b, size_t N) {
 
 
 std::vector<double> logarithmic_spaced_array(double a, double b, size_t N) {
+    if (N < 2) {
+        return N == 0 ? std::vector<double>{} : std::vector<double>{a};
+    }
     double logmin = log10(a);
     double logmax = log10(b);
 
     double h = (logmax - logmin) / static_cast<double>(N-1);
     std::vector<double> xs(N);
-    std::vector<double>::iterator x;
-    double val;
-    for (x = xs.begin(), val = log10(a); x != xs.end(); ++x, val += h) {
-        *x = pow(10, val);
+    for (size_t i = 0; i < N; ++i) {
+        xs[i] = pow(10, logmin + h * static_cast<double>(i));
     }
+    // The ends are the requested a and b, not pow(10, log10(.)) of them: the round trip can
+    // land one ulp outside, which puts a sweep ending at a material's last tabulated
+    // frequency just past it (and complex permeability throws there).
+    xs.front() = a;
+    xs.back() = b;
     return xs;
 }
 
@@ -2658,6 +2692,42 @@ double decibels_to_amplitude(double decibels) {
 }
 double amplitude_to_decibels(double amplitude) {
     return 20 * log10(amplitude);
+}
+
+std::string require_single_line_text(const std::string& text, const std::string& where) {
+    for (unsigned char c : text) {
+        if (c < 0x20 || c == 0x7f) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "The " + where + " contains a control character (code " + std::to_string(int(c)) +
+                "); a line break there would end the generated comment and be read as netlist or script");
+        }
+    }
+    return text;
+}
+
+std::string require_plecs_quoted_text(const std::string& text, const std::string& where) {
+    require_single_line_text(text, where);
+    if (text.find_first_of("\"\\") != std::string::npos) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "The " + where + " contains a double quote or a backslash, which would end the PLECS quoted string it is written into");
+    }
+    return text;
+}
+
+std::string escape_xml(const std::string& text) {
+    std::string escaped;
+    escaped.reserve(text.size());
+    for (char c : text) {
+        switch (c) {
+            case '&': escaped += "&amp;"; break;
+            case '<': escaped += "&lt;"; break;
+            case '>': escaped += "&gt;"; break;
+            case '"': escaped += "&quot;"; break;
+            case '\'': escaped += "&apos;"; break;
+            default: escaped += c;
+        }
+    }
+    return escaped;
 }
 
 std::string fix_filename(std::string filename) {
@@ -2688,29 +2758,60 @@ SignalDescriptor standardize_signal_descriptor(SignalDescriptor signalDescriptor
     return standardSignalDescriptor;
 }
 
-OperatingPointExcitation calculate_reflected_secondary(OperatingPointExcitation primaryExcitation, double turnRatio){
-    OperatingPointExcitation excitationOfThisWinding(primaryExcitation);
-    auto currentSignalDescriptorProcessed = Inputs::calculate_basic_processed_data(primaryExcitation.get_current().value().get_waveform().value());
-    auto voltageSignalDescriptorProcessed = Inputs::calculate_basic_processed_data(primaryExcitation.get_voltage().value().get_waveform().value());
-
-    auto voltageSignalDescriptor = Inputs::reflect_waveform(primaryExcitation.get_voltage().value(), 1.0 / turnRatio, voltageSignalDescriptorProcessed.get_label());
-    auto currentSignalDescriptor = Inputs::reflect_waveform(primaryExcitation.get_current().value(), turnRatio, currentSignalDescriptorProcessed.get_label());
-
-    auto voltageSampledWaveform = Inputs::calculate_sampled_waveform(voltageSignalDescriptor.get_waveform().value(), excitationOfThisWinding.get_frequency());
-    voltageSignalDescriptor.set_harmonics(Inputs::calculate_harmonics_data(voltageSignalDescriptor.get_waveform().value(), voltageSampledWaveform, excitationOfThisWinding.get_frequency()));
-    voltageSignalDescriptor.set_processed(Inputs::calculate_processed_data(voltageSignalDescriptor, voltageSampledWaveform, true));
-
-    auto currentSampledWaveform = Inputs::calculate_sampled_waveform(currentSignalDescriptor.get_waveform().value(), excitationOfThisWinding.get_frequency());
-    currentSignalDescriptor.set_harmonics(Inputs::calculate_harmonics_data(currentSignalDescriptor.get_waveform().value(), currentSampledWaveform, excitationOfThisWinding.get_frequency()));
-    currentSignalDescriptor.set_processed(Inputs::calculate_processed_data(currentSignalDescriptor, currentSampledWaveform, true));
-
-    excitationOfThisWinding.set_voltage(voltageSignalDescriptor);
-    excitationOfThisWinding.set_current(currentSignalDescriptor);
-
-    return excitationOfThisWinding;
+// ABT #1849: magnetic_autocomplete completes a winding that states no turns, no parallels or no
+// wire with a placeholder so the geometry can be drawn: 1 turn, 1 parallel, and the wire "Dummy",
+// which Winding::resolve_wire turns into "Round 0.01 - Grade 1" (10 um of copper). That is a
+// stand-in, not the design. Simulating it publishes the placeholder's losses and temperature as
+// the design's (PQ 32/30 with one such winding at 2 A rms: 12 Ohm, 48.3 W, 5880 C), so a
+// simulation is refused, naming each winding and what it lacks. After magnetic_autocomplete the
+// placeholder is a resolved wire like any other, so this reads the magnetic BEFORE completion.
+static void throw_if_a_winding_would_be_invented(const Magnetic& magnetic) {
+    const auto windings = magnetic.get_coil().get_functional_description();
+    std::string invented;
+    for (size_t windingIndex = 0; windingIndex < windings.size(); ++windingIndex) {
+        const auto& winding = windings[windingIndex];
+        std::vector<std::string> lacks;
+        if (winding.get_number_turns() == 0) {
+            lacks.push_back("numberTurns is 0");
+        }
+        if (winding.get_number_parallels() == 0) {
+            lacks.push_back("numberParallels is 0");
+        }
+        const auto wire = winding.get_wire();
+        if (std::holds_alternative<std::string>(wire)) {
+            const auto wireName = std::get<std::string>(wire);
+            if (wireName.empty()) {
+                lacks.push_back("it names no wire");
+            }
+            else if (wireName == DUMMY_SENTINEL_NAME) {
+                lacks.push_back(std::string("its wire is the placeholder '") + DUMMY_SENTINEL_NAME + "'");
+            }
+        }
+        if (lacks.empty()) {
+            continue;
+        }
+        if (!invented.empty()) {
+            invented += "; ";
+        }
+        invented += "winding " + std::to_string(windingIndex) + " ('" + winding.get_name() + "'): ";
+        for (size_t lackIndex = 0; lackIndex < lacks.size(); ++lackIndex) {
+            invented += (lackIndex == 0 ? "" : ", ") + lacks[lackIndex];
+        }
+    }
+    if (!invented.empty()) {
+        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+            "mas_autocomplete cannot simulate this magnetic: it would have to invent a winding (1 turn, 1 parallel "
+            "of a 10 um placeholder wire) and publish that stand-in's losses and temperature as the design's. " +
+            invented + ". Give each winding its turns, parallels and wire, or call mas_autocomplete with "
+            "simulate = false to complete the geometry only.");
+    }
 }
 
 Mas mas_autocomplete(Mas mas, bool simulate, json configuration) {
+
+    if (simulate) {
+        throw_if_a_winding_would_be_invented(mas.get_magnetic());
+    }
 
     // ABT #620: thread the design's own requirements into the coil so a re-wind here
     // (the common case for a file that only carries functionalDescription + bobbin)
@@ -2731,10 +2832,13 @@ Mas mas_autocomplete(Mas mas, bool simulate, json configuration) {
     // Because Simulation may remove some processed data, and we are in no rush here
     for (size_t operatingPointIndex = 0; operatingPointIndex < mas.get_inputs().get_operating_points().size(); operatingPointIndex++) {
         double magnetizingInductance = magnetizingInductanceObj.calculate_inductance_from_number_turns_and_gapping(mas.get_magnetic(), &mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex]).get_magnetizing_inductance().get_nominal().value();
-        mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex] = Inputs::process_operating_point(mas.get_inputs().get_operating_points()[operatingPointIndex], magnetizingInductance);
+        auto coilTurnsRatios = mas.get_magnetic().get_coil().get_turns_ratios();
+        mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex] = Inputs::process_operating_point(mas.get_inputs().get_operating_points()[operatingPointIndex], magnetizingInductance,
+                                                                                                                     coilTurnsRatios, false, mas.get_magnetic().get_coil().get_isolation_sides());
+        // The decision process_operating_point makes, compressed (ABT #1467).
+        auto processedOperatingPoint = mas.get_inputs().get_operating_points()[operatingPointIndex];
         for (size_t windingIndex = 0; windingIndex < numberWindings; windingIndex++) {
-            auto excitation = mas.get_inputs().get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex];
-            auto magnetizingCurrent = Inputs::calculate_magnetizing_current(excitation, magnetizingInductance, true, 0.0);
+            auto magnetizingCurrent = Inputs::calculate_magnetizing_current(processedOperatingPoint, windingIndex, magnetizingInductance, coilTurnsRatios, true);
             auto processed = Inputs::calculate_processed_data(magnetizingCurrent.get_waveform().value(), mas.get_inputs().get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex].get_frequency(), true);
             magnetizingCurrent.set_processed(processed);
             mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].set_magnetizing_current(magnetizingCurrent);
@@ -2816,16 +2920,19 @@ Inputs inputs_autocomplete(Inputs inputs, std::optional<Magnetic> magnetic, json
             }
             auto excitation = inputs.get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex];
 
-            auto magnetizingCurrent = Inputs::calculate_magnetizing_current(excitation, magnetizingInductance, true, 0.0);
+            // The decision Inputs::process_operating_point makes, compressed (ABT #1467): a
+            // single-winding inductor's current (ABT #1585), else Faraday on the voltage, which
+            // throws when the winding has none.
+            std::vector<double> requiredTurnsRatios;
+            for (auto& turnsRatio : inputs.get_design_requirements().get_turns_ratios()) {
+                requiredTurnsRatios.push_back(resolve_dimensional_values(turnsRatio));
+            }
+            auto magnetizingCurrent = Inputs::calculate_magnetizing_current(operatingPoint, windingIndex, magnetizingInductance, requiredTurnsRatios, true);
 
-            if (excitation.get_voltage()) {
-                if (excitation.get_voltage().value().get_processed()) {
-                    if (excitation.get_voltage().value().get_processed().value().get_duty_cycle()) {
-                        auto processed = magnetizingCurrent.get_processed().value();
-                        processed.set_duty_cycle(excitation.get_voltage().value().get_processed().value().get_duty_cycle().value());
-                        magnetizingCurrent.set_processed(processed);
-                    }
-                }
+            if (excitation.get_voltage() && excitation.get_voltage()->get_processed() && excitation.get_voltage()->get_processed()->get_duty_cycle()) {
+                auto processed = magnetizingCurrent.get_processed().value();
+                processed.set_duty_cycle(excitation.get_voltage()->get_processed()->get_duty_cycle().value());
+                magnetizingCurrent.set_processed(processed);
             }
             inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].set_magnetizing_current(magnetizingCurrent);
 
@@ -2837,7 +2944,11 @@ Inputs inputs_autocomplete(Inputs inputs, std::optional<Magnetic> magnetic, json
                 else {
                     turnRatioPrimary = OpenMagnetics::resolve_dimensional_values(inputs.get_design_requirements().get_turns_ratios()[0]);
                 }
-                auto secondaryExcitation = calculate_reflected_secondary(inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[0], turnRatioPrimary);
+                std::optional<std::string> secondaryName;
+                if (magnetic && magnetic->get_coil().get_functional_description().size() > 1) {
+                    secondaryName = magnetic->get_coil().get_functional_description()[1].get_name() + " winding excitation";
+                }
+                auto secondaryExcitation = Inputs::calculate_reflected_secondary(inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[0], turnRatioPrimary, secondaryName);
                 inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding().push_back(secondaryExcitation);
             }
         }
@@ -2992,12 +3103,148 @@ bool wind_magnetic_coil_as_described(Magnetic& magnetic, json configuration, std
                 }
             }
             std::vector<size_t> pattern(sequence.begin(), sequence.begin() + unitLength);
-            return magnetic.get_mutable_coil().wind(pattern, sequence.size() / unitLength);
+
+            // STATED SECTIONS. A coil that arrives with a sectionsDescription but no turns has
+            // stated where each section is and how big it is (MAS requires both), and which turns
+            // it holds. The winder used to re-stack such sections evenly over the whole window: four
+            // 1.8 mm sections of a WE-FC choke, spaced 0.8 / 3.0 / 0.8 mm apart along the column,
+            // came back as four 2.95 mm sections end to end, with turns in the spacing and no
+            // error. The stated rects and turn splits are imposed on the wind as hand-drawn section
+            // rects are (apply_custom_section_rects: after placement, layers and turns re-flowed
+            // inside each, judged for fit).
+            //
+            // Only here, where the pattern is derived from the stated sections themselves: the wind
+            // then builds the same sequence of conduction sections, so the i-th wound section is
+            // the i-th stated one. The winder names a section "<winding> section <k>" with k
+            // counting that winding's sections; a stated file may number them otherwise (El
+            // Magnetic's 750370900_00 says "SEC section 2" for the first SEC section), so each
+            // stated rect is keyed by the name the wind will give its section.
+            //
+            // Not under real winding: there the stored sections are owned by ABT #1487 R5 (stored
+            // heights above), which keeps each stored height unless the section's crossing
+            // stations need more -- a crossing station is a wire slot the stated rect never held.
+            // Not in a round window: there a section is [radial height, angle], and the drawn-rect
+            // re-flow only measures rectangles; a toroid's stored sections are wound by
+            // wind_by_round_sections from their own margins, order and turn split.
+            //
+            // A stated layout that does not fit is reported exactly as any other wind that does
+            // not fit (ABT #930, #1322, #1487): wind() returns false and the reason is in
+            // get_last_fit_failure, and the turns are laid out in the stated sections as far as
+            // they go. This function only reports it; magnetic_autocomplete keeps a stated layout
+            // as it was laid out and logs the reason as a WARNING (ABT #1496).
+            auto& coil = magnetic.get_mutable_coil();
+            bool rectangularWindows = true;
+            {
+                auto bobbin = coil.resolve_bobbin();
+                if (!bobbin.get_processed_description()) {
+                    throw CoilException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                        "The coil states its sections but its bobbin has no processed description to place them in");
+                }
+                // ABT #988: bind the optional first. get_processed_description() returns it BY
+                // VALUE, so ranging over ->get_winding_windows() of that temporary iterates a
+                // vector destroyed before the loop body runs (GCC does not diagnose the -> form).
+                auto bobbinProcessedDescription = bobbin.get_processed_description().value();
+                for (const auto& window : bobbinProcessedDescription.get_winding_windows()) {
+                    if (window.get_shape() != WindingWindowShape::RECTANGULAR) {
+                        rectangularWindows = false;
+                    }
+                }
+            }
+            std::vector<std::pair<std::string, Section>> statedSections;   // {wound name, stated}
+            if (!coil.get_turns_description() && !coil.is_planar() && !rewindForRealWinding && rectangularWindows) {
+                std::map<std::string, std::pair<std::vector<double>, std::vector<double>>> statedRects;
+                std::map<std::string, std::vector<PartialWinding>> statedPartialWindings;
+                std::map<std::string, size_t> sectionsSoFarPerWinding;
+                const auto givenSections = coil.get_sections_description().value();
+                for (const auto& section : givenSections) {
+                    if (section.get_type() != ElectricalType::CONDUCTION) {
+                        continue;
+                    }
+                    const std::string winding = section.get_partial_windings()[0].get_winding();
+                    const std::string woundName = winding + " section " + std::to_string(sectionsSoFarPerWinding[winding]++);
+                    statedRects[woundName] = {section.get_coordinates(), section.get_dimensions()};
+                    statedPartialWindings[woundName] = section.get_partial_windings();
+                    statedSections.push_back({woundName, section});
+                }
+                coil.preload_custom_section_rects(statedRects);
+                coil.preload_custom_section_partial_windings(statedPartialWindings);
+            }
+            // Transient: the stated rects belong to THIS wind; a later wind of the returned coil
+            // must place its sections afresh.
+            struct StatedSectionsGuard {
+                Coil& coil;
+                ~StatedSectionsGuard() {
+                    coil.preload_custom_section_rects({});
+                    coil.preload_custom_section_partial_windings({});
+                }
+            } statedSectionsGuard{coil};
+
+            const bool wound = coil.wind(pattern, sequence.size() / unitLength);
+            if (wound) {
+                // A wind that fits has imposed every stated rect (apply_custom_section_rects runs
+                // last on a fitting wind); one it did not keep is a winder defect, not a verdict.
+                const auto woundSections = coil.get_sections_description().value();
+                for (const auto& [woundName, stated] : statedSections) {
+                    auto found = std::find_if(woundSections.begin(), woundSections.end(),
+                                              [&](const Section& section) { return section.get_name() == woundName; });
+                    if (found == woundSections.end()) {
+                        throw CoilException(ErrorCode::COIL_WINDING_ERROR,
+                            "Stated section '" + stated.get_name() + "' has no counterpart '" + woundName +
+                            "' in the wound coil, so its rect was not kept");
+                    }
+                    for (size_t axis = 0; axis < 2; ++axis) {
+                        if (std::abs(found->get_coordinates()[axis] - stated.get_coordinates()[axis]) > 1e-12 ||
+                            std::abs(found->get_dimensions()[axis] - stated.get_dimensions()[axis]) > 1e-12) {
+                            throw CoilException(ErrorCode::COIL_WINDING_ERROR,
+                                "Stated section '" + stated.get_name() + "' was not kept by the wind");
+                        }
+                    }
+                }
+            }
+            return wound;
         }
         else {
             return magnetic.get_mutable_coil().wind();
         }
     }
+}
+
+std::optional<std::string> real_winding_refusal(const Magnetic& woundMagnetic, std::optional<Inputs> inputs) {
+    json magneticJson;
+    to_json(magneticJson, woundMagnetic);
+    magneticJson.at("coil").erase("layersDescription");
+    Magnetic rebuilt;
+    rebuilt.set_core(woundMagnetic.get_core());
+    rebuilt.set_coil(Coil(magneticJson.at("coil"), false));
+    SettingsGuard<bool> realWindingGuard(settings,
+                                         &Settings::get_coil_use_real_winding_geometry,
+                                         &Settings::set_coil_use_real_winding_geometry, true);
+    bool wound = false;
+    try {
+        wound = wind_magnetic_coil_as_described(rebuilt, json{}, inputs);
+    }
+    catch (const CoilException& e) {
+        if (e.code() != ErrorCode::COIL_WINDING_ERROR) {
+            throw;
+        }
+        return std::string(e.what());
+    }
+    auto& coil = rebuilt.get_mutable_coil();
+    if (!wound) {
+        return "real winding does not fit: " + (coil.get_last_fit_failure().empty()
+                                                ? std::string("the winder returned no fitting layout")
+                                                : coil.get_last_fit_failure());
+    }
+    if (!coil.get_turns_description() || coil.get_turns_description()->empty()) {
+        return std::string("real winding built no turns");
+    }
+    if (!coil.is_real_winding_blocking_applied()) {
+        return std::string("real winding did not apply connection blocking");
+    }
+    if (!coil.are_turns_inside_winding_window()) {
+        return "real winding puts turns outside the winding window: " + coil.get_last_fit_failure();
+    }
+    return std::nullopt;
 }
 
 Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optional<Inputs> inputs) {
@@ -3035,11 +3282,20 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optio
     }
     else if (magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::UI ||
              magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::PQI ||
+             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::UT ||
+             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::EI ||
              magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::DRUM_RING ||
-             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::DRUM_SEMISHIELDED) {
+             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::DRUM_SEMISHIELDED ||
+             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::DRUM_PLATE) {
         // Piece-and-plate: the record already describes the whole assembly, so it is "closed" in
         // the MAS sense of having to be used by itself (ABT #274/#275; drumRing per ABT #366 —
         // its two structural annular gaps are synthesized by Core::process_gap, not listed here).
+        //
+        // The family list is the one the Core constructor and create_quick_core classify as
+        // piece-and-plate. UT, EI and DRUM_PLATE were missing here, so a core that arrived as an
+        // explicit pieceAndPlate fell to the else branch and was re-typed TWO_PIECE_SET: the
+        // E/U piece was mirrored, which doubles le, the column height and the window height.
+        // On an ET 20 choke that halves L = N^2 mu0 mu Ae / le exactly (le 50.6 -> 101.3 mm).
         magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::PIECE_AND_PLATE);
         shape.set_magnetic_circuit(MagneticCircuit::CLOSED);
     }
@@ -3119,12 +3375,29 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optio
             // uses the standard polyester unless the wire declares otherwise). A foil that
             // really is bare -- anodised aluminium carries its own oxide -- says so explicitly,
             // and that declaration is still honoured.
-            // It must come BEFORE the outer-vs-conductor check: autocomplete itself gives a foil
-            // outerWidth = thickness + film (0.2 mm "Foil 0.2" -> 0.225 mm) and no coating, so a
-            // second autocomplete of its own output tripped that check on the 25 um film and threw
-            // INVALID_WIRE_DATA (two_switch_forward_transformer_complete, OMFEM corpus C1). For a
-            // foil that difference IS the film, not an unstated coating.
+            // It must come BEFORE the outer-vs-conductor check: before ABT #1151 autocomplete gave a
+            // foil outerWidth = thickness + film (0.2 mm "Foil 0.2" -> 0.225 mm) and no coating, and
+            // designs stored then still carry it; a re-autocomplete tripped that check on the 25 um
+            // film and threw INVALID_WIRE_DATA (two_switch_forward_transformer_complete, OMFEM corpus
+            // C1). Now a foil's outerWidth is its conductor (normalised here for such stored
+            // designs) and the film is counted in its wound width (Wire::get_maximum_outer_width).
             if (wire.get_type() == WireType::FOIL) {
+                // ABT #1151: MKF used to write an uncoated foil's outerWidth as conductor + the
+                // default interleaf film. A stored design carrying that value is brought to the
+                // conductor here; the film stays counted, once, in the wound width
+                // (Wire::get_maximum_outer_width). Any other outerWidth is left for that function
+                // to refuse.
+                if (wire.get_outer_width() && wire.get_conducting_width()) {
+                    const double outer = resolve_dimensional_values(wire.get_outer_width().value());
+                    const double conducting = resolve_dimensional_values(wire.get_conducting_width().value());
+                    const double legacyOuter = conducting + Wire::get_foil_interlayer_insulation(wire);
+                    const double tolerance = 1e-9 + 1e-9 * conducting;
+                    if (std::abs(outer - conducting) > tolerance && std::abs(outer - legacyOuter) <= tolerance) {
+                        DimensionWithTolerance conductorWidth;
+                        conductorWidth.set_nominal(conducting);
+                        wire.set_outer_width(conductorWidth);
+                    }
+                }
                 magnetic.get_mutable_coil().get_mutable_functional_description()[i].set_wire(wire);
                 continue;
             }
@@ -3399,23 +3672,52 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optio
     // re-winding one would buy nothing and would turn the refusal into a hard failure of
     // autocomplete itself, i.e. a global display setting would stop every planar design from
     // rendering at all. The gates that own the ruling still fire wherever routing is attempted.
+    // ABT #930 / #1496 (Alf, 2026-10-10): a wind that does not fit is never handed back silently.
+    // Before, the bool was discarded, with only a warning when no turns came back at all, and
+    // layouts with copper outside the window reached the 2D and 3D views and the simulation: with
+    // real winding on, 24 of the 107 tests/testData designs the web autocompletes came back that
+    // way (LLC_trafo_first: turn 0 10.6 mm below the window floor), and nothing said so.
+    //  - A layout MKF planned itself (the coil arrived with no sections, layers or turns) that does
+    //    not fit is an error: autocomplete throws COIL_WINDING_ERROR with the reason.
+    //  - A layout the design STATES (it arrived with sections, layers or turns of its own) is the
+    //    customer's: it is laid out in full as stated, so the views can show where it overflows
+    //    (Painter::paint_winding_fit_problems rings every turn outside the window), and the reason
+    //    is logged as a WARNING, which a caller collecting the log (Logger::enableCollector) reads.
+    //    That holds for a stated layout kept as it is, without a wind, too (planar, or real winding
+    //    off): it is judged the same way.
+    // The per-candidate wind() callers (CoilAdviser, Impedance, StrayCapacitance) cull on wind()'s
+    // false themselves and do not come through here.
+    auto& coilToComplete = magnetic.get_mutable_coil();
+    const bool layoutIsStated = coilToComplete.get_sections_description() || coilToComplete.get_layers_description() ||
+                                (coilToComplete.get_turns_description() && !coilToComplete.get_turns_description()->empty());
     if (magnetic_coil_needs_winding(magnetic)) {
-        // The bool is deliberately not acted on here: see the ABT #930 warning below.
-        wind_magnetic_coil_as_described(magnetic, configuration, inputs);
+        const bool wound = wind_magnetic_coil_as_described(magnetic, configuration, inputs);
+        if (!wound) {
+            auto& coil = magnetic.get_mutable_coil();
+            const std::string reason = coil.get_last_fit_failure();
+            const std::string what =
+                std::string("the winding does not fit its window") +
+                (settings.get_coil_use_real_winding_geometry() && !coil.is_planar() ? " with real winding geometry" : "") +
+                (coil.get_turns_description() ? "" : " (no turns were produced)") +
+                (reason.empty() ? std::string(", and the winder did not narrow the reason further") : ": " + reason);
+            if (!layoutIsStated) {
+                throw CoilException(ErrorCode::COIL_WINDING_ERROR, "Autocomplete could not wind this magnetic: " + what);
+            }
+            OM_WARNING_M("Utils", "The stated winding layout is laid out as stated, but " + what);
+        }
     }
-
-    // ABT #930: autocompleting ONE magnetic and getting a coil with no turns back, silently, is
-    // how "Turns not created" reached a reporter with no way to tell a broken winder from a
-    // conductor that cannot fit its window. Deliberately a loud warning and not a throw: the
-    // per-candidate wind() callers (CoilAdviser, Impedance, StrayCapacitance) legitimately cull
-    // on a failed wind, and a throw here would turn their culls into aborts.
-    if (!magnetic.get_mutable_coil().get_turns_description()) {
-        const auto& reason = magnetic.get_mutable_coil().get_last_fit_failure();
-        OM_WARNING_M("Utils", "Autocomplete produced no turns for this magnetic"
-                              + (reason.empty()
-                                 ? std::string(": the winding does not fit its window, and the reason could not "
-                                               "be narrowed further.")
-                                 : ". " + reason));
+    else if (layoutIsStated) {
+        auto& coil = magnetic.get_mutable_coil();
+        const bool inside = coil.are_turns_inside_winding_window();
+        // are_turns_inside_winding_window names the escaping turn; keep that reason when both fail.
+        const std::string outsideReason = inside ? std::string() : coil.get_last_fit_failure();
+        const bool fitting = !coil.get_sections_description() || !coil.get_layers_description() ||
+                             coil.are_sections_and_layers_fitting();
+        if (!inside || !fitting) {
+            const std::string reason = !inside ? outsideReason : coil.get_last_fit_failure();
+            OM_WARNING_M("Utils", std::string("The stated winding layout is kept as stated, but it does not fit its window") +
+                                  (reason.empty() ? std::string(" (its sections or layers overflow)") : ": " + reason));
+        }
     }
 
     // ABT #1172 (WP3, MAS RFC 0013): winding ends terminate on the bobbin's pins. After winding,

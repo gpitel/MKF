@@ -197,18 +197,19 @@ TEST_CASE("Test mutual inductance from turns ratio", "[physical-model][inductanc
     auto magnetic = create_two_winding_magnetic("ETD 39", "3C97", numberTurns, numberParallels);
 
     Inductance inductance;
-    double M = inductance.calculate_mutual_inductance(magnetic, 0, 1);
+    double frequency = 100000;
+    double M = inductance.calculate_mutual_inductance(magnetic, 0, 1, frequency);
 
     // Get magnetizing inductance for primary
     MagnetizingInductance magnetizingModel("ZHANG");
     auto magnetizingOutput = magnetizingModel.calculate_inductance_from_number_turns_and_gapping(magnetic);
     double Lm_primary = magnetizingOutput.get_magnetizing_inductance().get_nominal().value();
 
-    // For ideal coupling, M = Lm_primary * (N2/N1)
-    double turnsRatio = double(numberTurns[1]) / double(numberTurns[0]);
-    double expectedM = Lm_primary * turnsRatio;
-
-    CHECK_THAT(M, WithinRel(expectedM, maximumError));
+    // M = Lm_primary·(N1/N1)·(N2/N1) + Λ01: the magnetizing mutual plus the mutual leakage,
+    // evaluated in the same order as the model, so the two must be the same double.
+    double mutualLeakage = LeakageInductance().calculate_leakage_inductance_matrix(magnetic, frequency)[0][1];
+    double magnetizingMutual = Lm_primary * (double(numberTurns[0]) / double(numberTurns[0])) * (double(numberTurns[1]) / double(numberTurns[0]));
+    CHECK(M == magnetizingMutual + mutualLeakage);
 
     settings.reset();
 }
@@ -579,7 +580,7 @@ TEST_CASE("Test mutual inductance throws for self-reference", "[physical-model][
     Inductance inductance;
 
     // Mutual inductance between winding 0 and itself should throw
-    CHECK_THROWS_AS(inductance.calculate_mutual_inductance(magnetic, 0, 0), std::invalid_argument);
+    CHECK_THROWS_AS(inductance.calculate_mutual_inductance(magnetic, 0, 0, 100000), std::invalid_argument);
 
     settings.reset();
 }
@@ -806,29 +807,24 @@ TEST_CASE("Test mutual inductance relationships for three windings", "[physical-
     Inductance inductance;
 
     // Get mutual inductances
-    double M01 = inductance.calculate_mutual_inductance(magnetic, 0, 1);
-    double M02 = inductance.calculate_mutual_inductance(magnetic, 0, 2);
-    double M12 = inductance.calculate_mutual_inductance(magnetic, 1, 2);
+    double frequency = 100000;
+    double M01 = inductance.calculate_mutual_inductance(magnetic, 0, 1, frequency);
+    double M02 = inductance.calculate_mutual_inductance(magnetic, 0, 2, frequency);
+    double M12 = inductance.calculate_mutual_inductance(magnetic, 1, 2, frequency);
+    // The mutual carries the mutual leakage Λ_ij on top of the magnetizing term.
+    auto leakageMatrix = LeakageInductance().calculate_leakage_inductance_matrix(magnetic, frequency);
 
     // Get magnetizing inductances referred to each winding
     double Lm0 = inductance.calculate_magnetizing_inductance_referred_to_winding(magnetic, 0);
-    double Lm1 = inductance.calculate_magnetizing_inductance_referred_to_winding(magnetic, 1);
-    double Lm2 = inductance.calculate_magnetizing_inductance_referred_to_winding(magnetic, 2);
 
-    // For ideal coupling: M_ij = sqrt(Lm_i * Lm_j)
-    double expected_M01 = std::sqrt(Lm0 * Lm1);
-    double expected_M02 = std::sqrt(Lm0 * Lm2);
-    double expected_M12 = std::sqrt(Lm1 * Lm2);
-
-    CHECK_THAT(M01, WithinRel(expected_M01, 0.01));
-    CHECK_THAT(M02, WithinRel(expected_M02, 0.01));
-    CHECK_THAT(M12, WithinRel(expected_M12, 0.01));
-
-    // Verify turns ratio relationship for mutual inductances
-    // M01/M02 = N1/N2 (since M_0i = Lm0 * Ni/N0)
-    double ratio_M01_M02 = M01 / M02;
-    double expected_ratio = double(numberTurns[1]) / double(numberTurns[2]);
-    CHECK_THAT(ratio_M01_M02, WithinRel(expected_ratio, 0.01));
+    // M_ij = Lm0·(N_i/N0)·(N_j/N0) + Λ_ij, which is sqrt(Lm_i·Lm_j) + Λ_ij with Lm_i = Lm0·(N_i/N0)².
+    // Evaluated in the model's order, so each must be the same double.
+    auto magnetizingMutual = [&](size_t i, size_t j) {
+        return Lm0 * (double(numberTurns[i]) / double(numberTurns[0])) * (double(numberTurns[j]) / double(numberTurns[0]));
+    };
+    CHECK(M01 == magnetizingMutual(0, 1) + leakageMatrix[0][1]);
+    CHECK(M02 == magnetizingMutual(0, 2) + leakageMatrix[0][2]);
+    CHECK(M12 == magnetizingMutual(1, 2) + leakageMatrix[1][2]);
 
     settings.reset();
 }
@@ -1038,7 +1034,8 @@ TEST_CASE("Test_Coupling_Coefficient_Agrees_With_Inductance_Matrix", "[physical-
 
     // The sign the network reports is meaningful and must survive: the old clamp to [0, 1] turned a
     // legitimately negative coupling into a flat zero, i.e. "these windings do not couple".
-    double mutualFromPair = inductance.calculate_mutual_inductance(magnetic, 0, 1);
+    double mutualFromPair = inductance.calculate_mutual_inductance(magnetic, 0, 1, frequency);
+    CHECK(mutualFromPair == mutualFromMatrix);
     UNSCOPED_INFO("mutual inductance " << mutualFromPair);
     CHECK(std::isfinite(mutualFromPair));
     CHECK(std::abs(mutualFromPair) > 0);
@@ -1057,12 +1054,13 @@ TEST_CASE("Test_Coupling_Coefficient_Unchanged_For_Main_Column_Windings", "[phys
     auto magnetic = create_two_winding_magnetic("ETD 39", "3C97", numberTurns, numberParallels);
 
     Inductance inductance;
-    double mutualInductance = inductance.calculate_mutual_inductance(magnetic, 0, 1);
+    double mutualInductance = inductance.calculate_mutual_inductance(magnetic, 0, 1, 100000);
     MagnetizingInductance magnetizingModel("ZHANG");
     double magnetizingPrimary = magnetizingModel.calculate_inductance_from_number_turns_and_gapping(magnetic)
                                     .get_magnetizing_inductance().get_nominal().value();
-    double turnsRatio = double(numberTurns[1]) / double(numberTurns[0]);
-    CHECK_THAT(mutualInductance, WithinRel(magnetizingPrimary * turnsRatio, maximumError));
+    double mutualLeakage = LeakageInductance().calculate_leakage_inductance_matrix(magnetic, 100000)[0][1];
+    double magnetizingMutual = magnetizingPrimary * (double(numberTurns[0]) / double(numberTurns[0])) * (double(numberTurns[1]) / double(numberTurns[0]));
+    CHECK(mutualInductance == magnetizingMutual + mutualLeakage);
 
     double coupling = inductance.calculate_coupling_coefficient(magnetic, 0, 1, 100000);
     UNSCOPED_INFO("single-window coupling " << coupling);
@@ -1150,15 +1148,25 @@ TEST_CASE("Test_Toroid_Sector_Winding_Self_Inductance_Is_Placement_Independent",
                       << ", leakage " << leakage << " H");
 
         // Self inductance of either winding is the closed form, regardless of where its turns sit.
-        CHECK_THAT(selfFirst, WithinRel(closedForm, 1e-3));
-        CHECK_THAT(selfSecond, WithinRel(closedForm, 1e-3));
+        // Tolerance 0.5 % (was 0.1 %, 2026-09-30): L_ii = Lm + Λ_ii, and since the toroidal leakage model
+        // resolves the air field of a toroid (LeakageInductance.h, "Toroidal cores") the sector winding's self-leakage
+        // Λ_ii is 5.1 uH (0.14 % of the 3.5 mH core term) and its mutual leakage Λ_ij is -3.9 uH, so that
+        // Λ_11 + Λ_22 - 2 Λ_12 = 18 uH is the pairwise leakage. That size is right: measured WE sector-wound chokes
+        // have L_DM / L_CM near 0.5 % (WE 744822222: 10.7 uH against 2.17 mH), and it is still two orders below the
+        // 2.5x reading this test guards against.
+        CHECK_THAT(selfFirst, WithinRel(closedForm, 5e-3));
+        CHECK_THAT(selfSecond, WithinRel(closedForm, 5e-3));
         // The other winding links the same core flux: mutual is the closed form too, k is ~1.
-        CHECK_THAT(mutual, WithinRel(closedForm, 1e-3));
-        CHECK(coupling > 0.999);
+        CHECK_THAT(mutual, WithinRel(closedForm, 5e-3));
+        // k = 1 - Λ/(2L) for a symmetric pair. calculate_coupling_coefficient reads the same inductance matrix,
+        // mutual leakage Λ_12 included, so k = M / sqrt(L11 L22) = 0.9974 for the sector winding (WE 744822222
+        // gives 0.9975 from its measured L_DM / L_CM).
+        CHECK_THAT(coupling, WithinRel(mutual / std::sqrt(selfFirst * selfSecond), 1e-9));
+        CHECK(coupling > 0.995);
         CHECK(coupling <= 1.0);
         // And the parallel-connected common-mode inductance a choke datasheet states is (L+M)/2,
         // which the coupling moves by (1-k)/2 — nowhere near the 2.5x the ticket attributed to it.
-        CHECK_THAT(commonModeParallel, WithinRel(closedForm, 1e-3));
+        CHECK_THAT(commonModeParallel, WithinRel(closedForm, 5e-3));
 
         (isSector ? sectorLeakage : layeredLeakage) = leakage;
     }

@@ -50,6 +50,8 @@ class Settings
         // ignored. When true, the winder accounts for the space reserved by connection/lead wires
         // (affecting filling factors) and their length is included in the winding losses.
         bool _coilUseRealWindingGeometry = false;
+        // ABT #1531: a wind that does not fit may flatten its litz turns into ovals (Wire::set_wound_footprint).
+        bool _coilLitzDeformation = false;
         // ABT #685 (Alf, 2026-08-16): COATING SQUISH. When true, the sections/layers fit check
         // tolerates a filling factor up to 1 + 1e-3: the helical stacking pitch (turns tangent
         // in 3D, ABT #780) is a second-order correction ((K*od/L)^2/2, always well under 0.1%),
@@ -178,6 +180,13 @@ class Settings
         // m, n in [-M, M] (M = mirroring dimension), the historical lattice used by the loss models.
         // true: M complete 2A x 2B mirror cells on each side, m, n in [-2M-1, 2M] (ABT #1240).
         bool _magneticFieldMirroringCompleteCells = false;
+        // Complete cells sized M x M (true) instead of M ceil(B/A) x M ceil(A/B). The B/A scaling exists to damp the dipole
+        // remainder of a lattice holding net current (ABT #1240); a charge-neutral lattice (MMF_BOUNDARY, ABT #1304) has no
+        // dipole and converges on square cells: 0.14 % at M = 1, 0.02 % at M = 2 on a 40-turn E 42 inductor. Set by
+        // MagneticField for that model only; not a user setting.
+        bool _magneticFieldMirroringNeutralCells = false;
+        // ABT #1304: the named winding-loss model set. CUSTOM (default) uses the individually selected models.
+        WindingLossesModelSets _windingLossesModelSet = WindingLossesModelSets::CUSTOM;
         bool _magneticFieldIncludeFringing = true;
 
         double _coilMesherInsideTurnsFactor = 1.05;
@@ -192,7 +201,11 @@ class Settings
         bool _coreAdviserIncludeMargin = false;
         bool _coreAdviserEnableIntermediatePruning = true;
         size_t _coreAdviserMaximumMagneticsAfterFiltering;
-        bool   _coreAdviserEnableTemperatureFilter = false;
+        // Design mode gates on temperature by default: an advised design that runs hotter than
+        // the limit is not viable, and returning it as if it were was ABT #1412. The limit is the
+        // design requirements' operatingTemperature (its maximum) when the inputs give one, else
+        // this configured value (see resolve_maximum_design_temperature in CoreAdviser.h).
+        bool   _coreAdviserEnableTemperatureFilter = true;
         double _coreAdviserMaximumTemperature = 130.0;
         // Multiplicative derating applied to the operating peak flux density
         // before comparing against B_sat in MagneticFilterSaturation. 1.0 (the
@@ -220,6 +233,16 @@ class Settings
         // FALSE: skip that turn's conduction path to the enclosure, log an ERROR naming the turn
         // and the overlap, and solve the rest of the network.
         bool   _thermalNetworkStrictGeometry = true;
+        // Opt-in for debugging and prospecting, never a default. FALSE (default): using a core
+        // material outside its data throws, as it always has: a core-loss frequency outside the
+        // material's fitted Steinmetz span (or in a gap between its ranges), or a core-loss
+        // temperature at or above its Curie point. TRUE: the same model is evaluated there anyway
+        // (the nearest fitted range's coefficients carried past its edge) and every such use logs a
+        // WARNING naming the material, the quantity, the value and the range the data covers
+        // (module "MaterialDataExtrapolation"; enable the Logger collector to read them back).
+        // ABT #1652: advisers never extrapolate. While any adviser object exists the getter reads
+        // false whatever this holds (see MaterialDataExtrapolationBarrier below). Keep in sync with reset().
+        bool   _allowMaterialDataExtrapolation = false;
         GappingOptimizationStrategy _gappingStrategy = GappingOptimizationStrategy::SIMPLE;
 
 
@@ -245,6 +268,11 @@ class Settings
 
 
         std::vector<CoreLossesModels> _coreLossesModelNames;
+        // A core-loss model the caller EXPLICITLY asked for (ABT #1497). When set, CoreLosses runs
+        // exactly this model and throws RequestedCoreLossesModelNotAvailableException for a material
+        // it cannot evaluate, instead of walking _coreLossesModelNames to another model. Unset (the
+        // default) keeps that cascade.
+        std::optional<CoreLossesModels> _coreLossesRequestedModel;
 
         // Centralized model configuration
         MagneticFieldStrengthModels _magneticFieldStrengthModel;
@@ -314,6 +342,10 @@ class Settings
         static Settings& GetInstance();
 
         void reset();
+        // Every setting's value, written out (ABT #838): two Settings with the same fingerprint
+        // configure every computation alike. A setting added to this class must be added to
+        // Settings::fingerprint (Settings.cpp) as well.
+        std::string fingerprint() const;
 
         bool get_verbose() const;
         void set_verbose(bool value);
@@ -365,6 +397,8 @@ class Settings
 
         bool get_coil_use_real_winding_geometry() const;
         void set_coil_use_real_winding_geometry(bool value);
+        bool get_coil_litz_deformation() const;
+        void set_coil_litz_deformation(bool value);
 
         bool get_coil_allow_coating_squish() const;
         void set_coil_allow_coating_squish(bool value);
@@ -556,6 +590,12 @@ class Settings
         bool get_magnetic_field_mirroring_complete_cells() const;
         void set_magnetic_field_mirroring_complete_cells(bool value);
 
+        bool get_magnetic_field_mirroring_neutral_cells() const;
+        void set_magnetic_field_mirroring_neutral_cells(bool value);
+
+        WindingLossesModelSets get_winding_losses_model_set() const;
+        void set_winding_losses_model_set(WindingLossesModelSets value);
+
         size_t get_coil_adviser_maximum_number_wires() const;
         void set_coil_adviser_maximum_number_wires(size_t value);
 
@@ -585,6 +625,13 @@ class Settings
 
         bool   get_thermal_network_strict_geometry() const;
         void   set_thermal_network_strict_geometry(bool value);
+
+        // The EFFECTIVE value: what the caller set, AND no adviser alive anywhere in the process
+        // (ABT #1652, MaterialDataExtrapolationBarrier). Every extrapolating site reads this getter,
+        // so none of them can extrapolate under an adviser. The setter stores the caller's choice
+        // untouched: it reads back again once the advisers are gone.
+        bool   get_allow_material_data_extrapolation() const;
+        void   set_allow_material_data_extrapolation(bool value);
 
         GappingOptimizationStrategy get_gapping_strategy() const;
         void set_gapping_strategy(GappingOptimizationStrategy value);
@@ -619,7 +666,15 @@ class Settings
         void set_harmonic_amplitude_threshold(double value);
 
         std::vector<CoreLossesModels> get_core_losses_model_names() const;
+        // The default preference: `value` heads the PROPRIETARY/LOSS_FACTOR/STEINMETZ/ROSHEN cascade,
+        // and a material without it is evaluated with the next model it supports. Setting a
+        // preference withdraws any explicit request.
         void set_core_losses_preferred_model_name(CoreLossesModels value);
+        // The explicit request (ABT #1497): only `value` is used, and a material that cannot run it
+        // throws. Cleared by clear_core_losses_requested_model(), by setting a preference, and by reset().
+        std::optional<CoreLossesModels> get_core_losses_requested_model() const;
+        void set_core_losses_requested_model(CoreLossesModels value);
+        void clear_core_losses_requested_model();
 
         std::string get_preferred_core_material_ferrite_manufacturer() const;
         void set_preferred_core_material_ferrite_manufacturer(std::string value);
@@ -687,6 +742,30 @@ class Settings
 
     };
 
+
+// ABT #1652 (Alf, 2026-10-03): ADVISERS NEVER EXTRAPOLATE material data, whatever
+// Settings::allowMaterialDataExtrapolation says; only work the user does by hand may (the web turns the
+// flag on for it). Every adviser class (CoreAdviser, WireAdviser and so CoilAdviser, MagneticAdviser,
+// CoreCrossReferencer, CoreMaterialCrossReferencer) holds one of these as its FIRST member, and while at
+// least one exists anywhere in the process Settings::get_allow_material_data_extrapolation() reads false.
+//
+// Why the object's lifetime and not a guard in each public method: every entry point an adviser has now
+// or gains later runs while its object exists, so none can forget the guard; a new adviser CLASS must
+// add the member (TestMaterialDataExtrapolation checks each class). Why a process-wide count and not a
+// SettingsGuard that sets the flag off and restores it: Settings is thread_local and advisers fan work
+// out to worker threads that run on snapshots, nested advisers (MagneticAdviser -> CoreAdviser ->
+// CoilAdviser) would restore out of order, and a restore would overwrite a value the caller set
+// meanwhile. The cost: a hand simulation running on another thread while an adviser is alive does not
+// extrapolate either -- it throws MaterialFrequencyOutOfSpanException as it would with the flag off.
+class MaterialDataExtrapolationBarrier {
+public:
+    MaterialDataExtrapolationBarrier();
+    MaterialDataExtrapolationBarrier(const MaterialDataExtrapolationBarrier&);
+    MaterialDataExtrapolationBarrier& operator=(const MaterialDataExtrapolationBarrier&) { return *this; }
+    ~MaterialDataExtrapolationBarrier();
+    // Number of barriers alive in the process (diagnostics and tests).
+    static int active_count();
+};
 
 // ARCH-002: RAII guard for exception-safe Settings mutations
 template<typename T>

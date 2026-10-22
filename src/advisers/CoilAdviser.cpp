@@ -2,6 +2,8 @@
 #include "support/StableSortByIndex.h"
 #include "processors/Inputs.h"
 #include "advisers/CoilAdviser.h"
+#include "advisers/MagneticFilter.h"
+#include "processors/ResultsAnalyzer.h"
 #include "support/LibraryContext.h"
 #include "Models.h"
 #include "constructive_models/Insulation.h"
@@ -12,6 +14,59 @@
 #include "support/Exceptions.h"
 #include "support/Logger.h"
 
+
+namespace {
+// Concatenates the per-configuration candidate lists in configuration order (each list is capped
+// and ranked by its own WireAdviser call; their scores are never re-sorted together).
+std::vector<std::pair<OpenMagnetics::Winding, double>> concatenate_wire_candidates(
+        std::vector<std::vector<std::pair<OpenMagnetics::Winding, double>>>& candidatesPerConfiguration) {
+    std::vector<std::pair<OpenMagnetics::Winding, double>> concatenated;
+    for (auto& configurationCandidates : candidatesPerConfiguration) {
+        std::move(configurationCandidates.begin(), configurationCandidates.end(), std::back_inserter(concatenated));
+    }
+    return concatenated;
+}
+
+std::vector<std::map<std::string, double>> wire_configurations(double maximumEffectiveCurrentDensity, double maximumNumberParallels, bool relaxedWireLimits) {
+    if (relaxedWireLimits) {
+        // The normal search ran for every core: the limits themselves first, then beyond them.
+        return {
+            {{"maximumEffectiveCurrentDensity", maximumEffectiveCurrentDensity}, {"maximumNumberParallels", maximumNumberParallels}},
+            {{"maximumEffectiveCurrentDensity", maximumEffectiveCurrentDensity}, {"maximumNumberParallels", maximumNumberParallels * 2}},
+            {{"maximumEffectiveCurrentDensity", maximumEffectiveCurrentDensity * 2}, {"maximumNumberParallels", maximumNumberParallels}},
+            {{"maximumEffectiveCurrentDensity", maximumEffectiveCurrentDensity * 2}, {"maximumNumberParallels", maximumNumberParallels * 2}}
+        };
+    }
+    // The normal search asks the wire adviser at the limits only. Asking it again at lower
+    // current densities (8, 6 and 4 A/mm2) added no acceptable design on the 36-case Henry corpus
+    // when their fitting candidates were appended after these (91 acceptable designs either way),
+    // and lost designs when interleaved with these (80 against 87), see the commit message.
+    return {
+        {{"maximumEffectiveCurrentDensity", maximumEffectiveCurrentDensity}, {"maximumNumberParallels", maximumNumberParallels}}
+    };
+}
+
+// How many wound coils one pattern collects before keeping the maximumNumberResults with the
+// lowest losses (core + ohmic, skin and proximity winding losses). Two: on the 36-case Henry corpus
+// it gave 91 acceptable designs against 87 with a pool of one (the first coils that fit).
+const size_t kWoundCoilPoolMultiplier = 2;
+
+// The switching frequency of every operating point (first winding), for log lines that must name
+// the frequency a loss evaluation failed at.
+std::string describe_operating_frequencies(const OpenMagnetics::Inputs& inputs) {
+    std::string description = "frequency";
+    for (size_t operatingPointIndex = 0; operatingPointIndex < inputs.get_operating_points().size(); ++operatingPointIndex) {
+        const auto& operatingPoint = inputs.get_operating_points()[operatingPointIndex];
+        if (operatingPoint.get_excitations_per_winding().empty()) {
+            throw OpenMagnetics::InvalidInputException(OpenMagnetics::ErrorCode::MISSING_DATA,
+                "Operating point " + std::to_string(operatingPointIndex) + " has no excitations");
+        }
+        description += (operatingPointIndex == 0 ? " " : ", ") +
+                       std::to_string(operatingPoint.get_excitations_per_winding()[0].get_frequency()) + " Hz";
+    }
+    return description;
+}
+}  // namespace
 
 namespace OpenMagnetics {
 
@@ -294,11 +349,11 @@ namespace OpenMagnetics {
     }
 
     std::vector<std::pair<Mas, double>> CoilAdviser::score_magnetics(std::vector<Mas> masMagnetics, std::vector<MagneticFilterOperation> filterFlow, std::vector<std::pair<Mas, double>>* invalidMagneticsWithScoring) {
-        std::vector<std::pair<Mas, double>> masMagneticsWithScoring;
+        // ABT #1619: every filter is evaluated first, and only then normalised, separately over the
+        // valid and the rejected designs. Normalising one list holding both let a rejected design's
+        // score (an unpriced design's COST of 0, say) set the scale every valid design was ranked on.
         std::vector<bool> masValidFlags(masMagnetics.size(), true);
-        for (auto mas : masMagnetics) {
-            masMagneticsWithScoring.push_back({mas, 0.0});
-        }
+        std::vector<std::vector<double>> scoringsPerFilter;
         for (const auto& filterConfiguration : filterFlow) {
             MagneticFilters filterEnum = filterConfiguration.get_filter();
             std::vector<double> scorings;
@@ -310,23 +365,36 @@ namespace OpenMagnetics {
                 scorings.push_back(scoring);
                 add_scoring(masMagnetics[masIndex].get_mutable_magnetic().get_reference(), filterEnum, scoring);
             }
-            if (masMagneticsWithScoring.size() > 0) {
-                normalize_scoring(&masMagneticsWithScoring, scorings, filterConfiguration);
-            }
+            scoringsPerFilter.push_back(scorings);
         }
-        // Remove invalid designs
-        std::vector<std::pair<Mas, double>> validMasMagneticsWithScoring;
-        size_t invalidCount = 0;
-        for (size_t i = 0; i < masMagneticsWithScoring.size(); ++i) {
-            if (masValidFlags[i]) {
-                validMasMagneticsWithScoring.push_back(masMagneticsWithScoring[i]);
-            }
-            else {
-                if (invalidMagneticsWithScoring != nullptr) {
-                    invalidMagneticsWithScoring->push_back(masMagneticsWithScoring[i]);
+
+        auto scoreGroup = [&](bool validGroup) {
+            std::vector<std::pair<Mas, double>> group;
+            std::vector<size_t> indexes;
+            for (size_t masIndex = 0; masIndex < masMagnetics.size(); ++masIndex) {
+                if (masValidFlags[masIndex] == validGroup) {
+                    group.push_back({masMagnetics[masIndex], 0.0});
+                    indexes.push_back(masIndex);
                 }
-                invalidCount++;
             }
+            if (group.empty()) {
+                return group;
+            }
+            for (size_t filterIndex = 0; filterIndex < filterFlow.size(); ++filterIndex) {
+                std::vector<double> scorings;
+                for (auto masIndex : indexes) {
+                    scorings.push_back(scoringsPerFilter[filterIndex][masIndex]);
+                }
+                normalize_scoring(&group, scorings, filterFlow[filterIndex]);
+            }
+            return group;
+        };
+
+        auto validMasMagneticsWithScoring = scoreGroup(true);
+        size_t invalidCount = masMagnetics.size() - validMasMagneticsWithScoring.size();
+        if (invalidCount > 0 && invalidMagneticsWithScoring != nullptr) {
+            auto invalidGroup = scoreGroup(false);
+            invalidMagneticsWithScoring->insert(invalidMagneticsWithScoring->end(), invalidGroup.begin(), invalidGroup.end());
         }
         if (invalidCount > 0) {
             logEntry("Filtered out " + std::to_string(invalidCount) + " invalid designs out of " + std::to_string(masMagnetics.size()), "CoilAdviser", 2);
@@ -369,8 +437,14 @@ namespace OpenMagnetics {
         }
     }
 
-    std::vector<Mas> CoilAdviser::get_advised_coil(Mas mas, size_t maximumNumberResults){
-        logEntry("Starting Coil Adviser without wires", "CoilAdviser");
+    void CoilAdviser::limit_wire_insulation_requirements_for_margin(std::vector<WireSolidInsulationRequirements>& solidInsulationRequirementsForWires) {
+        for (auto& requirements : solidInsulationRequirementsForWires) {
+            requirements.set_maximum_number_layers(1);
+            requirements.set_maximum_grade(3);
+        }
+    }
+
+    std::vector<Wire> CoilAdviser::get_catalogue_wires(){
         // Inside a LibraryContext scope the (possibly empty) wireDatabase IS
         // the inventory — lazily reloading the full public catalog here would
         // silently un-restrict 'only my inventory' wire advising (same defect
@@ -378,7 +452,6 @@ namespace OpenMagnetics {
         if (wireDatabase.empty() && !LibraryContext::Scope::anyActive()) {
             load_wires();
         }
-        std::string jsonLine;
         std::vector<Wire> wires;
         // The common-wire-standard default (NEMA MW 1000 C) is a PREFERENCE:
         // against a small catalog (e.g. a LibraryContext inventory of IEC
@@ -422,6 +495,12 @@ namespace OpenMagnetics {
                 }
             }
         }
+        return wires;
+    }
+
+    std::vector<Mas> CoilAdviser::get_advised_coil(Mas mas, size_t maximumNumberResults){
+        logEntry("Starting Coil Adviser without wires", "CoilAdviser");
+        auto wires = get_catalogue_wires();
         return get_advised_coil(&wires, mas, maximumNumberResults);
     }
 
@@ -435,11 +514,27 @@ namespace OpenMagnetics {
         _diagnosisNoWiresDetail.clear();
         _diagnosisBestOverfill = std::numeric_limits<double>::max();
         _diagnosisBestFailure.clear();
+        _diagnosisRealWindingRefusals = 0;
+        _diagnosisRealWindingRefusal.clear();
+        _diagnosisInsulationOutsideWindow = 0;
+        _diagnosisInsulationOutsideWindowReason.clear();
+        _wireAdviser.reset_real_winding_packing_diagnosis();
         _lastNoResultsReason = std::nullopt;
         auto core = mas.get_magnetic().get_core();
         auto coreType = core.get_functional_description().get_type();
 
         auto inputs = mas.get_mutable_inputs();
+        // ABT #1718: the loss ranking integrates the primary voltage of every wound candidate;
+        // an unbalanced voltage is rejected once, here, before anything is wound.
+        {
+            const auto& coil = mas.get_magnetic().get_coil();
+            std::optional<std::string> primaryWindingName = std::nullopt;
+            if (!coil.get_functional_description().empty()) {
+                primaryWindingName = coil.get_functional_description()[0].get_name();
+            }
+            Inputs::check_adviser_inputs_volt_second_balance(inputs, coil.get_isolation_sides(), primaryWindingName,
+                                                             core.get_shape_family(), coreType);
+        }
         load_filter_flow(_defaultCustomMagneticFilterFlow, inputs);
         auto patterns = Coil::get_patterns(inputs, coreType);
         auto repetitions = Coil::get_repetitions(inputs, coreType);
@@ -529,6 +624,7 @@ namespace OpenMagnetics {
 
         std::vector<Mas> masesWithCoil;
         bool earlyTerminated = false;
+        auto advise_all_patterns = [&]() {
         for (auto repetition : repetitions) {
             if (earlyTerminated) break;
             for (auto pattern : patterns) {
@@ -598,6 +694,70 @@ namespace OpenMagnetics {
                 }
             }
         }
+        };
+
+        // Names the limits a coil breaks: the validity filters it fails (with the current density
+        // limit spelled out) and any winding with more parallels than the configured maximum.
+        auto violated_limits = [&](Mas& candidate) {
+            std::string violated;
+            auto append = [&](const std::string& reason) { violated += (violated.empty() ? "" : ", ") + reason; };
+            for (const auto& filterConfiguration : _loadedFilterFlow) {
+                auto filterEnum = filterConfiguration.get_filter();
+                if (!_filters[filterEnum]->evaluate_magnetic(&candidate.get_mutable_magnetic(), &candidate.get_mutable_inputs()).first) {
+                    std::string reason(magic_enum::enum_name(filterEnum));
+                    if (filterEnum == MagneticFilters::EFFECTIVE_CURRENT_DENSITY) {
+                        reason += " above " + std::to_string(defaults.maximumEffectiveCurrentDensity / 1e6) + " A/mm2";
+                    }
+                    append(reason);
+                }
+            }
+            for (const auto& winding : candidate.get_magnetic().get_coil().get_functional_description()) {
+                if (winding.get_number_parallels() > defaults.maximumNumberParallels) {
+                    append("winding '" + winding.get_name() + "' has " + std::to_string(winding.get_number_parallels()) +
+                           " parallels, above the " + std::to_string(defaults.maximumNumberParallels) + " maximum");
+                }
+            }
+            return violated;
+        };
+        auto stamp_invalid = [&](Mas& candidate) {
+            if (coil_failed_validity_filters(candidate)) {
+                return;
+            }
+            auto violated = violated_limits(candidate);
+            if (violated.empty()) {
+                // Found by the wider search but within every limit: a valid design.
+                return;
+            }
+            if (!candidate.get_magnetic().get_manufacturer_info()) {
+                candidate.get_mutable_magnetic().set_manufacturer_info(MagneticManufacturerInfo());
+            }
+            auto info = candidate.get_magnetic().get_manufacturer_info().value();
+            info.set_reference(INVALID_COIL_REFERENCE_PREFIX + info.get_reference().value_or("") + " [violates: " + violated + "]");
+            candidate.get_mutable_magnetic().set_manufacturer_info(info);
+        };
+
+        // The search mutates `mas` (pattern integrity checks on its coil); the retry starts from
+        // the same state the first search did.
+        const Mas masBeforeSearch = mas;
+        advise_all_patterns();
+        if (masesWithCoil.empty()) {
+            // No coil fits this core within the wire limits. Search again beyond them, so the caller
+            // still learns what the core would need, and mark every such coil INVALID with the limit
+            // it breaks: they rank below any valid design and MagneticAdviser only falls back to
+            // them when no core winds validly.
+            logEntry("No coil fits within the wire limits; retrying beyond them, results marked INVALID", "CoilAdviser", 2);
+            struct RelaxedWireLimitsGuard {
+                bool& flag;
+                explicit RelaxedWireLimitsGuard(bool& f) : flag(f) { flag = true; }
+                ~RelaxedWireLimitsGuard() { flag = false; }
+            } relaxedWireLimitsGuard(_relaxedWireLimits);
+            earlyTerminated = false;
+            mas = masBeforeSearch;
+            advise_all_patterns();
+            for (auto& candidate : masesWithCoil) {
+                stamp_invalid(candidate);
+            }
+        }
 
         // Multi-column winding placement (opt-in): for two-winding transformers on
         // multi-leg two-piece cores, additionally propose the secondary wound on a
@@ -635,6 +795,9 @@ namespace OpenMagnetics {
                 lateralCoil.set_bobbin(lateralBobbin);
                 lateralCoil.get_mutable_functional_description()[1].set_winding_window(static_cast<int64_t>(lateralWindowIndex.value()));
                 lateralCoil.set_core_columns(lateralCore.get_columns());
+                // ABT #1533: the core was re-processed in place (get_mutable_core), which the coil
+                // does not see; give it the re-processed core as well as its columns.
+                lateralCoil.set_core_geometry(lateralCore);
                 lateralCoil.unwind();
 
                 std::vector<size_t> lateralPattern = {0, 1};
@@ -691,11 +854,7 @@ namespace OpenMagnetics {
             size_t numToReturn = std::min(invalidMagneticsWithScoring.size(), maximumNumberResults);
             for (size_t i = 0; i < numToReturn; ++i) {
                 auto mas = invalidMagneticsWithScoring[i].first;
-                if (mas.get_magnetic().get_manufacturer_info()) {
-                    auto info = mas.get_magnetic().get_manufacturer_info().value();
-                    info.set_reference(INVALID_COIL_REFERENCE_PREFIX + info.get_reference().value_or(""));
-                    mas.get_mutable_magnetic().set_manufacturer_info(info);
-                }
+                stamp_invalid(mas);
                 masesWithoutScoring.push_back(mas);
             }
         }
@@ -759,6 +918,24 @@ namespace OpenMagnetics {
                 if (!_diagnosisBestFailure.empty()) {
                     reason += "; best candidate failed on: " + _diagnosisBestFailure;
                 }
+                if (_diagnosisRealWindingRefusals > 0) {
+                    reason += "; " + std::to_string(_diagnosisRealWindingRefusals)
+                        + " candidates were refused by the real winder, e.g. "
+                        + _diagnosisRealWindingRefusal;
+                }
+                if (_diagnosisInsulationOutsideWindow > 0) {
+                    reason += "; " + std::to_string(_diagnosisInsulationOutsideWindow)
+                        + " wound candidates were refused because their insulation does not fit the window, e.g. "
+                        + _diagnosisInsulationOutsideWindowReason;
+                }
+            }
+            // ABT #1699: with real winding geometry on, say how many wires the strict packing
+            // pass refused because the real winder could not close their section once its
+            // crossing stations and connection-lead slots are reserved.
+            if (_wireAdviser.get_real_winding_packing_refusals() > 0) {
+                reason += "; not real-windable in this window: " + std::to_string(_wireAdviser.get_real_winding_packing_refusals())
+                    + " wires do not pack once the real winder's crossing stations and connection-lead blocking are reserved, e.g. "
+                    + _wireAdviser.get_first_real_winding_packing_refusal();
             }
             _lastNoResultsReason = reason;
             logEntry("WARNING: " + reason, "CoilAdviser", 1);
@@ -949,24 +1126,8 @@ namespace OpenMagnetics {
         return stackUp;
     }
 
-    std::vector<Mas> CoilAdviser::get_advised_coil_for_pattern(std::vector<Wire>* wires, Mas mas, std::vector<size_t> pattern, size_t repetitions, std::vector<WireSolidInsulationRequirements> solidInsulationRequirementsForWires, size_t maximumNumberResults, std::string reference){
-        bool filterMode = bool(mas.get_mutable_inputs().get_design_requirements().get_minimum_impedance());
-        const bool isCmc = mas.get_mutable_inputs().get_design_requirements().get_sub_application().has_value()
-                        && mas.get_mutable_inputs().get_design_requirements().get_sub_application().value()
-                           == SubApplication::COMMON_MODE_NOISE_FILTERING;
-        size_t dmcWindingCount = 0;
-        if (!mas.get_inputs().get_operating_points().empty()) {
-            dmcWindingCount = mas.get_inputs().get_operating_points()[0].get_excitations_per_winding().size();
-        }
-        const bool isDmcMultiWinding =
-            mas.get_mutable_inputs().get_design_requirements().get_topology().has_value()
-            && mas.get_mutable_inputs().get_design_requirements().get_topology().value() == MAS::Topology::DIFFERENTIAL_MODE_CHOKE
-            && dmcWindingCount >= 2;
-        size_t maximumNumberWires = settings.get_coil_adviser_maximum_number_wires();
-        auto sectionProportions = calculate_winding_window_proportion_per_winding(mas.get_mutable_inputs(), mas.get_magnetic().get_coil());
-        auto core = mas.get_magnetic().get_core();
-        auto coil = mas.get_magnetic().get_coil();
-        if (core.get_functional_description().get_type() != CoreType::TOROIDAL) {
+    void CoilAdviser::apply_coil_stage_winding_layout(Coil& coil, CoreType coreType, bool filterMode) {
+        if (coreType != CoreType::TOROIDAL) {
             coil.set_winding_orientation(WindingOrientation::OVERLAPPING);
             coil.set_section_alignment(CoilAlignment::INNER_OR_TOP);
         }
@@ -1000,6 +1161,26 @@ namespace OpenMagnetics {
                 }
             }
         }
+    }
+
+    std::vector<Mas> CoilAdviser::get_advised_coil_for_pattern(std::vector<Wire>* wires, Mas mas, std::vector<size_t> pattern, size_t repetitions, std::vector<WireSolidInsulationRequirements> solidInsulationRequirementsForWires, size_t maximumNumberResults, std::string reference){
+        bool filterMode = bool(mas.get_mutable_inputs().get_design_requirements().get_minimum_impedance());
+        const bool isCmc = mas.get_mutable_inputs().get_design_requirements().get_sub_application().has_value()
+                        && mas.get_mutable_inputs().get_design_requirements().get_sub_application().value()
+                           == SubApplication::COMMON_MODE_NOISE_FILTERING;
+        size_t dmcWindingCount = 0;
+        if (!mas.get_inputs().get_operating_points().empty()) {
+            dmcWindingCount = mas.get_inputs().get_operating_points()[0].get_excitations_per_winding().size();
+        }
+        const bool isDmcMultiWinding =
+            mas.get_mutable_inputs().get_design_requirements().get_topology().has_value()
+            && mas.get_mutable_inputs().get_design_requirements().get_topology().value() == MAS::Topology::DIFFERENTIAL_MODE_CHOKE
+            && dmcWindingCount >= 2;
+        size_t maximumNumberWires = settings.get_coil_adviser_maximum_number_wires();
+        auto sectionProportions = calculate_winding_window_proportion_per_winding(mas.get_mutable_inputs(), mas.get_magnetic().get_coil());
+        auto core = mas.get_magnetic().get_core();
+        auto coil = mas.get_magnetic().get_coil();
+        apply_coil_stage_winding_layout(coil, core.get_functional_description().get_type(), filterMode);
         mas.get_mutable_magnetic().set_coil(coil);
 
         size_t numberWindings = coil.get_functional_description().size();
@@ -1040,10 +1221,7 @@ namespace OpenMagnetics {
 
         if (needsMargin) {
             // If we want to use margin, we set the maximum so the wires chosen will need margin (and be faster)
-            for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
-                solidInsulationRequirementsForWires[windingIndex].set_maximum_number_layers(1);
-                solidInsulationRequirementsForWires[windingIndex].set_maximum_grade(3);
-            }
+            limit_wire_insulation_requirements_for_margin(solidInsulationRequirementsForWires);
         }
 
         std::vector<std::vector<std::pair<OpenMagnetics::Winding, double>>> wireCoilPerWinding;
@@ -1114,7 +1292,7 @@ namespace OpenMagnetics {
                 if (!mas.get_inputs().get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex].get_current()->get_processed()->get_effective_frequency()) {
                     auto current = mas.get_inputs().get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex].get_current().value();
                     if (current.get_waveform()) {
-                        auto processed = Inputs::calculate_processed_data(current.get_waveform().value());
+                        auto processed = Inputs::calculate_processed_data(current.get_waveform().value(), mas.get_inputs().get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex].get_frequency());
                         current.set_processed(processed);
                         mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].set_current(current);
                     }
@@ -1145,14 +1323,8 @@ namespace OpenMagnetics {
                                          return p1.get_conditions().get_ambient_temperature() < p2.get_conditions().get_ambient_temperature();
                                      })).get_conditions().get_ambient_temperature();
 
-            // COA-OPT-1 NOTE: This wireConfigurations block is duplicated in wound and planar paths.
-            // TODO: Extract as static const or class member to reduce duplication.
-            std::vector<std::map<std::string, double>> wireConfigurations = {
-                {{"maximumEffectiveCurrentDensity", defaults.maximumEffectiveCurrentDensity}, {"maximumNumberParallels", defaults.maximumNumberParallels}},
-                {{"maximumEffectiveCurrentDensity", defaults.maximumEffectiveCurrentDensity}, {"maximumNumberParallels", defaults.maximumNumberParallels * 2}},
-                {{"maximumEffectiveCurrentDensity", defaults.maximumEffectiveCurrentDensity * 2}, {"maximumNumberParallels", defaults.maximumNumberParallels}},
-                {{"maximumEffectiveCurrentDensity", defaults.maximumEffectiveCurrentDensity * 2}, {"maximumNumberParallels", defaults.maximumNumberParallels * 2}}
-            };
+            auto wireConfigurations = wire_configurations(defaults.maximumEffectiveCurrentDensity, defaults.maximumNumberParallels, _relaxedWireLimits);
+            std::vector<std::vector<std::pair<Winding, double>>> candidatesPerConfiguration;
             logEntry("Trying " + std::to_string(wireConfigurations.size()) + " wire configurations", "CoilAdviser", 2);
 
             // wound_with windings (e.g. center-tapped LLC half-secondaries)
@@ -1216,17 +1388,19 @@ namespace OpenMagnetics {
                     if (wiresWithScoring.size() > kMaxWiresPerConfig) {
                         wiresWithScoring.resize(kMaxWiresPerConfig);
                     }
-                    timeout += wiresWithScoring.size();
-
-                    std::move(wiresWithScoring.begin(), wiresWithScoring.end(), std::back_inserter(wireCoilPerWinding.back()));
-                    // COA-FIX-INSULATION-MARGIN: Do NOT early-break here. Letting all
-                    // wireConfigurations run gives diversity in wire thickness — higher
-                    // current density / more parallels yield thinner wires which may
-                    // be the only ones that fit tight sections (e.g. with margin tape).
-                    // The wind() loop downstream is already bounded by
-                    // kMaxConsecutiveFailuresWithNoSuccess and the timeout counter.
+                    candidatesPerConfiguration.push_back(std::move(wiresWithScoring));
+                    // Do NOT early-break here: every wireConfiguration contributes candidates.
+                    // The configurations at twice the current density and/or twice the parallels
+                    // run only in the INVALID retry (_relaxedWireLimits): in the normal search
+                    // the strict EFFECTIVE_CURRENT_DENSITY filter rejected every design wound at
+                    // the doubled density, and the doubled parallels broke the very maximum this
+                    // adviser is configured with, so they only cost wind() calls. The wind() loop
+                    // downstream is bounded by kMaxConsecutiveFailuresWithNoSuccess and the timeout.
                 }
             }
+            auto mergedCandidates = concatenate_wire_candidates(candidatesPerConfiguration);
+            timeout += mergedCandidates.size();
+            std::move(mergedCandidates.begin(), mergedCandidates.end(), std::back_inserter(wireCoilPerWinding.back()));
         }
 
         for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
@@ -1263,6 +1437,7 @@ namespace OpenMagnetics {
         for (const auto& wpw : wireCoilPerWinding) totalCandidates += wpw.size();
         const size_t kMaxConsecutiveFailuresWithNoSuccess = std::max<size_t>(25, totalCandidates);
         size_t consecutiveFailures = 0;
+        const size_t windPoolSize = maximumNumberResults * kWoundCoilPoolMultiplier;
 
         while (true) {
 
@@ -1286,6 +1461,7 @@ namespace OpenMagnetics {
                     if (windings[pIdx].get_name() == partnerName) {
                         windings[wIdx].set_wire(windings[pIdx].get_wire());
                         windings[wIdx].set_number_parallels(windings[pIdx].get_number_parallels());
+                        WireAdviser::copy_lead_conductors(windings[pIdx], windings[wIdx]);  // ABT #1496: and its lead
                         break;
                     }
                 }
@@ -1303,6 +1479,7 @@ namespace OpenMagnetics {
                 for (size_t wIdx = 1; wIdx < windings.size(); ++wIdx) {
                     windings[wIdx].set_wire(w0.get_wire());
                     windings[wIdx].set_number_parallels(w0.get_number_parallels());
+                    WireAdviser::copy_lead_conductors(w0, windings[wIdx]);  // ABT #1496: and its lead
                 }
             }
 
@@ -1311,7 +1488,28 @@ namespace OpenMagnetics {
             // We have new wires combination, we need to restart insulation each time and let it compute it again
             mas.get_mutable_magnetic().get_mutable_coil().reset_insulation();
             _diagnosisWindAttempts++;
-            bool wound = mas.get_mutable_magnetic().get_mutable_coil().wind(sectionProportions, pattern, repetitions);
+            // ABT #1699: with real winding geometry on, this wind IS the real one, and the real
+            // winder refuses a layout it cannot close layer by layer by throwing COIL_WINDING_ERROR
+            // (the crossing stations and the connection-lead blocking do not converge). That is this
+            // candidate's verdict -- the same one real_winding_refusal returns for it -- not the
+            // adviser's: it is counted, logged and the walk goes on. Any other exception, and this
+            // one with the setting off, propagates.
+            auto windCandidate = [&](const std::vector<double>& proportions) -> bool {
+                try {
+                    return mas.get_mutable_magnetic().get_mutable_coil().wind(proportions, pattern, repetitions);
+                }
+                catch (const CoilException& e) {
+                    if (e.code() != ErrorCode::COIL_WINDING_ERROR || !settings.get_coil_use_real_winding_geometry()) {
+                        throw;
+                    }
+                    if (_diagnosisRealWindingRefusals++ == 0) {
+                        _diagnosisRealWindingRefusal = e.what();
+                    }
+                    logEntry(std::string("Candidate refused by the real winder: ") + e.what(), "CoilAdviser", 2);
+                    return false;
+                }
+            };
+            bool wound = windCandidate(sectionProportions);
             bool packable = true;
             if (!wound) {
                 // ABT #415 RECOVERY: the fixed equal shares above are decided before any wire is
@@ -1329,7 +1527,7 @@ namespace OpenMagnetics {
                                                    mas.get_mutable_magnetic().get_mutable_coil(), pattern, repetitions);
                 if (packable && combinationProportions != sectionProportions) {
                     mas.get_mutable_magnetic().get_mutable_coil().reset_insulation();
-                    wound = mas.get_mutable_magnetic().get_mutable_coil().wind(combinationProportions, pattern, repetitions);
+                    wound = windCandidate(combinationProportions);
                 }
                 else if (!packable) {
                     _diagnosisGuardSkips++;
@@ -1427,6 +1625,18 @@ namespace OpenMagnetics {
                         wound = false;
                     }
                 }
+                // ABT #838: the copper fitting is not the whole coil -- the insulation sections and
+                // layers the description carries must fit the window too (the wind's own verdict
+                // tests turns only). A coil whose outer insulation wrap ends past the window edge
+                // is not buildable and is not returned; the walk goes on to the next combination.
+                else if (!mas.get_mutable_magnetic().get_mutable_coil().are_insulation_layers_inside_winding_window()) {
+                    wound = false;
+                    const auto& insulationEscape = mas.get_mutable_magnetic().get_mutable_coil().get_last_fit_failure();
+                    if (_diagnosisInsulationOutsideWindow++ == 0) {
+                        _diagnosisInsulationOutsideWindowReason = insulationEscape;
+                    }
+                    logEntry("Wound candidate refused: " + insulationEscape, "CoilAdviser", 2);
+                }
 
                 if (wound) {
                     if (!mas.get_mutable_magnetic().get_manufacturer_info()) {
@@ -1441,7 +1651,7 @@ namespace OpenMagnetics {
 
                     masesWithCoil.push_back(mas);
                     wiresIndex++;
-                    if (masesWithCoil.size() == maximumNumberResults) {
+                    if (masesWithCoil.size() == windPoolSize) {
                         break;
                     }
                 }
@@ -1481,9 +1691,129 @@ namespace OpenMagnetics {
             if (!anyAdvanceable) break; // COA-BUG-1 FIX: all windings exhausted
             currentWireIndexPerWinding[lowestIndex]++;
         }
+        if (masesWithCoil.size() > maximumNumberResults) {
+            // Keep the coils with the lowest losses (core + ohmic, skin and proximity winding
+            // losses), as MKF's MagneticFilterLosses computes them on the wound coil: the wire
+            // ranking before winding cannot see the proximity field of the real layer stack.
+            // A coil whose losses MKF cannot evaluate (the material's loss fit does not cover the
+            // frequency, the thermal network does not converge, the filter refuses the coil) has
+            // no loss to rank by: it is dropped from the ranking with its reason logged, and no
+            // loss is invented for it.
+            // A coil whose core saturates at the temperature its own losses heat it to is a
+            // different case: that is a verdict on the design, as in the saturation filter (ABT
+            // #1740), so the coil is REJECTED, here and in the unranked return below (ABT #838, Alf
+            // 2026-10-12). The loss filter refuses it with the saturating operating point's solved
+            // losses in its outputs, and the verdict is the saturation check analyze_results makes
+            // on them (ABT #1855: the loss solve no longer throws for a saturated core).
+            MagneticFilterLosses lossesFilter;
+            std::vector<std::pair<Mas, double>> masesWithLosses;
+            std::vector<Mas> masesUnranked;
+            for (auto& woundMas : masesWithCoil) {
+                std::string reason;
+                try {
+                    std::vector<Outputs> lossesOutputs;
+                    auto [valid, losses] = lossesFilter.evaluate_magnetic(&woundMas.get_mutable_magnetic(), &woundMas.get_mutable_inputs(), &lossesOutputs);
+                    if (valid) {
+                        masesWithLosses.push_back({woundMas, losses});
+                        continue;
+                    }
+                    std::vector<ResultFinding> saturationFindings;
+                    const auto& operatingPoints = woundMas.get_inputs().get_operating_points();
+                    for (size_t operatingPointIndex = 0; operatingPointIndex < lossesOutputs.size() && operatingPointIndex < operatingPoints.size(); ++operatingPointIndex) {
+                        if (!lossesOutputs[operatingPointIndex].get_core_losses()) {
+                            continue;
+                        }
+                        for (auto& finding : ResultsAnalyzer::analyze_saturation(woundMas.get_magnetic(), operatingPoints[operatingPointIndex],
+                                                                                 lossesOutputs[operatingPointIndex], operatingPointIndex,
+                                                                                 woundMas.get_inputs().get_design_requirements().get_topology())) {
+                            saturationFindings.push_back(finding);
+                        }
+                    }
+                    if (!saturationFindings.empty()) {
+                        logEntry("Wound coil '" + woundMas.get_mutable_magnetic().get_reference() + "' (material " +
+                                 woundMas.get_mutable_magnetic().get_mutable_core().resolve_material().get_name() + ", " +
+                                 describe_operating_frequencies(woundMas.get_inputs()) +
+                                 ") rejected: its core saturates at the temperature its losses heat it to: " +
+                                 saturationFindings.front().message, "CoilAdviser");
+                        continue;
+                    }
+                    reason = "MagneticFilterLosses refused the coil (its windings do not match the operating point's excitations)";
+                }
+                catch (const MaterialFrequencyOutOfSpanException& exception) {
+                    reason = exception.what();
+                }
+                catch (const CalculationException& exception) {
+                    if (exception.code() != ErrorCode::CALCULATION_INVALID_RESULT &&
+                        exception.code() != ErrorCode::MATERIAL_FREQUENCY_OUT_OF_SPAN) {
+                        throw;
+                    }
+                    reason = exception.what();
+                }
+                masesUnranked.push_back(woundMas);
+                logEntry("Wound coil '" + woundMas.get_mutable_magnetic().get_reference() + "' (material " +
+                         woundMas.get_mutable_magnetic().get_mutable_core().resolve_material().get_name() + ", " +
+                         describe_operating_frequencies(woundMas.get_inputs()) +
+                         ") dropped from the loss ranking: its losses could not be evaluated: " + reason, "CoilAdviser");
+            }
+            if (masesWithLosses.empty()) {
+                // Nothing to rank by: the core keeps its coils in the order they were wound
+                // (the order before the loss ranking existed), and the log says why.
+                logEntry("None of the " + std::to_string(masesWithCoil.size()) + " wound coils on core '" +
+                         mas.get_mutable_magnetic().get_mutable_core().get_shape_name() +
+                         "' could be ranked by losses; returning them in winding order, unranked" +
+                         (masesUnranked.size() < masesWithCoil.size()
+                              ? ", without the " + std::to_string(masesWithCoil.size() - masesUnranked.size()) +
+                                    " whose core saturates at its operating temperature"
+                              : std::string()),
+                         "CoilAdviser");
+                masesWithCoil = std::move(masesUnranked);
+            }
+            else {
+                stable_sort_by_index(masesWithLosses, [](const std::pair<Mas, double>& left, const std::pair<Mas, double>& right) {
+                    return left.second < right.second;
+                });
+                masesWithCoil.clear();
+                for (auto& [rankedMas, losses] : masesWithLosses) {
+                    masesWithCoil.push_back(std::move(rankedMas));
+                }
+            }
+        }
+        // masesWithCoil is now in ranking order (or winding order when nothing could be ranked).
+        // The first maximumNumberResults are returned. ABT #1699: with real winding geometry on,
+        // only coils the real winder builds from their stored form (MagneticFilterRealWinding) are
+        // returned, walking the ranking until enough pass, so each candidate costs one real wind
+        // only when it would otherwise be returned. With the setting off the returned coils are the
+        // first maximumNumberResults, as before.
+        masesWithCoil = select_real_windable(std::move(masesWithCoil), maximumNumberResults);
         logEntry("Managed to wind " + std::to_string(masesWithCoil.size()) + " coils", "CoilAdviser");
 
         return masesWithCoil;
+    }
+
+    std::vector<Mas> CoilAdviser::select_real_windable(std::vector<Mas> rankedMases, size_t maximumNumberResults) {
+        if (!settings.get_coil_use_real_winding_geometry()) {
+            if (rankedMases.size() > maximumNumberResults) {
+                rankedMases.erase(rankedMases.begin() + maximumNumberResults, rankedMases.end());
+            }
+            return rankedMases;
+        }
+        MagneticFilterRealWinding realWindingFilter;
+        std::vector<Mas> selected;
+        for (auto& rankedMas : rankedMases) {
+            if (selected.size() == maximumNumberResults) {
+                break;
+            }
+            if (realWindingFilter.evaluate_magnetic(&rankedMas.get_mutable_magnetic(), &rankedMas.get_mutable_inputs()).first) {
+                selected.push_back(std::move(rankedMas));
+                continue;
+            }
+            if (_diagnosisRealWindingRefusals++ == 0) {
+                _diagnosisRealWindingRefusal = realWindingFilter.get_last_reason();
+            }
+            logEntry("Wound coil '" + rankedMas.get_mutable_magnetic().get_reference() +
+                     "' refused by the real winder: " + realWindingFilter.get_last_reason(), "CoilAdviser", 2);
+        }
+        return selected;
     }
 
     std::vector<Mas> CoilAdviser::get_advised_planar_coil_for_pattern(std::vector<Wire>* wires, Mas mas, std::vector<size_t> pattern, size_t repetitions, size_t maximumNumberResults, std::string reference){
@@ -1540,7 +1870,7 @@ namespace OpenMagnetics {
                 if (!mas.get_inputs().get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex].get_current()->get_processed()->get_effective_frequency()) {
                     auto current = mas.get_inputs().get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex].get_current().value();
                     if (current.get_waveform()) {
-                        auto processed = Inputs::calculate_processed_data(current.get_waveform().value());
+                        auto processed = Inputs::calculate_processed_data(current.get_waveform().value(), mas.get_inputs().get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex].get_frequency());
                         current.set_processed(processed);
                         mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].set_current(current);
                     }
@@ -1576,12 +1906,8 @@ namespace OpenMagnetics {
             }
 
             // Try multiple wire configurations to find optimal designs
-            std::vector<std::map<std::string, double>> wireConfigurations = {
-                {{"maximumEffectiveCurrentDensity", defaults.maximumEffectiveCurrentDensity}, {"maximumNumberParallels", defaults.maximumNumberParallels}},
-                {{"maximumEffectiveCurrentDensity", defaults.maximumEffectiveCurrentDensity}, {"maximumNumberParallels", defaults.maximumNumberParallels * 2}},
-                {{"maximumEffectiveCurrentDensity", defaults.maximumEffectiveCurrentDensity * 2}, {"maximumNumberParallels", defaults.maximumNumberParallels}},
-                {{"maximumEffectiveCurrentDensity", defaults.maximumEffectiveCurrentDensity * 2}, {"maximumNumberParallels", defaults.maximumNumberParallels * 2}}
-            };
+            auto wireConfigurations = wire_configurations(defaults.maximumEffectiveCurrentDensity, defaults.maximumNumberParallels, _relaxedWireLimits);
+            std::vector<std::vector<std::pair<Winding, double>>> candidatesPerConfiguration;
             logEntry("Trying " + std::to_string(wireConfigurations.size()) + " wire configurations", "CoilAdviser", 2);
 
             wireCoilPerWinding.push_back(std::vector<std::pair<Winding, double>>{});
@@ -1605,13 +1931,18 @@ namespace OpenMagnetics {
                     if (wiresWithScoring.size() > kMaxWiresPerConfig) {
                         wiresWithScoring.resize(kMaxWiresPerConfig);
                     }
-                    timeout += wiresWithScoring.size();
-                    // Only add wires up to the limit, but continue trying other configurations
-                    size_t spaceRemaining = maximumNumberResults * 4 - wireCoilPerWinding.back().size();
-                    size_t wiresToAdd = std::min(spaceRemaining, wiresWithScoring.size());
-                    std::move(wiresWithScoring.begin(), wiresWithScoring.begin() + wiresToAdd, std::back_inserter(wireCoilPerWinding.back()));
+                    candidatesPerConfiguration.push_back(std::move(wiresWithScoring));
                     found = true;
                 }
+            }
+            {
+                // Merge the configurations, then keep up to four candidates per requested result.
+                auto mergedCandidates = concatenate_wire_candidates(candidatesPerConfiguration);
+                if (mergedCandidates.size() > maximumNumberResults * 4) {
+                    mergedCandidates.resize(maximumNumberResults * 4);
+                }
+                timeout += mergedCandidates.size();
+                std::move(mergedCandidates.begin(), mergedCandidates.end(), std::back_inserter(wireCoilPerWinding.back()));
             }
             if (!found) {
                 logEntry("No planar wires found for winding " + std::to_string(windingIndex), "CoilAdviser", 2);
@@ -1661,6 +1992,7 @@ namespace OpenMagnetics {
                     if (windings[pIdx].get_name() == partnerName) {
                         windings[wIdx].set_wire(windings[pIdx].get_wire());
                         windings[wIdx].set_number_parallels(windings[pIdx].get_number_parallels());
+                        WireAdviser::copy_lead_conductors(windings[pIdx], windings[wIdx]);  // ABT #1496: and its lead
                         break;
                     }
                 }
@@ -1689,7 +2021,7 @@ namespace OpenMagnetics {
 
             // B19 FIX: Calculate planar clearances using InsulationCoordinator
             bool planarClearanceViolated = false;
-            if (mas.get_mutable_inputs().get_design_requirements().get_insulation() &&
+            if (mas.get_mutable_inputs().has_insulation_coordination_requirements() &&
                 mas.get_mutable_inputs().get_wiring_technology() == WiringTechnology::PRINTED) {
                 try {
                     InsulationCoordinator insulationCoordinator;

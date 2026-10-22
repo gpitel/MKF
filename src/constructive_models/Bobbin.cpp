@@ -1,3 +1,4 @@
+#include <magic_enum.hpp>
 #include "support/Utils.h"
 #include "constructive_models/Bobbin.h"
 #include "constructive_models/BobbinFamilyGeometry.h"
@@ -7,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <set>
 #include <numbers>
 #include <streambuf>
 #include <vector>
@@ -340,10 +342,26 @@ std::shared_ptr<BobbinDataProcessor> BobbinDataProcessor::factory(Bobbin bobbin)
     else if (family == BobbinFamily::U) {
         return std::make_shared<BobbinEDataProcessor>(ColumnShape::RECTANGULAR);
     }
-    else
+    // EI: formers of the ET 20 / ET 35 cores, which MAS classes as core family 'ei' (an E piece
+    // closed by a flat plate). CorePieceEi inherits CorePieceE's central column, a RECTANGLE, and
+    // so does a former built from it (create_quick_bobbin), so the record reads with the E labels
+    // and that column, like U.
+    else if (family == BobbinFamily::EI) {
+        return std::make_shared<BobbinEDataProcessor>(ColumnShape::RECTANGULAR);
+    }
+    else {
+        // Listed from the enum itself, in the spelling MAS files use, so a family added to the
+        // schema shows up here without anyone editing this message.
+        std::string options;
+        for (auto value : magic_enum::enum_values<BobbinFamily>()) {
+            json spelled;
+            to_json(spelled, value);
+            options += (options.empty() ? "" : ", ") + spelled.get<std::string>();
+        }
         throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
             "Unknown bobbin family (enumerator value " + std::to_string(static_cast<int>(family)) +
-            "), available options are: {E, EC, EFD, EL, EP, ER, ETD, P, PM, PQ, RM, T, U}");
+            "), available options are: {" + options + "}");
+    }
 }
 
 void load_interpolators() {
@@ -430,8 +448,13 @@ void load_interpolators() {
                 continue;
             }
             auto bobbinWindingWindow = scannedDescription->get_winding_windows()[0];
-            if (!bobbinWindingWindow.get_area() || !bobbinWindingWindow.get_width() || !bobbinWindingWindow.get_height()) {
-                unusableBobbins.push_back(datum.first + " (winding window has no area/width/height)");
+            // ABT #986: MAS makes a rectangular window's `area` OPTIONAL (width + height are what
+            // define it), so a catalogue former that declares width and height but no area is a
+            // legal record, not an unusable one. Its area is DERIVED, exactly as
+            // Bobbin::get_winding_window_area does (width * height). Only a window without width
+            // or height -- which this fit cannot place on either axis -- is skipped and reported.
+            if (!bobbinWindingWindow.get_width() || !bobbinWindingWindow.get_height()) {
+                unusableBobbins.push_back(datum.first + " (winding window has no width/height)");
                 continue;
             }
             try {
@@ -445,7 +468,9 @@ void load_interpolators() {
                     continue;
                 }
 
-                auto bobbinWindingWindowArea = bobbinWindingWindow.get_area().value();
+                double bobbinWindingWindowArea = bobbinWindingWindow.get_area() ?
+                    bobbinWindingWindow.get_area().value() :
+                    bobbinWindingWindow.get_width().value() * bobbinWindingWindow.get_height().value();
                 auto coreShapeWindingWindowArea = corePiece->get_winding_window().get_area().value() * 2; // Because if we are using a bobbin we have a two piece set
                 double bobbinFillingFactor = bobbinWindingWindowArea / coreShapeWindingWindowArea;
                 double bobbinWindingWindowWidth = bobbinWindingWindow.get_width().value();
@@ -653,9 +678,46 @@ Bobbin Bobbin::create_quick_bobbin(double windingWindowHeight, double windingWin
     return bobbin;
 }
 
+// ABT #761: the core families that never take a bobbin. Every drum family: the drum's flanges
+// ARE the former (the wire is wound directly on the core). And MOLDED (Alf, 2026-10-03): a molded
+// core is pressed around a coil that was wound before pressing, so it never has a former either.
+// Their quick bobbin is the core's own winding window with zero wall and column thickness, at
+// every size.
+static bool is_bobbinless_core_family(CoreShapeFamily family) {
+    return family == CoreShapeFamily::DRUM || family == CoreShapeFamily::DRUM_RING ||
+           family == CoreShapeFamily::DRUM_SEMISHIELDED || family == CoreShapeFamily::DRUM_PLATE ||
+           family == CoreShapeFamily::MOLDED;
+}
+
+// ABT #761 (Alf, 2026-10-03): standard UI/EI shapes that are specific Wurth Elektronik products
+// built without a bobbin. Nothing in the MAS shape data (family/type/magneticCircuit) tells them
+// apart from bobbin-wound UI/EI shapes, so they are named here exactly as in core_shapes.ndjson.
+// - The UI shapes are the WE-FLAT / FeFlat / FeSplit flat-cable ferrites (e.g. 7427807 =
+//   UI 56/5/12): the flat cable is clamped between the U and the I, no former.
+// - EI 3.02/1.95/1.35/4.87/1/2.5/2.3 is the WE-HCM 4035 (74434035010), wound directly on the core.
+// These are the 20 non-drum standard shapes whose catalogue-floored former left no winding window.
+static bool is_bobbinless_core_shape(const std::string& shapeName) {
+    static const std::set<std::string> bobbinlessShapes = {
+        "UI 13.5/2/4", "UI 13.5/2/6", "UI 13.5/2/10",
+        "UI 15.5/2/4", "UI 15.5/2/6", "UI 15.5/2/10",
+        "UI 16/5/8", "UI 16/5/12", "UI 16/5/19", "UI 16/5/20",
+        "UI 24/5/20", "UI 24.5/5/12", "UI 31/5/12", "UI 46/5/12", "UI 56/5/12",
+        "UI 20/3.3/12", "UI 33.5/3.3/12", "UI 40/3.3/12", "UI 45/3.3/12",
+        "EI 3.02/1.95/1.35/4.87/1/2.5/2.3",
+    };
+    return bobbinlessShapes.contains(shapeName);
+}
+
 Bobbin Bobbin::create_quick_bobbin(Core core, bool nullDimensions, std::optional<MAS::OrientationEnum> pinsOrientation) {
     if (!core.get_processed_description()) {
         core.process_data();
+    }
+    // ABT #761: drums (their flanges are the former), molded cores (wound before pressing) and
+    // the named bobbinless WE UI/EI products never take a bobbin. The quick bobbin is the
+    // bobbinless one (the same representation as nullDimensions: the core's own window, zero
+    // wall and column), whatever the core's size.
+    if (is_bobbinless_core_family(core.get_shape_family()) || is_bobbinless_core_shape(core.get_shape_name())) {
+        nullDimensions = true;
     }
 
     // Multi-window cores supported. Use the centre/main window (index 0)
@@ -743,7 +805,23 @@ Bobbin Bobbin::create_quick_bobbin(Core core, double wallThickness, double colum
         std::vector<double> bobbinWindingWindowDimensions;
 
         if (bobbinWindingWindowShape == WindingWindowShape::RECTANGULAR) {
-            bobbinWindingWindowDimensions = {std::max(0.0, coreWindingWindow.get_width().value() - columnThickness), std::max(0.0, coreWindingWindow.get_height().value() - wallThickness * 2)};
+            // ABT #761: never clamp the leftover to zero. A column or walls as thick as (or thicker
+            // than) the core window leave NO room to wind, and a window of width or height 0 is not
+            // a bobbin -- MAS rejects it, and every winder downstream divides by it. This bit the
+            // smallest molded parts (a 1610 cavity is 0.16 mm wide), where the quick bobbin's
+            // catalogue-floored thicknesses exceed the cavity. Say so instead.
+            double bobbinWindowWidth = coreWindingWindow.get_width().value() - columnThickness;
+            double bobbinWindowHeight = coreWindingWindow.get_height().value() - wallThickness * 2;
+            if (!(bobbinWindowWidth > 0) || !(bobbinWindowHeight > 0)) {
+                throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+                    "A bobbin with column thickness " + std::to_string(columnThickness) + " m and wall thickness " +
+                    std::to_string(wallThickness) + " m leaves no winding window in core '" +
+                    core.get_name().value_or("<unnamed>") + "' window " + std::to_string(windowIndex) + " (" +
+                    std::to_string(coreWindingWindow.get_width().value()) + " m wide x " +
+                    std::to_string(coreWindingWindow.get_height().value()) + " m high): bobbin window would be " +
+                    std::to_string(bobbinWindowWidth) + " m x " + std::to_string(bobbinWindowHeight) + " m");
+            }
+            bobbinWindingWindowDimensions = {bobbinWindowWidth, bobbinWindowHeight};
         }
         else {
             bobbinWindingWindowDimensions = {coreWindingWindow.get_radial_height().value(), coreWindingWindow.get_angle().value()};
@@ -1593,12 +1671,9 @@ Bobbin Bobbin::create_toroid_bobbin_on_base(Core core, const Bobbin& base) {
                 "Toroidal shape '" + core.get_shape_name() + "' has no dimension '" + label + "'.");
         }
     }
-    // ABT #1253 (Alf: "only a declared coating"). Core::get_coating_thickness() answers with a
-    // DEFAULT parylene/epoxy thickness when the core declares NO coating, so seating an uncoated
-    // core on a base silently shrank its winding window — the same core on a quick (Basic) bobbin
-    // keeps the bare window, and the two therefore wound differently for no physical reason
-    // (buck_inductor_complete: 2.9 mm seated against 3.0 mm bare). create_quick_bobbin already
-    // counts a coating only when the core declares one; match it. No silent default.
+    // ABT #1253 (Alf: "only a declared coating"). Only a declared coating shrinks the seated
+    // winding window, as in create_quick_bobbin; a core that declares none is bare
+    // (Core::get_coating_thickness() is 0), so the same core winds the same on either base.
     const double coating =
         core.get_functional_description().get_coating() ? core.get_coating_thickness() : 0.0;
     const double stacks = static_cast<double>(core.get_number_stacks());

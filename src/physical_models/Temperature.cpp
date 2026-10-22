@@ -1,6 +1,7 @@
 #include "physical_models/Temperature.h"
 #include "constructive_models/CorePiece.h"
 #include "physical_models/ThermalResistance.h"
+#include "physical_models/ReluctanceNetwork.h"
 #include "StrayCapacitance.h"
 #include "support/Painter.h"
 #include "support/Utils.h"
@@ -197,66 +198,50 @@ TemperatureConfig TemperatureConfig::fromSimulatedOutput(const MAS::OperatingPoi
 // ============================================================================
 
 double Temperature::getCoreThermalConductivity() const {
+    // ABT #1753: the one core-material resolver — the MAS value, or a WARNING-flagged estimate from
+    // the sourced materials of the same class, family, or all of MAS. No per-composition constants
+    // and no configured default: those were numbers nobody could trace to a datasheet.
     auto coreMaterial = Core(_magnetic.get_core()).resolve_material();
-    try {
-        return ThermalResistance::getCoreMaterialThermalConductivity(coreMaterial);
-    } catch (const MaterialException&) {
-        // No material in the MAS database currently carries thermalConductivity (audited
-        // 2026-08-02: 0 of 662), so this path is the effective source for every core. A single
-        // number for all chemistries is wrong — powder-core composites conduct 2-3x better than
-        // ferrites — so the estimate is per material COMPOSITION, which the database does carry,
-        // with values from vendor data (Ferroxcube/TDK ferrite datasheets ~3.5-5 W/mK; Magnetics
-        // Inc. powder cores ~8-13 W/mK for the distributed-gap composite, not the pure metal):
-        auto composition = coreMaterial.get_material_composition();
-        if (composition) {
-            switch (composition.value()) {
-                case MaterialComposition::MN_ZN:
-                case MaterialComposition::NI_ZN:
-                case MaterialComposition::MG_ZN:         return 4.0;   // ferrites
-                case MaterialComposition::FE_SI_AL:      return 8.0;   // Sendust
-                case MaterialComposition::FE_SI:         return 10.0;  // XFlux-class
-                case MaterialComposition::FE_NI:         return 9.0;   // High Flux
-                case MaterialComposition::FE_NI_MO:      return 9.0;   // MPP
-                case MaterialComposition::CARBONYL_IRON: return 6.0;
-                case MaterialComposition::IRON:          return 8.0;
-                case MaterialComposition::PROPRIETARY:   break;        // unknown chemistry: fall through
-            }
-        }
-        // Unknown composition: the conservative-hot choice (low k over-predicts the hot spot).
-        return _config.coreThermalConductivity;
-    }
+    return resolve_core_material_heat_conductivity(coreMaterial).value;
 }
 
 double Temperature::getBobbinThermalConductivity() const {
-    try {
-        auto bobbinOpt = _magnetic.get_coil().get_bobbin();
-        if (std::holds_alternative<Bobbin>(bobbinOpt)) {
-            auto bobbin = std::get<Bobbin>(bobbinOpt);
-            auto funcDesc = bobbin.get_functional_description();
-            if (funcDesc) {
-                auto materialOpt = funcDesc->get_material();
-                if (materialOpt) {
-                    auto& materialVariant = *materialOpt;
-                    if (std::holds_alternative<MAS::InsulationMaterial>(materialVariant)) {
-                        OpenMagnetics::InsulationMaterial resolved(
-                            std::get<MAS::InsulationMaterial>(materialVariant));
-                        return ThermalResistance::getInsulationMaterialThermalConductivity(resolved);
-                    } else if (std::holds_alternative<std::string>(materialVariant)) {
-                        auto material = find_insulation_material_by_name(
-                            std::get<std::string>(materialVariant));
-                        return ThermalResistance::getInsulationMaterialThermalConductivity(material);
-                    }
+    // ABT #1643 (Alf, 2026-10-18): no built-in bobbin conductivity. The bobbin material's own MAS
+    // value, or the WARNING-flagged estimate from its polymer class
+    // (resolve_bobbin_material_thermal_conductivity); a class that cannot be determined throws.
+    std::optional<OpenMagnetics::InsulationMaterial> material;
+    auto bobbinOpt = _magnetic.get_coil().get_bobbin();
+    if (std::holds_alternative<Bobbin>(bobbinOpt)) {
+        auto bobbin = std::get<Bobbin>(bobbinOpt);
+        auto funcDesc = bobbin.get_functional_description();
+        if (funcDesc && funcDesc->get_material()) {
+            const auto materialVariant = funcDesc->get_material().value();
+            if (std::holds_alternative<MAS::InsulationMaterial>(materialVariant)) {
+                material = OpenMagnetics::InsulationMaterial(std::get<MAS::InsulationMaterial>(materialVariant));
+            }
+            else {
+                const auto& name = std::get<std::string>(materialVariant);
+                try {
+                    material = find_insulation_material_by_name(name);
+                }
+                catch (const InvalidInputException&) {
+                    // A name MAS has no record of is not estimated: nothing says what it is made of
+                    // (ABT #1980 lists the catalogue bobbins naming such materials).
+                    throw MaterialException(ErrorCode::MATERIAL_NOT_FOUND,
+                        "Bobbin material '" + name + "' has no record in the MAS insulation materials: its thermal "
+                        "conductivity can be neither read nor estimated from its polymer class. Add the material to "
+                        "MAS or name one it has.");
                 }
             }
         }
-        // No material on bobbin: use default bobbin material (PET)
-        auto defaultMaterial = find_insulation_material_by_name(Defaults().defaultBobbinMaterial);
-        return ThermalResistance::getInsulationMaterialThermalConductivity(defaultMaterial);
-    } catch (const MaterialException&) {
-        // Only material-data-missing falls back to the constant; other failures
-        // (bad bobbin data, lookup bugs) must propagate.
-        return kBobbin_ThermalConductivity;
     }
+    if (!material) {
+        // A bobbin that states no material is Defaults().defaultBobbinMaterial (PET), the same
+        // project-wide answer StrayCapacitance gives for its wall permittivity (Alf's ruling,
+        // 2026-09-12). PET's MAS conductivity is itself unsourced, which the resolver flags.
+        material = find_insulation_material_by_name(Defaults().defaultBobbinMaterial);
+    }
+    return resolve_bobbin_material_thermal_conductivity(material.value()).value;
 }
 
 // ============================================================================
@@ -350,7 +335,13 @@ void Temperature::extractWireProperties() {
     
     auto wire = std::get<Wire>(wireVariant);
     _isRoundWire = (wire.get_type() == WireType::ROUND || wire.get_type() == WireType::LITZ);
-    _isPlanar = (wire.get_type() == WireType::PLANAR || wire.get_type() == WireType::FOIL);
+    // ABT #1735: "planar" is the PCB-trace topology (turns stacked on FR4 layers, the core's
+    // plates closing the stack), which createPlanarConvectionConnections models. A FOIL winding
+    // is wound around a column like any other concentric winding; classifying it as planar sent
+    // a foil-wound E 40/11 through the PCB path, whose core convects from its quarter-model
+    // section quadrants (~8 cm2) instead of the core's real exterior (~32 cm2, ABT #1459), and
+    // ran its core at 3x the core-only resistance.
+    _isPlanar = (wire.get_type() == WireType::PLANAR);
     
     // Get wire dimensions
     if (wire.get_type() == WireType::LITZ) {
@@ -416,7 +407,7 @@ void Temperature::extractWireProperties() {
         if (std::holds_alternative<Wire>(wv)) {
             auto w = std::get<Wire>(wv);
             wProps.isRoundWire = (w.get_type() == WireType::ROUND || w.get_type() == WireType::LITZ);
-            wProps.isPlanar = (w.get_type() == WireType::PLANAR || w.get_type() == WireType::FOIL);
+            wProps.isPlanar = (w.get_type() == WireType::PLANAR);  // ABT #1735: foil is wound, not PCB
             
             // Extract dimensions from THIS winding's wire (not winding[0])
             wProps.wireWidth = kWire_DefaultWidth;
@@ -530,6 +521,12 @@ void Temperature::createThermalNodes() {
         }
     }
 
+    // ABT #1735: a winding wound on a lateral leg gets its own window in the concentric network.
+    _lateralPlacement.reset();
+    if (!_config.coreOnly && !_isToroidal && ReluctanceNetwork::has_non_main_placement(_magnetic)) {
+        resolveLateralPlacement();
+    }
+
     if (_isToroidal) {
         createToroidalCoreNodes();
     } else {
@@ -550,6 +547,167 @@ void Temperature::createThermalNodes() {
     ambientNode.powerDissipation = 0.0;
     ambientNode.physicalCoordinates = {0, 0, 0};
     _nodes.push_back(ambientNode);
+}
+
+void Temperature::resolveLateralPlacement() {
+    // ABT #1735 (Alf 2026-10-11: model it, do not refuse it). The concentric network is the
+    // main column's window with its mirror image: every main-wound turn stands for both of its
+    // crossings, every core node for both symmetric halves. A winding on a lateral leg breaks
+    // the left/right symmetry, so the two legs become separate nodes and the lateral winding
+    // gets its own enclosure. Supported: a three-column shell whose two outer legs are mirror
+    // images, wound on either outer leg or on both. Cores without outer legs never get here.
+    const std::string who = "Temperature::resolveLateralPlacement (magnetic '" + _magnetic.get_reference() + "'): ";
+    if (_isPlanar) {
+        throw NotImplementedException(who + "a PCB-planar winding placed on a lateral column");
+    }
+    auto core = _magnetic.get_core();
+    if (!core.get_processed_description()) {
+        throw std::runtime_error(who + "core is not processed.");
+    }
+    auto columns = core.get_processed_description()->get_columns();
+    const size_t mainColumnIndex = core.get_main_column_index();
+    if (columns.size() != 3) {
+        throw NotImplementedException(who + "a winding on a lateral column of a core with " +
+                                      std::to_string(columns.size()) + " columns (only three-column shells are modelled)");
+    }
+    std::vector<size_t> lateralIndexes;
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (i != mainColumnIndex) lateralIndexes.push_back(i);
+    }
+    const double xA = columns[lateralIndexes[0]].get_coordinates()[0];
+    const double xB = columns[lateralIndexes[1]].get_coordinates()[0];
+    if (std::abs(xA + xB) > 1e-6 || std::abs(columns[mainColumnIndex].get_coordinates()[0]) > 1e-9 ||
+        std::abs(columns[lateralIndexes[0]].get_width() - columns[lateralIndexes[1]].get_width()) > 1e-9 ||
+        std::abs(columns[lateralIndexes[0]].get_depth() - columns[lateralIndexes[1]].get_depth()) > 1e-9) {
+        throw NotImplementedException(who + "a winding on a lateral column of a shell whose outer legs are not "
+                                      "mirror images about a centred main column");
+    }
+
+    auto& coil = _magnetic.get_mutable_coil();
+    auto bobbinVariant = coil.get_bobbin();
+    if (!std::holds_alternative<Bobbin>(bobbinVariant) || !std::get<Bobbin>(bobbinVariant).get_processed_description()) {
+        throw std::runtime_error(who + "bobbin is not resolved or not processed.");
+    }
+    auto bobbinWindows = std::get<Bobbin>(bobbinVariant).get_processed_description()->get_winding_windows();
+    auto sectionsOptional = coil.get_sections_description();
+    if (!sectionsOptional || sectionsOptional->empty()) {
+        throw std::runtime_error(who + "coil has no sections; the column each turn is wound on is unknown.");
+    }
+    const auto sections = sectionsOptional.value();
+    LateralPlacement placement;
+    placement.mainColumnIndex = mainColumnIndex;
+    placement.plusLegIndex = xA > 0 ? lateralIndexes[0] : lateralIndexes[1];
+    placement.minusLegIndex = xA > 0 ? lateralIndexes[1] : lateralIndexes[0];
+    for (const auto& section : sections) {
+        size_t windowIndex = coil.resolve_section_winding_window_index(section);
+        if (windowIndex >= bobbinWindows.size()) {
+            throw std::runtime_error(who + "section " + section.get_name() + " references winding window " +
+                                     std::to_string(windowIndex) + " but the bobbin has " +
+                                     std::to_string(bobbinWindows.size()) + ".");
+        }
+        auto columnEdge = bobbinWindows[windowIndex].get_column();
+        // Schema default: a window without a column edge wraps the main column (Coil does the same).
+        size_t column = columnEdge ? static_cast<size_t>(columnEdge.value()) : mainColumnIndex;
+        if (column >= columns.size()) {
+            throw std::runtime_error(who + "winding window " + std::to_string(windowIndex) + " references column " +
+                                     std::to_string(column) + " but the core has " + std::to_string(columns.size()) + ".");
+        }
+        placement.columnOfSection[section.get_name()] = column;
+        if (section.get_type() != ElectricalType::CONDUCTION) continue;
+        double sectionX = section.get_coordinates()[0];
+        if (column == mainColumnIndex) {
+            // The main winding is drawn once, at +x, and stands for both of its crossings.
+            if (sectionX < 0) {
+                throw NotImplementedException(who + "main-column section " + section.get_name() +
+                                              " drawn in the -x window together with a lateral winding");
+            }
+            continue;
+        }
+        double legX = columns[column].get_coordinates()[0];
+        if (sectionX * legX <= 0) {
+            throw std::runtime_error(who + "section " + section.get_name() + " is wound on the leg at x = " +
+                                     std::to_string(legX) + " but drawn at x = " + std::to_string(sectionX) + ".");
+        }
+        auto known = placement.bobbinWindowOfWoundLeg.find(column);
+        if (known != placement.bobbinWindowOfWoundLeg.end() && known->second != windowIndex) {
+            throw NotImplementedException(who + "a lateral leg wound from two different winding windows");
+        }
+        if (!bobbinWindows[windowIndex].get_coordinates() || !bobbinWindows[windowIndex].get_height() ||
+            !bobbinWindows[windowIndex].get_width()) {
+            throw std::runtime_error(who + "lateral bobbin window " + std::to_string(windowIndex) +
+                                     " has no coordinates, width or height.");
+        }
+        placement.bobbinWindowOfWoundLeg[column] = windowIndex;
+    }
+    if (placement.bobbinWindowOfWoundLeg.empty()) {
+        throw std::runtime_error(who + "a winding resolves to a lateral column but no conduction section is placed there.");
+    }
+    _lateralPlacement = placement;
+}
+
+size_t Temperature::woundColumnOfSection(const std::optional<std::string>& sectionName, const std::string& what) const {
+    if (!_lateralPlacement) {
+        throw std::logic_error("Temperature::woundColumnOfSection called without a lateral placement.");
+    }
+    if (!sectionName) {
+        throw std::runtime_error("Temperature: " + what + " has no section; the column it is wound on is unknown.");
+    }
+    auto it = _lateralPlacement->columnOfSection.find(sectionName.value());
+    if (it == _lateralPlacement->columnOfSection.end()) {
+        throw std::runtime_error("Temperature: " + what + " names section " + sectionName.value() +
+                                 ", which the coil does not describe.");
+    }
+    return it->second;
+}
+
+bool Temperature::isLateralWound(const ThermalNetworkNode& node) const {
+    return _lateralPlacement && node.woundColumnIndex &&
+           node.woundColumnIndex.value() != _lateralPlacement->mainColumnIndex;
+}
+
+double Temperature::lateralSide(const ThermalNetworkNode& node) const {
+    if (!isLateralWound(node)) {
+        throw std::logic_error("Temperature::lateralSide: " + node.name + " is not wound on a lateral leg.");
+    }
+    return node.woundColumnIndex.value() == _lateralPlacement->plusLegIndex ? 1.0 : -1.0;
+}
+
+bool Temperature::isLegWound(size_t columnIndex) const {
+    return _lateralPlacement && _lateralPlacement->bobbinWindowOfWoundLeg.count(columnIndex) > 0;
+}
+
+Temperature::LateralWrap Temperature::lateralWrapGeometry(size_t columnIndex) const {
+    auto core = _magnetic.get_core();
+    auto columns = core.get_processed_description()->get_columns();
+    if (columnIndex >= columns.size()) {
+        throw std::runtime_error("Temperature::lateralWrapGeometry: column " + std::to_string(columnIndex) + " out of range.");
+    }
+    auto bobbinVariant = _magnetic.get_coil().get_bobbin();
+    if (!std::holds_alternative<Bobbin>(bobbinVariant) || !std::get<Bobbin>(bobbinVariant).get_processed_description()) {
+        throw std::runtime_error("Temperature::lateralWrapGeometry: bobbin is not resolved or not processed.");
+    }
+    const double wall = std::get<Bobbin>(bobbinVariant).get_processed_description()->get_column_thickness();
+    if (wall < 0) {
+        throw std::runtime_error("Temperature::lateralWrapGeometry: negative bobbin column thickness.");
+    }
+    const auto& leg = columns[columnIndex];
+    LateralWrap wrap;
+    wrap.axisX = leg.get_coordinates()[0];
+    wrap.halfWidth = leg.get_width() / 2.0 + wall;
+    wrap.halfDepth = leg.get_depth() / 2.0 + wall;
+    // The leg's face toward the main column (the window side).
+    wrap.legFaceX = wrap.axisX > 0 ? wrap.axisX - leg.get_width() / 2.0 : wrap.axisX + leg.get_width() / 2.0;
+    wrap.wallThickness = wall;
+    wrap.shape = leg.get_shape();
+    return wrap;
+}
+
+size_t Temperature::legNodeIndex(size_t columnIndex) const {
+    const std::string name = "Core_Column_" + std::to_string(columnIndex);
+    for (size_t i = 0; i < _nodes.size(); ++i) {
+        if (_nodes[i].part == ThermalNodePartType::CORE_LATERAL_COLUMN && _nodes[i].name == name) return i;
+    }
+    throw std::runtime_error("Temperature::legNodeIndex: no node for outer leg column " + std::to_string(columnIndex) + ".");
 }
 
 void Temperature::createToroidalCoreNodes() {
@@ -575,43 +733,12 @@ void Temperature::createToroidalCoreNodes() {
     
     double coreK = getCoreThermalConductivity();
     
-    // Pre-calculate turn positions and widths for segment-specific coverage
-    // Map each turn to its angular position and width
-    struct TurnCoverageInfo {
-        double angle;           // Angular position (radians)
-        double innerWidth;      // Width at inner radius
-        double outerWidth;      // Width at outer radius
-        bool isInner;           // Is this turn on inner or outer half?
-    };
-    std::vector<TurnCoverageInfo> turnCoverageInfo;
-    
-    auto coil = _magnetic.get_coil();
-    auto turns = coil.get_turns_description();
-    if (turns) {
-        for (const auto& turn : *turns) {
-            auto coords = turn.get_coordinates();
-            if (coords.size() >= 2) {
-                // Calculate angular position from turn center coordinates
-                double turnAngle = std::atan2(coords[1], coords[0]);
-                
-                // Determine if turn is on inner or outer half based on radius
-                double turnRadius = std::sqrt(coords[0]*coords[0] + coords[1]*coords[1]);
-                bool isInner = turnRadius < meanRadius;
-                
-                // Calculate turn width at inner and outer radii
-                // Use turn's actual dimensions if available, otherwise use defaults
-                double innerWidth = _wireWidth;  // Use cached wire width
-                double outerWidth = _wireWidth;
-                if (turn.get_dimensions() && turn.get_dimensions()->size() >= 1) {
-                    innerWidth = (*turn.get_dimensions())[0];
-                    outerWidth = innerWidth;
-                }
-                
-                turnCoverageInfo.push_back({turnAngle, innerWidth, outerWidth, isInner});
-            }
-        }
-    }
-    
+    // A segment's radial faces start fully exposed. Which share of them a winding covers is decided
+    // ONCE, by createToroidalConvectionConnections, from the TURN nodes resting on each face (ABT
+    // #1735). This used to be computed here from the coil's turn description even in core-only
+    // mode -- where no turn exists in the network -- so the "bare core" of the first-pass solve
+    // was wrapped in invisible copper (a T 20/10/7 wound with 60 turns lost its whole bore).
+
     // Pre-calculate loss weighting proportional to 1/r^2 (B ~ 1/r, losses ~ B^2)
     // Each segment's mean radius determines its share of total core losses
     double lossWeightSum = 0.0;
@@ -655,59 +782,17 @@ void Temperature::createToroidalCoreNodes() {
         
         double tangentialArea = radialDepth * height;
         
-        // Calculate segment-specific surface coverage
-        // Find turns that are adjacent to this core segment's angular span
-        std::vector<double> innerTurnWidths;
-        std::vector<double> outerTurnWidths;
-        
-        for (const auto& turnInfo : turnCoverageInfo) {
-            // Normalize turn angle to [0, 2π)
-            double turnAngle = turnInfo.angle;
-            while (turnAngle < 0) turnAngle += 2.0 * M_PI;
-            
-            // Check if turn is within this segment's angular span [angle, angle + angularStep)
-            // Add small tolerance for edge cases
-            double tol = angularStep * 0.1;
-            double segStart = angle - tol;
-            double segEnd = angle + angularStep + tol;
-            
-            bool inSegment = false;
-            if (segStart <= turnAngle && turnAngle < segEnd) {
-                inSegment = true;
-            } else if (segStart < 0 && turnAngle >= (2.0 * M_PI + segStart)) {
-                // Handle wrap-around at 0/2π boundary
-                inSegment = true;
-            } else if (segEnd > 2.0 * M_PI && turnAngle < (segEnd - 2.0 * M_PI)) {
-                // Handle wrap-around at 0/2π boundary
-                inSegment = true;
-            }
-            
-            if (inSegment) {
-                innerTurnWidths.push_back(turnInfo.innerWidth);
-                outerTurnWidths.push_back(turnInfo.outerWidth);
-            }
-        }
-        
-        // Calculate surface coverage for inner and outer radial surfaces
-        // Inner surface: turns cover from the inside
-        double innerCoverage = ThermalNetworkNode::calculateToroidalSurfaceCoverage(
-            windingWindowInnerRadius, angularStep, innerTurnWidths);
-        
-        // Outer surface: turns cover from the outside
-        double outerCoverage = ThermalNetworkNode::calculateToroidalSurfaceCoverage(
-            windingWindowOuterRadius, angularStep, outerTurnWidths);
-        
         node.quadrants[0].face = ThermalNodeFace::RADIAL_INNER;
         node.quadrants[0].surfaceArea = radialInnerArea;
         node.quadrants[0].length = radialLength;
         node.quadrants[0].thermalConductivity = coreK;
-        node.quadrants[0].surfaceCoverage = innerCoverage;
+        node.quadrants[0].surfaceCoverage = 1.0;
         
         node.quadrants[1].face = ThermalNodeFace::RADIAL_OUTER;
         node.quadrants[1].surfaceArea = radialOuterArea;
         node.quadrants[1].length = radialLength;
         node.quadrants[1].thermalConductivity = coreK;
-        node.quadrants[1].surfaceCoverage = outerCoverage;
+        node.quadrants[1].surfaceCoverage = 1.0;
         
         node.quadrants[2].face = ThermalNodeFace::TANGENTIAL_LEFT;
         node.quadrants[2].surfaceArea = tangentialArea;
@@ -840,6 +925,26 @@ void Temperature::createConcentricCoreNodes() {
     bottomYoke.initializeConcentricCoreQuadrants(coreWidth / 2, mainColumn.get_width()/2, coreDepth / 2, coreK);
     _nodes.push_back(bottomYoke);
     
+    // ABT #1735: a winding on an outer leg breaks the left/right symmetry: each outer leg is its
+    // own node, carrying half of the two-leg loss and (below) half of the yoke links and of the
+    // legs' exterior. Unwound, the two halves are the old two-leg node exactly.
+    if (_lateralPlacement) {
+        for (size_t legIndex : {_lateralPlacement->plusLegIndex, _lateralPlacement->minusLegIndex}) {
+            const auto& leg = columns[legIndex];
+            double legX = leg.get_coordinates()[0];
+            double sign = legX > 0 ? 1.0 : -1.0;
+            ThermalNetworkNode legNode;
+            legNode.part = ThermalNodePartType::CORE_LATERAL_COLUMN;
+            legNode.name = "Core_Column_" + std::to_string(legIndex);  // painter matches by column index
+            legNode.temperature = _config.ambientTemperature;
+            legNode.powerDissipation = lateralColumnLosses / 2.0;
+            legNode.physicalCoordinates = {sign * (coreWidth / 2 - leg.get_width() / 2), 0, 0};
+            legNode.initializeConcentricCoreQuadrants(leg.get_width(), leg.get_height(), leg.get_depth() / 2.0, coreK);
+            _nodes.push_back(legNode);
+        }
+        return;
+    }
+
     // Create lateral column node (RIGHT side only for symmetry - half core model)
     if (columns.size() > 1) {
         double latHalfDepth = rightColumn.get_depth() / 2.0; // Model half the core
@@ -1066,6 +1171,20 @@ void Temperature::createBobbinNodes() {
     _nodes.push_back(bottomYokeWall);
 }
 
+namespace {
+// ABT #1540: an insulation layer drawn in Cartesian coordinates with orientation CONTIGUOUS is a
+// tape lying across the winding window between axially stacked sections or layers: its dimensions
+// are [radial span, thickness]. Every other concentric layer is wrapped around the column and is
+// [thickness, axial span]. Same rule as Coil::get_insulation_layer_thickness.
+bool isCartesianLayerAcrossWindow(const Layer& layer) {
+    auto coordinateSystem = layer.get_coordinate_system();
+    if (coordinateSystem && coordinateSystem.value() != MAS::CoordinateSystem::CARTESIAN) {
+        return false;
+    }
+    return layer.get_orientation() == WindingOrientation::CONTIGUOUS;
+}
+} // namespace
+
 void Temperature::createInsulationLayerNodes() {
     auto coil = _magnetic.get_mutable_coil();
     
@@ -1135,10 +1254,19 @@ void Temperature::createInsulationLayerNodes() {
         // does not exist and, worse, phantom convecting/radiating surfaces INSIDE the winding.
         // Real specified thickness is honoured; true zero is skipped, and the turns connect
         // directly across the boundary exactly as they physically touch.
-        if (!_isToroidal && layerWidth < 1e-9) {
+        //
+        // ABT #1540: the thickness is dimensions[0] only for a layer wrapped around the column. A
+        // tape lying ACROSS the window between axially stacked sections (Cartesian, orientation
+        // CONTIGUOUS) is drawn [radial span, thickness], so its thickness is dimensions[1] --
+        // the same rule Coil::get_insulation_layer_thickness applies. Testing dimensions[0] alone
+        // let a zero-thickness inter-section marker through as a node with no height: nothing
+        // could bear on it, and it then stood "between" the turns resting on it.
+        const bool liesAcrossWindow = !_isToroidal && isCartesianLayerAcrossWindow(layer);
+        double& drawnThickness = liesAcrossWindow ? layerHeight : layerWidth;
+        if (!_isToroidal && drawnThickness < 1e-9) {
             double specifiedThickness = coil.get_insulation_layer_thickness(layer);
             if (specifiedThickness > 1e-9) {
-                layerWidth = specifiedThickness;
+                drawnThickness = specifiedThickness;
             } else {
                 layerIdx++;
                 continue;
@@ -1397,14 +1525,28 @@ void Temperature::createInsulationLayerNodes() {
                         wrapColumnDepth = bobbinDesc->get_column_depth();
                     }
                 }
-                double innerRadius = std::max(layerX - layerWidth / 2.0, 1e-6);
-                double outerRadius = layerX + layerWidth / 2.0;
+                double wrapRadius = layerX;
+                bool onPlusLeg = false;
+                if (_lateralPlacement) {
+                    insulationNode.woundColumnIndex = woundColumnOfSection(layer.get_section(), "insulation layer " + layer.get_name());
+                    if (isLateralWound(insulationNode)) {
+                        auto wrap = lateralWrapGeometry(insulationNode.woundColumnIndex.value());
+                        wrapRadius = std::abs(layerX - wrap.axisX);
+                        wrapColumnShape = wrap.shape;
+                        wrapColumnWidth = wrap.halfWidth;
+                        wrapColumnDepth = wrap.halfDepth;
+                        onPlusLeg = lateralSide(insulationNode) > 0;
+                    }
+                }
+                double innerRadius = std::max(wrapRadius - layerWidth / 2.0, 1e-6);
+                double outerRadius = wrapRadius + layerWidth / 2.0;
                 double wrapInner = ThermalNetworkNode::computeTurnLengthAtRadius(
                     innerRadius, wrapColumnShape, wrapColumnWidth, wrapColumnDepth);
                 double wrapOuter = ThermalNetworkNode::computeTurnLengthAtRadius(
                     outerRadius, wrapColumnShape, wrapColumnWidth, wrapColumnDepth);
                 double wrapCenter = ThermalNetworkNode::computeTurnLengthAtRadius(
-                    layerX, wrapColumnShape, wrapColumnWidth, wrapColumnDepth);
+                    wrapRadius, wrapColumnShape, wrapColumnWidth, wrapColumnDepth);
+                if (onPlusLeg) std::swap(wrapInner, wrapOuter);  // ABT #1735: +x leg, -x face is the far one
                 insulationNode.quadrants[0].surfaceArea = layerHeight * wrapOuter;   // RADIAL_OUTER
                 insulationNode.quadrants[1].surfaceArea = layerHeight * wrapInner;   // RADIAL_INNER
                 insulationNode.quadrants[2].surfaceArea = layerWidth * wrapCenter;   // TOP
@@ -1684,11 +1826,30 @@ void Temperature::createTurnNodes() {
             
             // Use turn's x-coordinate (radial position) as centerRadius
             double centerRadius = coords[0];
+            ColumnShape turnColShape = colShape;
+            double turnColWidth = colWidth;
+            double turnColDepth = colDepth;
+            if (_lateralPlacement) {
+                node.woundColumnIndex = woundColumnOfSection(turn.get_section(), "turn " + turn.get_name());
+                if (isLateralWound(node)) {
+                    auto wrap = lateralWrapGeometry(node.woundColumnIndex.value());
+                    centerRadius = std::abs(coords[0] - wrap.axisX);
+                    turnColShape = wrap.shape;
+                    turnColWidth = wrap.halfWidth;
+                    turnColDepth = wrap.halfDepth;
+                }
+            }
             node.initializeConcentricTurnQuadrants(wireWidth, wireHeight, centerRadius,
-                                                   colShape, colWidth, colDepth,
+                                                   turnColShape, turnColWidth, turnColDepth,
                                                    defaultWireThermalCond,
                                                    defaultWireCoating,
                                                    isRoundWire ? TurnCrossSectionalShape::ROUND : TurnCrossSectionalShape::RECTANGULAR);
+            if (isLateralWound(node) && lateralSide(node) > 0) {
+                // On the +x leg the -x face (RADIAL_INNER) is the one AWAY from the leg's axis:
+                // swap the wrap lengths the initializer assigned by radius.
+                std::swap(node.quadrants[0].surfaceArea, node.quadrants[1].surfaceArea);
+                std::swap(node.quadrants[0].length, node.quadrants[1].length);
+            }
             _nodes.push_back(node);
         }
     }
@@ -1862,6 +2023,34 @@ void Temperature::createConcentricCoreConnections() {
         }
     }
     
+    // ABT #1735: split outer legs (one node per leg, same height): each joins both yokes with half
+    // the old two-leg link, over the distance its mirror image has on the modelled +x half.
+    if (_lateralPlacement) {
+        for (size_t legIdx : lateralColumnIndices) {
+            for (const auto& [yokes, legFace, yokeFace] :
+                 {std::tuple{&topYokeIndices, ThermalNodeFace::TANGENTIAL_LEFT, ThermalNodeFace::TANGENTIAL_RIGHT},
+                  std::tuple{&bottomYokeIndices, ThermalNodeFace::TANGENTIAL_RIGHT, ThermalNodeFace::TANGENTIAL_LEFT}}) {
+                if (yokes->size() != 1) {
+                    throw std::runtime_error("Temperature::createConcentricCoreConnections: split outer legs need exactly "
+                                             "one top and one bottom yoke node.");
+                }
+                size_t yokeIdx = yokes->front();
+                double dx = std::abs(_nodes[legIdx].physicalCoordinates[0]) - _nodes[yokeIdx].physicalCoordinates[0];
+                double dy = _nodes[legIdx].physicalCoordinates[1] - _nodes[yokeIdx].physicalCoordinates[1];
+                ThermalResistanceElement r;
+                r.nodeFromId = legIdx;
+                r.quadrantFrom = legFace;
+                r.nodeToId = yokeIdx;
+                r.quadrantTo = yokeFace;
+                r.type = HeatTransferType::CONDUCTION;
+                r.resistance = ThermalResistance::calculateConductionResistance(
+                    std::sqrt(dx * dx + dy * dy), coreK, getColumnCrossSection(legIdx) / 2.0);
+                _resistances.push_back(r);
+            }
+        }
+        lateralColumnIndices.clear();  // the chain and single-leg links below do not apply
+    }
+
     // 2. Connect lateral column chunks to closest neighbors (vertical chain)
     if (lateralColumnIndices.size() > 1) {
         std::sort(lateralColumnIndices.begin(), lateralColumnIndices.end(),
@@ -2156,6 +2345,113 @@ void Temperature::createTurnToTurnConnections() {
     }
 }
 
+namespace {
+// Geometric tolerance for "touching": coordinates in MAS are computed in double precision from
+// millimetre dimensions; 0.1 um is far below any wire, film or wall thickness, far above rounding.
+constexpr double kEnclosureGeometryTolerance = 1e-7;
+
+// ABT #1540: how two turn outlines of a concentric winding stand to each other.
+struct TurnOutlineGap {
+    bool facing = false;      // a face of one looks at a face of the other
+    bool horizontal = false;  // the facing faces are the radial (left/right) ones
+    double distance = 0.0;    // surface to surface along the facing direction; negative = one outline inside the other
+};
+
+// Two round outlines: the distance between the circles, facing along the larger centre offset
+// (what this network always did). As soon as one outline is a rectangle (rectangular, foil and
+// planar conductors) the extent of a turn depends on the direction: a 5.6 x 0.47 mm strip reaches
+// 2.8 mm sideways and 0.24 mm up. Taking half the SMALLER side in every direction, as before,
+// left two strips lying side by side 5 mm "apart", and read the facing faces from the centre
+// offsets, so a strip under a round turn standing off its centre was taken as its side neighbour.
+// For those pairs the gap is measured between the outlines along each axis, and two faces face
+// each other only where the outlines overlap along the other axis.
+TurnOutlineGap turnOutlineGap(const ThermalNetworkNode& node1, const ThermalNetworkNode& node2) {
+    TurnOutlineGap gap;
+    const double dx = std::abs(node1.physicalCoordinates[0] - node2.physicalCoordinates[0]);
+    const double dy = std::abs(node1.physicalCoordinates[1] - node2.physicalCoordinates[1]);
+    const bool round1 = node1.crossSectionalShape == TurnCrossSectionalShape::ROUND;
+    const bool round2 = node2.crossSectionalShape == TurnCrossSectionalShape::ROUND;
+    if (round1 && round2) {
+        const double radius1 = std::min(node1.dimensions.width, node1.dimensions.height) / 2.0;
+        const double radius2 = std::min(node2.dimensions.width, node2.dimensions.height) / 2.0;
+        gap.facing = true;
+        gap.horizontal = dx > dy;
+        gap.distance = std::sqrt(dx * dx + dy * dy) - radius1 - radius2;
+        return gap;
+    }
+
+    const double gapX = dx - (node1.dimensions.width + node2.dimensions.width) / 2.0;
+    const double gapY = dy - (node1.dimensions.height + node2.dimensions.height) / 2.0;
+    const bool overlapAlongX = gapX < -kEnclosureGeometryTolerance;
+    const bool overlapAlongY = gapY < -kEnclosureGeometryTolerance;
+    if (overlapAlongX && overlapAlongY) {
+        // The bounding outlines penetrate: by the shallower of the two depths. A round outline
+        // beyond the rectangle's corner is measured from the corner instead of from its own
+        // bounding square.
+        gap.facing = true;
+        gap.horizontal = gapX > gapY;
+        gap.distance = std::max(gapX, gapY);
+        if (round1 != round2) {
+            const auto& round = round1 ? node1 : node2;
+            const auto& rectangle = round1 ? node2 : node1;
+            const double beyondX = dx - rectangle.dimensions.width / 2.0;
+            const double beyondY = dy - rectangle.dimensions.height / 2.0;
+            if (beyondX > 0 && beyondY > 0) {
+                gap.distance = std::sqrt(beyondX * beyondX + beyondY * beyondY) -
+                               std::min(round.dimensions.width, round.dimensions.height) / 2.0;
+            }
+        }
+    } else if (overlapAlongY) {
+        gap.facing = true;
+        gap.horizontal = true;
+        gap.distance = gapX;
+    } else if (overlapAlongX) {
+        gap.facing = true;
+        gap.horizontal = false;
+        gap.distance = gapY;
+    }
+    return gap;
+}
+} // namespace
+
+bool Temperature::isPlanarTurn(const ThermalNetworkNode& node) const {
+    if (!node.windingIndex.has_value()) {
+        throw std::runtime_error("Temperature::isPlanarTurn: turn node " + node.name + " has no winding index.");
+    }
+    auto props = _perWindingWireProps.find(node.windingIndex.value());
+    if (props == _perWindingWireProps.end()) {
+        throw std::runtime_error("Temperature::isPlanarTurn: no wire properties for winding " +
+                                 std::to_string(node.windingIndex.value()) + " of turn node " + node.name + ".");
+    }
+    return props->second.isPlanar;
+}
+
+bool Temperature::turnBetweenAlongAxis(const std::vector<size_t>& turnNodeIndices, size_t node1Idx, size_t node2Idx) const {
+    // A third turn lying in the gap between the two along the axis, overlapping both radially.
+    const auto& node1 = _nodes[node1Idx];
+    const auto& node2 = _nodes[node2Idx];
+    const auto& upper = node1.physicalCoordinates[1] > node2.physicalCoordinates[1] ? node1 : node2;
+    const auto& lower = node1.physicalCoordinates[1] > node2.physicalCoordinates[1] ? node2 : node1;
+    const double gapTop = upper.physicalCoordinates[1] - upper.dimensions.height / 2.0;
+    const double gapBottom = lower.physicalCoordinates[1] + lower.dimensions.height / 2.0;
+    const double left = std::max(node1.physicalCoordinates[0] - node1.dimensions.width / 2.0,
+                                 node2.physicalCoordinates[0] - node2.dimensions.width / 2.0);
+    const double right = std::min(node1.physicalCoordinates[0] + node1.dimensions.width / 2.0,
+                                  node2.physicalCoordinates[0] + node2.dimensions.width / 2.0);
+    for (size_t otherIdx : turnNodeIndices) {
+        if (otherIdx == node1Idx || otherIdx == node2Idx) continue;
+        const auto& other = _nodes[otherIdx];
+        const double otherTop = other.physicalCoordinates[1] + other.dimensions.height / 2.0;
+        const double otherBottom = other.physicalCoordinates[1] - other.dimensions.height / 2.0;
+        const double otherLeft = other.physicalCoordinates[0] - other.dimensions.width / 2.0;
+        const double otherRight = other.physicalCoordinates[0] + other.dimensions.width / 2.0;
+        const bool inTheGap = otherTop > gapBottom + kEnclosureGeometryTolerance && otherBottom < gapTop - kEnclosureGeometryTolerance;
+        const bool underBoth = otherRight > left + kEnclosureGeometryTolerance && otherLeft < right - kEnclosureGeometryTolerance;
+        if (inTheGap && underBoth) return true;
+    }
+    return false;
+}
+
 void Temperature::createConcentricTurnToTurnConnections(const std::vector<size_t>& turnNodeIndices, double minConductionDist) {
     // NOTE: O(N^2) complexity over turn nodes. For designs with >1000 turns,
     // consider implementing spatial indexing (grid hash or k-d tree) for neighbor search.
@@ -2170,34 +2466,31 @@ void Temperature::createConcentricTurnToTurnConnections(const std::vector<size_t
             
             double dx = node1.physicalCoordinates[0] - node2.physicalCoordinates[0];
             double dy = node1.physicalCoordinates[1] - node2.physicalCoordinates[1];
-            double centerDistance = std::sqrt(dx*dx + dy*dy);
             
             // Connection condition: surface distance < min(min_outer_dim1, min_outer_dim2) / 4
             double minOuterDim1 = std::min(node1.dimensions.width, node1.dimensions.height);
             double minOuterDim2 = std::min(node2.dimensions.width, node2.dimensions.height);
             double thresholdDist = std::min(minOuterDim1, minOuterDim2) / 4.0;
             
-            // For rectangular wires, calculate surface distance based on relative orientation
-            // The surface distance is center distance minus the projected size in the connection direction
-            double surfaceDistance;
-            if (centerDistance < 1e-9) {
-                surfaceDistance = 0;
-            } else {
-                // For each node, use half the min dimension as the conservative extent estimate
-                // This works for both rectangular and round wires
-                double extent1 = minOuterDim1 / 2.0;
-                double extent2 = minOuterDim2 / 2.0;
-                
-                surfaceDistance = centerDistance - extent1 - extent2;
-            }
-            
-            if (surfaceDistance > thresholdDist) continue;
+            // ABT #1540: surface-to-surface distance and facing faces from the turns' real outlines.
+            const TurnOutlineGap outlineGap = turnOutlineGap(node1, node2);
+            if (!outlineGap.facing) continue;
+            const double surfaceDistance = outlineGap.distance;
+
+            // ABT #1856: planar turns are copper on a board. Two of them stacked in one column with
+            // no turn between face each other through that board's dielectric, not through air,
+            // however far apart they are; a stated board layer between them is a node and the
+            // insulation checks below route the pair through it instead.
+            const bool throughBoard = surfaceDistance > thresholdDist && !outlineGap.horizontal &&
+                                      isPlanarTurn(node1) && isPlanarTurn(node2) &&
+                                      !turnBetweenAlongAxis(turnNodeIndices, node1Idx, node2Idx);
+            if (surfaceDistance > thresholdDist && !throughBoard) continue;
             
             // Find which quadrants are facing each other
             ThermalNodeFace face1, face2;
             
             // Determine primary direction of connection
-            bool moreHorizontal = std::abs(dx) > std::abs(dy);
+            bool moreHorizontal = outlineGap.horizontal;
             
             if (moreHorizontal) {
                 // Horizontal connection - use RADIAL faces
@@ -2248,8 +2541,7 @@ void Temperature::createConcentricTurnToTurnConnections(const std::vector<size_t
 
                 // Check if there's a solid insulation layer between these turns
                 // If so, skip direct connection - turns will connect through insulation layer node
-                auto coil = _magnetic.get_coil();
-                auto turnsDescription = coil.get_turns_description();
+                const auto& turnsDescription = this->turnsDescription();
                 bool hasSolidInsulationBetween = false;
 
                 if (turnsDescription && turn1Idx >= 0 && turn1Idx < static_cast<int>(turnsDescription->size()) &&
@@ -2257,7 +2549,7 @@ void Temperature::createConcentricTurnToTurnConnections(const std::vector<size_t
                     try {
                         auto& turn1 = (*turnsDescription)[turn1Idx];
                         auto& turn2 = (*turnsDescription)[turn2Idx];
-                        auto layersBetween = StrayCapacitance::get_insulation_layers_between_two_turns(turn1, turn2, coil);
+                        auto layersBetween = insulationLayersBetweenTurns(turn1, turn2);
                         hasSolidInsulationBetween = !layersBetween.empty();
                     } catch (const std::exception& e) { // IMP-8
                         // If we can't determine insulation layers (e.g., missing layer description),
@@ -2297,8 +2589,14 @@ void Temperature::createConcentricTurnToTurnConnections(const std::vector<size_t
                         double insLeft = insX - insWidth / 2;
                         double insRight = insX + insWidth / 2;
                         
-                        // Check if insulation overlaps the line between turns
-                        bool xOverlap = (insLeft < maxTurnX) && (insRight > minTurnX);
+                        // ABT #1540: a layer separates two side-by-side turns only if it stands
+                        // BETWEEN their centres: its whole radial extent inside the centre-to-centre
+                        // span. The old test (any overlap with that span) was also true for a tape
+                        // lying across the window UNDER or OVER the pair -- the tape between two
+                        // axially stacked sections runs under the whole row -- so the turns resting
+                        // on it lost their edge to each other. With exact touching, which side of
+                        // the strict < the pair fell on was decided by rounding.
+                        bool xOverlap = (insLeft >= minTurnX) && (insRight <= maxTurnX);
                         bool yOverlap = std::abs(insY - turn1Y) < (insHeight / 2 + node1.dimensions.height / 2);
                         
                         if (xOverlap && yOverlap) {
@@ -2312,8 +2610,10 @@ void Temperature::createConcentricTurnToTurnConnections(const std::vector<size_t
                         double insBottom = insY - insHeight / 2;
                         double insTop = insY + insHeight / 2;
                         
-                        // Check if insulation overlaps the line between turns
-                        bool yOverlap = (insBottom < maxTurnY) && (insTop > minTurnY);
+                        // ABT #1540: same rule along the axis -- the layer's whole axial extent
+                        // inside the centre-to-centre span. A layer wrapped around the column BESIDE
+                        // two turns stacked in one layer is not between them.
+                        bool yOverlap = (insBottom >= minTurnY) && (insTop <= maxTurnY);
                         bool xOverlap = std::abs(insX - turn1X) < (insWidth / 2 + node1.dimensions.width / 2);
                         
                         if (xOverlap && yOverlap) {
@@ -2326,7 +2626,14 @@ void Temperature::createConcentricTurnToTurnConnections(const std::vector<size_t
                 // Only create direct turn-to-turn connection if there's NO solid insulation layer
                 // Solid insulation layers are now modeled as separate thermal nodes
                 if (!hasSolidInsulationBetween && !insulationNodeBetween) {
-                    r.resistance = getInsulationLayerThermalResistance(turn1Idx, turn2Idx, contactArea);
+                    if (throughBoard) {
+                        // The board's material is not described with the turns; the planar path
+                        // takes the same through-plane FR4 conductivity for a turn on a board layer.
+                        r.resistance = ThermalResistance::calculateConductionResistance(surfaceDistance, kFR4_ThermalConductivity, contactArea);
+                    }
+                    else {
+                        r.resistance = getInsulationLayerThermalResistance(turn1Idx, turn2Idx, contactArea);
+                    }
                     
                     if (q1->coating.has_value()) {
                         r.resistance += WireCoatingUtils::calculateCoatingResistance(q1->coating.value(), contactArea);
@@ -2464,8 +2771,7 @@ void Temperature::createToroidalTurnToTurnConnections(const std::vector<size_t>&
 
                 // Check if there's a solid insulation layer between these turns
                 // If so, skip direct connection - turns will connect through insulation layer node
-                auto coil = _magnetic.get_coil();
-                auto turnsDescription = coil.get_turns_description();
+                const auto& turnsDescription = this->turnsDescription();
                 bool hasSolidInsulationBetween = false;
 
                 if (turnsDescription && turn1Idx >= 0 && turn1Idx < static_cast<int>(turnsDescription->size()) &&
@@ -2473,7 +2779,7 @@ void Temperature::createToroidalTurnToTurnConnections(const std::vector<size_t>&
                     try {
                         auto& turn1 = (*turnsDescription)[turn1Idx];
                         auto& turn2 = (*turnsDescription)[turn2Idx];
-                        auto layersBetween = StrayCapacitance::get_insulation_layers_between_two_turns(turn1, turn2, coil);
+                        auto layersBetween = insulationLayersBetweenTurns(turn1, turn2);
                         // Zero-thickness layers are geometric boundary markers, not physical insulation.
                         // Filter them out so they don't block direct turn-to-turn connections.
                         layersBetween.erase(
@@ -2901,10 +3207,6 @@ struct WindingItem {
     double x0, x1, y0, y1;
 };
 
-// Geometric tolerance for "touching": coordinates in MAS are computed in double precision from
-// millimetre dimensions; 0.1 um is far below any wire, film or wall thickness, far above rounding.
-constexpr double kEnclosureGeometryTolerance = 1e-7;
-
 // Unshadowed share of each item's face looking in -x (fromLow=true, sorted by x0 ascending) or
 // +x (sorted by x1 descending); or, with alongY, in +y / -y. The item closest to the surface
 // casts its span onto the ones behind it.
@@ -2963,6 +3265,20 @@ double Temperature::inWindowFraction() const {
         throw std::runtime_error("Temperature::inWindowFraction: main column has non-positive width or depth.");
     }
     return columnDepth / (columnWidth + columnDepth);
+}
+
+double Temperature::inWindowFraction(const ThermalNetworkNode& node) const {
+    if (!isLateralWound(node)) {
+        return inWindowFraction();
+    }
+    // A wrap around an outer leg runs through a window on ONE side only: its inner segment along
+    // the leg's depth. The segment on the leg's outer face lies outside the core, and the two
+    // segments across the leg's ends lie beyond the core's depth: all three face the room.
+    auto leg = _magnetic.get_core().get_processed_description()->get_columns()[node.woundColumnIndex.value()];
+    if (leg.get_width() <= 0 || leg.get_depth() <= 0) {
+        throw std::runtime_error("Temperature::inWindowFraction: outer leg has non-positive width or depth.");
+    }
+    return leg.get_depth() / (2.0 * (leg.get_width() + leg.get_depth()));
 }
 
 std::pair<double, double> Temperature::surfaceFilm(const WindingWireProperties& properties, const std::string& nodeName) {
@@ -3077,6 +3393,16 @@ double Temperature::faceToSurfaceResistance(size_t nodeIdx, ThermalNodeFace face
 void Temperature::createWindingToEnclosureConnections() {
     auto items = collectWindingItems(_nodes);
     if (items.empty()) return;
+    // ABT #1735: windings on outer legs have their own enclosure (below); the main-column logic
+    // sees only the main winding.
+    std::vector<WindingItem> lateralItems;
+    if (_lateralPlacement) {
+        std::vector<WindingItem> mainItems;
+        for (const auto& item : items) {
+            (isLateralWound(_nodes[item.nodeIdx]) ? lateralItems : mainItems).push_back(item);
+        }
+        items = mainItems;
+    }
 
     const size_t npos = std::numeric_limits<size_t>::max();
     size_t bobbinColumnIdx = npos, bobbinTopIdx = npos, bobbinBottomIdx = npos, coreColumnIdx = npos;
@@ -3183,11 +3509,75 @@ void Temperature::createWindingToEnclosureConnections() {
                     bottomShares[k], flangePlastic);
         }
     }
+
+    // ABT #1735: a winding on an outer leg rests on that leg's own bobbin column: its leg-facing
+    // face conducts across the gap and the whole column wall to the leg. Worked in the leg's
+    // outward frame u = |x| (leg-facing = +u), so both legs share one sweep.
+    if (_lateralPlacement && !lateralItems.empty()) {
+        for (const auto& [legIndex, window] : _lateralPlacement->bobbinWindowOfWoundLeg) {
+            auto wrap = lateralWrapGeometry(legIndex);
+            const double side = wrap.axisX > 0 ? 1.0 : -1.0;
+            const ThermalNodeFace legFace = side > 0 ? ThermalNodeFace::RADIAL_OUTER : ThermalNodeFace::RADIAL_INNER;
+            const double restingU = std::abs(wrap.legFaceX) - wrap.wallThickness;
+            const double legPlasticK = wrap.wallThickness > 0 ? getBobbinThermalConductivity() : 0.0;
+            const size_t legIdx = legNodeIndex(legIndex);
+            std::vector<WindingItem> legItems, uItems;
+            for (const auto& item : lateralItems) {
+                if (_nodes[item.nodeIdx].woundColumnIndex.value() != legIndex) continue;
+                legItems.push_back(item);
+                WindingItem u = item;
+                if (side < 0) { u.x0 = -item.x1; u.x1 = -item.x0; }
+                uItems.push_back(u);
+            }
+            auto shares = unshadowedShares(uItems, false, false);
+            for (size_t k = 0; k < legItems.size(); ++k) {
+                if (shares[k] <= 0) continue;
+                if (connectedQuadrants.count({legItems[k].nodeIdx, legFace})) continue;
+                double gap = restingU - uItems[k].x1;
+                if (gap < -kEnclosureGeometryTolerance) {
+                    throw std::runtime_error("Temperature::createWindingToEnclosureConnections: " +
+                                             _nodes[legItems[k].nodeIdx].name + " overlaps the bobbin column of its leg by " +
+                                             std::to_string(-gap * 1e3) + " mm.");
+                }
+                gap = std::max(gap, 0.0);
+                const auto* q = _nodes[legItems[k].nodeIdx].getQuadrant(legFace);
+                double footprint = shares[k] * q->surfaceArea;
+                double resistance = faceToSurfaceResistance(legItems[k].nodeIdx, legFace, gap, shares[k]);
+                if (wrap.wallThickness > 0) {
+                    resistance += ThermalResistance::calculateConductionResistance(wrap.wallThickness, legPlasticK, footprint);
+                }
+                if (!(resistance > 0) || !std::isfinite(resistance)) {
+                    throw std::runtime_error("Temperature::createWindingToEnclosureConnections: non-positive or non-finite "
+                                             "resistance from " + _nodes[legItems[k].nodeIdx].name + " to its leg.");
+                }
+                ThermalResistanceElement r;
+                r.nodeFromId = legItems[k].nodeIdx;
+                r.quadrantFrom = legFace;
+                r.nodeToId = legIdx;
+                r.quadrantTo = ThermalNodeFace::NONE;
+                r.type = HeatTransferType::CONDUCTION;
+                r.area = footprint;
+                r.length = gap;
+                r.resistance = resistance;
+                _resistances.push_back(r);
+            }
+        }
+    }
 }
 
 void Temperature::createWindingToCoreAcrossWindowConnections(size_t ambientIdx) {
     auto items = collectWindingItems(_nodes);
     if (items.empty()) return;
+    if (_lateralPlacement) {
+        // ABT #1735: the radial across-window faces and the outer legs' windings are handled by
+        // createLateralAcrossWindowConnections; here only the main winding's top/bottom faces.
+        std::vector<WindingItem> mainItems;
+        for (const auto& item : items) {
+            if (!isLateralWound(_nodes[item.nodeIdx])) mainItems.push_back(item);
+        }
+        items = mainItems;
+        if (items.empty()) return;
+    }
     std::map<size_t, size_t> itemOfNode;
     for (size_t k = 0; k < items.size(); ++k) itemOfNode[items[k].nodeIdx] = k;
 
@@ -3234,7 +3624,7 @@ void Temperature::createWindingToCoreAcrossWindowConnections(size_t ambientIdx) 
 
         size_t target = npos;
         double gap = 0, sweepShare = 0;
-        if (convection.quadrantFrom == ThermalNodeFace::RADIAL_OUTER && lateralIdx != npos) {
+        if (convection.quadrantFrom == ThermalNodeFace::RADIAL_OUTER && lateralIdx != npos && !_lateralPlacement) {
             target = lateralIdx; gap = outerSurfaceX - item.x1; sweepShare = outerShares[itemIt->second];
         } else if (!hasBobbin && convection.quadrantFrom == ThermalNodeFace::TANGENTIAL_LEFT && topYokeIdx != npos) {
             target = topYokeIdx; gap = topSurfaceY - item.y1; sweepShare = topShares[itemIt->second];
@@ -3285,6 +3675,276 @@ void Temperature::createWindingToCoreAcrossWindowConnections(size_t ambientIdx) 
     }
 }
 
+void Temperature::createLateralAcrossWindowConnections(size_t ambientIdx) {
+    // ABT #1735 (Alf 2026-10-11, option A). With a winding on an outer leg, each window holds the
+    // main winding's crossing (inner side, drawn once at +x and standing for both crossings) and,
+    // if that window's leg is wound, the leg's winding (outer side). Worked per window in the
+    // outward frame u = |x|: main faces look at +u, a leg winding's across-window face at -u.
+    // For every vertical strip the two front faces are found; then
+    //   - main front and leg-winding front face each other: they conduct across the air gap split
+    //     at its mid-plane, each face's own film/wedge in series (for equal faces the mid-plane is
+    //     an isotherm, so the split is exact there);
+    //   - a main front with nothing in front: to the leg (across the gap, plus the leg's bobbin
+    //     wall when the leg is wound), as before the split;
+    //   - a leg-winding front with nothing in front: to the main column's bobbin wall.
+    // Shares: a main face gives phi/2 per crossing (phi = the main wrap's in-window fraction), a
+    // leg winding's face its own in-window fraction (one crossing). Top/bottom faces of a leg
+    // winding bear on its flanges: their in-window share conducts to the yoke through gap and
+    // flange; the rest of the wrap faces the room and keeps convecting.
+    auto all = collectWindingItems(_nodes);
+    if (all.empty()) return;
+    const size_t npos = std::numeric_limits<size_t>::max();
+
+    // Exposed faces: the convection resistor of each (node, face).
+    std::map<std::pair<size_t, ThermalNodeFace>, size_t> convectionOf;
+    for (size_t k = 0; k < _resistances.size(); ++k) {
+        const auto& c = _resistances[k];
+        if (c.nodeToId != ambientIdx || c.area <= 0) continue;
+        if (c.type != HeatTransferType::NATURAL_CONVECTION && c.type != HeatTransferType::FORCED_CONVECTION) continue;
+        if (c.nodeFromId >= _nodes.size()) continue;
+        auto part = _nodes[c.nodeFromId].part;
+        if (part != ThermalNodePartType::TURN && part != ThermalNodePartType::INSULATION_LAYER) continue;
+        if (convectionOf.count({c.nodeFromId, c.quadrantFrom})) {
+            throw std::runtime_error("Temperature::createLateralAcrossWindowConnections: two convection resistors on " +
+                                     _nodes[c.nodeFromId].name + ".");
+        }
+        convectionOf[{c.nodeFromId, c.quadrantFrom}] = k;
+    }
+    auto exposedShare = [&](size_t nodeIdx, ThermalNodeFace face) {
+        auto it = convectionOf.find({nodeIdx, face});
+        if (it == convectionOf.end()) return 0.0;
+        const auto* q = _nodes[nodeIdx].getQuadrant(face);
+        return std::min(1.0, _resistances[it->second].area / q->surfaceArea);
+    };
+
+    auto core = _magnetic.get_core();
+    auto windows = core.get_winding_windows();
+    if (windows.empty() || !windows[0].get_width() || !windows[0].get_height()) {
+        throw std::runtime_error("Temperature::createLateralAcrossWindowConnections: core winding window has no width or height.");
+    }
+    auto mainColumn = core.get_processed_description()->get_columns()[_lateralPlacement->mainColumnIndex];
+    // Same far edge as the unsplit network: the wound column's face plus the window width.
+    const double unwoundLegSurfaceU = mainColumn.get_width() / 2.0 + windows[0].get_width().value();
+    auto bobbinVariant = _magnetic.get_mutable_coil().get_bobbin();
+    auto bobbinDescription = std::get<Bobbin>(bobbinVariant).get_processed_description().value();
+    if (!bobbinDescription.get_column_width()) {
+        throw std::runtime_error("Temperature::createLateralAcrossWindowConnections: bobbin has no column width.");
+    }
+    const double mainColumnSurfaceU = bobbinDescription.get_column_width().value();
+    const double mainColumnThickness = bobbinDescription.get_column_thickness();
+    const double flangeThickness = bobbinDescription.get_wall_thickness();
+    const double plasticK = (mainColumnThickness > 0 || flangeThickness > 0) ? getBobbinThermalConductivity() : 0.0;
+    size_t bobbinColumnIdx = npos, coreColumnIdx = npos, topYokeIdx = npos, bottomYokeIdx = npos;
+    for (size_t i = 0; i < _nodes.size(); ++i) {
+        if (_nodes[i].part == ThermalNodePartType::BOBBIN_CENTRAL_COLUMN) bobbinColumnIdx = i;
+        if (_nodes[i].part == ThermalNodePartType::CORE_CENTRAL_COLUMN && coreColumnIdx == npos) coreColumnIdx = i;
+        if (_nodes[i].part == ThermalNodePartType::CORE_TOP_YOKE && topYokeIdx == npos) topYokeIdx = i;
+        if (_nodes[i].part == ThermalNodePartType::CORE_BOTTOM_YOKE && bottomYokeIdx == npos) bottomYokeIdx = i;
+    }
+    if (coreColumnIdx == npos || topYokeIdx == npos || bottomYokeIdx == npos) {
+        throw std::runtime_error("Temperature::createLateralAcrossWindowConnections: missing core column or yoke node.");
+    }
+    const bool hasBobbin = hasBobbinNodes();
+    const size_t mainColumnTarget = hasBobbin ? bobbinColumnIdx : coreColumnIdx;
+    const double mainColumnPlastic = hasBobbin ? mainColumnThickness / 2.0 : mainColumnThickness;
+    if (mainColumnTarget == npos) {
+        throw std::runtime_error("Temperature::createLateralAcrossWindowConnections: no bobbin column node.");
+    }
+
+    // One conduction to be made: from a face, either to another face (pair) or to a solid node.
+    struct Link {
+        size_t from; ThermalNodeFace fromFace; double fromFraction;   // strip height / face height
+        size_t to; ThermalNodeFace toFace; double toFraction;         // pair only
+        bool pair; double gap; double plastic; int side;
+    };
+    std::vector<Link> links;
+    // Strip coverage per (node, face, side), to clip by the face's exposed share.
+    std::map<std::tuple<size_t, ThermalNodeFace, int>, double> covered;
+    const double phiMain = inWindowFraction();
+
+    for (int side : {1, -1}) {
+        const size_t legIndex = side > 0 ? _lateralPlacement->plusLegIndex : _lateralPlacement->minusLegIndex;
+        const bool legWound = isLegWound(legIndex);
+        const size_t legIdx = legNodeIndex(legIndex);
+        double legSurfaceU = unwoundLegSurfaceU, legPlastic = 0.0;
+        if (legWound) {
+            auto wrap = lateralWrapGeometry(legIndex);
+            legSurfaceU = std::abs(wrap.legFaceX) - wrap.wallThickness;
+            legPlastic = wrap.wallThickness;
+        }
+        const ThermalNodeFace acrossFace = side > 0 ? ThermalNodeFace::RADIAL_INNER : ThermalNodeFace::RADIAL_OUTER;
+        // Items of this window in the u frame.
+        std::vector<WindingItem> mainU, legU;
+        for (const auto& item : all) {
+            const auto& node = _nodes[item.nodeIdx];
+            if (!isLateralWound(node)) {
+                mainU.push_back(item);
+            } else if (node.woundColumnIndex.value() == legIndex) {
+                WindingItem u = item;
+                if (side < 0) { u.x0 = -item.x1; u.x1 = -item.x0; }
+                legU.push_back(u);
+            }
+        }
+        std::vector<double> ys;
+        for (const auto* group : {&mainU, &legU}) {
+            for (const auto& it : *group) { ys.push_back(it.y0); ys.push_back(it.y1); }
+        }
+        std::sort(ys.begin(), ys.end());
+        for (size_t b = 0; b + 1 < ys.size(); ++b) {
+            double ya = ys[b], yb = ys[b + 1];
+            if (yb - ya <= kEnclosureGeometryTolerance) continue;
+            double ym = (ya + yb) / 2.0;
+            const WindingItem* mainFront = nullptr;
+            const WindingItem* legFront = nullptr;
+            for (const auto& it : mainU) {
+                if (it.y0 < ym && ym < it.y1 && (!mainFront || it.x1 > mainFront->x1)) mainFront = &it;
+            }
+            for (const auto& it : legU) {
+                if (it.y0 < ym && ym < it.y1 && (!legFront || it.x0 < legFront->x0)) legFront = &it;
+            }
+            const double dy = yb - ya;
+            bool mainExposed = mainFront && exposedShare(mainFront->nodeIdx, ThermalNodeFace::RADIAL_OUTER) > 0;
+            bool legExposed = legFront && exposedShare(legFront->nodeIdx, acrossFace) > 0;
+            if (mainFront && legFront) {
+                if (!mainExposed || !legExposed) continue;  // a covered face already has its conduction path
+                double mainH = mainFront->y1 - mainFront->y0, legH = legFront->y1 - legFront->y0;
+                links.push_back({legFront->nodeIdx, acrossFace, dy / legH, mainFront->nodeIdx, ThermalNodeFace::RADIAL_OUTER,
+                                 dy / mainH, true, legFront->x0 - mainFront->x1, 0.0, side});
+                covered[{legFront->nodeIdx, acrossFace, side}] += dy / legH;
+                covered[{mainFront->nodeIdx, ThermalNodeFace::RADIAL_OUTER, side}] += dy / mainH;
+            } else if (mainFront && mainExposed) {
+                double mainH = mainFront->y1 - mainFront->y0;
+                links.push_back({mainFront->nodeIdx, ThermalNodeFace::RADIAL_OUTER, dy / mainH, legIdx, ThermalNodeFace::NONE,
+                                 0.0, false, legSurfaceU - mainFront->x1, legPlastic, side});
+                covered[{mainFront->nodeIdx, ThermalNodeFace::RADIAL_OUTER, side}] += dy / mainH;
+            } else if (legFront && legExposed) {
+                double legH = legFront->y1 - legFront->y0;
+                links.push_back({legFront->nodeIdx, acrossFace, dy / legH, mainColumnTarget, ThermalNodeFace::NONE,
+                                 0.0, false, legFront->x0 - mainColumnSurfaceU, mainColumnPlastic, side});
+                covered[{legFront->nodeIdx, acrossFace, side}] += dy / legH;
+            }
+        }
+    }
+
+    // Lateral windings' top/bottom faces: in-window share to the yokes through gap + flange.
+    struct FlangeLink { size_t from; ThermalNodeFace face; double share; size_t to; double gap; double plastic; };
+    std::vector<FlangeLink> flangeLinks;
+    for (const auto& [legIndex, windowIndex] : _lateralPlacement->bobbinWindowOfWoundLeg) {
+        std::vector<WindingItem> legItems;
+        for (const auto& item : all) {
+            const auto& node = _nodes[item.nodeIdx];
+            if (isLateralWound(node) && node.woundColumnIndex.value() == legIndex) legItems.push_back(item);
+        }
+        if (legItems.empty()) continue;
+        double topSurfaceY, bottomSurfaceY, plastic;
+        if (flangeThickness > 0) {
+            auto bobbinWindow = bobbinDescription.get_winding_windows()[windowIndex];
+            topSurfaceY = bobbinWindow.get_coordinates().value()[1] + bobbinWindow.get_height().value() / 2.0;
+            bottomSurfaceY = bobbinWindow.get_coordinates().value()[1] - bobbinWindow.get_height().value() / 2.0;
+            plastic = flangeThickness;
+        } else {
+            topSurfaceY = windows[0].get_height().value() / 2.0;
+            bottomSurfaceY = -windows[0].get_height().value() / 2.0;
+            plastic = 0.0;
+        }
+        auto topShares = unshadowedShares(legItems, true, false);
+        auto bottomShares = unshadowedShares(legItems, true, true);
+        for (size_t k = 0; k < legItems.size(); ++k) {
+            double phi = inWindowFraction(_nodes[legItems[k].nodeIdx]);
+            double exposedTop = exposedShare(legItems[k].nodeIdx, ThermalNodeFace::TANGENTIAL_LEFT);
+            double exposedBottom = exposedShare(legItems[k].nodeIdx, ThermalNodeFace::TANGENTIAL_RIGHT);
+            if (exposedTop > 0 && topShares[k] > 0) {
+                flangeLinks.push_back({legItems[k].nodeIdx, ThermalNodeFace::TANGENTIAL_LEFT, phi * std::min(topShares[k], exposedTop),
+                                       topYokeIdx, topSurfaceY - legItems[k].y1, plastic});
+            }
+            if (exposedBottom > 0 && bottomShares[k] > 0) {
+                flangeLinks.push_back({legItems[k].nodeIdx, ThermalNodeFace::TANGENTIAL_RIGHT, phi * std::min(bottomShares[k], exposedBottom),
+                                       bottomYokeIdx, legItems[k].y0 - bottomSurfaceY, plastic});
+            }
+        }
+    }
+
+    // Shares: phi per crossing, clipped so a face never conducts more than it exposes.
+    auto shareOf = [&](size_t nodeIdx, ThermalNodeFace face, double fraction, int side) {
+        double phi = isLateralWound(_nodes[nodeIdx]) ? inWindowFraction(_nodes[nodeIdx]) : phiMain / 2.0;
+        double cover = covered.at({nodeIdx, face, side});
+        double exposed = exposedShare(nodeIdx, face);
+        double scale = cover > exposed ? exposed / cover : 1.0;
+        return phi * fraction * scale;
+    };
+    std::map<std::pair<size_t, ThermalNodeFace>, double> conductingArea;
+    auto checkGap = [&](double gap, size_t nodeIdx) {
+        if (gap < -kEnclosureGeometryTolerance) {
+            throw std::runtime_error("Temperature::createLateralAcrossWindowConnections: " + _nodes[nodeIdx].name +
+                                     " overlaps what it faces across the window by " + std::to_string(-gap * 1e3) + " mm.");
+        }
+        return std::max(gap, 0.0);
+    };
+    auto push = [&](size_t from, ThermalNodeFace fromFace, size_t to, ThermalNodeFace toFace, double area, double gap,
+                    double resistance) {
+        if (!(resistance > 0) || !std::isfinite(resistance)) {
+            throw std::runtime_error("Temperature::createLateralAcrossWindowConnections: non-positive or non-finite "
+                                     "resistance from " + _nodes[from].name + " to " + _nodes[to].name + ".");
+        }
+        ThermalResistanceElement r;
+        r.nodeFromId = from;
+        r.quadrantFrom = fromFace;
+        r.nodeToId = to;
+        r.quadrantTo = toFace;
+        r.type = HeatTransferType::CONDUCTION;
+        r.area = area;
+        r.length = gap;
+        r.resistance = resistance;
+        _resistances.push_back(r);
+    };
+    for (const auto& link : links) {
+        double gap = checkGap(link.gap, link.from);
+        double fromShare = shareOf(link.from, link.fromFace, link.fromFraction, link.side);
+        if (fromShare <= 0) continue;
+        double fromArea = fromShare * _nodes[link.from].getQuadrant(link.fromFace)->surfaceArea;
+        if (link.pair) {
+            double toShare = shareOf(link.to, link.toFace, link.toFraction, link.side);
+            if (toShare <= 0) continue;
+            double toArea = toShare * _nodes[link.to].getQuadrant(link.toFace)->surfaceArea;
+            double resistance = faceToSurfaceResistance(link.from, link.fromFace, gap / 2.0, fromShare) +
+                                faceToSurfaceResistance(link.to, link.toFace, gap / 2.0, toShare);
+            push(link.from, link.fromFace, link.to, link.toFace, std::min(fromArea, toArea), gap, resistance);
+            conductingArea[{link.from, link.fromFace}] += fromArea;
+            conductingArea[{link.to, link.toFace}] += toArea;
+        } else {
+            double resistance = faceToSurfaceResistance(link.from, link.fromFace, gap, fromShare);
+            if (link.plastic > 0) {
+                resistance += ThermalResistance::calculateConductionResistance(link.plastic, plasticK, fromArea);
+            }
+            push(link.from, link.fromFace, link.to, ThermalNodeFace::NONE, fromArea, gap, resistance);
+            conductingArea[{link.from, link.fromFace}] += fromArea;
+        }
+    }
+    for (const auto& link : flangeLinks) {
+        if (link.share <= 0) continue;
+        double gap = checkGap(link.gap, link.from);
+        double area = link.share * _nodes[link.from].getQuadrant(link.face)->surfaceArea;
+        double resistance = faceToSurfaceResistance(link.from, link.face, gap, link.share);
+        if (link.plastic > 0) {
+            resistance += ThermalResistance::calculateConductionResistance(link.plastic, plasticK, area);
+        }
+        push(link.from, link.face, link.to, ThermalNodeFace::NONE, area, gap, resistance);
+        conductingArea[{link.from, link.face}] += area;
+    }
+
+    // The conducting share no longer convects; resistance scales with the remaining area.
+    for (const auto& [key, area] : conductingArea) {
+        size_t k = convectionOf.at(key);
+        double remainingArea = _resistances[k].area - area;
+        if (remainingArea <= 0) {
+            throw std::runtime_error("Temperature::createLateralAcrossWindowConnections: no convecting area left on " +
+                                     _nodes[key.first].name + ".");
+        }
+        _resistances[k].resistance *= _resistances[k].area / remainingArea;
+        _resistances[k].area = remainingArea;
+    }
+}
+
 void Temperature::createTurnToInsulationConnections() {
     // Find all insulation layer nodes
     std::vector<size_t> insulationNodeIndices;
@@ -3316,6 +3976,22 @@ void Temperature::createTurnToInsulationConnections() {
     if (!_isToroidal) {
         // For concentric cores: iterate through turns and find closest insulation layer on each side
         // This ensures turns connect to the correct insulation layer based on perpendicular distance
+
+        // ABT #1540: a tape lying across the window (between axially stacked sections) faces the
+        // turns with its top and bottom, not with its sides: it is a candidate for a turn's TOP
+        // and BOTTOM faces only. Which way a layer lies is read from its MAS description.
+        auto insulationLayerDescriptions = _magnetic.get_mutable_coil().get_layers_description_insulation();
+        std::map<size_t, bool> liesAcrossWindow;
+        for (size_t insulationIdx : insulationNodeIndices) {
+            const auto& insulationNode = _nodes[insulationIdx];
+            if (!insulationNode.insulationLayerIndex.has_value() ||
+                insulationNode.insulationLayerIndex.value() >= insulationLayerDescriptions.size()) {
+                throw std::runtime_error("Temperature::createTurnToInsulationConnections: insulation node " +
+                                         insulationNode.name + " does not point to an insulation layer of the coil.");
+            }
+            liesAcrossWindow[insulationIdx] =
+                isCartesianLayerAcrossWindow(insulationLayerDescriptions[insulationNode.insulationLayerIndex.value()]);
+        }
         
         for (size_t turnIdx : turnNodeIndices) {
             const auto& turnNode = _nodes[turnIdx];
@@ -3343,6 +4019,11 @@ void Temperature::createTurnToInsulationConnections() {
             InsulationCandidate rightCandidate;
             bool hasLeft = false;
             bool hasRight = false;
+            // ABT #1540: closest tape lying across the window below and above the turn.
+            InsulationCandidate belowCandidate;
+            InsulationCandidate aboveCandidate;
+            bool hasBelow = false;
+            bool hasAbove = false;
 
             for (size_t insulationIdx : insulationNodeIndices) {
                 const auto& insulationNode = _nodes[insulationIdx];
@@ -3366,6 +4047,50 @@ void Temperature::createTurnToInsulationConnections() {
                 double insulationTop = insulationY + insulationH / 2.0;
                 double turnBottom = turnY - turnHeight / 2.0;
                 double turnTop = turnY + turnHeight / 2.0;
+
+                if (liesAcrossWindow.at(insulationIdx)) {
+                    // ABT #1540: the tape lies across the window. It bears on the turn's bottom
+                    // (top) face when it is under (over) the turn: their radial spans overlap, its
+                    // surface is at or beyond the turn's surface within half its own thickness,
+                    // and no other turn lies in between. Mirrors the LEFT/RIGHT rule below, with
+                    // the axes exchanged.
+                    double turnLeftEdge = turnX - turnWidth / 2.0;
+                    double turnRightEdge = turnX + turnWidth / 2.0;
+                    if (insulationRightEdge <= turnLeftEdge || insulationLeftEdge >= turnRightEdge) continue;
+
+                    double distToBelow = turnBottom - insulationTop;
+                    double distToAbove = insulationBottom - turnTop;
+                    const double axialSideTolerance = insulationH / 2.0;
+                    auto turnBetweenAxially = [&](double fromY, double toY) {
+                        for (size_t otherIdx : turnNodeIndices) {
+                            if (otherIdx == turnIdx) continue;
+                            const auto& other = _nodes[otherIdx];
+                            double otherX = other.physicalCoordinates[0];
+                            if (std::abs(otherX - turnX) >= (other.dimensions.width + turnWidth) / 2.0) continue;
+                            double otherY = other.physicalCoordinates[1];
+                            double otherBottom = otherY - other.dimensions.height / 2.0;
+                            double otherTop = otherY + other.dimensions.height / 2.0;
+                            double lo = std::min(fromY, toY) - axialSideTolerance;
+                            double hi = std::max(fromY, toY) + axialSideTolerance;
+                            if (otherBottom >= lo && otherTop <= hi) return true;
+                        }
+                        return false;
+                    };
+
+                    if (distToBelow >= -axialSideTolerance && distToBelow <= connectionThreshold &&
+                        (!hasBelow || distToBelow < belowCandidate.distance) &&
+                        !turnBetweenAxially(insulationTop, turnBottom)) {
+                        belowCandidate = {insulationIdx, distToBelow, insulationK, insulationW, insulationH};
+                        hasBelow = true;
+                    }
+                    if (distToAbove >= -axialSideTolerance && distToAbove <= connectionThreshold &&
+                        (!hasAbove || distToAbove < aboveCandidate.distance) &&
+                        !turnBetweenAxially(turnTop, insulationBottom)) {
+                        aboveCandidate = {insulationIdx, distToAbove, insulationK, insulationW, insulationH};
+                        hasAbove = true;
+                    }
+                    continue;  // never a LEFT/RIGHT neighbour: its sides are its thin edges
+                }
 
                 // Use generous Y-overlap check: allow partial overlap or nearby turns
                 double yTolerance = std::max(turnHeight, insulationH);
@@ -3508,6 +4233,42 @@ void Temperature::createTurnToInsulationConnections() {
                               << r.resistance << " K/W)" << std::endl;
                 }
             }
+
+            // ABT #1540: connection to the tape lying across the window below / above the turn.
+            // Half the tape (the node is its mid-plane) over the turn's face, in series with the
+            // air of any real clearance, exactly like the LEFT/RIGHT connections above.
+            auto connectAcrossWindowTape = [&](const InsulationCandidate& candidate, ThermalNodeFace turnFace,
+                                               ThermalNodeFace tapeFace) {
+                if (connectedQuadrants.count({turnIdx, turnFace})) return;
+                auto* turnQuadrant = turnNode.getQuadrant(turnFace);
+                if (!turnQuadrant) {
+                    throw std::runtime_error("Temperature: turn-to-insulation connection: turn node " + turnNode.name +
+                                             " is missing the " + std::string(magic_enum::enum_name(turnFace)) +
+                                             " quadrant; cannot determine contact area.");
+                }
+                double contactArea = turnQuadrant->surfaceArea;
+                ThermalResistanceElement r;
+                r.nodeFromId = candidate.insulationIdx;
+                r.quadrantFrom = tapeFace;
+                r.nodeToId = turnIdx;
+                r.quadrantTo = turnFace;
+                r.type = HeatTransferType::CONDUCTION;
+                r.resistance = ThermalResistance::calculateConductionResistance(
+                    candidate.insulationHeight / 2.0, candidate.insulationK, contactArea);
+                if (candidate.distance > 0) {
+                    r.resistance += ThermalResistance::calculateConductionResistance(
+                        candidate.distance, gapAirThermalConductivity(), contactArea);
+                }
+                _resistances.push_back(r);
+            };
+            if (hasBelow) {
+                // Tape's TOP face under the turn's BOTTOM face.
+                connectAcrossWindowTape(belowCandidate, ThermalNodeFace::TANGENTIAL_RIGHT, ThermalNodeFace::TANGENTIAL_LEFT);
+            }
+            if (hasAbove) {
+                // Tape's BOTTOM face over the turn's TOP face.
+                connectAcrossWindowTape(aboveCandidate, ThermalNodeFace::TANGENTIAL_LEFT, ThermalNodeFace::TANGENTIAL_RIGHT);
+            }
         }
     }
     
@@ -3601,7 +4362,9 @@ void Temperature::createTurnToInsulationConnections() {
             double turnSurfaceOuterRadius = turnRadiusPos + turnRadiusActual;
             
             // Find layers that are close on either radial side of the turn
-            std::vector<std::pair<int, double>> matchingLayers;  // (layerIdx, whichSide: -1=inner, +1=outer)
+            // (layerIdx, whichSide: -1=inner, +1=outer, radial surface gap, layer half thickness)
+            struct MatchingLayer { int layerIdx; double whichSide; double surfaceGap; double semiThickness; };
+            std::vector<MatchingLayer> matchingLayers;
             
             for (const auto& layer : allLayers) {
                 // Skip layers on opposite side of core (inner vs outer)
@@ -3615,19 +4378,19 @@ void Temperature::createTurnToInsulationConnections() {
                 // (layer is closer to center than turn)
                 double gapInner = turnSurfaceInnerRadius - layerSurfaceOuterRadius;
                 if (std::abs(gapInner) < proximityThreshold) {
-                    matchingLayers.push_back({layer.layerIdx, -1.0});  // -1 = turn's inner side
+                    matchingLayers.push_back({layer.layerIdx, -1.0, gapInner, layer.semiThickness});  // -1 = turn's inner side
                 }
                 
                 // Check if turn's OUTER surface is close to layer's INNER surface
                 // (layer is farther from center than turn)
                 double gapOuter = layerSurfaceInnerRadius - turnSurfaceOuterRadius;
                 if (std::abs(gapOuter) < proximityThreshold) {
-                    matchingLayers.push_back({layer.layerIdx, +1.0});  // +1 = turn's outer side
+                    matchingLayers.push_back({layer.layerIdx, +1.0, gapOuter, layer.semiThickness});  // +1 = turn's outer side
                 }
             }
             
             // For each matching layer, find closest node by angle and create connection
-            for (const auto& [layerIdx, whichSide] : matchingLayers) {
+            for (const auto& [layerIdx, whichSide, surfaceGap, layerSemiThickness] : matchingLayers) {
                 const auto& layerInsIndices = insNodesByLayer[layerIdx];
                 
                 // Find closest insulation node in this layer by angular proximity
@@ -3718,17 +4481,25 @@ void Temperature::createTurnToInsulationConnections() {
                                   (turnNode.dimensions.width * turnNode.dimensions.height * 0.5);
                 }
                 
-                // Conduction distance is the surface-to-surface distance
-                double conductionDistance = std::max(minQuadrantDistance, 1e-6);
-                
                 // Get insulation thermal conductivity
                 double insulationK = kInsulation_DefaultConductivity;
                 if (insNode.quadrants[0].thermalConductivity > 0) {
                     insulationK = insNode.quadrants[0].thermalConductivity;
                 }
-                
+
+                // ABT #1735: heat crosses the RADIAL path from the turn's surface to the layer's
+                // centre -- the air gap between them (if any) and half the layer's thickness.
+                // The conduction length used to be the distance between the two quadrants' limit
+                // points, which sit at the TURN's angle and at the IL SEGMENT's mid-angle: on a
+                // T 36/23/15 with 8 segments that chord is up to ~4 mm of "tape", turning a
+                // ~0.05 mm contact into ~1000 K/W per turn and hiding the whole wrap behind it.
+                (void) minQuadrantDistance;  // only selects the facing pair above
                 r.resistance = ThermalResistance::calculateConductionResistance(
-                    conductionDistance, insulationK, contactArea);
+                    layerSemiThickness, insulationK, contactArea);
+                if (surfaceGap > 0) {
+                    r.resistance += ThermalResistance::calculateConductionResistance(
+                        surfaceGap, gapAirThermalConductivity(), contactArea);
+                }
                 
                 _resistances.push_back(r);
                 connectionCount++;
@@ -4139,7 +4910,9 @@ void Temperature::createConvectionConnections() {
         if (_isToroidal) {
             // A wound toroid's convection-exposed winding surfaces are its outer periphery and
             // top/bottom faces — they see the ROOM. The bore is a near-isothermal cavity (turns
-            // facing turns at winding temperature), so its net radiative exchange is ~zero, and
+            // facing turns at winding temperature): its wall reaches the room only through the two
+            // openings, with the view factor the builder stores on each bore resistor
+            // (roomViewFactor, ABT #1735), and its exchange with itself nets ~zero; and
             // the core is covered by the winding precisely where a turn could otherwise face it.
             // Radiating exposed toroidal surfaces at the core (the pre-#527 behaviour) pumped
             // winding heat into a body those surfaces do not see.
@@ -4219,8 +4992,15 @@ void Temperature::createConvectionConnections() {
                 if (h_rad <= 0) continue;
 
                 // Split the turn's radiating area by what each share of the wrap faces.
-                double coreFacingArea = convectionResistor.area * windowFacingFraction;
+                double nodeWindowFacingFraction =
+                    (_lateralPlacement && !_isToroidal && !_isPlanar) ? inWindowFraction(sourceNode) : windowFacingFraction;
+                double coreFacingArea = convectionResistor.area * nodeWindowFacingFraction;
                 double roomFacingArea = convectionResistor.area - coreFacingArea;
+                // ABT #1735: a surface lining a cavity (a toroid's bore) reaches the room only
+                // through the cavity's openings; the rest of its view is its own wall.
+                if (convectionResistor.roomViewFactor) {
+                    roomFacingArea *= convectionResistor.roomViewFactor.value();
+                }
 
                 if (coreFacingArea > 0) {
                     ThermalResistanceElement radiationResistor;
@@ -4286,9 +5066,16 @@ void Temperature::createConvectionConnections() {
                 radiationResistor.nodeToId = ambientIdx;
                 radiationResistor.quadrantTo = ThermalNodeFace::NONE;
                 radiationResistor.type = HeatTransferType::RADIATION;
-                radiationResistor.area = convectionResistor.area;
+                // ABT #1735: bare ferrite lining a toroid's bore reaches the room only through the
+                // bore's openings.
+                double roomFacingArea = convectionResistor.area;
+                if (convectionResistor.roomViewFactor) {
+                    roomFacingArea *= convectionResistor.roomViewFactor.value();
+                }
+                if (!(roomFacingArea > 0)) continue;
+                radiationResistor.area = roomFacingArea;
                 radiationResistor.orientation = convectionResistor.orientation;
-                radiationResistor.resistance = 1.0 / (h_rad * convectionResistor.area);
+                radiationResistor.resistance = 1.0 / (h_rad * roomFacingArea);
                 _resistances.push_back(radiationResistor);
             }
         }
@@ -4298,6 +5085,9 @@ void Temperature::createConvectionConnections() {
     // in-window share across the air gap (after radiation, which keeps the full exposed area).
     if (!_isToroidal && !_isPlanar && !_config.coreOnly) {
         createWindingToCoreAcrossWindowConnections(ambientIdx);
+        if (_lateralPlacement) {
+            createLateralAcrossWindowConnections(ambientIdx);
+        }
     }
 }
 
@@ -4307,14 +5097,6 @@ void Temperature::createToroidalConvectionConnections(size_t ambientIdx, double 
     auto dimensions = flatten_dimensions(core.resolve_shape().get_dimensions().value());
     double coreInnerR = dimensions["B"] / 2.0;
     double coreOuterR = dimensions["A"] / 2.0;
-
-    std::set<std::string> connectedQuadrants;
-    for (const auto& res : _resistances) {
-        if (res.type == HeatTransferType::CONDUCTION) {
-            connectedQuadrants.insert(std::to_string(res.nodeFromId) + "_" + std::string(magic_enum::enum_name(res.quadrantFrom)));
-            connectedQuadrants.insert(std::to_string(res.nodeToId) + "_" + std::string(magic_enum::enum_name(res.quadrantTo)));
-        }
-    }
 
     bool hasInsulationLayers = false;
     bool hasOuterInsulationLayers = false;
@@ -4330,6 +5112,61 @@ void Temperature::createToroidalConvectionConnections(size_t ambientIdx, double 
             if (ilR > coreOuterR) hasOuterInsulationLayers = true;
         }
     }
+
+    // ABT #1735 (Alf 2026-10-11): every toroid surface convects with its OWN orientation and
+    // boundary-layer length, through the existing law (ThermalResistance::
+    // calculateNaturalConvectionCoefficient). The rim and the bore are vertical cylinders whose
+    // boundary layer runs the wound body's height (C + 2t); the two annular faces are horizontal
+    // plates, the top one hot-facing-up and the bottom one hot-facing-down, with L = area /
+    // perimeter of the annulus, (R_out - R_in)/2. They used to be one lumped resistor per node,
+    // evaluated as VERTICAL with L = the processed core height, which for a toroid is the OD.
+    // The lengths are set here once; recalculateConvectionResistances re-reads them.
+    const HeatTransferType ambientConvectionType = _config.includeForcedConvection ?
+                                                   HeatTransferType::FORCED_CONVECTION :
+                                                   HeatTransferType::NATURAL_CONVECTION;
+    auto addConvectionToAmbient = [&](size_t nodeIdx, ThermalNodeFace face, double area,
+                                      SurfaceOrientation orientation, double characteristicLength) -> ThermalResistanceElement& {
+        if (!(characteristicLength > 0)) {
+            throw std::runtime_error("Temperature::createToroidalConvectionConnections: surface of node " +
+                                     _nodes[nodeIdx].name + " has a non-positive characteristic length (" +
+                                     std::to_string(characteristicLength) + " m).");
+        }
+        ThermalResistanceElement r;
+        r.nodeFromId = nodeIdx;
+        r.quadrantFrom = face;
+        r.nodeToId = ambientIdx;
+        r.quadrantTo = ThermalNodeFace::NONE;
+        r.type = ambientConvectionType;
+        r.orientation = orientation;
+        r.characteristicLength = characteristicLength;
+        r.area = area;
+        r.resistance = 1.0 / (h_conv * area);
+        _resistances.push_back(r);
+        return _resistances.back();
+    };
+    // A vertical cylinder of the given area plus an annular-face area split equally between the
+    // top and the bottom face. A bore cylinder (cylinderRoomViewFactor set) looks at the room only
+    // through the bore's two openings; its radiation path reads that fraction
+    // (createConvectionConnections). Rim cylinders and annular faces face the room openly.
+    auto addCylinderAndFaces = [&](size_t nodeIdx, ThermalNodeFace face, double cylinderArea, double cylinderHeight,
+                                   double facesArea, double faceLength, std::optional<double> cylinderRoomViewFactor) {
+        if (cylinderArea > 0) {
+            auto& cylinder = addConvectionToAmbient(nodeIdx, face, cylinderArea, SurfaceOrientation::VERTICAL, cylinderHeight);
+            cylinder.roomViewFactor = cylinderRoomViewFactor;
+        }
+        if (facesArea > 0) {
+            addConvectionToAmbient(nodeIdx, face, facesArea / 2.0, SurfaceOrientation::HORIZONTAL_TOP, faceLength);
+            addConvectionToAmbient(nodeIdx, face, facesArea / 2.0, SurfaceOrientation::HORIZONTAL_BOTTOM, faceLength);
+        }
+    };
+    // Wound-body envelope, shared by the turns' envelope and the bare core between them.
+    double envelopeHeight = 0.0;
+    double envelopeFaceLength = 0.0;
+    // ABT #1735: the bore of the wound body (radius innerEnvelopeR, height envelopeHeight) sees the
+    // room only through its two openings. Every surface lining it -- the bore-side turns' envelope
+    // and the bare ferrite between them -- radiates to the room with this view factor; the rest of
+    // its view is the bore's own wall, a near-isothermal cavity with ~zero net exchange.
+    double envelopeBoreViewFactor = 0.0;
 
     // ---- Envelope-based ambient interface for the wound toroid (ABT #906) ----
     // A packed toroidal winding presents its ENVELOPE to the air: the outer cylinder
@@ -4385,7 +5222,9 @@ void Temperature::createToroidalConvectionConnections(size_t ambientIdx, double 
         }
 
         // The wound body is the core axial height plus one wire on each face.
-        double envelopeHeight = axialLength + 2.0 * maximumTurnDimension;
+        envelopeHeight = axialLength + 2.0 * maximumTurnDimension;
+        envelopeFaceLength = (outerEnvelopeR - innerEnvelopeR) / 2.0;
+        envelopeBoreViewFactor = ThermalResistance::calculateCylinderWallToOpeningsViewFactor(innerEnvelopeR, envelopeHeight);
         double outerCylinderArea = 2.0 * std::numbers::pi * outerEnvelopeR * envelopeHeight;
         double holeCylinderArea = 2.0 * std::numbers::pi * innerEnvelopeR * envelopeHeight;
         double annularFacesArea = 2.0 * std::numbers::pi * (outerEnvelopeR * outerEnvelopeR - innerEnvelopeR * innerEnvelopeR);
@@ -4434,26 +5273,23 @@ void Temperature::createToroidalConvectionConnections(size_t ambientIdx, double 
         double outerCoverage = boundaryCoverage(outerBoundaryNodes);
         double holeCoverage = boundaryCoverage(holeBoundaryNodes);
 
-        auto connectBoundaryNodes = [&](const std::vector<size_t>& boundaryNodes, double boundaryArea,
-                                        ThermalNodeFace face) {
-            if (boundaryNodes.empty() || boundaryArea <= 0) return;
-            double areaShare = boundaryArea / boundaryNodes.size();
+        auto connectBoundaryNodes = [&](const std::vector<size_t>& boundaryNodes, double cylinderArea,
+                                        double facesArea, ThermalNodeFace face) {
+            if (boundaryNodes.empty() || cylinderArea + facesArea <= 0) return;
+            double cylinderShare = cylinderArea / boundaryNodes.size();
+            double facesShare = facesArea / boundaryNodes.size();
+            const std::optional<double> cylinderRoomViewFactor =
+                face == ThermalNodeFace::RADIAL_INNER ? std::optional<double>(envelopeBoreViewFactor) : std::nullopt;
             for (size_t i : boundaryNodes) {
-                ThermalResistanceElement r;
-                r.nodeFromId = i;
-                r.quadrantFrom = face;
-                r.nodeToId = ambientIdx;
-                r.quadrantTo = ThermalNodeFace::NONE;
-                r.type = _config.includeForcedConvection ?
-                         HeatTransferType::FORCED_CONVECTION :
-                         HeatTransferType::NATURAL_CONVECTION;
-                r.resistance = 1.0 / (h_conv * areaShare);
-                r.area = areaShare;
+                size_t first = _resistances.size();
+                addCylinderAndFaces(i, face, cylinderShare, envelopeHeight, facesShare, envelopeFaceLength, cylinderRoomViewFactor);
                 auto* q = _nodes[i].getQuadrant(face);
                 if (q && q->coating.has_value()) {
-                    r.resistance += WireCoatingUtils::calculateCoatingResistance(q->coating.value(), areaShare);
+                    for (size_t k = first; k < _resistances.size(); ++k) {
+                        _resistances[k].resistance +=
+                            WireCoatingUtils::calculateCoatingResistance(q->coating.value(), _resistances[k].area);
+                    }
                 }
-                _resistances.push_back(r);
             }
         };
 
@@ -4461,124 +5297,391 @@ void Temperature::createToroidalConvectionConnections(size_t ambientIdx, double 
         // (the top/bottom of the wound body span from the hole to the outer rim;
         // splitting them between the two boundary node groups keeps the total right),
         // scaled by the angular fraction of the circle that boundary actually covers.
-        connectBoundaryNodes(outerBoundaryNodes, (outerCylinderArea + annularFacesArea / 2.0) * outerCoverage,
+        connectBoundaryNodes(outerBoundaryNodes, outerCylinderArea * outerCoverage, annularFacesArea / 2.0 * outerCoverage,
                              ThermalNodeFace::RADIAL_OUTER);
-        connectBoundaryNodes(holeBoundaryNodes, (holeCylinderArea + annularFacesArea / 2.0) * holeCoverage,
+        connectBoundaryNodes(holeBoundaryNodes, holeCylinderArea * holeCoverage, annularFacesArea / 2.0 * holeCoverage,
                              ThermalNodeFace::RADIAL_INNER);
     }
 
         
-        // Core convection - connect exposed core quadrants
-        // When insulation layers are present, core is covered by insulation and has no convection
-        if (!hasInsulationLayers) {
+    // ---- Exposed core surface of a wound toroid (ABT #1735) ----
+    // The core between the turns is bare ferrite looking at the room. The envelope above hands
+    // the turns only the share of the wound-body surface their own arcs cover (outerCoverage /
+    // holeCoverage), so the uncovered remainder MUST be the core's, or it is in nobody's books.
+    // The previous builder blocked a whole segment face as soon as one turn rested on it (and a
+    // face a turn conducted into was skipped as well), so a sparsely wound toroid -- 10 turns on
+    // a T 20/10/7 -- lost ~80% of its surface to ambient and ran several times hotter than the
+    // same core bare. Coverage is now partial and per face, measured with exactly the arc the
+    // envelope uses for a turn: its largest dimension plus one stagnant gap, as an angle at the
+    // turn's own radius. Each segment face convects its uncovered fraction; the two annular faces
+    // (absent from the old model even for a bare core) convect theirs too, covered where the
+    // turns cross them radially -- a strip of width (d + gap) whose angular share is taken at
+    // the annulus mean radius.
+    // When insulation layers are present, a full-circle layer wraps the core (partial-arc
+    // separators create no nodes, see createInsulationLayerNodes), so the core's bare surface
+    // sees the WRAP, not the room: it conducts across the air gap the turns hold open between
+    // core and tape, into the wrap layer nearest the core, and the outermost layer carries the
+    // envelope to ambient (below). Without that gap path the core's only way out was through
+    // the turns' contact strips -- ten turns on a T 20/10/7 -- however much bare ferrite faced
+    // the tape a wire's diameter away.
+    {
+        const double twoPi = 2.0 * std::numbers::pi;
+        const double stagnantGap = ThermalDefaults::kConvection_StagnantAirGap;
+        const double coreHeight = dimensions["C"];
+        const double annulusMeanR = (coreInnerR + coreOuterR) / 2.0;
+        const size_t numberSegments = static_cast<size_t>(_config.toroidalSegments);
+        if (numberSegments == 0) {
+            throw std::runtime_error("Temperature::createToroidalConvectionConnections: toroidalSegments must be positive.");
+        }
+        const double segmentSpan = twoPi / numberSegments;
+
+        // Angular arcs as [start, end) with 0 <= start < 2*pi; an arc crossing 2*pi is split.
+        using Arc = std::pair<double, double>;
+        auto addArc = [&](std::vector<Arc>& arcs, double centerAngle, double halfWidth) {
+            double start = std::fmod(std::fmod(centerAngle - halfWidth, twoPi) + twoPi, twoPi);
+            double end = start + 2.0 * halfWidth;
+            if (2.0 * halfWidth >= twoPi) {
+                arcs.push_back({0.0, twoPi});
+            }
+            else if (end > twoPi) {
+                arcs.push_back({start, twoPi});
+                arcs.push_back({0.0, end - twoPi});
+            }
+            else {
+                arcs.push_back({start, end});
+            }
+        };
+        auto mergeArcs = [](std::vector<Arc> arcs) {
+            std::sort(arcs.begin(), arcs.end());
+            std::vector<Arc> merged;
+            for (const auto& arc : arcs) {
+                if (!merged.empty() && arc.first <= merged.back().second) {
+                    merged.back().second = std::max(merged.back().second, arc.second);
+                }
+                else {
+                    merged.push_back(arc);
+                }
+            }
+            return merged;
+        };
+        auto coveredFractionOfSegment = [&](const std::vector<Arc>& mergedArcs, double segmentStart) {
+            double segmentEnd = segmentStart + segmentSpan;
+            double covered = 0.0;
+            for (const auto& arc : mergedArcs) {
+                covered += std::max(0.0, std::min(arc.second, segmentEnd) - std::max(arc.first, segmentStart));
+            }
+            return std::clamp(covered / segmentSpan, 0.0, 1.0);
+        };
+
+        // Radial offset of the innermost wrap on each side (the tape that would lie on the core).
+        double rimTapeOffset = std::numeric_limits<double>::max();
+        double boreTapeOffset = std::numeric_limits<double>::max();
+        for (const auto& ilNode : _nodes) {
+            if (ilNode.part != ThermalNodePartType::INSULATION_LAYER) continue;
+            double ilR = std::hypot(ilNode.physicalCoordinates[0], ilNode.physicalCoordinates[1]);
+            if (ilNode.isInnerTurn) {
+                boreTapeOffset = std::min(boreTapeOffset, coreInnerR - ilR);
+            }
+            else {
+                rimTapeOffset = std::min(rimTapeOffset, ilR - coreOuterR);
+            }
+        }
+        // Arcs where some turn lies between the core and that innermost wrap, at any layer: only
+        // there does the wrap stand off the core. Between turns the wrap is a tensioned loop
+        // around the core's cross-section, so it lies on the ferrite (a T 20/10/7 with 5 turns of
+        // 0.5 mm wire: 6 mm pitch in the bore, >90% of the circumference has no turn under the
+        // tape). The contact arcs above are the subset that rests on the core itself.
+        std::vector<Arc> rimUnderTapeArcs, boreUnderTapeArcs, annulusUnderTapeArcs;
+        std::vector<Arc> outerFaceArcs, boreFaceArcs, annulusArcs;
+        for (size_t j = 0; j < _nodes.size(); j++) {
+            if (_nodes[j].part != ThermalNodePartType::TURN) continue;
+            double turnR = std::hypot(_nodes[j].physicalCoordinates[0], _nodes[j].physicalCoordinates[1]);
+            if (turnR <= 0) continue;
+            double turnMaxDim = std::max(_nodes[j].dimensions.width, _nodes[j].dimensions.height);
+            double turnAngle = std::atan2(_nodes[j].physicalCoordinates[1], _nodes[j].physicalCoordinates[0]);
+            double coveredWidth = turnMaxDim + stagnantGap;
+            if (turnR > coreOuterR && turnR - coreOuterR < rimTapeOffset) {
+                addArc(rimUnderTapeArcs, turnAngle, coveredWidth / 2.0 / turnR);
+            }
+            if (turnR < coreInnerR && coreInnerR - turnR < boreTapeOffset) {
+                addArc(boreUnderTapeArcs, turnAngle, coveredWidth / 2.0 / turnR);
+                addArc(annulusUnderTapeArcs, turnAngle, coveredWidth / 2.0 / annulusMeanR);
+            }
+            // Same surface-to-surface test as ABT #906: a turn rests on a face when its near
+            // surface is within the stagnant gap of the core surface.
+            if (turnR > coreOuterR && (turnR - turnMaxDim / 2.0) - coreOuterR < stagnantGap) {
+                addArc(outerFaceArcs, turnAngle, coveredWidth / 2.0 / turnR);
+            }
+            if (turnR < coreInnerR && coreInnerR - (turnR + turnMaxDim / 2.0) < stagnantGap) {
+                addArc(boreFaceArcs, turnAngle, coveredWidth / 2.0 / turnR);
+                // Every turn crosses both annular faces between the bore and the rim.
+                addArc(annulusArcs, turnAngle, coveredWidth / 2.0 / annulusMeanR);
+            }
+        }
+        outerFaceArcs = mergeArcs(outerFaceArcs);
+        boreFaceArcs = mergeArcs(boreFaceArcs);
+        annulusArcs = mergeArcs(annulusArcs);
+        // A turn resting on the core is under the wrap too, whatever its centre radius.
+        rimUnderTapeArcs.insert(rimUnderTapeArcs.end(), outerFaceArcs.begin(), outerFaceArcs.end());
+        boreUnderTapeArcs.insert(boreUnderTapeArcs.end(), boreFaceArcs.begin(), boreFaceArcs.end());
+        annulusUnderTapeArcs.insert(annulusUnderTapeArcs.end(), annulusArcs.begin(), annulusArcs.end());
+        rimUnderTapeArcs = mergeArcs(rimUnderTapeArcs);
+        boreUnderTapeArcs = mergeArcs(boreUnderTapeArcs);
+        annulusUnderTapeArcs = mergeArcs(annulusUnderTapeArcs);
+
+        const double annularAreaPerSegment =
+            2.0 * std::numbers::pi * (coreOuterR * coreOuterR - coreInnerR * coreInnerR) / numberSegments;
+        if (!(coreHeight > 0) || !(annularAreaPerSegment > 0)) {
+            throw std::runtime_error("Temperature::createToroidalConvectionConnections: toroidal core has a "
+                                     "non-positive height or annulus; cannot build its exposed surface.");
+        }
+
+        // Bare ferrite between the turns is part of the wound body's surface: its cylinder share
+        // takes the body's height and its annular share the body's face length.
+        auto connectCoreSurface = [&](size_t nodeIdx, ThermalNodeFace face, double cylinderArea, double annulusArea) {
+            const std::optional<double> cylinderRoomViewFactor =
+                face == ThermalNodeFace::RADIAL_INNER ? std::optional<double>(envelopeBoreViewFactor) : std::nullopt;
+            addCylinderAndFaces(nodeIdx, face, cylinderArea, envelopeHeight, annulusArea, envelopeFaceLength, cylinderRoomViewFactor);
+        };
+
+        // Bare core face -> the wrap layer nearest the core on that side. Where the wrap lies on
+        // the ferrite (contactArea) the path is half the tape; where a turn under the tape holds
+        // it off the core, add the air gap between the core surface and the tape.
+        auto connectCoreSurfaceToWrap = [&](size_t coreIdx, double coreAngle, bool boreSide, double cylinderArea,
+                                            double annulusArea, double contactArea) {
+            double exposedArea = cylinderArea + annulusArea;
+            if (exposedArea <= 0) return;
+            size_t bestIdx = 0;
+            double bestOffset = std::numeric_limits<double>::max();
+            double bestAngleDifference = std::numeric_limits<double>::max();
+            bool found = false;
+            for (size_t k = 0; k < _nodes.size(); k++) {
+                const auto& ilNode = _nodes[k];
+                if (ilNode.part != ThermalNodePartType::INSULATION_LAYER || ilNode.isInnerTurn != boreSide) continue;
+                double ilR = std::hypot(ilNode.physicalCoordinates[0], ilNode.physicalCoordinates[1]);
+                double offset = boreSide ? coreInnerR - ilR : ilR - coreOuterR;
+                double angleDifference = std::abs(std::atan2(ilNode.physicalCoordinates[1], ilNode.physicalCoordinates[0]) - coreAngle);
+                if (angleDifference > std::numbers::pi) angleDifference = 2.0 * std::numbers::pi - angleDifference;
+                // Innermost layer first, then the segment facing this one.
+                bool better = !found || offset < bestOffset - 1e-9 ||
+                              (std::abs(offset - bestOffset) <= 1e-9 && angleDifference < bestAngleDifference);
+                if (better) {
+                    found = true;
+                    bestIdx = k;
+                    bestOffset = offset;
+                    bestAngleDifference = angleDifference;
+                }
+            }
+            if (!found) {
+                // A contiguous toroid has no rim-side wrap nodes (createInsulationLayerNodes skips
+                // them); its rim is the turns' envelope, so the bare rim convects to the room.
+                if (!boreSide) {
+                    connectCoreSurface(coreIdx, ThermalNodeFace::RADIAL_OUTER, cylinderArea, annulusArea);
+                    return;
+                }
+                throw std::runtime_error("Temperature::createToroidalConvectionConnections: the toroid has insulation "
+                                         "layer nodes but none on the bore side to receive core segment " +
+                                         _nodes[coreIdx].name + ".");
+            }
+            const auto& wrapNode = _nodes[bestIdx];
+            double thickness = wrapNode.dimensions.width;
+            double airGap = bestOffset - thickness / 2.0;
+            double insulationK = wrapNode.quadrants[0].thermalConductivity;
+            if (!(thickness > 0) || !(insulationK > 0)) {
+                throw std::runtime_error("Temperature::createToroidalConvectionConnections: insulation layer node " +
+                                         wrapNode.name + " has no thickness or conductivity.");
+            }
+            if (contactArea < 0 || contactArea > exposedArea * (1.0 + 1e-12)) {
+                throw std::logic_error("Temperature::createToroidalConvectionConnections: core segment " +
+                                       _nodes[coreIdx].name + " has a wrap contact area outside its exposed area.");
+            }
+            double liftedArea = std::max(0.0, exposedArea - contactArea);
+            auto addPath = [&](double area, bool overAirGap) {
+                if (area <= 0) return;
+                ThermalResistanceElement r;
+                r.nodeFromId = coreIdx;
+                r.quadrantFrom = boreSide ? ThermalNodeFace::RADIAL_INNER : ThermalNodeFace::RADIAL_OUTER;
+                r.nodeToId = bestIdx;
+                r.quadrantTo = boreSide ? ThermalNodeFace::RADIAL_OUTER : ThermalNodeFace::RADIAL_INNER;
+                r.type = HeatTransferType::CONDUCTION;
+                r.area = area;
+                r.resistance = ThermalResistance::calculateConductionResistance(thickness / 2.0, insulationK, area);
+                if (overAirGap && airGap > 0) {
+                    r.resistance += ThermalResistance::calculateConductionResistance(airGap, gapAirThermalConductivity(), area);
+                }
+                _resistances.push_back(r);
+            };
+            addPath(contactArea, false);
+            addPath(liftedArea, true);
+        };
+
         for (size_t i = 0; i < _nodes.size(); i++) {
             if (_nodes[i].part != ThermalNodePartType::CORE_TOROIDAL_SEGMENT) continue;
-            
-            // Check RADIAL_OUTER - exposed if no turn wraps the outer core surface.
-            // Surface-to-surface: a turn resting on the core OD has its CENTER half a
-            // wire dimension (plus coating/placement clearance) beyond coreOuterR, so
-            // the previous |turnR - coreOuterR| < turnWidth center test never fired and
-            // the wrapped core surface kept convecting to ambient through the winding
-            // (ABT #906). Block when the turn's inner surface is within the stagnant
-            // gap of the core surface.
-            // Per-SEGMENT blocking (ABT #906 follow-up): a sector-wound toroid wraps
-            // only some segments; the bare arc's core surface must keep convecting.
-            double segmentAngle = std::atan2(_nodes[i].physicalCoordinates[1], _nodes[i].physicalCoordinates[0]);
-            double segmentHalfSpan = std::numbers::pi / std::max(1, _config.toroidalSegments);
-            auto turnOverlapsSegment = [&](size_t j, double turnR, double turnMaxDim) {
-                if (turnR <= 0) return false;
-                double turnAngle = std::atan2(_nodes[j].physicalCoordinates[1], _nodes[j].physicalCoordinates[0]);
-                double turnHalfWidth = (turnMaxDim + ThermalDefaults::kConvection_StagnantAirGap) / 2.0 / turnR;
-                double angleDiff = turnAngle - segmentAngle;
-                while (angleDiff > std::numbers::pi) angleDiff -= 2.0 * std::numbers::pi;
-                while (angleDiff < -std::numbers::pi) angleDiff += 2.0 * std::numbers::pi;
-                return std::abs(angleDiff) < segmentHalfSpan + turnHalfWidth;
+            double midAngle = std::atan2(_nodes[i].physicalCoordinates[1], _nodes[i].physicalCoordinates[0]);
+            double segmentStart = std::fmod(std::fmod(midAngle - segmentSpan / 2.0, twoPi) + twoPi, twoPi);
+            // A segment starting just below 2*pi through rounding would see none of the arcs that
+            // were split at 0; segment starts are multiples of the span, so snap to the nearest.
+            segmentStart = std::round(segmentStart / segmentSpan) * segmentSpan;
+            if (segmentStart >= twoPi - 1e-12) segmentStart = 0.0;
+
+            auto* outerQuadrant = _nodes[i].getQuadrant(ThermalNodeFace::RADIAL_OUTER);
+            auto* innerQuadrant = _nodes[i].getQuadrant(ThermalNodeFace::RADIAL_INNER);
+            if (!outerQuadrant || !innerQuadrant) {
+                throw std::runtime_error("Temperature::createToroidalConvectionConnections: core segment " +
+                                         _nodes[i].name + " is missing a radial quadrant.");
+            }
+            outerQuadrant->surfaceCoverage = 1.0 - coveredFractionOfSegment(outerFaceArcs, segmentStart);
+            innerQuadrant->surfaceCoverage = 1.0 - coveredFractionOfSegment(boreFaceArcs, segmentStart);
+            double annulusExposed = 1.0 - coveredFractionOfSegment(annulusArcs, segmentStart);
+
+            double outerExposedArea = outerQuadrant->surfaceArea * outerQuadrant->surfaceCoverage;
+            double innerExposedArea = innerQuadrant->surfaceArea * innerQuadrant->surfaceCoverage;
+            // The annular faces have no quadrant of their own (a segment has radial and
+            // tangential faces only); their exposed share is lumped on the outer face's side.
+            double annulusExposedArea = annularAreaPerSegment * annulusExposed;
+            // Of the exposed core, the share with no turn under the innermost wrap: the wrap
+            // rests on it.
+            double rimContactArea = outerQuadrant->surfaceArea * (1.0 - coveredFractionOfSegment(rimUnderTapeArcs, segmentStart));
+            double boreContactArea = innerQuadrant->surfaceArea * (1.0 - coveredFractionOfSegment(boreUnderTapeArcs, segmentStart));
+            double annulusContactArea = annularAreaPerSegment * (1.0 - coveredFractionOfSegment(annulusUnderTapeArcs, segmentStart));
+            if (!hasInsulationLayers) {
+                connectCoreSurface(i, ThermalNodeFace::RADIAL_OUTER, outerExposedArea, annulusExposedArea);
+                connectCoreSurface(i, ThermalNodeFace::RADIAL_INNER, innerExposedArea, 0.0);
+            }
+            else {
+                connectCoreSurfaceToWrap(i, midAngle, false, outerExposedArea, annulusExposedArea,
+                                         rimContactArea + annulusContactArea);
+                connectCoreSurfaceToWrap(i, midAngle, true, innerExposedArea, 0.0, boreContactArea);
+            }
+        }
+
+        // ---- Wrap on wrap (ABT #1735) ----
+        // A wrap laid over a sparse winding is a tensioned loop around the cross-section like the
+        // first one: between that winding's turns it lies on the wrap below it, and stands off it
+        // only under a turn's footprint. The two layers had no path between them at all except
+        // through the turns' contact strips (5 turns on a T 20/10/7). Each pair of consecutive
+        // wraps on a side is joined, per core segment, through half of each tape where they touch
+        // and across the air gap between them where a turn holds them apart. The areas are the
+        // core segment's own faces (the wraps sit a fraction of a millimetre off it).
+        if (hasInsulationLayers) {
+            struct WrapLayer {
+                double offset = 0;
+                std::vector<size_t> nodes;
             };
-
-            bool outerBlocked = false;
-            for (size_t j = 0; j < _nodes.size(); j++) {
-                if (_nodes[j].part != ThermalNodePartType::TURN) continue;
-
-                double turnR = std::sqrt(
-                    _nodes[j].physicalCoordinates[0]*_nodes[j].physicalCoordinates[0] +
-                    _nodes[j].physicalCoordinates[1]*_nodes[j].physicalCoordinates[1]
-                );
-                double turnMaxDim = std::max(_nodes[j].dimensions.width, _nodes[j].dimensions.height);
-
-                double surfaceGap = (turnR - turnMaxDim / 2.0) - coreOuterR;
-                if (turnR > coreOuterR && surfaceGap < ThermalDefaults::kConvection_StagnantAirGap &&
-                    turnOverlapsSegment(j, turnR, turnMaxDim)) {
-                    outerBlocked = true;
-                    break;
-                }
-            }
-            
-            if (!outerBlocked) {
-                std::string qKey = std::to_string(i) + "_" + 
-                                  std::string(magic_enum::enum_name(ThermalNodeFace::RADIAL_OUTER));
-                if (connectedQuadrants.count(qKey) == 0) {
-                    auto* q = _nodes[i].getQuadrant(ThermalNodeFace::RADIAL_OUTER);
-                    if (q) {
-                        ThermalResistanceElement r;
-                        r.nodeFromId = i;
-                        r.quadrantFrom = ThermalNodeFace::RADIAL_OUTER;
-                        r.nodeToId = ambientIdx;
-                        r.quadrantTo = ThermalNodeFace::NONE;
-                        r.type = _config.includeForcedConvection ? 
-                                 HeatTransferType::FORCED_CONVECTION : 
-                                 HeatTransferType::NATURAL_CONVECTION;
-                        r.resistance = q->calculateConvectionResistance(h_conv);
-                        r.area = q->surfaceArea * q->surfaceCoverage;
-                        _resistances.push_back(r);
+            for (bool boreSide : {false, true}) {
+                std::map<size_t, WrapLayer> byIndex;
+                for (size_t k = 0; k < _nodes.size(); k++) {
+                    const auto& ilNode = _nodes[k];
+                    if (ilNode.part != ThermalNodePartType::INSULATION_LAYER || ilNode.isInnerTurn != boreSide) continue;
+                    if (!ilNode.insulationLayerIndex.has_value()) {
+                        throw std::runtime_error("Temperature::createToroidalConvectionConnections: insulation layer node " +
+                                                 ilNode.name + " is missing insulationLayerIndex.");
                     }
+                    double ilR = std::hypot(ilNode.physicalCoordinates[0], ilNode.physicalCoordinates[1]);
+                    auto& layer = byIndex[ilNode.insulationLayerIndex.value()];
+                    layer.offset = boreSide ? coreInnerR - ilR : ilR - coreOuterR;
+                    layer.nodes.push_back(k);
                 }
-            }
-            
-            // Check RADIAL_INNER - exposed if no turn lines the inner core surface.
-            // Same surface-to-surface reasoning as RADIAL_OUTER above (ABT #906): a
-            // turn resting on the core ID has its center half a wire dimension inside
-            // coreInnerR.
-            bool innerBlocked = false;
-            for (size_t j = 0; j < _nodes.size(); j++) {
-                if (_nodes[j].part != ThermalNodePartType::TURN) continue;
-
-                double turnR = std::sqrt(
-                    _nodes[j].physicalCoordinates[0]*_nodes[j].physicalCoordinates[0] +
-                    _nodes[j].physicalCoordinates[1]*_nodes[j].physicalCoordinates[1]
-                );
-                double turnMaxDim = std::max(_nodes[j].dimensions.width, _nodes[j].dimensions.height);
-
-                double surfaceGap = coreInnerR - (turnR + turnMaxDim / 2.0);
-                if (turnR < coreInnerR && surfaceGap < ThermalDefaults::kConvection_StagnantAirGap &&
-                    turnOverlapsSegment(j, turnR, turnMaxDim)) {
-                    innerBlocked = true;
-                    break;
-                }
-            }
-            
-            if (!innerBlocked) {
-                std::string qKey = std::to_string(i) + "_" + 
-                                  std::string(magic_enum::enum_name(ThermalNodeFace::RADIAL_INNER));
-                if (connectedQuadrants.count(qKey) == 0) {
-                    auto* q = _nodes[i].getQuadrant(ThermalNodeFace::RADIAL_INNER);
-                    if (q) {
-                        ThermalResistanceElement r;
-                        r.nodeFromId = i;
-                        r.quadrantFrom = ThermalNodeFace::RADIAL_INNER;
-                        r.nodeToId = ambientIdx;
-                        r.quadrantTo = ThermalNodeFace::NONE;
-                        r.type = _config.includeForcedConvection ?
-                                 HeatTransferType::FORCED_CONVECTION :
-                                 HeatTransferType::NATURAL_CONVECTION;
-                        r.resistance = q->calculateConvectionResistance(h_conv);
-                        r.area = q->surfaceArea * q->surfaceCoverage;
-                        _resistances.push_back(r);
+                std::vector<WrapLayer> layers;
+                for (auto& [index, layer] : byIndex) layers.push_back(layer);
+                std::sort(layers.begin(), layers.end(), [](const WrapLayer& a, const WrapLayer& b) { return a.offset < b.offset; });
+                for (size_t l = 0; l + 1 < layers.size(); ++l) {
+                    const auto& lower = layers[l];
+                    const auto& upper = layers[l + 1];
+                    // Turns between the two wraps on this side hold them apart.
+                    std::vector<Arc> faceArcs;
+                    for (const auto& turn : _nodes) {
+                        if (turn.part != ThermalNodePartType::TURN || turn.isInnerTurn != boreSide) continue;
+                        double turnR = std::hypot(turn.physicalCoordinates[0], turn.physicalCoordinates[1]);
+                        double turnOffset = boreSide ? coreInnerR - turnR : turnR - coreOuterR;
+                        if (turnR <= 0 || turnOffset <= lower.offset || turnOffset >= upper.offset) continue;
+                        double turnMaxDim = std::max(turn.dimensions.width, turn.dimensions.height);
+                        double turnAngle = std::atan2(turn.physicalCoordinates[1], turn.physicalCoordinates[0]);
+                        double halfWidth = (turnMaxDim + stagnantGap) / 2.0;
+                        addArc(faceArcs, turnAngle, halfWidth / turnR);
+                    }
+                    faceArcs = mergeArcs(faceArcs);
+                    auto nearestNode = [&](const WrapLayer& layer, double angle) {
+                        size_t best = layer.nodes.front();
+                        double bestDifference = std::numeric_limits<double>::max();
+                        for (size_t k : layer.nodes) {
+                            double difference = std::abs(std::atan2(_nodes[k].physicalCoordinates[1], _nodes[k].physicalCoordinates[0]) - angle);
+                            if (difference > std::numbers::pi) difference = twoPi - difference;
+                            if (difference < bestDifference) {
+                                bestDifference = difference;
+                                best = k;
+                            }
+                        }
+                        return best;
+                    };
+                    for (size_t i = 0; i < _nodes.size(); i++) {
+                        if (_nodes[i].part != ThermalNodePartType::CORE_TOROIDAL_SEGMENT) continue;
+                        double midAngle = std::atan2(_nodes[i].physicalCoordinates[1], _nodes[i].physicalCoordinates[0]);
+                        double segmentStart = std::fmod(std::fmod(midAngle - segmentSpan / 2.0, twoPi) + twoPi, twoPi);
+                        segmentStart = std::round(segmentStart / segmentSpan) * segmentSpan;
+                        if (segmentStart >= twoPi - 1e-12) segmentStart = 0.0;
+                        // The rim-side wraps also cover the annular faces (as the core's annulus goes to
+                        // the rim-side wrap above); the turns crossing them are the bore-side turns.
+                        const auto* faceQuadrant = _nodes[i].getQuadrant(boreSide ? ThermalNodeFace::RADIAL_INNER : ThermalNodeFace::RADIAL_OUTER);
+                        if (!faceQuadrant) {
+                            throw std::runtime_error("Temperature::createToroidalConvectionConnections: core segment " +
+                                                     _nodes[i].name + " is missing a radial quadrant.");
+                        }
+                        double totalArea = faceQuadrant->surfaceArea;
+                        double contactArea = faceQuadrant->surfaceArea * (1.0 - coveredFractionOfSegment(faceArcs, segmentStart));
+                        if (!boreSide) {
+                            // Bore-side turns between the bore wraps cross the faces between the
+                            // matching rim wraps; recomputed here for the pair at the same rank.
+                            std::vector<Arc> crossing;
+                            for (const auto& turn : _nodes) {
+                                if (turn.part != ThermalNodePartType::TURN || !turn.isInnerTurn) continue;
+                                double turnR = std::hypot(turn.physicalCoordinates[0], turn.physicalCoordinates[1]);
+                                double turnOffset = coreInnerR - turnR;
+                                if (turnR <= 0 || turnOffset <= lower.offset || turnOffset >= upper.offset) continue;
+                                double turnMaxDim = std::max(turn.dimensions.width, turn.dimensions.height);
+                                double turnAngle = std::atan2(turn.physicalCoordinates[1], turn.physicalCoordinates[0]);
+                                addArc(crossing, turnAngle, (turnMaxDim + stagnantGap) / 2.0 / annulusMeanR);
+                            }
+                            crossing = mergeArcs(crossing);
+                            totalArea += annularAreaPerSegment;
+                            contactArea += annularAreaPerSegment * (1.0 - coveredFractionOfSegment(crossing, segmentStart));
+                        }
+                        size_t lowerIdx = nearestNode(lower, midAngle);
+                        size_t upperIdx = nearestNode(upper, midAngle);
+                        double lowerThickness = _nodes[lowerIdx].dimensions.width;
+                        double upperThickness = _nodes[upperIdx].dimensions.width;
+                        double lowerK = _nodes[lowerIdx].quadrants[0].thermalConductivity;
+                        double upperK = _nodes[upperIdx].quadrants[0].thermalConductivity;
+                        if (!(lowerThickness > 0) || !(upperThickness > 0) || !(lowerK > 0) || !(upperK > 0)) {
+                            throw std::runtime_error("Temperature::createToroidalConvectionConnections: insulation layer node " +
+                                                     _nodes[lowerIdx].name + " or " + _nodes[upperIdx].name +
+                                                     " has no thickness or conductivity.");
+                        }
+                        double airGap = upper.offset - lower.offset - lowerThickness / 2.0 - upperThickness / 2.0;
+                        auto addPath = [&](double area, bool overAirGap) {
+                            if (area <= 0) return;
+                            ThermalResistanceElement r;
+                            r.nodeFromId = lowerIdx;
+                            r.quadrantFrom = boreSide ? ThermalNodeFace::RADIAL_INNER : ThermalNodeFace::RADIAL_OUTER;
+                            r.nodeToId = upperIdx;
+                            r.quadrantTo = boreSide ? ThermalNodeFace::RADIAL_OUTER : ThermalNodeFace::RADIAL_INNER;
+                            r.type = HeatTransferType::CONDUCTION;
+                            r.area = area;
+                            r.resistance = ThermalResistance::calculateConductionResistance(lowerThickness / 2.0, lowerK, area) +
+                                           ThermalResistance::calculateConductionResistance(upperThickness / 2.0, upperK, area);
+                            if (overAirGap && airGap > 0) {
+                                r.resistance += ThermalResistance::calculateConductionResistance(airGap, gapAirThermalConductivity(), area);
+                            }
+                            _resistances.push_back(r);
+                        };
+                        addPath(contactArea, false);
+                        addPath(totalArea - contactArea, true);
                     }
                 }
             }
         }
-        }
-        
+    }
+
         // Insulation layer convection - only the outermost insulation layer has convection to ambient
         // Find the outermost insulation layer (highest layer index)
         int maxLayerIdx = -1;
@@ -4594,6 +5697,59 @@ void Temperature::createToroidalConvectionConnections(size_t ambientIdx, double 
                 }
             }
         }
+
+        // ABT #1735: the outermost wrap's exposed skin is its ENVELOPE, as for the turns above: the
+        // cylinder the wrap forms outside the core OD, the one lining the bore, and the two
+        // annular faces it covers over the core's flat faces -- all at the wrap's own offset from
+        // the core. Each IL segment node used to convect its section-plane quadrant instead
+        // (segment arc at the MEAN of the bore and rim radii x HALF the core height, identical for
+        // the bore and the rim node, no annular faces): 13.9 cm2 for a wrap whose skin is ~44 cm2
+        // on a T 36/23/15. Every wound toroid with a tape layer -- any multi-winding quick coil --
+        // shed its whole loss through that third of its surface and ran 3-6x hotter than the
+        // bare core. The wrap's radial offset and thickness come from the node itself (its
+        // centre radius against the core surface it wraps, and its radial dimension).
+        size_t outermostOuterNodes = 0;
+        size_t outermostInnerNodes = 0;
+        for (const auto& node : _nodes) {
+            if (node.part != ThermalNodePartType::INSULATION_LAYER || !node.insulationLayerIndex.has_value() ||
+                static_cast<int>(node.insulationLayerIndex.value()) != maxLayerIdx) {
+                continue;
+            }
+            if (node.isInnerTurn) {
+                ++outermostInnerNodes;
+            }
+            else {
+                ++outermostOuterNodes;
+            }
+        }
+        struct WrapSkin { double cylinderArea = 0, facesArea = 0, height = 0, faceLength = 0, boreRadius = 0; };
+        auto wrapSkinArea = [&](const ThermalNetworkNode& node) {
+            double nodeR = std::hypot(node.physicalCoordinates[0], node.physicalCoordinates[1]);
+            double thickness = node.dimensions.width;
+            double radialOffset = node.isInnerTurn ? coreInnerR - nodeR : nodeR - coreOuterR;
+            if (!(thickness > 0) || radialOffset < 0) {
+                throw std::runtime_error("Temperature::createToroidalConvectionConnections: insulation layer node " +
+                                         node.name + " does not wrap the core (offset " + std::to_string(radialOffset) +
+                                         " m, thickness " + std::to_string(thickness) + " m).");
+            }
+            double skinOffset = radialOffset + thickness / 2.0;
+            double rimSkinR = coreOuterR + skinOffset;
+            double boreSkinR = coreInnerR - skinOffset;
+            if (!(boreSkinR > 0)) {
+                throw std::runtime_error("Temperature::createToroidalConvectionConnections: insulation layer node " +
+                                         node.name + " closes the bore (skin radius " + std::to_string(boreSkinR) + " m).");
+            }
+            WrapSkin skin;
+            skin.height = dimensions["C"] + 2.0 * skinOffset;
+            skin.faceLength = (rimSkinR - boreSkinR) / 2.0;
+            skin.boreRadius = boreSkinR;
+            // Half of the two annular faces (one face's worth) goes with each side.
+            double halfAnnularFaces = std::numbers::pi * (rimSkinR * rimSkinR - boreSkinR * boreSkinR);
+            double sideNodes = static_cast<double>(node.isInnerTurn ? outermostInnerNodes : outermostOuterNodes);
+            skin.cylinderArea = 2.0 * std::numbers::pi * (node.isInnerTurn ? boreSkinR : rimSkinR) * skin.height / sideNodes;
+            skin.facesArea = halfAnnularFaces / sideNodes;
+            return skin;
+        };
 
         // Only create convection for the outermost insulation layer
         for (size_t i = 0; i < _nodes.size(); i++) {
@@ -4617,20 +5773,9 @@ void Temperature::createToroidalConvectionConnections(size_t ambientIdx, double 
             if (isOuterNode) {
                 auto* q = node.getQuadrant(ThermalNodeFace::RADIAL_OUTER);
                 if (q && q->surfaceArea > 0) {
-                    ThermalResistanceElement r;
-                    r.nodeFromId = i;
-                    r.quadrantFrom = ThermalNodeFace::RADIAL_OUTER;
-                    r.nodeToId = ambientIdx;
-                    r.quadrantTo = ThermalNodeFace::NONE;
-                    r.type = _config.includeForcedConvection ? 
-                             HeatTransferType::FORCED_CONVECTION : 
-                             HeatTransferType::NATURAL_CONVECTION;
-                    r.resistance = q->calculateConvectionResistance(h_conv);
-                    r.area = q->surfaceArea * q->surfaceCoverage;
-                    _resistances.push_back(r);
-                    if (THERMAL_DEBUG) {
-                    }
-                } else if (THERMAL_DEBUG) {
+                    auto skin = wrapSkinArea(node);
+                    addCylinderAndFaces(i, ThermalNodeFace::RADIAL_OUTER, skin.cylinderArea, skin.height, skin.facesArea,
+                                        skin.faceLength, std::nullopt);
                 }
             }
             
@@ -4638,20 +5783,11 @@ void Temperature::createToroidalConvectionConnections(size_t ambientIdx, double 
             if (isInnerNode) {
                 auto* q = node.getQuadrant(ThermalNodeFace::RADIAL_INNER);
                 if (q && q->surfaceArea > 0) {
-                    ThermalResistanceElement r;
-                    r.nodeFromId = i;
-                    r.quadrantFrom = ThermalNodeFace::RADIAL_INNER;
-                    r.nodeToId = ambientIdx;
-                    r.quadrantTo = ThermalNodeFace::NONE;
-                    r.type = _config.includeForcedConvection ? 
-                             HeatTransferType::FORCED_CONVECTION : 
-                             HeatTransferType::NATURAL_CONVECTION;
-                    r.resistance = q->calculateConvectionResistance(h_conv);
-                    r.area = q->surfaceArea * q->surfaceCoverage;
-                    _resistances.push_back(r);
-                    if (THERMAL_DEBUG) {
-                    }
-                } else if (THERMAL_DEBUG) {
+                    auto skin = wrapSkinArea(node);
+                    // The wrap lining the bore sees the room through the bore's openings only.
+                    addCylinderAndFaces(i, ThermalNodeFace::RADIAL_INNER, skin.cylinderArea, skin.height, skin.facesArea,
+                                        skin.faceLength,
+                                        ThermalResistance::calculateCylinderWallToOpeningsViewFactor(skin.boreRadius, skin.height));
                 }
             }
         }
@@ -5310,8 +6446,13 @@ void Temperature::createConcentricConvectionConnections(size_t ambientIdx, doubl
                         double turnTop = turnY + turnHeight / 2;
                         double turnBottom = turnY - turnHeight / 2;
                         
+                        // ABT #1735: "outward" is away from the column the turn is wound on: +x for
+                        // the main column and the -x leg, -x for the +x leg; and only a layer
+                        // wrapping the same column covers it.
+                        const bool outwardIsMinusX = isLateralWound(_nodes[i]) && lateralSide(_nodes[i]) > 0;
                         for (size_t j = 0; j < _nodes.size(); j++) {
                             if (_nodes[j].part != ThermalNodePartType::INSULATION_LAYER) continue;
+                            if (_lateralPlacement && _nodes[j].woundColumnIndex != _nodes[i].woundColumnIndex) continue;
                             
                             double insX = _nodes[j].physicalCoordinates[0];
                             double insY = _nodes[j].physicalCoordinates[1];
@@ -5324,7 +6465,8 @@ void Temperature::createConcentricConvectionConnections(size_t ambientIdx, doubl
                             
                             // Check if insulation layer is to the right of this turn
                             // AND overlaps in Y (vertically)
-                            bool isToTheRight = insLeftEdge >= turnRightEdge;
+                            bool isToTheRight = outwardIsMinusX ? (insX + insWidth / 2 <= turnX - turnWidth / 2)
+                                                                : (insLeftEdge >= turnRightEdge);
                             bool overlapsVertically = !(insBottom > turnTop || insTop < turnBottom);
                             
                             if (isToTheRight && overlapsVertically) {
@@ -5338,8 +6480,10 @@ void Temperature::createConcentricConvectionConnections(size_t ambientIdx, doubl
                         }
                         
                         // Block RIGHT, TOP, and BOTTOM faces if there's insulation to the right
+                        const ThermalNodeFace outwardFace = outwardIsMinusX ? ThermalNodeFace::RADIAL_INNER
+                                                                            : ThermalNodeFace::RADIAL_OUTER;
                         if (hasInsulationToRight && 
-                            (face == ThermalNodeFace::RADIAL_OUTER || 
+                            (face == outwardFace || 
                              face == ThermalNodeFace::TANGENTIAL_LEFT || 
                              face == ThermalNodeFace::TANGENTIAL_RIGHT)) {
                             isBlocked = true;
@@ -5447,7 +6591,17 @@ void Temperature::createConcentricConvectionConnections(size_t ambientIdx, doubl
         addExterior(topYokeIdx, ThermalNodeFace::RADIAL_OUTER, exterior.plateSideBand);
         addExterior(bottomYokeIdx, ThermalNodeFace::TANGENTIAL_RIGHT, exterior.secondPlateFace);
         addExterior(bottomYokeIdx, ThermalNodeFace::RADIAL_OUTER, exterior.secondPlateSideBand);
-        if (lateralIdx != _nodes.size()) {
+        if (_lateralPlacement) {
+            // ABT #1735: each outer leg owns half of the legs' exterior (its outer face and its two
+            // ends). A WOUND leg's faces over the window height are wrapped by its bobbin and winding
+            // -- they look at the winding, not the room, exactly like the main column's -- and its
+            // heat leaves through the winding (createWindingToEnclosureConnections).
+            for (size_t legIndex : {_lateralPlacement->plusLegIndex, _lateralPlacement->minusLegIndex}) {
+                if (!isLegWound(legIndex)) {
+                    addExterior(legNodeIndex(legIndex), ThermalNodeFace::RADIAL_OUTER, exterior.lateralLegs / 2.0);
+                }
+            }
+        } else if (lateralIdx != _nodes.size()) {
             addExterior(lateralIdx, ThermalNodeFace::RADIAL_OUTER, exterior.lateralLegs);
         } else if (exterior.lateralLegs > 0) {
             throw std::runtime_error("Temperature::createConcentricConvectionConnections: the core has a leg exterior "
@@ -5498,14 +6652,41 @@ double Temperature::calculateContactArea(const ThermalNodeQuadrant& q1, const Th
     return height * minLength;
 }
 
+const std::optional<std::vector<Turn>>& Temperature::turnsDescription() {
+    if (!_turnsDescriptionRead) {
+        _turnsDescription = _magnetic.get_coil().get_turns_description();
+        _turnsDescriptionRead = true;
+    }
+    return _turnsDescription;
+}
+
+const std::vector<Layer>& Temperature::insulationLayers() {
+    if (!_insulationLayers) {
+        const auto& coil = _magnetic.get_coil();
+        if (!coil.get_sections_description()) {
+            throw std::invalid_argument("Missing sections description");
+        }
+        if (!coil.get_layers_description()) {
+            throw std::invalid_argument("Missing layers description");
+        }
+        _insulationLayers = coil.get_layers_description_insulation();
+    }
+    return _insulationLayers.value();
+}
+
+std::vector<Layer> Temperature::insulationLayersBetweenTurns(const Turn& firstTurn, const Turn& secondTurn) {
+    const auto& layers = insulationLayers();
+    return StrayCapacitance::get_insulation_layers_between_two_turns_in_place(firstTurn, secondTurn, _magnetic.get_mutable_coil(), layers);
+}
+
 double Temperature::getInsulationLayerThermalResistance(int turnIdx1, int turnIdx2, double contactArea) {
     if (contactArea <= 0.0) {
         throw std::runtime_error("Temperature::getInsulationLayerThermalResistance: Contact area is zero or negative (" +
                                  std::to_string(contactArea) + "). Cannot calculate thermal resistance.");
     }
 
-    auto coil = _magnetic.get_coil();
-    auto turnsDescription = coil.get_turns_description();
+    auto& coil = _magnetic.get_mutable_coil();
+    const auto& turnsDescription = this->turnsDescription();
 
     if (turnIdx2 < 0) {
         // Turn-to-solid connection: read coating from the wire itself, no defaults.
@@ -5534,7 +6715,7 @@ double Temperature::getInsulationLayerThermalResistance(int turnIdx1, int turnId
     auto& turn1 = (*turnsDescription)[turnIdx1];
     auto& turn2 = (*turnsDescription)[turnIdx2];
 
-    auto layersBetween = StrayCapacitance::get_insulation_layers_between_two_turns(turn1, turn2, coil);
+    auto layersBetween = insulationLayersBetweenTurns(turn1, turn2);
 
     double totalLayerResistance = 0.0;
     for (const auto& layer : layersBetween) {
@@ -5723,9 +6904,12 @@ void Temperature::recalculateConvectionResistances(const std::vector<double>& te
         if (res.nodeFromId >= temperatures.size()) continue;
         double surfaceTemp = temperatures[res.nodeFromId];
         double ambientTemp = _config.ambientTemperature;
+        // ABT #1735: a surface whose builder set its own boundary-layer length uses it for the
+        // natural-convection term (the forced term's length is the flow length over the part).
+        double naturalLength = res.characteristicLength ? res.characteristicLength.value() : characteristicLength;
         if (res.type == HeatTransferType::NATURAL_CONVECTION && res.area > 0) {
             double h_new = ThermalResistance::calculateNaturalConvectionCoefficient(
-                surfaceTemp, ambientTemp, characteristicLength, res.orientation);
+                surfaceTemp, ambientTemp, naturalLength, res.orientation);
             if (h_new > 0) res.resistance = 1.0 / (h_new * res.area);
         } else if (res.type == HeatTransferType::FORCED_CONVECTION && res.area > 0) {
             // ABT #838: MIXED convection, the same law applyForcedConvectionCooling uses when it
@@ -5739,7 +6923,7 @@ void Temperature::recalculateConvectionResistances(const std::vector<double>& te
             double h_forced = ThermalResistance::calculateForcedConvectionCoefficient(
                 _config.airVelocity, characteristicLength, surfaceTemp);
             double h_natural = ThermalResistance::calculateNaturalConvectionCoefficient(
-                surfaceTemp, ambientTemp, characteristicLength, res.orientation);
+                surfaceTemp, ambientTemp, naturalLength, res.orientation);
             double h_new = CoolingUtils::calculateMixedConvectionCoefficient(h_natural, h_forced);
             if (h_new > 0) res.resistance = 1.0 / (h_new * res.area);
         } else if (res.type == HeatTransferType::RADIATION && res.area > 0) {
@@ -6036,7 +7220,7 @@ ThermalResult Temperature::solveThermalCircuit() {
     // confident wrong number, and rated currents and datasheet temperature rises are derived
     // from this value.
     if (!converged && _config.requireConvergence) {
-        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+        throw ThermalNetworkNotConvergedException(
             "Thermal network did not converge in " + std::to_string(_config.maxIterations) +
             " iterations (tolerance " + std::to_string(_config.convergenceTolerance) + " K). The "
             "last iterate is not a temperature estimate and must not be reported. Check the "
@@ -6087,6 +7271,9 @@ ThermalResult Temperature::solveThermalCircuit() {
             _nodes[i].part == ThermalNodePartType::CORE_BOTTOM_YOKE) {
             coreTempSum += temperatures[i];
             coreCount++;
+            if (!result.maximumCoreTemperature || temperatures[i] > result.maximumCoreTemperature.value()) {
+                result.maximumCoreTemperature = temperatures[i];
+            }
         } else if (_nodes[i].part == ThermalNodePartType::TURN) {
             coilTempSum += temperatures[i];
             coilCount++;
@@ -6095,6 +7282,9 @@ ThermalResult Temperature::solveThermalCircuit() {
     
     result.averageCoreTemperature = coreCount > 0 ? coreTempSum / coreCount : _config.ambientTemperature;
     result.averageCoilTemperature = coilCount > 0 ? coilTempSum / coilCount : _config.ambientTemperature;
+    if (coilCount > 0) {
+        result.averageTurnTemperature = coilTempSum / coilCount;
+    }
     result.methodUsed = "Quadrant-based Thermal Equivalent Circuit";
     
     return result;

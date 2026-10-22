@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
+#include <limits>
 #include <cmath>
 #include <complex>
 #include <filesystem>
@@ -93,12 +94,25 @@ void ifft(std::vector<std::complex<double>>& x)
     }
 }
 
-double Inputs::calculate_waveform_average(Waveform waveform) {
+double Inputs::calculate_waveform_average(Waveform waveform, std::optional<double> frequency) {
     // get_time() returns the optional BY VALUE, so indexing it inside the loop copied the whole
     // time axis twice per sample: O(N^2), minutes for an imported waveform with a few hundred
     // thousand points. Take it once.
     const auto time = waveform.get_time().value();
     const auto& data = waveform.get_data();
+    if (frequency && WaveformProcessor::check_time_axis_spans_one_period(time, frequency.value())) {
+        // Open axis (ABT #1713): sample i holds over [t_i, t_i+1), the last one over one more step
+        // up to t0 + T. The trapezoid over t_0..t_N-1 left that last step out, divided by (N - 1) dt
+        // and ramped every edge: an exactly balanced 688.5 V / -229.5 V rectangle (32 of 128
+        // samples high) read a -1.807 V mean, which was then removed from the voltage before
+        // integrating it and left a DC on its magnetizing current.
+        const double lastStep = time[time.size() - 1] - time[time.size() - 2];
+        double voltSeconds = data.back() * lastStep;
+        for (size_t i = 0; i + 1 < data.size(); ++i) {
+            voltSeconds += data[i] * (time[i + 1] - time[i]);
+        }
+        return voltSeconds / (time.back() + lastStep - time.front());
+    }
     double integration = 0;
     double period = time.back() - time.front();
     for (size_t i = 0; i < data.size() - 1; ++i)
@@ -113,6 +127,14 @@ Waveform Inputs::multiply_waveform(Waveform waveform, double scalarValue){
     auto& data = waveform.get_mutable_data();
     for (auto& datum : data) {
         datum *= scalarValue;
+    }
+    // A positive factor keeps the shape, so it keeps the label. Zero leaves an identically
+    // zero waveform, which is no shape at all: a current scaled to zero kept "rectangular" on
+    // 2 vertices and its duty was read from a third that does not exist (ABT #1878). A
+    // negative factor flips the shape: a unipolar or flyback waveform is no longer one, and a
+    // rectangle's duty becomes 1 - D, not the one its vertices are read for.
+    if (!(scalarValue > 0)) {
+        waveform.set_ancillary_label(std::nullopt);
     }
     return waveform;
 }
@@ -220,116 +242,304 @@ bool is_close_enough(double x, double y, double error){
     return fabs(x - y) <= error;
 }
 
-bool include_dc_offset_into_magnetizing_current_rosano(Waveform voltageSampledWaveform) {
-    double maximumVoltage = 0;
-    for (auto point : voltageSampledWaveform.get_data()) {
-        maximumVoltage = std::max(maximumVoltage, fabs(point));
+// Every winding's current on ONE time grid, and at which instants it carries current (ABT #1467).
+// The old classifier compared the windings' RAW waveforms index by index whenever a winding's
+// current and voltage had the same number of points, ignoring their time vectors: a 3-winding
+// flyback whose secondaries were tabulated on another grid looked simultaneously conducting and
+// lost its magnetizing DC. Here every current is resampled onto the same numberPoints over the
+// period first. Conduction is judged on the current (Ampere: a winding carries ampere-turns iff it
+// carries current), against 1 % of that winding's own peak, the classifier's existing figure.
+// std::nullopt when no winding has a current: the operating point is given by its voltages
+// alone (transformer mode), and the currents say nothing about the magnetizing MMF. When some
+// windings have a current and another has none, the ampere-turns cannot be summed: that throws
+// (ABT #1814), where it used to return std::nullopt and the magnetizing current lost its DC
+// without a word.
+std::optional<Inputs::WindingConduction> Inputs::calculate_winding_conduction(const OperatingPoint& operatingPoint, std::optional<size_t> numberPoints) {
+    const auto excitations = operatingPoint.get_excitations_per_winding();
+    if (excitations.empty()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "calculate_winding_conduction: the operating point has no excitations");
     }
-
-    size_t numberPointsClosedToZero = 0;
-    for (auto point : voltageSampledWaveform.get_data()) {
-        if (fabs(point) < maximumVoltage * 0.05) {
-            numberPointsClosedToZero++;
+    std::optional<size_t> windingWithCurrent;
+    std::optional<size_t> windingWithoutCurrent;
+    for (size_t windingIndex = 0; windingIndex < excitations.size(); ++windingIndex) {
+        if (excitations[windingIndex].get_current()) {
+            if (!windingWithCurrent) {
+                windingWithCurrent = windingIndex;
+            }
+        }
+        else if (!windingWithoutCurrent) {
+            windingWithoutCurrent = windingIndex;
         }
     }
+    if (!windingWithCurrent) {
+        return std::nullopt;
+    }
+    if (windingWithoutCurrent) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "calculate_winding_conduction: winding " + std::to_string(windingWithoutCurrent.value()) +
+                                    " has no current while winding " + std::to_string(windingWithCurrent.value()) +
+                                    " has one: the magnetizing MMF is the sum of every winding's ampere-turns, so the DC of the magnetizing current"
+                                    " cannot be told from the currents unless every winding carries one");
+    }
+    size_t gridPoints = settings.get_inputs_number_points_sampled_waveforms();
+    for (size_t windingIndex = 0; windingIndex < excitations.size(); ++windingIndex) {
+        const auto current = excitations[windingIndex].get_current();
+        if (!current->get_waveform()) {
+            throw InvalidInputException(ErrorCode::MISSING_DATA, "calculate_winding_conduction: winding " + std::to_string(windingIndex) +
+                                        " has a current without a waveform; processed values carry no timing to compare the windings on");
+        }
+        size_t windingPoints = 1;
+        while (windingPoints < current->get_waveform()->get_data().size()) {
+            windingPoints *= 2;
+        }
+        gridPoints = std::max(gridPoints, windingPoints);
+        if (excitations[windingIndex].get_frequency() != excitations[0].get_frequency()) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "calculate_winding_conduction: winding " + std::to_string(windingIndex) + " is excited at " +
+                                        std::to_string(excitations[windingIndex].get_frequency()) + " Hz, winding 0 at " + std::to_string(excitations[0].get_frequency()) + " Hz");
+        }
+    }
+    if (numberPoints) {
+        if (numberPoints.value() == 0 || (numberPoints.value() & (numberPoints.value() - 1)) != 0) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "calculate_winding_conduction: the grid must have a power-of-2 number of points, got " + std::to_string(numberPoints.value()));
+        }
+        gridPoints = numberPoints.value();
+    }
 
-    if (numberPointsClosedToZero > voltageSampledWaveform.get_data().size() * 0.02) {
-        return false;
+    WindingConduction conduction;
+    for (size_t windingIndex = 0; windingIndex < excitations.size(); ++windingIndex) {
+        auto sampled = calculate_sampled_waveform(excitations[windingIndex].get_current()->get_waveform().value(),
+                                                  excitations[windingIndex].get_frequency(), gridPoints, gridPoints);
+        auto data = sampled.get_data();
+        if (data.size() != gridPoints) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "calculate_winding_conduction: winding " + std::to_string(windingIndex) + " sampled to " +
+                                        std::to_string(data.size()) + " points instead of " + std::to_string(gridPoints));
+        }
+        double peak = 0;
+        for (auto value : data) {
+            peak = std::max(peak, std::fabs(value));
+        }
+        std::vector<bool> conducting(gridPoints);
+        for (size_t pointIndex = 0; pointIndex < gridPoints; ++pointIndex) {
+            conducting[pointIndex] = std::fabs(data[pointIndex]) > peak * 0.01;
+        }
+        conduction.currents.push_back(data);
+        conduction.conducting.push_back(conducting);
     }
-    else {
-        return true;
-    }
+    return conduction;
 }
 
-bool is_instantaneously_conducting_power(OperatingPoint operatingPoint) {
-    auto excitationPerWinding = operatingPoint.get_excitations_per_winding();
-    std::vector<std::vector<double>> powerWaveforms;
-    double maximumPeakPower = 0;
-    for (auto excitation : excitationPerWinding) {
-        if (!excitation.get_current()) {
-            // If only voltage is defined, we are in transformer mode
-            return true;
+std::vector<bool> Inputs::calculate_magnetizing_conduction_instants(const WindingConduction& conduction, size_t windingIndex) {
+    // The instants at which winding windingIndex's current is the magnetizing current (referred to
+    // it): it conducts, and the primary (winding 0) hands it the magnetizing MMF rather than
+    // carrying load current with it. For the primary: no other winding conducts. For any other
+    // winding: the primary does not. A flyback's primary on-time and its secondaries' off-time
+    // qualify; so does a forward's reset interval (the primary alone, its current returning the
+    // magnetizing energy), while a forward's on-time, where primary and secondary carry the load
+    // current together, does not.
+    const size_t numberWindings = conduction.conducting.size();
+    if (windingIndex >= numberWindings) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "calculate_magnetizing_conduction_instants: winding " + std::to_string(windingIndex) +
+                                    " of an operating point with " + std::to_string(numberWindings) + " windings");
+    }
+    const size_t gridPoints = conduction.conducting[windingIndex].size();
+    std::vector<bool> instants(gridPoints, false);
+    for (size_t pointIndex = 0; pointIndex < gridPoints; ++pointIndex) {
+        if (!conduction.conducting[windingIndex][pointIndex]) {
+            continue;
         }
-        if (!excitation.get_voltage()) {
-            // If only current is defined, we are in inductor mode
-            return false;
-        }
-        if (!excitation.get_current()->get_waveform()) {
-            throw std::invalid_argument("Missing current waveform");
-        }
-        if (!excitation.get_voltage()->get_waveform()) {
-            throw std::invalid_argument("Missing voltage waveform");
-        }
-        std::vector<double> currentWaveform;
-        std::vector<double> voltageWaveform;
-
-        if (excitation.get_current()->get_waveform()->get_data().size() != excitation.get_voltage()->get_waveform()->get_data().size()) {
-            // Determine a common number of points for both waveforms to ensure they have the same size after resampling
-            size_t currentSize = excitation.get_current()->get_waveform()->get_data().size();
-            size_t voltageSize = excitation.get_voltage()->get_waveform()->get_data().size();
-            size_t numberPointsForSampling = settings.get_inputs_number_points_sampled_waveforms();
-            size_t maxSize = std::max(currentSize, voltageSize);
-            if (maxSize > numberPointsForSampling) {
-                // Check if maxSize is a power of 2
-                if (maxSize > 0 && ((maxSize & (maxSize - 1)) == 0)) {
-                    numberPointsForSampling = maxSize;
-                }
-                else {
-                    numberPointsForSampling = round_up_size_to_power_of_2(maxSize);
+        bool alone = true;
+        if (windingIndex == 0) {
+            for (size_t otherIndex = 1; otherIndex < numberWindings; ++otherIndex) {
+                if (conduction.conducting[otherIndex][pointIndex]) {
+                    alone = false;
+                    break;
                 }
             }
-            auto currentSampledWaveform = Inputs::calculate_sampled_waveform(excitation.get_current()->get_waveform().value(), excitation.get_frequency(), numberPointsForSampling);
-            auto voltageSampledWaveform = Inputs::calculate_sampled_waveform(excitation.get_voltage()->get_waveform().value(), excitation.get_frequency(), numberPointsForSampling);
-            currentWaveform = currentSampledWaveform.get_data();
-            voltageWaveform = voltageSampledWaveform.get_data();
         }
-        else{
-            currentWaveform = excitation.get_current()->get_waveform()->get_data();
-            voltageWaveform = excitation.get_voltage()->get_waveform()->get_data();
+        else {
+            alone = !conduction.conducting[0][pointIndex];
         }
-        std::vector<double> powerWaveform;
-        for (size_t i = 0; i < currentWaveform.size(); ++i) {
-            powerWaveform.push_back(currentWaveform[i] * voltageWaveform[i]);
-        }
-        double peakPower = *max_element(powerWaveform.begin(), powerWaveform.end());
-
-        powerWaveforms.push_back(powerWaveform);
-        maximumPeakPower = std::max(maximumPeakPower, peakPower);
+        instants[pointIndex] = alone;
     }
+    return instants;
+}
 
-    size_t numberPointNotConductingAtTheSameTime = 0;
-    for (size_t pointIndex = 0; pointIndex < powerWaveforms[0].size(); ++pointIndex) {
-        for (size_t windingIndex = 0; windingIndex < powerWaveforms.size() - 1; ++windingIndex) {
-            bool is_left_winding_conducting = fabs(powerWaveforms[windingIndex][pointIndex]) > maximumPeakPower * 0.01;  // hardcoded
-            bool is_right_winding_conducting = fabs(powerWaveforms[windingIndex + 1][pointIndex]) > maximumPeakPower * 0.01;  // hardcoded
-            if (is_left_winding_conducting != is_right_winding_conducting) {
-                numberPointNotConductingAtTheSameTime++;
+bool windings_alternate(const Inputs::WindingConduction& conduction) {
+    // Windings that do not always conduct together: an adjacent pair differs on more than 10 % of
+    // the period (the classifier's existing figure).
+    const auto& conducting = conduction.conducting;
+    const size_t gridPoints = conducting[0].size();
+    size_t numberPointsNotConductingAtTheSameTime = 0;
+    for (size_t pointIndex = 0; pointIndex < gridPoints; ++pointIndex) {
+        for (size_t windingIndex = 0; windingIndex + 1 < conducting.size(); ++windingIndex) {
+            if (conducting[windingIndex][pointIndex] != conducting[windingIndex + 1][pointIndex]) {
+                numberPointsNotConductingAtTheSameTime++;
                 break;
             }
-
         }
     }
-    if (numberPointNotConductingAtTheSameTime > powerWaveforms[0].size() * 0.1) { // hardcoded
-        return false;
-    }
-    else {
-        return true;
-    }
-
+    return numberPointsNotConductingAtTheSameTime > gridPoints * 0.1;
 }
 
 bool Inputs::include_dc_offset_into_magnetizing_current(OperatingPoint operatingPoint, std::vector<double> turnsRatios) {
     // Determine if this is truly a single-winding component (inductor) by checking both
     // the turns ratios and the actual number of excitations in the operating point
     bool onlyOneWinding = turnsRatios.size() == 0 && operatingPoint.get_excitations_per_winding().size() <= 1;
+    if (onlyOneWinding) {
+        return true;
+    }
 
-    auto excitationPerWinding = operatingPoint.get_excitations_per_winding();
-    auto voltageWaveform = excitationPerWinding[0].get_voltage()->get_waveform().value();
-    auto sampledWaveform = calculate_sampled_waveform(voltageWaveform, excitationPerWinding[0].get_frequency());
-    bool includeAccordingToRosanoMethod = include_dc_offset_into_magnetizing_current_rosano(sampledWaveform);
-    bool includeAccordingToCoupledPower = !is_instantaneously_conducting_power(operatingPoint);
+    // Windings that do not always conduct together (a flyback, or a forward's reset interval):
+    // somewhere one of them carries the magnetizing MMF alone, so the currents give the DC
+    // (calculate_magnetizing_current_dc_anchor). Windings that always conduct together (a
+    // transformer) carry load current on top of it, and their DC is not anchored. Compared on one
+    // time grid (ABT #1467); a pair differing on more than 10 % of the period counts, as before.
+    // The voltage's zero intervals used to veto the DC too (include_dc_offset_into_magnetizing_current_rosano):
+    // a DCM flyback's dead time is 0 V, so its magnetizing current lost its DC once it came from
+    // Faraday instead of the FLYBACK label's triangle (ABT #1467).
+    auto conduction = calculate_winding_conduction(operatingPoint);
+    if (!conduction) {
+        return false;
+    }
+    return windings_alternate(conduction.value());
+}
 
-    return onlyOneWinding || (includeAccordingToRosanoMethod && includeAccordingToCoupledPower);
+double Inputs::calculate_magnetizing_current_dc_anchor(const OperatingPoint& operatingPoint, size_t windingIndex, Waveform voltageSampledWaveform, double magnetizingInductance) {
+    // The DC of winding windingIndex's magnetizing current, from the currents (ABT #907, #1467).
+    // Faraday gives the magnetizing current's shape, i_F(t) = (1/L) int v dt with zero mean; the DC
+    // is where the currents say what the magnetizing MMF is: at the instants where this winding
+    // carries it alone (calculate_magnetizing_conduction_instants), by Ampere i_m = i_winding.
+    //  - No winding conducts somewhere (a dead time): i_m = 0 there. Preferred, as it does not
+    //    depend on the L_m the currents were simulated with.
+    //  - The winding's current peaks there (a flyback): peak(i_m) = peak(i_winding), anchored on
+    //    the current's exact peak and the excursion's maximum (ABT #907: the commutation steps of
+    //    the current move no flux, so its midpoint or pk-pk do not describe i_m).
+    //  - It peaks while sharing the load current (a forward's on-time): the peak is load current
+    //    and anchors nothing. The largest current of the magnetizing-only instants (the start of
+    //    the forward's reset) anchors instead, at the same instant of i_F.
+    //  - It never carries the magnetizing MMF alone (a forward's secondary): no DC.
+    const auto excitations = operatingPoint.get_excitations_per_winding();
+    if (windingIndex >= excitations.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "calculate_magnetizing_current_dc_anchor: winding " + std::to_string(windingIndex) +
+                                    " of an operating point with " + std::to_string(excitations.size()) + " windings");
+    }
+    if (magnetizingInductance <= 0) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "magnetizingInductance cannot be zero or negative");
+    }
+    auto excitation = excitations[windingIndex];
+    if (!excitation.get_current()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "calculate_magnetizing_current_dc_anchor: winding " + std::to_string(windingIndex) +
+                                    " has no current to anchor the DC of its magnetizing current on");
+    }
+    // Every winding has a current here, or calculate_winding_conduction throws (ABT #1814).
+    auto conduction = calculate_winding_conduction(operatingPoint).value();
+    return calculate_magnetizing_current_dc_anchor(excitation, conduction, windingIndex, voltageSampledWaveform, magnetizingInductance);
+}
+
+double Inputs::calculate_magnetizing_current_dc_anchor(OperatingPointExcitation excitation, const WindingConduction& conduction, size_t windingIndex,
+                                                       Waveform voltageSampledWaveform, double magnetizingInductance) {
+    if (!excitation.get_current()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "calculate_magnetizing_current_dc_anchor: winding " + std::to_string(windingIndex) +
+                                    " has no current to anchor the DC of its magnetizing current on");
+    }
+    if (windingIndex >= conduction.currents.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "calculate_magnetizing_current_dc_anchor: winding " + std::to_string(windingIndex) +
+                                    " of a conduction map with " + std::to_string(conduction.currents.size()) + " windings");
+    }
+    const auto& current = conduction.currents[windingIndex];
+
+    // Instants where no winding conducts and the winding voltage is zero (a forward's dead time
+    // after its reset, a DCM flyback's dead time): every winding's ampere-turns are zero, so by
+    // Ampere the magnetizing current is zero there, whatever inductance the currents were
+    // simulated with. The voltage must be zero too: a winding voltage means the flux is still
+    // moving, so currents that read zero there are a gap in the data, not a dead time (the
+    // mas-flyback-3-winding-lv fixture's secondaries start conducting 2.8 us after the primary
+    // stops, under the full -8 V reset voltage). This anchor needs only the
+    // voltage's shape, so it is preferred to the ones below, which convert a current into flux
+    // through this core's L_m and inherit any mismatch between that L_m and the one behind the
+    // currents (the forward-228w fixture's reset current, 0.55 A, is a ~1.2 mH reset; on a core with
+    // another L_m, anchoring on it shifted B by 0.14 T).
+    auto voltageOnGrid = calculate_sampled_waveform(voltageSampledWaveform, excitation.get_frequency(), current.size(), current.size()).get_data();
+    if (voltageOnGrid.size() != current.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "calculate_magnetizing_current_dc_anchor: the voltage sampled to " +
+                                    std::to_string(voltageOnGrid.size()) + " points, the currents to " + std::to_string(current.size()));
+    }
+    double voltagePeak = 0;
+    for (auto value : voltageOnGrid) {
+        voltagePeak = std::max(voltagePeak, std::fabs(value));
+    }
+    std::vector<size_t> deadInstants;
+    for (size_t pointIndex = 0; pointIndex < current.size(); ++pointIndex) {
+        if (std::fabs(voltageOnGrid[pointIndex]) > voltagePeak * 0.01) {
+            continue;
+        }
+        bool anyConducting = false;
+        for (const auto& windingConducting : conduction.conducting) {
+            if (windingConducting[pointIndex]) {
+                anyConducting = true;
+                break;
+            }
+        }
+        if (!anyConducting) {
+            deadInstants.push_back(pointIndex);
+        }
+    }
+    if (!deadInstants.empty()) {
+        // The same mean-free integral the magnetizing current is built from (calculate_magnetizing_current).
+        double meanVoltage = calculate_steady_state_mean_voltage(excitation, voltageSampledWaveform, "Excitation '" + excitation.get_name().value_or("unnamed") + "'");
+        auto centeredMagnetizingWaveform = calculate_integral_waveform(sum_waveform(voltageSampledWaveform, -meanVoltage), true);
+        centeredMagnetizingWaveform = multiply_waveform(centeredMagnetizingWaveform, 1.0 / magnetizingInductance);
+        auto excursionOnGrid = calculate_sampled_waveform(centeredMagnetizingWaveform, excitation.get_frequency(), current.size(), current.size()).get_data();
+        if (excursionOnGrid.size() != current.size()) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "calculate_magnetizing_current_dc_anchor: the volt-second integral sampled to " +
+                                        std::to_string(excursionOnGrid.size()) + " points, the currents to " + std::to_string(current.size()));
+        }
+        double excursionWhileDead = 0;
+        for (auto pointIndex : deadInstants) {
+            excursionWhileDead += excursionOnGrid[pointIndex];
+        }
+        return -excursionWhileDead / deadInstants.size();
+    }
+
+    auto instants = calculate_magnetizing_conduction_instants(conduction, windingIndex);
+    std::optional<size_t> aloneMaximumIndex;
+    std::optional<double> sharedMaximum;
+    for (size_t pointIndex = 0; pointIndex < current.size(); ++pointIndex) {
+        if (instants[pointIndex]) {
+            if (!aloneMaximumIndex || current[pointIndex] > current[aloneMaximumIndex.value()]) {
+                aloneMaximumIndex = pointIndex;
+            }
+        }
+        else if (conduction.conducting[windingIndex][pointIndex]) {
+            if (!sharedMaximum || current[pointIndex] > sharedMaximum.value()) {
+                sharedMaximum = current[pointIndex];
+            }
+        }
+    }
+    if (!aloneMaximumIndex) {
+        return 0;
+    }
+
+    // The same mean-free integral the magnetizing current is built from (calculate_magnetizing_current).
+    double meanVoltage = calculate_steady_state_mean_voltage(excitation, voltageSampledWaveform, "Excitation '" + excitation.get_name().value_or("unnamed") + "'");
+    auto centeredMagnetizingWaveform = calculate_integral_waveform(sum_waveform(voltageSampledWaveform, -meanVoltage), true);
+    centeredMagnetizingWaveform = multiply_waveform(centeredMagnetizingWaveform, 1.0 / magnetizingInductance);
+
+    if (!sharedMaximum || current[aloneMaximumIndex.value()] >= sharedMaximum.value()) {
+        auto currentSignal = excitation.get_current().value();
+        if (!currentSignal.get_processed() || !currentSignal.get_processed()->get_peak()) {
+            auto currentWaveform = currentSignal.get_waveform().value();
+            currentSignal.set_processed(calculate_processed_data(currentWaveform, excitation.get_frequency()));
+        }
+        const auto& excursion = centeredMagnetizingWaveform.get_data();
+        double excursionAboveMean = *max_element(excursion.begin(), excursion.end());
+        return currentSignal.get_processed()->get_peak().value() - excursionAboveMean;
+    }
+    auto excursionOnGrid = calculate_sampled_waveform(centeredMagnetizingWaveform, excitation.get_frequency(), current.size(), current.size()).get_data();
+    if (excursionOnGrid.size() != current.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "calculate_magnetizing_current_dc_anchor: the volt-second integral sampled to " +
+                                    std::to_string(excursionOnGrid.size()) + " points, the currents to " + std::to_string(current.size()));
+    }
+    return current[aloneMaximumIndex.value()] - excursionOnGrid[aloneMaximumIndex.value()];
 }
 
 
@@ -489,6 +699,26 @@ bool Inputs::is_waveform_imported(Waveform waveform) {
 
 }
 
+bool Inputs::has_flyback_label(const OperatingPointExcitation& excitation) {
+    auto current = excitation.get_current();
+    if (!current) {
+        return false;
+    }
+    if (current->get_waveform() && current->get_waveform()->get_ancillary_label()) {
+        WaveformLabel ancillaryLabel = current->get_waveform()->get_ancillary_label().value();
+        if (ancillaryLabel == WaveformLabel::FLYBACK_PRIMARY || ancillaryLabel == WaveformLabel::FLYBACK_SECONDARY) {
+            return true;
+        }
+    }
+    if (current->get_processed()) {
+        auto label = current->get_processed()->get_label();
+        if (label == WaveformLabel::FLYBACK_PRIMARY || label == WaveformLabel::FLYBACK_SECONDARY) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool Inputs::is_multiport_inductor(OperatingPoint operatingPoint, std::optional<std::vector<IsolationSide>> isolationSides) {
     auto excitations = operatingPoint.get_excitations_per_winding();
     if (excitations.size() < 2) {
@@ -508,23 +738,8 @@ bool Inputs::is_multiport_inductor(OperatingPoint operatingPoint, std::optional<
             }
         }
 
-        // Check for flyback-type labels on primary winding current
-        bool hasFlybackLabel = false;
         OperatingPointExcitation excitation = Inputs::get_primary_excitation(operatingPoint);
-        if (excitation.get_current()->get_waveform()) {
-            if (excitation.get_current()->get_waveform()->get_ancillary_label()) {
-                WaveformLabel ancillaryLabel = excitation.get_current()->get_waveform()->get_ancillary_label().value();
-                if (ancillaryLabel == WaveformLabel::FLYBACK_PRIMARY || ancillaryLabel == WaveformLabel::FLYBACK_SECONDARY) {
-                    hasFlybackLabel = true;
-                }
-            }
-        }
-        if (!hasFlybackLabel && excitation.get_current()->get_processed()) {
-            auto label = excitation.get_current()->get_processed()->get_label();
-            if (label == WaveformLabel::FLYBACK_PRIMARY || label == WaveformLabel::FLYBACK_SECONDARY) {
-                hasFlybackLabel = true;
-            }
-        }
+        bool hasFlybackLabel = has_flyback_label(excitation);
 
         if (hasFlybackLabel) {
             // Guard: If another winding shares the primary's isolation side, this is a
@@ -545,7 +760,7 @@ bool Inputs::is_multiport_inductor(OperatingPoint operatingPoint, std::optional<
 }
 
 
-bool Inputs::can_be_common_mode_choke(OperatingPoint operatingPoint) {
+bool Inputs::can_be_common_mode_choke(OperatingPoint operatingPoint, std::optional<std::vector<IsolationSide>> isolationSides) {
     auto excitations = operatingPoint.get_excitations_per_winding();
     // CMC topologies: 2 (line + neutral), 3 (three-phase delta), or 4
     // (three-phase + neutral). Four-winding was previously excluded, which
@@ -553,6 +768,21 @@ bool Inputs::can_be_common_mode_choke(OperatingPoint operatingPoint) {
     // the full line current into the core-flux calculation.
     if (excitations.size() < 2 || excitations.size() > 4) {
         return false;
+    }
+    // MKF signs a winding's ampere-turns by its isolation side: windings on different sides oppose,
+    // so the same current on a primary and a secondary cancels in the core. That is a transformer
+    // carrying load current, not common-mode current; reading it as a CMC stored the load current
+    // as the magnetizing current (ABT #1467: a 1:1 transformer's 3 A instead of V / (w L_m) = 0.16 A).
+    if (isolationSides) {
+        if (isolationSides->size() < excitations.size()) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "can_be_common_mode_choke: " + std::to_string(isolationSides->size()) +
+                                        " isolation sides for " + std::to_string(excitations.size()) + " windings");
+        }
+        for (size_t windingIndex = 1; windingIndex < excitations.size(); ++windingIndex) {
+            if (isolationSides.value()[windingIndex] != isolationSides->front()) {
+                return false;
+            }
+        }
     }
 
     if (!operatingPoint.get_excitations_per_winding()[0].get_current()) {
@@ -613,42 +843,62 @@ bool Inputs::can_be_common_mode_choke(OperatingPoint operatingPoint) {
     return false;
 }
 
-SignalDescriptor Inputs::get_multiport_inductor_magnetizing_current(OperatingPoint operatingPoint) {
+SignalDescriptor Inputs::get_multiport_inductor_magnetizing_current(OperatingPoint operatingPoint,
+                                                                   double magnetizingInductance,
+                                                                   const std::vector<double>& turnsRatios,
+                                                                   std::optional<std::vector<IsolationSide>> isolationSides) {
+    // ABT #1467: this used to rebuild a TRIANGULAR current from the primary current's offset, peak
+    // to peak and duty cycle, rising over D and falling over the whole of 1 - D. A DCM flyback's
+    // dead time was lost (its flux, and so its core losses, read from the wrong shape), and for
+    // windings on one side the other windings' ampere-turns were ignored.
     OperatingPointExcitation excitation = Inputs::get_primary_excitation(operatingPoint);
-
-    if (!excitation.get_current()->get_processed()) {
-        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION, "Current is not processed");
+    if (!excitation.get_current()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Multiport inductor: the primary excitation has no current");
     }
-
-    auto processed = excitation.get_current()->get_processed().value();
-    double peakToPeak = processed.get_peak_to_peak().value();
-    double offset = processed.get_offset();
-
-    // Preserve the duty cycle from the original waveform to get correct asymmetric slopes
-    double dutyCycle = 0.5;
-    if (processed.get_duty_cycle()) {
-        dutyCycle = processed.get_duty_cycle().value();
-    } else if (excitation.get_current()->get_waveform()) {
-        dutyCycle = try_guess_duty_cycle(excitation.get_current()->get_waveform().value(),
-                                          processed.get_label(),
-                                          excitation.get_frequency());
-    }
-
-    // Build a continuous triangular magnetizing current with the correct offset,
-    // peak-to-peak, and duty cycle (asymmetric slopes for tOn vs tOff)
-    ProcessedWaveform triangularProcessed;
-    triangularProcessed.set_label(WaveformLabel::TRIANGULAR);
-    triangularProcessed.set_offset(offset + peakToPeak / 2);
-    triangularProcessed.set_peak_to_peak(peakToPeak);
-    triangularProcessed.set_duty_cycle(dutyCycle);
-
-    auto waveform = create_waveform(triangularProcessed, excitation.get_frequency());
     SignalDescriptor magnetizingCurrent;
-    auto sampledWaveform = Inputs::calculate_sampled_waveform(waveform, excitation.get_frequency());
-    magnetizingCurrent.set_waveform(sampledWaveform);
-    magnetizingCurrent.set_harmonics(calculate_harmonics_data(waveform, sampledWaveform, excitation.get_frequency()));
+    size_t numberWindings = operatingPoint.get_excitations_per_winding().size();
+    if (has_flyback_label(excitation) && excitation.get_voltage()) {
+        // The windings conduct alternately: the flux comes from the primary voltage (Faraday),
+        // anchored where the primary carries the whole magnetizing MMF alone.
+        magnetizingCurrent = calculate_magnetizing_current(operatingPoint, 0, magnetizingInductance, turnsRatios, false);
+    }
+    else {
+        // No primary voltage on a flyback, or every winding on one isolation side: the ampere-turn
+        // sum of the winding currents, referred to the primary, each winding signed by its isolation
+        // side as calculate_ampere_turn_current does. By Ampere that sum IS the magnetizing MMF only
+        // while the given currents are the windings' true currents: for a flyback it is exact while
+        // either winding conducts and through the dead time (both zero), but it carries no flux the
+        // currents do not show (no ringing, no leakage-commutation overlap), which Faraday would.
+        if (!isolationSides || isolationSides->empty()) {
+            throw InvalidInputException(ErrorCode::MISSING_DATA,
+                "Multiport inductor: without a flyback primary voltage, the magnetizing current is the windings' ampere-turn sum, which needs their isolation sides");
+        }
+        std::vector<IsolationSide> sides;
+        for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
+            sides.push_back(windingIndex < isolationSides->size() ? isolationSides.value()[windingIndex] : get_isolation_side_from_index(windingIndex));
+        }
+        if (!has_flyback_label(excitation)) {
+            for (auto side : sides) {
+                if (side != sides.front()) {
+                    throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                        "Multiport inductor without a flyback label: its windings must share one isolation side for their ampere-turns to add");
+                }
+            }
+            // calculate_ampere_turn_current needs a primary-side reference; with every winding on
+            // one side, which side it is does not change the sum.
+            std::fill(sides.begin(), sides.end(), IsolationSide::PRIMARY);
+        }
+        auto ampereTurnCurrent = calculate_ampere_turn_current(operatingPoint, turnsRatios, sides);
+        auto waveform = ampereTurnCurrent.get_waveform().value();
+        magnetizingCurrent.set_waveform(waveform);
+        magnetizingCurrent.set_harmonics(calculate_harmonics_data(waveform, waveform, excitation.get_frequency()));
+    }
+    auto sampledWaveform = magnetizingCurrent.get_waveform().value();
+    if (!is_size_power_of_2(sampledWaveform.get_data())) {
+        sampledWaveform = Inputs::calculate_sampled_waveform(sampledWaveform, excitation.get_frequency());
+        magnetizingCurrent.set_waveform(sampledWaveform);
+    }
     magnetizingCurrent.set_processed(calculate_processed_data(magnetizingCurrent, sampledWaveform, true));
-
     return magnetizingCurrent;
 }
 
@@ -1104,6 +1354,12 @@ Waveform Inputs::calculate_integral_waveform(Waveform waveform, bool subtractAve
     std::vector<double> time = waveform.get_time().value();
     std::vector<double> integration;
     Waveform resultWaveform(waveform);
+    // The integral is a different shape from its integrand: a rectangular voltage integrates
+    // to a triangular magnetizing current. Copying the voltage's label onto it made a 3- or
+    // 4-vertex triangle "rectangular" or "bipolarRectangular", whose offset and duty were then
+    // read at vertex indices it does not have (ABT #1878). The integral's shape is the one its
+    // data shows, so it carries no label.
+    resultWaveform.set_ancillary_label(std::nullopt);
 
     // FIXED: BUG-02 — Ensure integration result matches time vector size
     double integral = 0;
@@ -1117,8 +1373,26 @@ Waveform Inputs::calculate_integral_waveform(Waveform waveform, bool subtractAve
     resultWaveform.set_data(integration);
 
     if (subtractAverage) {
-        double integrationAverage = calculate_waveform_average(resultWaveform);
-        resultWaveform = sum_waveform(resultWaveform, -integrationAverage);
+        // The integration constant is the integral's average over the whole PERIOD (ABT #1713).
+        // Sample i holds data[i] over [t_i, t_i+1); the last sample holds over one more step,
+        // [t_N-1, t_N-1 + dt), which closes the period of a sampled waveform (N points spanning
+        // [0, T)). The trapezoid of the integral over t_0..t_N-1 alone left that interval out and
+        // divided by (N - 1) dt: a zero-volt-second voltage kept ~1 % of its peak as DC.
+        if (integrationSize < 2) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "calculate_integral_waveform: the waveform needs at least 2 samples to remove the integration constant");
+        }
+        double lastStep = time[integrationSize - 1] - time[integrationSize - 2];
+        if (!(lastStep > 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "calculate_integral_waveform: the last two samples share an instant, so the hold of the last sample (and the period) is undefined");
+        }
+        double closedIntegral = integration.back() + data[integrationSize - 1] * lastStep;
+        double area = 0;
+        for (size_t i = 0; i + 1 < integration.size(); ++i) {
+            area += (integration[i] + integration[i + 1]) / 2 * (time[i + 1] - time[i]);
+        }
+        area += (integration.back() + closedIntegral) / 2 * lastStep;
+        double period = time[integrationSize - 1] + lastStep - time[0];
+        resultWaveform = sum_waveform(resultWaveform, -area / period);
     }
 
     // Taken once: get_time() copies the whole axis on every call (see calculate_waveform_average).
@@ -1174,10 +1448,11 @@ OperatingPointExcitation Inputs::get_excitation_with_proportional_current(Operat
     auto sampledCurrentWaveform = calculate_sampled_waveform(multipliedWaveform, excitation.get_frequency());
     current.set_harmonics(calculate_harmonics_data(multipliedWaveform, sampledCurrentWaveform, excitation.get_frequency()));
     // The basic processed data (peak, peak to peak, offset) scale with the waveform, so they are calculated again:
-    // handing over the previous processed data would keep its values. Only the label survives, as the shape does.
+    // handing over the previous processed data would keep its values. Only the label survives, as the shape does,
+    // which is only for a positive proportion (see multiply_waveform).
     auto previousProcessedCurrent = current.get_processed();
     auto processedCurrent = calculate_processed_data(current, sampledCurrentWaveform, true, std::nullopt);
-    if (previousProcessedCurrent) {
+    if (previousProcessedCurrent && proportion > 0) {
         processedCurrent.set_label(previousProcessedCurrent->get_label());
     }
     current.set_processed(processedCurrent);
@@ -1199,10 +1474,11 @@ OperatingPointExcitation Inputs::get_excitation_with_proportional_voltage(Operat
     auto sampledVoltageWaveform = calculate_sampled_waveform(multipliedWaveform, excitation.get_frequency());
     voltage.set_harmonics(calculate_harmonics_data(multipliedWaveform, sampledVoltageWaveform, excitation.get_frequency()));
     // The basic processed data (peak, peak to peak, offset) scale with the waveform, so they are calculated again:
-    // handing over the previous processed data would keep its values. Only the label survives, as the shape does.
+    // handing over the previous processed data would keep its values. Only the label survives, as the shape does,
+    // which is only for a positive proportion (see multiply_waveform).
     auto previousProcessedVoltage = voltage.get_processed();
     auto processedVoltage = calculate_processed_data(voltage, sampledVoltageWaveform, true, std::nullopt);
-    if (previousProcessedVoltage) {
+    if (previousProcessedVoltage && proportion > 0) {
         processedVoltage.set_label(previousProcessedVoltage->get_label());
     }
     voltage.set_processed(processedVoltage);
@@ -1241,29 +1517,62 @@ SignalDescriptor Inputs::reflect_waveform(SignalDescriptor primarySignalDescript
 SignalDescriptor Inputs::reflect_waveform(SignalDescriptor signal,
                                                  double ratio,
                                                  WaveformLabel label) {
-    
-    if (label == WaveformLabel::CUSTOM) {
-        return reflect_waveform(signal, ratio);
+    // ABT #1670: every label is handled explicitly. An ideal transformer scales the
+    // instantaneous winding voltage by 1/n and the load-referred current by n without
+    // changing its shape, so every shape that is not a flyback current is reflected by
+    // plain scaling. Only the flyback labels below change shape. A unipolar pulse is
+    // not a flyback: a current transformer's or forward's secondary conducts DURING the
+    // primary pulse, i2 = n i1 point by point (ABT #1718 review); the flyback's
+    // off-time transfer has its own FLYBACK_* labels. Before,
+    // any label without a case (RECTANGULAR among them) fell through a `default:`, so
+    // a label nobody had thought about silently took somebody else's branch.
+    switch (label) {
+        case WaveformLabel::CUSTOM:
+        case WaveformLabel::SINUSOIDAL:
+        case WaveformLabel::TRIANGULAR:
+        case WaveformLabel::TRIANGULAR_WITH_DEADTIME:
+        case WaveformLabel::RECTANGULAR:
+        case WaveformLabel::RECTANGULAR_DCM:
+        case WaveformLabel::RECTANGULAR_WITH_DEADTIME:
+        case WaveformLabel::SECONDARY_RECTANGULAR:
+        case WaveformLabel::SECONDARY_RECTANGULAR_WITH_DEADTIME:
+        case WaveformLabel::BIPOLAR_RECTANGULAR:
+        case WaveformLabel::BIPOLAR_TRIANGULAR:
+        case WaveformLabel::UNIPOLAR_TRIANGULAR:
+        case WaveformLabel::UNIPOLAR_RECTANGULAR:
+            return reflect_waveform(signal, ratio);
+        case WaveformLabel::FLYBACK_PRIMARY:
+        case WaveformLabel::FLYBACK_SECONDARY:
+            break;
+        case WaveformLabel::FLYBACK_SECONDARY_WITH_DEADTIME:
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "reflect_waveform: a flybackSecondaryWithDeadtime waveform has no reflection: the primary"
+                " current of a discontinuous flyback depends on the on-time, which this waveform does not"
+                " carry. Supply the other winding's excitation directly.");
     }
-    ProcessedWaveform processed;
-    if (!signal.get_processed()) {
-        auto waveform = signal.get_waveform().value();
-        if (is_waveform_sampled(waveform)) {
-            waveform = compress_waveform(waveform);
-        }
-        processed = calculate_basic_processed_data(waveform);
+
+    if (!signal.get_waveform() || !signal.get_waveform()->get_time()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA,
+            "reflect_waveform: reflecting a labelled waveform needs the waveform with its time axis");
     }
-    else {
-        processed = signal.get_processed().value();
+    // ABT #1670: the shape parameters come from the waveform being reflected, never from
+    // the signal's processed block. The label is (by the bindings) guessed from the
+    // waveform, and the processed block a client sends along can describe a different
+    // waveform altogether: the web's default voltage carried processed {peakToPeak 100,
+    // offset 0} over data -20.5/70.5, and mixing the data's label with the block's
+    // numbers is how a 1:1 reflection came out as 0/-100 V.
+    auto waveformToProcess = signal.get_waveform().value();
+    if (is_waveform_sampled(waveformToProcess)) {
+        waveformToProcess = compress_waveform(waveformToProcess);
     }
+    // The label is checked on, and read off, the waveform as given, not on its compressed copy (ABT #1878).
+    ProcessedWaveform processed = calculate_basic_processed_data(waveformToProcess, signal.get_waveform().value());
     Waveform newWaveform;
 
     double period = signal.get_waveform()->get_time()->back() - signal.get_waveform()->get_time()->front();
     double frequency = 1.0 / period;
     double peakToPeak = processed.get_peak_to_peak().value() * ratio;
     double offset = processed.get_offset() * ratio;
-    double dutyCycle = processed.get_duty_cycle().value();
-
 
     switch(label) {
         case WaveformLabel::FLYBACK_PRIMARY:
@@ -1278,34 +1587,69 @@ SignalDescriptor Inputs::reflect_waveform(SignalDescriptor signal,
             processed.set_peak_to_peak(peakToPeak);
             newWaveform = create_waveform(processed, frequency);
             break;
-        case WaveformLabel::UNIPOLAR_TRIANGULAR: {
-            double max = peakToPeak * dutyCycle / (1 - dutyCycle) + offset;
-            double min = offset;
-            double dc = dutyCycle * period;
-            std::vector<double> data = {min, min, max, min};
-            std::vector<double> time = {0, dc, dc, period};
-            newWaveform.set_data(data);
-            newWaveform.set_time(time);
-            break;
-        }
-        case WaveformLabel::UNIPOLAR_RECTANGULAR: {
-            double max = peakToPeak * dutyCycle / (1 - dutyCycle) + offset;
-            double min = offset;
-            double dc = dutyCycle * period;
-            std::vector<double> data = {-min, -min, -max, -max, -min};
-            std::vector<double> time = {0, dc, dc, period, period};
-            newWaveform.set_data(data);
-            newWaveform.set_time(time);
-            break;
-        }
         default:
-            return reflect_waveform(signal, ratio);
-            break;
+            // Unreachable for the labels dispatched above; a label added to the schema later
+            // must be given its own reflection, not borrow another label's.
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "reflect_waveform: no reflection is defined for waveform label " +
+                std::to_string(static_cast<int>(label)));
     }
 
     SignalDescriptor newSignal;
     newSignal.set_waveform(newWaveform);
     return newSignal;
+}
+
+// The excitation of the other winding of an ideal two-winding transformer: the voltage scaled
+// by voltageRatio (Faraday's law, point by point, whatever the shape), the current reflected by
+// its label with currentRatio, and both re-processed. Shared by calculate_reflected_secondary and
+// calculate_reflected_primary so the two directions cannot drift apart.
+static OperatingPointExcitation reflect_excitation(const OperatingPointExcitation& excitation,
+                                                   double voltageRatio,
+                                                   double currentRatio,
+                                                   std::optional<std::string> name,
+                                                   const std::string& functionName) {
+    if (!excitation.get_voltage() || !excitation.get_voltage()->get_waveform() ||
+        !excitation.get_current() || !excitation.get_current()->get_waveform()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA,
+            functionName + ": the excitation needs both a voltage and a current waveform to reflect");
+    }
+    OperatingPointExcitation excitationOfThisWinding(excitation);
+    // ABT #1670: the copy carried the other winding's name, so the secondary was presented as
+    // "Primary winding excitation". It is named after its own winding when that is known,
+    // and carries no name otherwise rather than the other winding's.
+    excitationOfThisWinding.set_name(name);
+    auto currentSignalDescriptorProcessed = Inputs::calculate_basic_processed_data(excitation.get_current().value().get_waveform().value());
+
+    // ABT #1670: the voltage is reflected by Faraday's law alone. Every winding links the
+    // same flux, so v2(t) = v1(t) / n whatever the shape; no label changes that. Routing it
+    // through the label-dispatched reflection turned the web's default -20.5/70.5 V
+    // rectangle into 0/-100 V, a 50 V DC level across a winding.
+    auto voltageSignalDescriptor = Inputs::reflect_waveform(excitation.get_voltage().value(), voltageRatio);
+    auto currentSignalDescriptor = Inputs::reflect_waveform(excitation.get_current().value(), currentRatio, currentSignalDescriptorProcessed.get_label());
+
+    auto voltageSampledWaveform = Inputs::calculate_sampled_waveform(voltageSignalDescriptor.get_waveform().value(), excitationOfThisWinding.get_frequency());
+    voltageSignalDescriptor.set_harmonics(Inputs::calculate_harmonics_data(voltageSignalDescriptor.get_waveform().value(), voltageSampledWaveform, excitationOfThisWinding.get_frequency()));
+    voltageSignalDescriptor.set_processed(Inputs::calculate_processed_data(voltageSignalDescriptor, voltageSampledWaveform, true));
+
+    auto currentSampledWaveform = Inputs::calculate_sampled_waveform(currentSignalDescriptor.get_waveform().value(), excitationOfThisWinding.get_frequency());
+    currentSignalDescriptor.set_harmonics(Inputs::calculate_harmonics_data(currentSignalDescriptor.get_waveform().value(), currentSampledWaveform, excitationOfThisWinding.get_frequency()));
+    currentSignalDescriptor.set_processed(Inputs::calculate_processed_data(currentSignalDescriptor, currentSampledWaveform, true));
+
+    excitationOfThisWinding.set_voltage(voltageSignalDescriptor);
+    excitationOfThisWinding.set_current(currentSignalDescriptor);
+
+    return excitationOfThisWinding;
+}
+
+OperatingPointExcitation Inputs::calculate_reflected_secondary(OperatingPointExcitation primaryExcitation, double turnRatio, std::optional<std::string> secondaryName){
+    return reflect_excitation(primaryExcitation, 1.0 / turnRatio, turnRatio, secondaryName, "calculate_reflected_secondary");
+}
+
+// ABT #1698: the web reflected the primary in its own binding, a copy of the old secondary
+// logic with plain current scaling and the aliased harmonics; the reflection lives here now.
+OperatingPointExcitation Inputs::calculate_reflected_primary(OperatingPointExcitation secondaryExcitation, double turnRatio, std::optional<std::string> primaryName){
+    return reflect_excitation(secondaryExcitation, turnRatio, 1.0 / turnRatio, primaryName, "calculate_reflected_primary");
 }
 
 std::pair<bool, std::string> Inputs::check_integrity() {
@@ -1348,8 +1692,6 @@ std::pair<bool, std::string> Inputs::check_integrity() {
 
     for (size_t i = 0; i < operatingPoints.size(); ++i) {
         std::vector<OperatingPointExcitation> processedExcitationsPerWinding;
-        // bool includeDcOffsetIntoMagnetizingCurrent = include_dc_offset_into_magnetizing_current(operatingPoints[i], turnsRatiosValues);
-
         for (auto& excitation : operatingPoints[i].get_mutable_excitations_per_winding()) {
             // Here we processed this excitation voltage
             if (excitation.get_voltage()) {
@@ -1378,11 +1720,8 @@ std::pair<bool, std::string> Inputs::check_integrity() {
                 }
                 auto voltageWaveform = excitation.get_voltage()->get_waveform().value();
                 auto sampledWaveform = calculate_sampled_waveform(voltageWaveform, excitation.get_frequency());
-                bool includeDcOffsetIntoMagnetizingCurrent = include_dc_offset_into_magnetizing_current(operatingPoints[i], turnsRatiosValues);
-                // bool includeDcOffsetIntoMagnetizingCurrent = include_dc_offset_into_magnetizing_current_rosano(sampledWaveform);
-                excitation.set_current(
-                    calculate_magnetizing_current(excitation, sampledWaveform, magnetizing_inductance(), true, includeDcOffsetIntoMagnetizingCurrent,
-                                                  operatingPoints[i].get_excitations_per_winding().size() > 1));
+                // This winding has no current, so no current gives its magnetizing DC: Faraday alone.
+                excitation.set_current(integrate_magnetizing_current(excitation, sampledWaveform, magnetizing_inductance(), true, 0.0));
             }
             processedExcitationsPerWinding.push_back(excitation);
         }
@@ -1418,6 +1757,8 @@ std::pair<bool, std::string> Inputs::check_integrity() {
                         }
 
                         OperatingPointExcitation excitationOfThisWinding(excitationOfPrimaryWinding);
+                        // ABT #1670: the copy is not the primary; it must not carry its name.
+                        excitationOfThisWinding.set_name(std::nullopt);
 
                         // Reflect only what the primary actually carries. Inventing the other half
                         // would be making up an operating point nobody asked for.
@@ -1498,18 +1839,18 @@ double calculate_offset(Waveform waveform, WaveformLabel label) {
     return 0;
 }
 
-ProcessedWaveform Inputs::calculate_basic_processed_data(Waveform waveform) {
+ProcessedWaveform Inputs::calculate_basic_processed_data(Waveform waveform, std::optional<Waveform> givenWaveform) {
     // Delegates to WaveformProcessor, which additionally fixed part of ABT
     // #602 this copy never had: the duty-cycle measurement for a CUSTOM label
     // (i.e. real imported/simulated data) needs the UNCOMPRESSED waveform —
     // this copy always passed the compressed one, so real SPICE data (which
     // compress_waveform collapses to 50-60 points instead of an analytical
     // 3/4/5-point shape) had its duty measured against a thinned-out signal.
-    return WaveformProcessor::calculate_basic_processed_data(waveform, settings.get_inputs_number_points_sampled_waveforms());
+    return WaveformProcessor::calculate_basic_processed_data(waveform, settings.get_inputs_number_points_sampled_waveforms(), givenWaveform);
 }
 
 ProcessedWaveform Inputs::calculate_processed_data(Waveform waveform,
-                                            std::optional<double> frequency,
+                                            double frequency,
                                             bool includeAdvancedData,
                                             std::optional<ProcessedWaveform> processed) {
     return WaveformProcessor::calculate_processed_data(waveform, frequency, includeAdvancedData, processed,
@@ -1771,145 +2112,269 @@ OperatingPoint Inputs::prune_harmonics(OperatingPoint operatingPoint, double win
 }
 
 
-Waveform Inputs::compress_waveform(const Waveform& waveform) {
-    Waveform compressedWaveform;
-    auto data = waveform.get_data();
-    if (data.size() < 2) {
-        return waveform;
-    }
-    data.push_back(data[0]);
-    auto time = waveform.get_time().value();
-    if (time.size() < 2) {
-        return waveform;
-    }
-    time.push_back(time[time.size() - 1] + (time[time.size() - 1] - time[time.size() - 2]));
-    std::vector<double> compressedData;
-    std::vector<double> compressedTime;
-    double previousSlope = DBL_MAX;
-    for (size_t i = 0; i < data.size() - 1; ++i){
-        // FIXED: BUG-01 — Guard against division by zero on identical time points
-        double slope;
-        if (time[i + 1] == time[i]) {
-            slope = (data[i + 1] >= data[i]) ? DBL_MAX : -DBL_MAX;
-        } else {
-            slope = (data[i + 1] - data[i]) / (time[i + 1] - time[i]);
-        }
-        
-        // Emit point if: (1) discontinuity, OR (2) slope changes significantly
-        bool isDiscontinuity = (slope == DBL_MAX || slope == -DBL_MAX);
-        bool previousWasDiscontinuity = (previousSlope == DBL_MAX || previousSlope == -DBL_MAX);
-        
-        // Detect slope change: use relative change if possible, absolute if previous slope is near zero
-        bool slopeChanged = false;
-        if (!isDiscontinuity && !previousWasDiscontinuity) {
-            if (fabs(previousSlope) > 1e-9) {
-                // Non-zero previous slope: use relative change
-                slopeChanged = fabs((slope - previousSlope) / previousSlope) > 0.01;
-            } else {
-                // Previous slope near zero: use absolute change
-                slopeChanged = fabs(slope) > 1e-9;
-            }
-        }
-        if (isDiscontinuity || previousWasDiscontinuity || slopeChanged) {
-            compressedData.push_back(data[i]);
-            compressedTime.push_back(time[i]);
-        }
-        previousSlope = slope;
-    }
-    compressedData.push_back(data.back());
-    compressedTime.push_back(time.back());
-    compressedWaveform.set_data(compressedData);
-    compressedWaveform.set_time(compressedTime);
-    if (waveform.get_ancillary_label()) {
-        compressedWaveform.set_ancillary_label(waveform.get_ancillary_label().value());
-    }
-    return compressedWaveform;
+Waveform Inputs::compress_waveform(const Waveform& waveform, std::optional<double> frequency) {
+    return WaveformProcessor::compress_waveform(waveform, frequency);
 }
 
-SignalDescriptor Inputs::calculate_magnetizing_current(OperatingPointExcitation& excitation,
-                                                                Waveform voltageSampledWaveform,
-                                                                double magnetizingInductance,
-                                                                bool compress,
-                                                                bool addOffset,
-                                                                bool alternatingConduction) {
-    double dcCurrent = 0;
+Inputs::VoltSecondBalance Inputs::calculate_volt_second_balance(const Waveform& voltageSampledWaveform, const std::string& context) {
+    // ABT #1585: the magnetizing current is the integral of the voltage over the inductance. Only
+    // the integration constant is removed (calculate_integral_waveform), so a voltage whose
+    // volt-seconds do not balance over the period ramps the "current" by its imbalance instead of
+    // describing the flux swing: Kirchhoff's line-cycle PFC inductor voltages gave 1635 A against
+    // 12.3 A of real winding current, and every core then failed the energy-stored gate.
+    if (!voltageSampledWaveform.get_time() || voltageSampledWaveform.get_data().size() < 2) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA,
+            context + ": the voltage needs a sampled waveform with a time axis to check its volt-second balance");
+    }
+    VoltSecondBalance balance;
+    balance.meanVoltage = calculate_waveform_average(voltageSampledWaveform);
+    const auto time = voltageSampledWaveform.get_time().value();
+    balance.period = time.back() - time.front();
+    balance.netVoltSeconds = balance.meanVoltage * balance.period;
+    auto acFluxLinkage = calculate_integral_waveform(sum_waveform(voltageSampledWaveform, -balance.meanVoltage), true);
+    const auto& acData = acFluxLinkage.get_data();
+    balance.acSwing = *std::max_element(acData.begin(), acData.end()) - *std::min_element(acData.begin(), acData.end());
+    if (balance.acSwing > 0) {
+        balance.imbalance = std::fabs(balance.netVoltSeconds) / balance.acSwing;
+    }
+    else {
+        // A constant voltage: any non-zero value is pure imbalance; zero is no voltage at all.
+        balance.imbalance = balance.meanVoltage != 0 ? std::numeric_limits<double>::infinity() : 0;
+    }
+    return balance;
+}
+
+std::optional<std::string> Inputs::describe_volt_second_imbalance(const Waveform& voltageSampledWaveform, const std::string& context) {
+    auto balance = calculate_volt_second_balance(voltageSampledWaveform, context);
+    if (balance.acSwing <= 0) {
+        if (balance.meanVoltage != 0) {
+            return context + ": the voltage is a constant " + std::to_string(balance.meanVoltage) +
+                " V, which has no periodic steady state; its integral is not a magnetizing current";
+        }
+        return std::nullopt;
+    }
+    if (balance.imbalance > maximumVoltSecondImbalance) {
+        return context + ": the voltage is not volt-second balanced (mean " + std::to_string(balance.meanVoltage) +
+            " V over a " + std::to_string(balance.period) + " s period, so its integral drifts by " +
+            std::to_string(balance.netVoltSeconds) + " V*s per period against an AC swing of " + std::to_string(balance.acSwing) +
+            " V*s, " + std::to_string(balance.imbalance) + " of it; the limit is " + std::to_string(maximumVoltSecondImbalance) +
+            "). A magnetizing current integrated from it would describe the drift: give a balanced steady-state "
+            "voltage, or the magnetizing current itself";
+    }
+    return std::nullopt;
+}
+
+void Inputs::check_volt_second_balance(const Waveform& voltageSampledWaveform, const std::string& context) {
+    auto imbalance = describe_volt_second_imbalance(voltageSampledWaveform, context);
+    if (imbalance) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, imbalance.value());
+    }
+}
+
+double Inputs::calculate_steady_state_mean_voltage(const OperatingPointExcitation& excitation,
+                                                   const Waveform& voltageSampledWaveform,
+                                                   const std::string& context) {
+    // The sampled voltage must have a time axis (the same refusal as the balance check), but an
+    // unbalanced voltage is not refused here: its mean is removed like any other (ABT #1855).
+    calculate_volt_second_balance(voltageSampledWaveform, context);
+    // The mean is taken from the voltage as given, not from its resampled copy: resampling a clean
+    // rectangle moves its edges by a fraction of a sample and invents a mean of ~1 % of the swing,
+    // which is not in the data and must not bend the integral.
+    const Waveform& givenWaveform = (excitation.get_voltage() && excitation.get_voltage()->get_waveform() &&
+                                     excitation.get_voltage()->get_waveform()->get_time() &&
+                                     excitation.get_voltage()->get_waveform()->get_data().size() >= 2)
+                                        ? excitation.get_voltage()->get_waveform().value()
+                                        : voltageSampledWaveform;
+    double meanVoltage = calculate_waveform_average(givenWaveform, excitation.get_frequency());
+    if (meanVoltage == 0) {
+        return 0;
+    }
+    const auto givenTime = givenWaveform.get_time().value();
+    double period = givenTime.back() - givenTime.front();
+    double meanSampledVoltage = calculate_waveform_average(voltageSampledWaveform, excitation.get_frequency());
+    auto acFluxLinkage = calculate_integral_waveform(sum_waveform(voltageSampledWaveform, -meanSampledVoltage), true);
+    const auto& acData = acFluxLinkage.get_data();
+    double acSwing = *std::max_element(acData.begin(), acData.end()) - *std::min_element(acData.begin(), acData.end());
+    double imbalance = acSwing > 0 ? std::fabs(meanVoltage * period) / acSwing : 0;
+    if (imbalance > voltSecondImbalanceWarningThreshold) {
+        Logger::getInstance().warning(context + ": the voltage's mean of " + std::to_string(meanVoltage) +
+            " V (net volt-seconds " + std::to_string(imbalance * 100) + " % of the AC swing) was removed before integrating "
+            "the magnetizing current; a winding in periodic steady state has none (probe offset, resistive drop or a "
+            "capture that is not a whole number of periods)", "Inputs");
+    }
+    return meanVoltage;
+}
+
+void Inputs::check_adviser_inputs_volt_second_balance(const Inputs& inputs,
+                                                      std::optional<std::vector<IsolationSide>> coilIsolationSides,
+                                                      std::optional<std::string> primaryWindingName,
+                                                      std::optional<CoreShapeFamily> coreShapeFamily,
+                                                      std::optional<CoreType> coreType) {
+    // Open-core families are priced by their own models (calculate_flux_density_for_family_model),
+    // which never integrate the voltage. DRUM_RING and MOLDED take those models only for some
+    // grades, so the whole family is left unchecked rather than guessing which.
+    if (coreShapeFamily) {
+        switch (coreShapeFamily.value()) {
+            case CoreShapeFamily::DRUM:
+            case CoreShapeFamily::DRUM_SEMISHIELDED:
+            case CoreShapeFamily::DRUM_RING:
+            case CoreShapeFamily::ROD:
+            case CoreShapeFamily::MOLDED:
+                return;
+            default:
+                break;
+        }
+    }
+
+    const auto& operatingPoints = inputs.get_operating_points();
+    for (size_t operatingPointIndex = 0; operatingPointIndex < operatingPoints.size(); ++operatingPointIndex) {
+        const auto& operatingPoint = operatingPoints[operatingPointIndex];
+        const auto& excitations = operatingPoint.get_excitations_per_winding();
+        if (excitations.empty()) {
+            continue;
+        }
+        // The loss path integrates only the primary (winding 0) excitation.
+        auto excitation = get_primary_excitation(operatingPoint);
+        if (!excitation.get_voltage()) {
+            continue;
+        }
+        bool hasCurrent = excitation.get_current().has_value();
+
+        // Mirrors the routing in MagnetizingInductance::calculate_inductance_and_magnetic_flux_density.
+        // One winding in the circuit with a current: that current is the magnetizing current (the
+        // loss path also requires the coil to have one winding; with the coil unknown, or with it
+        // known, this check stays on the side that does not integrate).
+        if (excitations.size() == 1 && hasCurrent) {
+            continue;
+        }
+        if (excitations.size() >= 2) {
+            // With no primary current, the routing below throws its own error before integrating.
+            if (!hasCurrent) {
+                continue;
+            }
+            // Common-mode choke on a toroid: its magnetizing current is the winding average. With
+            // the core type unknown, every CMC-shaped operating point is skipped.
+            bool coreCanBeToroidal = !coreType || coreType.value() == CoreType::TOROIDAL;
+            if (coreCanBeToroidal && can_be_common_mode_choke(operatingPoint)) {
+                continue;
+            }
+            // Multiport inductor: the coil's isolation sides decide, unless the coil has fewer
+            // windings than the circuit. With no coil yet, either reading skips the check.
+            std::optional<std::vector<IsolationSide>> effectiveIsolationSides = std::nullopt;
+            if (coilIsolationSides && coilIsolationSides->size() >= excitations.size()) {
+                effectiveIsolationSides = coilIsolationSides;
+            }
+            // A flyback-labelled multiport inductor has its primary voltage integrated (ABT #1467);
+            // one with every winding on one side takes the ampere-turn sum and integrates nothing.
+            if (!has_flyback_label(excitation)) {
+                if (is_multiport_inductor(operatingPoint, effectiveIsolationSides)) {
+                    continue;
+                }
+                if (!coilIsolationSides) {
+                    auto requiredIsolationSides = inputs.get_design_requirements().get_isolation_sides();
+                    if (requiredIsolationSides && is_multiport_inductor(operatingPoint, requiredIsolationSides.value())) {
+                        continue;
+                    }
+                }
+            }
+        }
+        // Every current label has its voltage integrated (ABT #1467): a FLYBACK_PRIMARY /
+        // FLYBACK_SECONDARY / UNIPOLAR_TRIANGULAR current is no longer rebuilt from its own knots.
+
+        // The same preparation the loss path gives the voltage before integrating it, so the
+        // numbers in the message are the ones it would have reported.
+        double frequency = excitation.get_frequency();
+        OperatingPoint preparedOperatingPoint = operatingPoint;
+        if (excitation.get_current()) {
+            excitation.set_current(standardize_waveform(excitation.get_current().value(), frequency));
+        }
+        excitation.set_voltage(standardize_waveform(excitation.get_voltage().value(), frequency));
+        preparedOperatingPoint.get_mutable_excitations_per_winding()[0] = excitation;
+        make_waveform_size_power_of_two(&preparedOperatingPoint);
+        auto preparedVoltage = preparedOperatingPoint.get_excitations_per_winding()[0].get_voltage().value();
+        auto sampledVoltageWaveform = calculate_sampled_waveform(preparedVoltage.get_waveform().value(), frequency);
+
+        std::string operatingPointLabel = "operating point " + std::to_string(operatingPointIndex);
+        if (operatingPoint.get_name()) {
+            operatingPointLabel += " ('" + operatingPoint.get_name().value() + "')";
+        }
+        std::string windingName = primaryWindingName ? primaryWindingName.value()
+                                                     : excitation.get_name().value_or("unnamed");
+        check_volt_second_balance(sampledVoltageWaveform,
+            "Adviser inputs are invalid: " + operatingPointLabel + ", winding 0 ('" + windingName + "')");
+    }
+}
+
+std::optional<SignalDescriptor> Inputs::get_single_winding_magnetizing_current(const OperatingPointExcitation& excitation,
+                                                                              size_t numberWindings) {
+    if (numberWindings != 1 || !excitation.get_current()) {
+        return std::nullopt;
+    }
+    auto magnetizingCurrent = excitation.get_current().value();
+    if (!magnetizingCurrent.get_waveform()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Excitation '" + excitation.get_name().value_or("unnamed") +
+                                    "': the current has no waveform, so it cannot be taken as the magnetizing current");
+    }
+    // The current's processed data keeps the fields the caller gave (e.g. only offset and peak to
+    // peak); the magnetizing current needs all of them (peak included), as
+    // calculate_magnetizing_current would have produced.
+    auto currentWaveform = magnetizingCurrent.get_waveform().value();
+    Waveform sampledCurrentWaveform = is_waveform_sampled(currentWaveform) ? currentWaveform
+                                                                            : calculate_sampled_waveform(currentWaveform, excitation.get_frequency());
+    magnetizingCurrent.set_processed(calculate_processed_data(magnetizingCurrent, sampledCurrentWaveform, true));
+    return magnetizingCurrent;
+}
+
+SignalDescriptor Inputs::calculate_magnetizing_current(const OperatingPoint& operatingPoint,
+                                                       size_t windingIndex,
+                                                       double magnetizingInductance,
+                                                       const std::vector<double>& turnsRatios,
+                                                       bool compress,
+                                                       std::optional<Waveform> voltageSampledWaveform) {
+    // The one decision for a winding's magnetizing current (ABT #1467): Faraday on the winding's
+    // voltage, plus the DC the currents give. process_operating_point, the core adviser's
+    // pre-processing and the autocomplete paths all come through here, so they cannot drift apart.
+    const auto excitations = operatingPoint.get_excitations_per_winding();
+    if (windingIndex >= excitations.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "calculate_magnetizing_current: winding " + std::to_string(windingIndex) +
+                                    " of an operating point with " + std::to_string(excitations.size()) + " windings");
+    }
     if (magnetizingInductance <= 0) {
         throw InvalidInputException(ErrorCode::INVALID_INPUT, "magnetizingInductance cannot be zero or negative");
     }
-
-    if (addOffset && excitation.get_current()) {
-
-        if (!excitation.get_current()->get_processed()) {
-            auto currentExcitation = excitation.get_current().value();
-            auto currentExcitationWaveform = currentExcitation.get_waveform().value();
-            auto sampledCurrentWaveform = calculate_sampled_waveform(currentExcitationWaveform, excitation.get_frequency());
-            currentExcitation.set_harmonics(calculate_harmonics_data(currentExcitationWaveform, sampledCurrentWaveform, excitation.get_frequency()));
-            currentExcitation.set_processed(calculate_processed_data(currentExcitation, sampledCurrentWaveform, true, currentExcitation.get_processed()));
-            excitation.set_current(currentExcitation);
-        }
-
-        if (excitation.get_current()->get_waveform()) {
-            if (!excitation.get_current()->get_processed()->get_peak()) {
-                auto currentExcitation = excitation.get_current().value();
-                auto processed = calculate_processed_data(excitation.get_current()->get_waveform().value());
-                currentExcitation.set_processed(processed);
-                excitation.set_current(currentExcitation);
-
-            }
-
-            if (alternatingConduction) {
-                // Several windings conducting alternately (flyback style): this winding's
-                // measured waveform contains commutation steps (the other winding's
-                // ampere-turns handed over at the switching instant), which move no flux,
-                // so neither its midpoint nor its pk-pk ripple describe the magnetizing
-                // current. What IS exact is the peak: at this winding's current peak it
-                // carries the whole magnetizing MMF, so peak(i_mag) == peak(i_winding).
-                // Anchor there, subtracting the magnetizing excursion above its mean taken
-                // from the same zero-mean volt-second integral the overload below builds
-                // the waveform from. The previous code subtracted half this winding's own
-                // pk-pk ripple (commutation step included), understating the DC anchor and
-                // with it B_dc and B_peak by ~30% on CCM flyback/flybuck (ABT #907).
-                auto centeredMagnetizingWaveform = calculate_integral_waveform(voltageSampledWaveform, true);
-                centeredMagnetizingWaveform = multiply_waveform(centeredMagnetizingWaveform, 1.0 / magnetizingInductance);
-                double excursionAboveMean = *max_element(centeredMagnetizingWaveform.get_data().begin(),
-                                                         centeredMagnetizingWaveform.get_data().end());
-                dcCurrent = excitation.get_current()->get_processed()->get_peak().value() - excursionAboveMean;
-            }
-            else {
-                // Single winding: the measured current IS the magnetizing current, and the
-                // measurement is the only source of DC truth (the voltage integral carries
-                // none). Anchor at its midpoint. (Named locals: MAS getters return by
-                // value, so chaining into get_data() would dangle.)
-                auto currentSignal = excitation.get_current().value();
-                auto currentWaveform = currentSignal.get_waveform().value();
-                const std::vector<double>& currentData = currentWaveform.get_data();
-                dcCurrent = (*max_element(currentData.begin(), currentData.end()) +
-                             *min_element(currentData.begin(), currentData.end())) / 2;
-            }
-        }
-        else {
-            dcCurrent = excitation.get_current()->get_processed()->get_offset();
+    auto excitation = excitations[windingIndex];
+    // A single-winding inductor's winding current IS its magnetizing current (ABT #1585): the
+    // voltage is integrated only when the current is absent or several windings share the flux.
+    if (turnsRatios.empty()) {
+        auto singleWindingMagnetizingCurrent = get_single_winding_magnetizing_current(excitation, excitations.size());
+        if (singleWindingMagnetizingCurrent) {
+            return singleWindingMagnetizingCurrent.value();
         }
     }
-    return calculate_magnetizing_current(excitation, voltageSampledWaveform, magnetizingInductance, compress, dcCurrent);
-}
-
-SignalDescriptor Inputs::calculate_magnetizing_current(OperatingPointExcitation& excitation,
-                                                                double magnetizingInductance,
-                                                                bool compress,
-                                                                bool addOffset,
-                                                                bool alternatingConduction) {
-    if (!excitation.get_voltage()) {
-        throw std::invalid_argument("Missing voltage signal");
+    if (!voltageSampledWaveform) {
+        if (!excitation.get_voltage()) {
+            throw InvalidInputException(ErrorCode::MISSING_DATA, "calculate_magnetizing_current: winding " + std::to_string(windingIndex) +
+                                        " has no voltage to derive its magnetizing current from (Faraday)");
+        }
+        auto voltageExcitation = standardize_waveform(excitation.get_voltage().value(), excitation.get_frequency());
+        auto waveform = voltageExcitation.get_waveform().value();
+        if (!is_waveform_sampled(waveform)) {
+            waveform = calculate_sampled_waveform(waveform, excitation.get_frequency());
+        }
+        voltageSampledWaveform = waveform;
     }
-    auto voltageExcitation = excitation.get_voltage().value();
-    voltageExcitation = standardize_waveform(voltageExcitation, excitation.get_frequency());
-    auto waveform = voltageExcitation.get_waveform().value();
 
-    if (!is_waveform_sampled(waveform)) {
-        waveform = calculate_sampled_waveform(waveform, excitation.get_frequency());
+    double dcCurrent = 0;
+    if (excitations.size() > 1) {
+        // Several windings: the same classification as include_dc_offset_into_magnetizing_current,
+        // on one conduction map shared with the anchor. No winding with a current: a voltage-only
+        // operating point, no DC from the currents. Some with and some without: throws (ABT #1814).
+        auto conduction = calculate_winding_conduction(operatingPoint);
+        if (conduction && windings_alternate(conduction.value())) {
+            dcCurrent = calculate_magnetizing_current_dc_anchor(excitation, conduction.value(), windingIndex, voltageSampledWaveform.value(), magnetizingInductance);
+        }
     }
-    return calculate_magnetizing_current(excitation, waveform, magnetizingInductance, compress, addOffset, alternatingConduction);
+    return integrate_magnetizing_current(excitation, voltageSampledWaveform.value(), magnetizingInductance, compress, dcCurrent);
 }
 
 bool is_continuously_conducting_power(OperatingPointExcitation excitation) {
@@ -1980,78 +2445,50 @@ SignalDescriptor Inputs::calculate_magnetizing_current(OperatingPointExcitation&
                                                                 double magnetizingInductance,
                                                                 bool compress,
                                                                 double dcCurrent) {
+    // The induced current asked for this voltage: an unbalanced one is refused with its own message (ABT #1855).
+    check_volt_second_balance(voltageSampledWaveform, "Excitation '" + excitation.get_name().value_or("unnamed") + "'");
+    return integrate_magnetizing_current(excitation, voltageSampledWaveform, magnetizingInductance, compress, dcCurrent);
+}
+
+SignalDescriptor Inputs::integrate_magnetizing_current(OperatingPointExcitation& excitation,
+                                                       Waveform voltageSampledWaveform,
+                                                       double magnetizingInductance,
+                                                       bool compress,
+                                                       double dcCurrent) {
     if (magnetizingInductance <= 0) {
         throw InvalidInputException(ErrorCode::INVALID_INPUT, "magnetizingInductance cannot be zero or negative");
     }
 
 
     SignalDescriptor magnetizingCurrentExcitation;
-    Waveform sampledMagnetizingCurrentWaveform;
-    // The triangular branch builds the current from its knots; its harmonics come from those
-    // knots exactly, not from their 128 samples (ABT #1460).
-    std::optional<Waveform> magnetizingCurrentKnots;
+    // Faraday, for every excitation (ABT #1467): v = N dPhi/dt, so the magnetizing current is the
+    // voltage's integral over the magnetizing inductance, plus the DC anchor the caller derived
+    // (dcCurrent). A FLYBACK_PRIMARY / FLYBACK_SECONDARY / UNIPOLAR_TRIANGULAR current used to be
+    // rebuilt instead as a triangle from its own offset, peak to peak and duty cycle, rising over D
+    // and falling over the whole of 1 - D: a DCM flyback lost its dead time (h1 of N_p i_m 17 % low
+    // and 29 degrees off the windings' net MMF), and the load current's shape stood in for the flux.
+    //
+    // The integration constant is always removed: it depends only on where the numerical
+    // integration starts within the cycle and is physically meaningless; any real DC bias is
+    // supplied separately via dcCurrent. A small net volt-second imbalance (probe offset, resistive
+    // drop, a capture that is not a whole number of periods) is removed before integrating.
+    double meanVoltage = calculate_steady_state_mean_voltage(excitation, voltageSampledWaveform, "Excitation '" + excitation.get_name().value_or("unnamed") + "'");
+    Waveform sampledMagnetizingCurrentWaveform = calculate_integral_waveform(sum_waveform(voltageSampledWaveform, -meanVoltage), true);
+    sampledMagnetizingCurrentWaveform = multiply_waveform(sampledMagnetizingCurrentWaveform, 1.0 / magnetizingInductance);
+    sampledMagnetizingCurrentWaveform = sum_waveform(sampledMagnetizingCurrentWaveform, dcCurrent);
 
-    if (excitation.get_current() && 
-        (excitation.get_current()->get_processed()->get_label() == WaveformLabel::FLYBACK_PRIMARY || 
-        excitation.get_current()->get_processed()->get_label() == WaveformLabel::FLYBACK_SECONDARY || 
-        excitation.get_current()->get_processed()->get_label() == WaveformLabel::UNIPOLAR_TRIANGULAR)) {
-
-        double offset = excitation.get_current()->get_processed()->get_offset();
-        double peakToPeak = excitation.get_current()->get_processed()->get_peak_to_peak().value();
-
-        // Preserve the duty cycle from the original waveform to get correct asymmetric slopes
-        double dutyCycle = 0.5;
-        if (excitation.get_current()->get_processed()->get_duty_cycle()) {
-            dutyCycle = excitation.get_current()->get_processed()->get_duty_cycle().value();
-        } else if (excitation.get_current()->get_waveform()) {
-            dutyCycle = try_guess_duty_cycle(excitation.get_current()->get_waveform().value(),
-                                              excitation.get_current()->get_processed()->get_label());
-        }
-
-        ProcessedWaveform triangularProcessed;
-        triangularProcessed.set_label(WaveformLabel::TRIANGULAR);
-        triangularProcessed.set_offset(offset + peakToPeak / 2);
-        triangularProcessed.set_peak_to_peak(peakToPeak);
-        triangularProcessed.set_duty_cycle(dutyCycle);
-        auto newWaveform = create_waveform(triangularProcessed, excitation.get_frequency());
-        sampledMagnetizingCurrentWaveform = calculate_sampled_waveform(newWaveform, excitation.get_frequency());
-        magnetizingCurrentKnots = newWaveform;
-    }
-    else {
-        // Always subtract the integration constant: in steady state, a pure
-        // inductor driven by a symmetric AC voltage has zero net DC in the
-        // magnetizing current. The integration of V(t) produces an arbitrary
-        // constant of integration that depends on where the numerical
-        // integration starts within the cycle — for asymmetric / harmonic-rich
-        // waveforms (e.g. distorted "sinusoidal" with high THD) this constant
-        // is non-zero and lopsides the resulting current into a unipolar
-        // [0, +Imax] shape. Any intentional DC bias is supplied separately
-        // via `dcCurrent` and added back below; the integration constant
-        // itself is physically meaningless and must always be removed.
-        //
-        // The previous `is_continuously_conducting_power(excitation)` heuristic
-        // was wrong for inductor mode: a pure inductor has V and I in ~90°
-        // quadrature, so V·I ≈ sin(2ωt) crosses zero often and the heuristic
-        // misclassified the load as discontinuous, leaving the spurious DC in
-        // place. The result was Bpeak = peakToPeak (instead of peakToPeak/2)
-        // for harmonic-rich AC excitations.
-        sampledMagnetizingCurrentWaveform = calculate_integral_waveform(voltageSampledWaveform, true);
-        SignalDescriptor magnetizingCurrentExcitation;
-
-
-        sampledMagnetizingCurrentWaveform = multiply_waveform(sampledMagnetizingCurrentWaveform, 1.0 / magnetizingInductance);
-        sampledMagnetizingCurrentWaveform = sum_waveform(sampledMagnetizingCurrentWaveform, dcCurrent);
-    }
- 
     if (compress){
-        magnetizingCurrentExcitation.set_waveform(compress_waveform(sampledMagnetizingCurrentWaveform));
+        // With the frequency: the sampled waveform's axis is closed (it reaches t0 + T), and closing
+        // it again made the compressed magnetizing current span T + dt, which the sampler then
+        // refuses (ABT #1837).
+        magnetizingCurrentExcitation.set_waveform(compress_waveform(sampledMagnetizingCurrentWaveform, excitation.get_frequency()));
     }
     else {
         magnetizingCurrentExcitation.set_waveform(sampledMagnetizingCurrentWaveform);
     }
 
     magnetizingCurrentExcitation.set_harmonics(
-        calculate_harmonics_data(magnetizingCurrentKnots ? *magnetizingCurrentKnots : sampledMagnetizingCurrentWaveform, sampledMagnetizingCurrentWaveform, excitation.get_frequency()));
+        calculate_harmonics_data(sampledMagnetizingCurrentWaveform, sampledMagnetizingCurrentWaveform, excitation.get_frequency()));
     {
         auto processedData = calculate_processed_data(magnetizingCurrentExcitation, sampledMagnetizingCurrentWaveform);
         // The 'offset' field represents the AC mean of the magnetizing current (DC bias is captured in harmonics[0]).
@@ -2083,169 +2520,34 @@ SignalDescriptor Inputs::calculate_magnetizing_current(OperatingPointExcitation&
     return calculate_magnetizing_current(excitation, voltageSampledWaveform, magnetizingInductance, compress, dcCurrent);
 }
 
-OperatingPoint Inputs::process_operating_point(OperatingPoint operatingPoint, double magnetizingInductance, std::optional<std::vector<double>> turnsRatios, bool isDmcTopology) {
-    // Decide the excitation's effective loss-driving frequency.
-    //
-    // Two cases must both work:
-    // 1. Single-tone excitations below the line-frequency gate (e.g. a 250 Hz
-    //    triangular inductor, 60 Hz mains transformer): the stated fundamental IS
-    //    the loss-driving frequency and must be preserved verbatim.
-    // 2. PFC-style excitations where the stated fundamental is the slow line/envelope
-    //    frequency but the loss-driving content sits at a much higher switching
-    //    frequency: downstream loss/thermal math needs the switching frequency, so
-    //    we replace the stated value with the dominant loss-contributing harmonic.
-    //
-    // Score each harmonic by f·amplitude (a loss-relevant quantity that grows with
-    // both frequency and flux swing). Below the line-frequency gate we look up the
-    // max-scoring bin; above the gate the stated frequency is taken as authoritative,
-    // which also keeps the heuristic idempotent (no drift into FFT noise on re-runs).
-    constexpr double kLineFrequencyGate = 400.0;
+SignalDescriptor Inputs::integrate_magnetizing_current(OperatingPointExcitation& excitation,
+                                                       double magnetizingInductance,
+                                                       bool compress,
+                                                       double dcCurrent) {
+    if (!excitation.get_voltage()) {
+        throw std::invalid_argument("Missing voltage signal");
+    }
+    auto voltageExcitation = excitation.get_voltage().value();
+    voltageExcitation = standardize_waveform(voltageExcitation, excitation.get_frequency());
+    auto waveform = voltageExcitation.get_waveform().value();
 
-    auto effectiveFrequencyFromHarmonics = [](const SignalDescriptor& sig) -> double {
-        if (!sig.get_harmonics()) {
-            return 0.0;
-        }
-        auto harmonics = sig.get_harmonics().value();
-        const auto& freqs = harmonics.get_frequencies();
-        const auto& amps = harmonics.get_amplitudes();
-        if (freqs.size() != amps.size() || freqs.size() < 2) {
-            return 0.0;
-        }
-        double peakAmplitude = 0.0;
-        for (size_t k = 0; k < freqs.size(); ++k) {
-            if (freqs[k] > 0 && amps[k] > peakAmplitude) {
-                peakAmplitude = amps[k];
-            }
-        }
-        if (peakAmplitude <= 0) {
-            return 0.0;
-        }
-        // Threshold out FFT leakage: ignore bins with tiny amplitude so f·amp scoring
-        // doesn't drift into high-frequency noise.
-        const double amplitudeFloor = peakAmplitude * 0.01;
-        double bestScore = 0.0;
-        double bestFreq = 0.0;
-        for (size_t k = 0; k < freqs.size(); ++k) {
-            if (freqs[k] <= 0) continue;
-            if (amps[k] < amplitudeFloor) continue;
-            double score = freqs[k] * amps[k];
-            if (score > bestScore) {
-                bestScore = score;
-                bestFreq = freqs[k];
-            }
-        }
-        return bestFreq;
-    };
+    auto voltageSampledWaveform = calculate_sampled_waveform(waveform, excitation.get_frequency());
+    return integrate_magnetizing_current(excitation, voltageSampledWaveform, magnetizingInductance, compress, dcCurrent);
+}
 
-    // Returns the amplitude at the harmonic bin closest to `target` Hz, or 0 if
-    // the spectrum is unavailable. Used to decide whether to override a stated
-    // fundamental: if the user-stated fundamental already carries comparable
-    // amplitude to the candidate switching bin, we should not override.
-    auto amplitudeAtFrequency = [](const SignalDescriptor& sig, double target) -> double {
-        if (!sig.get_harmonics() || target <= 0) {
-            return 0.0;
-        }
-        auto harmonics = sig.get_harmonics().value();
-        const auto& freqs = harmonics.get_frequencies();
-        const auto& amps = harmonics.get_amplitudes();
-        if (freqs.size() != amps.size() || freqs.empty()) {
-            return 0.0;
-        }
-        size_t closestIdx = 0;
-        double bestDiff = std::numeric_limits<double>::infinity();
-        for (size_t k = 0; k < freqs.size(); ++k) {
-            if (freqs[k] <= 0) continue;
-            double diff = std::abs(freqs[k] - target);
-            if (diff < bestDiff) {
-                bestDiff = diff;
-                closestIdx = k;
-            }
-        }
-        return amps[closestIdx];
-    };
-
+OperatingPoint Inputs::process_operating_point(OperatingPoint operatingPoint, double magnetizingInductance, std::optional<std::vector<double>> turnsRatios, bool isDmcTopology,
+                                                std::optional<std::vector<IsolationSide>> isolationSides) {
+    // The stated frequency is the excitation's: it is never replaced by a harmonic of the waveform. A
+    // line-cycle (PFC) record keeps its line frequency; its switching cycles are priced per cycle by
+    // the core-loss models. A missing or invalid frequency throws (ABT #1467).
     for (size_t i = 0; i < operatingPoint.get_excitations_per_winding().size(); ++i) {
-        auto& excitation = operatingPoint.get_mutable_excitations_per_winding()[i];
-        auto freq = excitation.get_frequency();
-
-        // Garbage guard: NaN / inf / non-positive stated frequency.
-        if (std::isnan(freq) || std::isinf(freq) || freq <= 0) {
-            double effectiveFreq = 0.0;
-            if (excitation.get_current()) {
-                effectiveFreq = effectiveFrequencyFromHarmonics(excitation.get_current().value());
-            }
-            if (effectiveFreq <= 0 && excitation.get_voltage()) {
-                effectiveFreq = effectiveFrequencyFromHarmonics(excitation.get_voltage().value());
-            }
-            if (effectiveFreq > 0) {
-                excitation.set_frequency(effectiveFreq);
-            }
-            continue;
-        }
-
-        // Idempotency gate: above the line-frequency threshold the stated frequency
-        // is authoritative. Stops re-runs from drifting into FFT noise.
-        if (freq >= kLineFrequencyGate) {
-            continue;
-        }
-
-        double effectiveFreq = 0.0;
-        // The amplitude check below must be against the *same* signal that
-        // produced effectiveFreq, otherwise we compare bins from different
-        // spectra. Stash a copy of the driving signal (get_current()/get_voltage()
-        // return optionals by value here, so a raw pointer would dangle).
-        std::optional<SignalDescriptor> drivingSignal;
-        if (excitation.get_current()) {
-            auto sig = excitation.get_current().value();
-            effectiveFreq = effectiveFrequencyFromHarmonics(sig);
-            if (effectiveFreq > 0) {
-                drivingSignal = sig;
-            }
-        }
-        if (effectiveFreq <= 0 && excitation.get_voltage()) {
-            auto sig = excitation.get_voltage().value();
-            effectiveFreq = effectiveFrequencyFromHarmonics(sig);
-            if (effectiveFreq > 0) {
-                drivingSignal = sig;
-            }
-        }
-
-        // Replace only when (1) the loss-dominant harmonic lives above the gate
-        // (PFC-style) AND (2) the user-stated fundamental does not already carry
-        // comparable amplitude. Without the second check we hijack a real 50 Hz
-        // line-transformer waveform that happens to have switching ripple at
-        // 100 kHz: f·amp scoring favours the switching bin because of the f
-        // factor, even when its amplitude is a small fraction of the fundamental.
-        //
-        // PFC inductor current: amp@line ≪ amp@switching → override fires.
-        // Line transformer current with small ripple: amp@line ≫ amp@switching
-        //   → don't override.
-        if (effectiveFreq >= kLineFrequencyGate && effectiveFreq > freq && drivingSignal.has_value()) {
-            double ampAtStated    = amplitudeAtFrequency(drivingSignal.value(), freq);
-            double ampAtEffective = amplitudeAtFrequency(drivingSignal.value(), effectiveFreq);
-            // Threshold: if the stated fundamental's amplitude is at least half
-            // of the candidate switching bin's amplitude, treat the stated
-            // frequency as authoritative. Half is conservative — real PFC
-            // inductor currents have amp@line many orders of magnitude below
-            // amp@switching.
-            const double overrideAmplitudeRatio = 0.5;
-            if (ampAtStated < overrideAmplitudeRatio * ampAtEffective) {
-                excitation.set_frequency(effectiveFreq);
-            }
+        double frequency = operatingPoint.get_excitations_per_winding()[i].get_frequency();
+        if (!std::isfinite(frequency) || frequency <= 0) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "process_operating_point: excitation " + std::to_string(i) + " has frequency " + std::to_string(frequency) +
+                "; every excitation needs its frequency (finite and positive)");
         }
     }
-
-    auto physFreqFromWaveform = [](const Waveform& w, double fallback) -> double {
-        if (w.get_time()) {
-            auto t = w.get_time().value();
-            if (t.size() >= 2) {
-                double step = t[1] - t[0];
-                double period = step * static_cast<double>(t.size());
-                if (period > 0 && std::isfinite(1.0 / period)) return 1.0 / period;
-            }
-        }
-        return fallback;
-    };
 
     std::vector<OperatingPointExcitation> processedExcitationsPerWinding;
     std::vector<Waveform> voltageSampledWaveforms;
@@ -2269,7 +2571,7 @@ OperatingPoint Inputs::process_operating_point(OperatingPoint operatingPoint, do
             else {
                 sampledWaveform = waveform;
             }
-            currentExcitation.set_harmonics(calculate_harmonics_data(waveform, sampledWaveform, physFreqFromWaveform(sampledWaveform, excitation.get_frequency())));
+            currentExcitation.set_harmonics(calculate_harmonics_data(waveform, sampledWaveform, excitation.get_frequency()));
             currentExcitation.set_processed(calculate_processed_data(currentExcitation, sampledWaveform, true, currentExcitation.get_processed()));
             excitation.set_current(currentExcitation);
         }
@@ -2285,7 +2587,7 @@ OperatingPoint Inputs::process_operating_point(OperatingPoint operatingPoint, do
                 else {
                     sampledWaveform = waveform;
                 }
-                currentExcitation.set_harmonics(calculate_harmonics_data(waveform, sampledWaveform, physFreqFromWaveform(sampledWaveform, excitation.get_frequency())));
+                currentExcitation.set_harmonics(calculate_harmonics_data(waveform, sampledWaveform, excitation.get_frequency()));
                 currentExcitation.set_processed(calculate_processed_data(currentExcitation, sampledWaveform, true, currentExcitation.get_processed()));
                 excitation.set_current(currentExcitation);
             }
@@ -2306,9 +2608,21 @@ OperatingPoint Inputs::process_operating_point(OperatingPoint operatingPoint, do
                 sampledWaveform = waveform;
             }
             voltageSampledWaveforms.push_back(sampledWaveform);
-            voltageExcitation.set_harmonics(calculate_harmonics_data(waveform, sampledWaveform, physFreqFromWaveform(sampledWaveform, excitation.get_frequency())));
+            voltageExcitation.set_harmonics(calculate_harmonics_data(waveform, sampledWaveform, excitation.get_frequency()));
             voltageExcitation.set_processed(calculate_processed_data(voltageExcitation, sampledWaveform));
             excitation.set_voltage(voltageExcitation);
+            // A single-winding inductor's winding current IS its magnetizing current, exactly as in
+            // the no-voltage branch below. Integrating the voltage (the generic path further down) is
+            // needed only when the current is absent or several windings share the flux, and it was
+            // wrong whenever the given voltage is not volt-second balanced: Kirchhoff's line-cycle
+            // PFC voltages integrated to kA "magnetizing" peaks against ~12 A of real current, and
+            // no core passed the energy-stored gate (ABT #1585).
+            if (!excitation.get_magnetizing_current()) {
+                auto singleWindingMagnetizingCurrent = get_single_winding_magnetizing_current(excitation, operatingPoint.get_excitations_per_winding().size());
+                if (singleWindingMagnetizingCurrent) {
+                    excitation.set_magnetizing_current(singleWindingMagnetizingCurrent.value());
+                }
+            }
         }
         else {
             if (operatingPoint.get_excitations_per_winding().size() == 1 && excitation.get_current()) {
@@ -2329,7 +2643,7 @@ OperatingPoint Inputs::process_operating_point(OperatingPoint operatingPoint, do
                     sampledWaveform = waveform;
                 }
                 voltageSampledWaveforms.push_back(sampledWaveform);
-                voltageExcitation.set_harmonics(calculate_harmonics_data(waveform, sampledWaveform, physFreqFromWaveform(sampledWaveform, excitation.get_frequency())));
+                voltageExcitation.set_harmonics(calculate_harmonics_data(waveform, sampledWaveform, excitation.get_frequency()));
                 voltageExcitation.set_processed(calculate_processed_data(voltageExcitation, sampledWaveform, true, voltageExcitation.get_processed()));
                 excitation.set_voltage(voltageExcitation);
             }
@@ -2351,8 +2665,6 @@ OperatingPoint Inputs::process_operating_point(OperatingPoint operatingPoint, do
 
             turnsRatios.push_back(turnsRatio);
         }
-
-        bool includeDcOffsetIntoMagnetizingCurrent = include_dc_offset_into_magnetizing_current(operatingPoint, turnsRatios);
 
         // ── CMC handling ─────────────────────────────────────────────────
         // In a common-mode choke every winding carries identical DM + CM
@@ -2392,9 +2704,19 @@ OperatingPoint Inputs::process_operating_point(OperatingPoint operatingPoint, do
         // — it's a plain series inductor and the regular path handles it.
         bool isDmcOperatingPoint = !primaryHasMagnetizingCurrent
             && can_be_differential_mode_choke(operatingPoint, isDmcTopology);
+        // The windings' isolation sides decide whether identical currents add (one side: a
+        // common-mode choke) or cancel (a transformer). Undeclared, MKF's index convention applies.
+        std::vector<IsolationSide> windingIsolationSides;
+        // (Fewer declared than windings: the rest by index, as get_isolation_sides_used extends them.)
+        if (isolationSides) {
+            windingIsolationSides = isolationSides.value();
+        }
+        for (size_t windingIndex = windingIsolationSides.size(); windingIndex < operatingPoint.get_excitations_per_winding().size(); ++windingIndex) {
+            windingIsolationSides.push_back(get_isolation_side_from_index(windingIndex));
+        }
         bool isCmcOperatingPoint = !primaryHasMagnetizingCurrent
             && !isDmcOperatingPoint
-            && can_be_common_mode_choke(operatingPoint);
+            && can_be_common_mode_choke(operatingPoint, windingIsolationSides);
         if (isDmcOperatingPoint) {
             auto dmMagnetizingCurrent = get_differential_mode_choke_magnetizing_current(operatingPoint);
             // Stamp the synthesized DMC magnetizing current on every winding;
@@ -2420,8 +2742,7 @@ OperatingPoint Inputs::process_operating_point(OperatingPoint operatingPoint, do
                     if (windingIndex < voltageSampledWaveforms.size()) {
                         waveform = voltageSampledWaveforms[windingIndex];
                     }
-                    excitation.set_magnetizing_current(calculate_magnetizing_current(excitation, waveform, magnetizingInductance, false, includeDcOffsetIntoMagnetizingCurrent,
-                                                                                     operatingPoint.get_excitations_per_winding().size() > 1));
+                    excitation.set_magnetizing_current(calculate_magnetizing_current(operatingPoint, windingIndex, magnetizingInductance, turnsRatios, false, waveform));
                 }
                 processedExcitationsPerWinding[windingIndex] = excitation;
             }
@@ -2441,6 +2762,19 @@ void Inputs::process(std::optional<std::variant<double, std::vector<double>>> ma
     // DMCs (configuration is implied by the operating point's winding count).
     bool isDmcTopology = get_design_requirements().get_topology().has_value()
         && get_design_requirements().get_topology().value() == MAS::Topology::DIFFERENTIAL_MODE_CHOKE;
+
+    // The windings' isolation sides (ABT #1467): declared, or every winding on the line side for a
+    // declared common-mode choke; otherwise process_operating_point applies MKF's index convention.
+    std::optional<std::vector<IsolationSide>> isolationSides = get_design_requirements().get_isolation_sides();
+    bool isCmcTopology = get_design_requirements().get_topology().has_value()
+        && get_design_requirements().get_topology().value() == MAS::Topology::COMMON_MODE_CHOKE;
+    if (!isolationSides && isCmcTopology) {
+        size_t numberWindings = get_design_requirements().get_turns_ratios().size() + 1;
+        for (auto& operatingPoint : operatingPoints) {
+            numberWindings = std::max(numberWindings, operatingPoint.get_excitations_per_winding().size());
+        }
+        isolationSides = std::vector<IsolationSide>(numberWindings, IsolationSide::PRIMARY);
+    }
 
     for (size_t operatingPointIndex = 0; operatingPointIndex < operatingPoints.size(); ++operatingPointIndex) {
         auto operatingPoint = operatingPoints[operatingPointIndex];
@@ -2465,7 +2799,7 @@ void Inputs::process(std::optional<std::variant<double, std::vector<double>>> ma
         else {
             magnetizingInductanceToProcess = resolve_dimensional_values(get_design_requirements().get_magnetizing_inductance());
         }
-        processed_operating_points.push_back(process_operating_point(operatingPoint, magnetizingInductanceToProcess, std::nullopt, isDmcTopology));
+        processed_operating_points.push_back(process_operating_point(operatingPoint, magnetizingInductanceToProcess, std::nullopt, isDmcTopology, isolationSides));
     }
     set_operating_points(processed_operating_points);
 }
@@ -2502,7 +2836,7 @@ OperatingPoint Inputs::create_operating_point_with_sinusoidal_current_mask(doubl
             auto voltage = calculate_induced_voltage(excitation, magnetizingInductance);
             voltage.set_processed(calculate_basic_processed_data(voltage.get_waveform().value()));
             excitation.set_voltage(voltage);
-            auto magnetizingCurrent = calculate_magnetizing_current(excitation, magnetizingInductance, true, 0.0);
+            auto magnetizingCurrent = integrate_magnetizing_current(excitation, magnetizingInductance, true, 0.0);
             magnetizingCurrent.set_processed(calculate_basic_processed_data(magnetizingCurrent.get_waveform().value()));
             excitation.set_magnetizing_current(magnetizingCurrent);
         }
@@ -2525,7 +2859,7 @@ OperatingPoint Inputs::create_operating_point_with_sinusoidal_current_mask(doubl
             auto voltage = calculate_induced_voltage(excitation, magnetizingInductance / pow(turnsRatio, 2));
             voltage.set_processed(calculate_basic_processed_data(voltage.get_waveform().value()));
             excitation.set_voltage(voltage);
-            auto magnetizingCurrent = calculate_magnetizing_current(excitation, magnetizingInductance, true, 0.0);
+            auto magnetizingCurrent = integrate_magnetizing_current(excitation, magnetizingInductance, true, 0.0);
             magnetizingCurrent.set_processed(calculate_basic_processed_data(magnetizingCurrent.get_waveform().value()));
             excitation.set_magnetizing_current(magnetizingCurrent);
         }
@@ -2602,7 +2936,7 @@ Inputs Inputs::create_quick_operating_point(double frequency,
 
         excitation.set_voltage(voltage);
         if (magnetizingInductance > 0) {
-            auto current = calculate_magnetizing_current(excitation, magnetizingInductance, true, dcCurrent);
+            auto current = integrate_magnetizing_current(excitation, magnetizingInductance, true, dcCurrent);
             excitation.set_current(current);
             excitation.set_magnetizing_current(current);
         }
@@ -2621,7 +2955,7 @@ Inputs Inputs::create_quick_operating_point(double frequency,
         voltage = standardize_waveform(voltage, frequency);
         excitation.set_voltage(voltage);
         if (magnetizingInductance > 0) {
-            auto current = calculate_magnetizing_current(excitation, magnetizingInductance * pow(turnsRatio, 2), true, dcCurrent);
+            auto current = integrate_magnetizing_current(excitation, magnetizingInductance * pow(turnsRatio, 2), true, dcCurrent);
             excitation.set_current(current);
             excitation.set_magnetizing_current(current);
         }
@@ -2981,25 +3315,29 @@ void Inputs::scale_time_to_frequency(OperatingPoint& operatingPoint, double newF
 
 void Inputs::scale_time_to_frequency(OperatingPointExcitation& excitation, double newFrequency, bool cleanFrequencyDependentFields, bool processSignals, bool useCurrentAsBase){
     excitation.set_frequency(newFrequency);
-    if (excitation.get_current() && excitation.get_current()->get_waveform()) {
-        auto current = excitation.get_current().value();
-        current.set_waveform(scale_time_to_frequency(current.get_waveform().value(), newFrequency));
+    // A signal whose time axis is rescaled keeps its waveform; its harmonics and processed data were
+    // derived from the old time axis. They are recomputed from the rescaled waveform when processSignals
+    // is set, and dropped otherwise, so that no consumer reads a spectrum at the old frequencies (a
+    // swept DMC record kept its 100 kHz ripple harmonic while its waveform moved to 1 MHz, ABT #1764).
+    // A signal without a waveform is described by its processed data alone and is left as it is.
+    auto rescale = [&](SignalDescriptor signal) {
+        signal.set_waveform(scale_time_to_frequency(signal.get_waveform().value(), newFrequency));
         if (processSignals) {
-            auto sampledWaveform = Inputs::calculate_sampled_waveform(current.get_waveform().value(), newFrequency);
-            current.set_harmonics(Inputs::calculate_harmonics_data(current.get_waveform().value(), sampledWaveform, newFrequency));
-            current.set_processed(Inputs::calculate_processed_data(current, sampledWaveform, true));
+            auto sampledWaveform = Inputs::calculate_sampled_waveform(signal.get_waveform().value(), newFrequency);
+            signal.set_harmonics(Inputs::calculate_harmonics_data(signal.get_waveform().value(), sampledWaveform, newFrequency));
+            signal.set_processed(Inputs::calculate_processed_data(signal, sampledWaveform, true));
         }
-        excitation.set_current(current);
+        else {
+            signal.set_harmonics(std::nullopt);
+            signal.set_processed(std::nullopt);
+        }
+        return signal;
+    };
+    if (excitation.get_current() && excitation.get_current()->get_waveform()) {
+        excitation.set_current(rescale(excitation.get_current().value()));
     }
     if (excitation.get_voltage() && excitation.get_voltage()->get_waveform()) {
-        auto voltage = excitation.get_voltage().value();
-        voltage.set_waveform(scale_time_to_frequency(voltage.get_waveform().value(), newFrequency));
-        if (processSignals) {
-            auto sampledWaveform = Inputs::calculate_sampled_waveform(voltage.get_waveform().value(), newFrequency);
-            voltage.set_harmonics(Inputs::calculate_harmonics_data(voltage.get_waveform().value(), sampledWaveform, newFrequency));
-            voltage.set_processed(Inputs::calculate_processed_data(voltage, sampledWaveform, true));
-        }
-        excitation.set_voltage(voltage);
+        excitation.set_voltage(rescale(excitation.get_voltage().value()));
     }
     if (cleanFrequencyDependentFields) {
         if (useCurrentAsBase) {
@@ -3014,34 +3352,13 @@ void Inputs::scale_time_to_frequency(OperatingPointExcitation& excitation, doubl
     }
     else {
         if (excitation.get_magnetizing_current() && excitation.get_magnetizing_current()->get_waveform()) {
-            auto magnetizingCurrent = excitation.get_magnetizing_current().value();
-            magnetizingCurrent.set_waveform(scale_time_to_frequency(magnetizingCurrent.get_waveform().value(), newFrequency));
-            if (processSignals) {
-                auto sampledWaveform = Inputs::calculate_sampled_waveform(magnetizingCurrent.get_waveform().value(), newFrequency);
-                magnetizingCurrent.set_harmonics(Inputs::calculate_harmonics_data(magnetizingCurrent.get_waveform().value(), sampledWaveform, newFrequency));
-                magnetizingCurrent.set_processed(Inputs::calculate_processed_data(magnetizingCurrent, sampledWaveform, true));
-            }
-            excitation.set_magnetizing_current(magnetizingCurrent);
+            excitation.set_magnetizing_current(rescale(excitation.get_magnetizing_current().value()));
         }
         if (excitation.get_magnetic_flux_density() && excitation.get_magnetic_flux_density()->get_waveform()) {
-            auto magneticFluxDensity = excitation.get_magnetic_flux_density().value();
-            magneticFluxDensity.set_waveform(scale_time_to_frequency(magneticFluxDensity.get_waveform().value(), newFrequency));
-            if (processSignals) {
-                auto sampledWaveform = Inputs::calculate_sampled_waveform(magneticFluxDensity.get_waveform().value(), newFrequency);
-                magneticFluxDensity.set_harmonics(Inputs::calculate_harmonics_data(magneticFluxDensity.get_waveform().value(), sampledWaveform, newFrequency));
-                magneticFluxDensity.set_processed(Inputs::calculate_processed_data(magneticFluxDensity, sampledWaveform, true));
-            }
-            excitation.set_magnetic_flux_density(magneticFluxDensity);
+            excitation.set_magnetic_flux_density(rescale(excitation.get_magnetic_flux_density().value()));
         }
         if (excitation.get_magnetic_field_strength() && excitation.get_magnetic_field_strength()->get_waveform()) {
-            auto magneticFieldStrength = excitation.get_magnetic_field_strength().value();
-            magneticFieldStrength.set_waveform(scale_time_to_frequency(magneticFieldStrength.get_waveform().value(), newFrequency));
-            if (processSignals) {
-                auto sampledWaveform = Inputs::calculate_sampled_waveform(magneticFieldStrength.get_waveform().value(), newFrequency);
-                magneticFieldStrength.set_harmonics(Inputs::calculate_harmonics_data(magneticFieldStrength.get_waveform().value(), sampledWaveform, newFrequency));
-                magneticFieldStrength.set_processed(Inputs::calculate_processed_data(magneticFieldStrength, sampledWaveform, true));
-            }
-            excitation.set_magnetic_field_strength(magneticFieldStrength);
+            excitation.set_magnetic_field_strength(rescale(excitation.get_magnetic_field_strength().value()));
         }
     }
 }
@@ -3415,12 +3732,19 @@ std::vector<InsulationStandards> Inputs::get_standards() {
             "this design names none");
     }
 
+    if (get_design_requirements().get_insulation()->get_standards()->empty()) {
+        // ABT #1228: an empty list is no more a standard than an absent one; reading it as "no
+        // standard asks for anything" returned 0 mm clearance and creepage.
+        throw InvalidInputException(ErrorCode::MISSING_DATA,
+            "designRequirements.insulation.standards is empty: insulation coordination takes its tables from the "
+            "standards the design names, and this design names none");
+    }
     return get_design_requirements().get_insulation()->get_standards().value();
 }
 
 bool Inputs::has_insulation_coordination_requirements() const {
     auto insulation = get_design_requirements().get_insulation();
-    return insulation && insulation->get_standards();
+    return insulation && insulation->get_standards() && !insulation->get_standards()->empty();
 }
 
 void Inputs::throw_if_json_lacks_required_fields(const json& inputsJson) {
@@ -3465,33 +3789,123 @@ void Inputs::set_current_as_magnetizing_current(OperatingPoint* operatingPoint) 
     operatingPoint->get_mutable_excitations_per_winding()[0] = excitation;
 }
 
-double Inputs::get_switching_frequency(const OperatingPointExcitation& excitation) {
-    if (excitation.get_frequency() < 400) {
-        if (excitation.get_current()) {
-            if (excitation.get_current()->get_waveform()) {
-                auto waveform = excitation.get_current()->get_waveform().value();
-                if (waveform.get_data().size() > constants.numberPointsSampledWaveforms) {
-                    if (excitation.get_current()->get_harmonics()) {
-                        auto harmonics = excitation.get_current()->get_harmonics().value();
-                        double mainHarmonicAmplitude = harmonics.get_amplitudes()[1];
-                        double strongestHarmonicAmplitudeAfterMain = 0;
-                        double strongestHarmonicAmplitudeAfterMainFrequency = harmonics.get_frequencies()[1];
-                        for (size_t harmonicIndex = 2; harmonicIndex < harmonics.get_amplitudes().size(); ++harmonicIndex) {
-                            if (harmonics.get_amplitudes()[harmonicIndex] > 0.01 * mainHarmonicAmplitude) {
-                                if (harmonics.get_amplitudes()[harmonicIndex] > strongestHarmonicAmplitudeAfterMain) {
-                                    strongestHarmonicAmplitudeAfterMain = harmonics.get_amplitudes()[harmonicIndex];
-                                    strongestHarmonicAmplitudeAfterMainFrequency = harmonics.get_frequencies()[harmonicIndex];
-                                }
-                            }
-                        }
-
-                        return strongestHarmonicAmplitudeAfterMainFrequency;
-                    }
-                }
+// Valleys of a record, found with a hysteresis of `noise`: a reversal smaller than that is not a
+// flux reversal. Plateaus keep their first sample.
+std::vector<size_t> Inputs::find_valleys(const std::vector<double>& data, double noise) {
+    std::vector<size_t> valleys;
+    int direction = 0;  // +1 rising towards a peak, -1 falling towards a valley, 0 not yet known
+    size_t extremum = 0;
+    for (size_t i = 1; i < data.size(); ++i) {
+        if (direction == 0) {
+            if (data[i] > data[0] + noise) {
+                direction = 1;
+                extremum = i;
+            }
+            else if (data[i] < data[0] - noise) {
+                direction = -1;
+                extremum = i;
+            }
+        }
+        else if (direction > 0) {
+            if (data[i] > data[extremum]) {
+                extremum = i;
+            }
+            else if (data[extremum] - data[i] > noise) {
+                direction = -1;
+                extremum = i;
+            }
+        }
+        else {
+            if (data[i] < data[extremum]) {
+                extremum = i;
+            }
+            else if (data[i] - data[extremum] > noise) {
+                valleys.push_back(extremum);
+                direction = 1;
+                extremum = i;
             }
         }
     }
-    return excitation.get_frequency();
+    return valleys;
+}
+
+std::optional<std::vector<size_t>> Inputs::find_switching_cycle_valleys(const std::vector<double>& time, const std::vector<double>& data) {
+    if (data.size() != time.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "Switching cycles: the record has " + std::to_string(data.size()) + " samples and " + std::to_string(time.size()) + " time points");
+    }
+    if (data.size() < 2 * minimumSwitchingCyclesInRecord + 1) {
+        return std::nullopt;  // too few samples to hold that many cycles
+    }
+    auto [minimumIt, maximumIt] = std::minmax_element(data.begin(), data.end());
+    double recordPeakToPeak = *maximumIt - *minimumIt;
+    if (!(recordPeakToPeak > 0)) {
+        return std::nullopt;
+    }
+    // A reversal below one part in 1e9 of the record's swing is the round-off of the waveform's
+    // arithmetic (resampling, scaling current into flux), not a reversal.
+    auto valleys = find_valleys(data, recordPeakToPeak * 1e-9);
+    if (valleys.size() < minimumSwitchingCyclesInRecord + 1) {
+        return std::nullopt;
+    }
+    double recordDuration = time.back() - time.front();
+    for (size_t cycleIndex = 0; cycleIndex + 1 < valleys.size(); ++cycleIndex) {
+        double duration = time[valleys[cycleIndex + 1]] - time[valleys[cycleIndex]];
+        if (duration * static_cast<double>(minimumSwitchingCyclesInRecord) > recordDuration) {
+            return std::nullopt;
+        }
+    }
+    return valleys;
+}
+
+double Inputs::get_switching_frequency(const OperatingPointExcitation& excitation) {
+    // The switching frequency of an excitation is its frequency, unless its current is a line-cycle
+    // record: a record of repeated switching cycles (find_switching_cycle_valleys) described at the
+    // frequency of its period, the line. Its switching frequency is then the rate of its cycles. The
+    // record is read from its waveform at any excitation frequency, whether or not a processed copy
+    // cached the waveform's spectrum (ABT #1764: a fixed f < 400 Hz gate gave a DMC record swept to 500 Hz
+    // no line bias, and an unprocessed 50 Hz copy returned 50 Hz for want of cached harmonics: mu 300
+    // instead of ~104 on an MPP 300 toroid, B 1.02 T instead of 0.35 T, 16.3 W instead of 1.74 W).
+    double frequency = excitation.get_frequency();
+    if (!excitation.get_current() || !excitation.get_current()->get_waveform()) {
+        return frequency;
+    }
+    auto waveform = excitation.get_current()->get_waveform().value();
+    if (!waveform.get_time()) {
+        return frequency;  // an equidistant waveform is one period of its frequency, not a record
+    }
+    auto time = waveform.get_time().value();
+    if (time.size() < 2) {
+        return frequency;
+    }
+    // A record that spans that many periods of the excitation's frequency already carries the switching
+    // frequency as its frequency (Kirchhoff's PFC/Vienna records do).
+    if ((time.back() - time.front()) * frequency >= static_cast<double>(minimumSwitchingCyclesInRecord)) {
+        return frequency;
+    }
+    auto valleys = find_switching_cycle_valleys(time, waveform.get_data());
+    if (!valleys) {
+        return frequency;
+    }
+    // The record's switching rate is its number of cycles over their span. A cycle in which the line
+    // outran the ripple, so that it shows no valley, appears as one cycle twice the usual length: each
+    // cycle counts as its length in typical cycles (the median one), rounded. A periodic record switches
+    // at a harmonic of its period, so the rate is the nearest one: the cycles are bounded by samples, so
+    // their span is off by up to a sample at each end.
+    std::vector<double> durations;
+    for (size_t cycleIndex = 0; cycleIndex + 1 < valleys->size(); ++cycleIndex) {
+        durations.push_back(time[(*valleys)[cycleIndex + 1]] - time[(*valleys)[cycleIndex]]);
+    }
+    auto sortedDurations = durations;
+    std::nth_element(sortedDurations.begin(), sortedDurations.begin() + sortedDurations.size() / 2, sortedDurations.end());
+    double typicalDuration = sortedDurations[sortedDurations.size() / 2];
+    double numberCycles = 0;
+    for (auto duration : durations) {
+        numberCycles += std::max(1.0, std::round(duration / typicalDuration));
+    }
+    double cyclesSpan = time[valleys->back()] - time[valleys->front()];
+    double cycleRate = numberCycles / cyclesSpan;
+    return std::round(cycleRate / frequency) * frequency;
 }
 
 double Inputs::get_magnetic_flux_density_peak(OperatingPointExcitation excitation, double switchingFrequency) {
@@ -3500,16 +3914,8 @@ double Inputs::get_magnetic_flux_density_peak(OperatingPointExcitation excitatio
     if (!excitation.get_magnetic_flux_density()->get_harmonics() && magneticFluxDensity.get_waveform()) {
         auto magneticFluxDensityWaveform = magneticFluxDensity.get_waveform().value();
         auto sampledWaveform = Inputs::calculate_sampled_waveform(magneticFluxDensityWaveform, excitation.get_frequency());
-        double physFreq = excitation.get_frequency();
-        if (sampledWaveform.get_time()) {
-            auto t = sampledWaveform.get_time().value();
-            if (t.size() >= 2) {
-                double step = t[1] - t[0];
-                double period = step * static_cast<double>(t.size());
-                if (period > 0 && std::isfinite(1.0 / period)) physFreq = 1.0 / period;
-            }
-        }
-        magneticFluxDensity.set_harmonics(calculate_harmonics_data(magneticFluxDensityWaveform, sampledWaveform, physFreq));
+        // Harmonic k at k times the excitation frequency, as every other MKF harmonics list (ABT #1880).
+        magneticFluxDensity.set_harmonics(calculate_harmonics_data(magneticFluxDensityWaveform, sampledWaveform, excitation.get_frequency()));
         excitation.set_magnetic_flux_density(magneticFluxDensity);
     }
 
@@ -3533,16 +3939,8 @@ double Inputs::get_magnetic_flux_density_peak_to_peak(OperatingPointExcitation e
     if (!excitation.get_magnetic_flux_density()->get_harmonics() && magneticFluxDensity.get_waveform()) {
         auto magneticFluxDensityWaveform = magneticFluxDensity.get_waveform().value();
         auto sampledWaveform = Inputs::calculate_sampled_waveform(magneticFluxDensityWaveform, excitation.get_frequency());
-        double physFreq = excitation.get_frequency();
-        if (sampledWaveform.get_time()) {
-            auto t = sampledWaveform.get_time().value();
-            if (t.size() >= 2) {
-                double step = t[1] - t[0];
-                double period = step * static_cast<double>(t.size());
-                if (period > 0 && std::isfinite(1.0 / period)) physFreq = 1.0 / period;
-            }
-        }
-        magneticFluxDensity.set_harmonics(calculate_harmonics_data(magneticFluxDensityWaveform, sampledWaveform, physFreq));
+        // Harmonic k at k times the excitation frequency, as every other MKF harmonics list (ABT #1880).
+        magneticFluxDensity.set_harmonics(calculate_harmonics_data(magneticFluxDensityWaveform, sampledWaveform, excitation.get_frequency()));
         excitation.set_magnetic_flux_density(magneticFluxDensity);
     }
 
@@ -3573,7 +3971,7 @@ SignalDescriptor Inputs::get_current_with_effective_maximum(size_t windingIndex)
         if (!get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex].get_current()->get_processed()->get_effective_frequency()) {
             auto current = get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex].get_current().value();
             if (current.get_waveform()) {
-                auto processed = calculate_processed_data(current.get_waveform().value());
+                auto processed = calculate_processed_data(current.get_waveform().value(), get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex].get_frequency());
                 current.set_processed(processed);
                 get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].set_current(current);
             }

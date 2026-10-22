@@ -202,6 +202,12 @@ struct ThermalResult {
     double maximumTemperature;
     double averageCoreTemperature;
     double averageCoilTemperature;
+    // ABT #838: the core's own hot spot (maximum over CORE nodes only) and the mean over TURN
+    // nodes. Unlike the two averages above, these are left EMPTY when the network has no node of
+    // that kind instead of reporting the ambient temperature, so a caller that needs the core's
+    // or the winding's temperature can tell "not modelled" from "at ambient".
+    std::optional<double> maximumCoreTemperature;
+    std::optional<double> averageTurnTemperature;
     std::map<std::string, double> nodeTemperatures;
     double totalThermalResistance;
     size_t iterationsToConverge;
@@ -244,7 +250,6 @@ struct TemperatureConfig {
     // maxIterations to build the resistance network and draw it, and legitimately never
     // intend to solve it.
     bool requireConvergence = true;
-    double coreThermalConductivity = 4.0;  // Ferrite thermal conductivity (W/m·K)
     
     // Inter-turn insulation (electrical insulation tape between turns)
     bool useInterTurnInsulation = false;        // Enable inter-turn insulation layers
@@ -331,6 +336,9 @@ private:
     bool _isPlanar = false;         // True for planar windings (PCB traces)
     bool _isRoundWire = false;      // True for round wires and litz
     std::optional<InsulationWireCoating> _wireCoating;  // Wire coating for thermal calculations
+    bool _turnsDescriptionRead = false;  // _turnsDescription holds the coil's turns (see turnsDescription())
+    std::optional<std::vector<Turn>> _turnsDescription;
+    std::optional<std::vector<Layer>> _insulationLayers;  // the coil's insulation layers (see insulationLayers())
     
     // =========================================================================
     // IMP-NEW-06: Per-winding wire properties for multi-winding transformers
@@ -347,6 +355,33 @@ private:
         std::optional<Wire> wire;
     };
     std::map<size_t, WindingWireProperties> _perWindingWireProps;
+    bool isPlanarTurn(const ThermalNetworkNode& node) const;
+    /// True when another turn lies in the axial gap between two turns, radially under both.
+    bool turnBetweenAlongAxis(const std::vector<size_t>& turnNodeIndices, size_t node1Idx, size_t node2Idx) const;
+
+    // ABT #1735: a winding wound on a lateral leg of a three-column shell. The concentric
+    // network then splits the lateral-column node into the two legs and gives the wound leg's
+    // winding its own enclosure (its leg, the flanges, the shared -x window).
+    struct LateralPlacement {
+        size_t mainColumnIndex;
+        size_t plusLegIndex;               // outer leg at +x (processed column index)
+        size_t minusLegIndex;              // outer leg at -x
+        std::map<size_t, size_t> bobbinWindowOfWoundLeg;  // wound outer leg -> bobbin window of its winding
+        std::map<std::string, size_t> columnOfSection;    // section name -> wound column
+    };
+    std::optional<LateralPlacement> _lateralPlacement;
+    void resolveLateralPlacement();
+    /// Column a turn/layer of section @p sectionName is wound around (lateral placement only).
+    size_t woundColumnOfSection(const std::optional<std::string>& sectionName, const std::string& what) const;
+    bool isLateralWound(const ThermalNetworkNode& node) const;
+    /// +1 / -1: side of the leg a lateral-wound node is wound on.
+    double lateralSide(const ThermalNetworkNode& node) const;
+    bool isLegWound(size_t columnIndex) const;
+    /// Wrap of a lateral leg's winding: the leg's own bobbin column (leg + one column-wall thickness),
+    /// as Coil::get_wound_column_frame_for_section builds it.
+    struct LateralWrap { double axisX; double halfWidth; double halfDepth; double legFaceX; double wallThickness; ColumnShape shape; };
+    LateralWrap lateralWrapGeometry(size_t columnIndex) const;
+    size_t legNodeIndex(size_t columnIndex) const;
     // The film on a conductor's OUTER surface, the one that rests on a bobbin, core or wrap:
     // {thickness, thermal conductivity}; thickness 0 means bare metal. For litz it is the
     // serving when there is one and the outer strands' own enamel when there is not (ABT #1454).
@@ -466,18 +501,19 @@ private:
     /**
      * @brief Get core thermal conductivity from actual material data
      * 
-     * Resolves the core material from the database and returns its thermal
-     * conductivity. Falls back to _config.coreThermalConductivity if material
-     * resolution fails.
+     * Resolves the core material and returns resolve_core_material_heat_conductivity(...).value:
+     * the MAS value, or a flagged class/family/all-sourced estimate (absence never throws).
      */
     double getCoreThermalConductivity() const;
     
     /**
      * @brief Get bobbin thermal conductivity from bobbin material data
-     * 
-     * Checks if the bobbin has a material specified in its functional description.
-     * If so, resolves it and returns its thermal conductivity.
-     * Falls back to the default bobbin material (PET) from Defaults.
+     *
+     * The bobbin's material (functional description) through
+     * resolve_bobbin_material_thermal_conductivity: its MAS value, or a WARNING-flagged estimate
+     * from its polymer class (ABT #1643). A material name MAS has no record of throws
+     * MATERIAL_NOT_FOUND. A bobbin that states no material is Defaults().defaultBobbinMaterial
+     * (PET), the same answer the stray-capacitance model gives (Alf's ruling 2026-09-12).
      */
     double getBobbinThermalConductivity() const;
     
@@ -659,6 +695,11 @@ private:
 
     /// Share of a concentric wrap that lies inside the core windows: column depth / (width + depth).
     double inWindowFraction() const;
+    /// ABT #1735: in-window share of THIS node's wrap: the main column's for main-wound nodes; for a
+    /// lateral leg only its inner segment runs through a window, depth / (2 (width + depth)).
+    double inWindowFraction(const ThermalNetworkNode& node) const;
+    /// ABT #1735: across-window conduction in the shared -x window and the lateral leg's flanges.
+    void createLateralAcrossWindowConnections(size_t ambientIdx);
 
     /// ABT #1459: exposed (room-facing) outer surface of a concentric core, from its real geometry.
     struct CoreExteriorAreas {
@@ -755,6 +796,30 @@ private:
      * @brief Get insulation layer thermal resistance between turns
      */
     double getInsulationLayerThermalResistance(int turnIdx1, int turnIdx2, double contactArea);
+
+    /**
+     * @brief The coil's turns description, copied once per network (ABT #838)
+     *
+     * The MAS getter returns the turns BY VALUE; the turn-to-turn connections read it for every
+     * touching pair, which copied the whole description O(N^2) times (0.8 s per network for a
+     * 492-turn coil).
+     */
+    const std::optional<std::vector<Turn>>& turnsDescription();
+
+    /**
+     * @brief The coil's insulation layers, read once per network (ABT #1840)
+     *
+     * Coil::get_layers_description_insulation copies every layer of the coil (the MAS getter returns them
+     * BY VALUE); the turn-to-turn connections asked for it for every touching pair. Throws, every time it
+     * is asked, what StrayCapacitance::get_insulation_layers_between_two_turns_in_place throws for a coil
+     * without sections or layers description.
+     */
+    const std::vector<Layer>& insulationLayers();
+
+    /**
+     * @brief StrayCapacitance::get_insulation_layers_between_two_turns_in_place on insulationLayers()
+     */
+    std::vector<Layer> insulationLayersBetweenTurns(const Turn& firstTurn, const Turn& secondTurn);
     
     /**
      * @brief Calculate contact area between two quadrants

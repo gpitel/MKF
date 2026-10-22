@@ -16,6 +16,7 @@
 #include "json.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <algorithm>
@@ -1248,12 +1249,50 @@ TEST_CASE("UT_20", "[constructive-model][core][processed-description][smoke-test
     REQUIRE_THAT(*(core.get_processed_description()->get_winding_windows()[0].get_width()), Catch::Matchers::WithinAbs(0.0075, 0.0075 * 0.2));
     REQUIRE_THAT(core.get_processed_description()->get_columns()[0].get_width(), Catch::Matchers::WithinAbs(0.0041, 0.0041 * 0.2));
     REQUIRE_THAT(core.get_processed_description()->get_columns()[0].get_depth(), Catch::Matchers::WithinAbs(0.0046 * numberStacks, 0.0046 * numberStacks * 0.2));
-    REQUIRE_THAT(core.get_processed_description()->get_columns()[1].get_width(), Catch::Matchers::WithinAbs(0.0033 * numberStacks, 0.0033 * numberStacks * 0.2));
+    // Return leg A - E - F = 14.1 - 7.5 - 4.1 = 2.5 mm (it read the symmetric (A - E)/2 = 3.3 mm
+    // before the UT columns took F into account).
+    REQUIRE_THAT(core.get_processed_description()->get_columns()[1].get_width(), Catch::Matchers::WithinAbs(0.0025 * numberStacks, 0.0025 * numberStacks * 0.2));
     REQUIRE_THAT(core.get_processed_description()->get_columns()[1].get_depth(), Catch::Matchers::WithinAbs(0.0046 * numberStacks, 0.0046 * numberStacks * 0.2));
     REQUIRE(core.get_processed_description()->get_columns()[0].get_shape() ==
           ColumnShape::RECTANGULAR);
     REQUIRE(core.get_processed_description()->get_columns()[1].get_shape() ==
           ColumnShape::RECTANGULAR);
+}
+
+TEST_CASE("UT_20_Columns_Are_The_Wound_Leg_F_And_The_Return_Leg", "[constructive-model][core][processed-description][ut-columns]") {
+    // MAS 'UT 20': A 14.1, C 4.6, D 16, E 7.5, F 4.1 mm. The wound leg is F wide and the return
+    // leg takes the rest of the width, A - E - F = 2.5 mm; get_shape_constants (Ae/le) has always
+    // used that split, while the columns, the winding window and the column positions assumed two
+    // equal (A - E)/2 = 3.3 mm legs.
+    settings.reset();
+    auto coreShape = OpenMagnetics::find_core_shape_by_name("UT 20");
+    Core core(coreShape, OpenMagnetics::find_core_material_by_name("3C95"));
+    core.process_data();
+    auto processedDescription = core.get_processed_description().value();
+    auto columns = processedDescription.get_columns();
+    REQUIRE(columns.size() == 2);
+    double halfDigit = 0.05e-3;  // MAS states these dimensions to 0.1 mm
+    CHECK_THAT(columns[0].get_width(), Catch::Matchers::WithinAbs(4.1e-3, halfDigit));
+    CHECK_THAT(columns[1].get_width(), Catch::Matchers::WithinAbs(2.5e-3, halfDigit));
+    CHECK_THAT(columns[0].get_area(), Catch::Matchers::WithinAbs(4.1e-3 * 4.6e-3, 1e-9));
+    CHECK_THAT(columns[1].get_area(), Catch::Matchers::WithinAbs(2.5e-3 * 4.6e-3, 1e-9));
+    // Column frame: origin on the wound leg's axis. Return-leg axis at F/2 + E + (A-E-F)/2 = 10.8 mm;
+    // window centre at the wound leg's face plus half the window, F/2 + E/2 = 5.8 mm.
+    CHECK_THAT(columns[1].get_coordinates()[0], Catch::Matchers::WithinAbs(10.8e-3, halfDigit));
+    auto windingWindow = processedDescription.get_winding_windows()[0];
+    CHECK_THAT(windingWindow.get_width().value(), Catch::Matchers::WithinAbs(7.5e-3, halfDigit));
+    CHECK_THAT(windingWindow.get_coordinates().value()[0], Catch::Matchers::WithinAbs(5.8e-3, halfDigit));
+    // The window's inner edge is the wound leg's face and its outer edge the return leg's face.
+    CHECK_THAT(windingWindow.get_coordinates().value()[0] - windingWindow.get_width().value() / 2,
+               Catch::Matchers::WithinAbs(columns[0].get_width() / 2, 1e-9));
+    CHECK_THAT(windingWindow.get_coordinates().value()[0] + windingWindow.get_width().value() / 2,
+               Catch::Matchers::WithinAbs(columns[1].get_coordinates()[0] - columns[1].get_width() / 2, 1e-9));
+    auto effective = processedDescription.get_effective_parameters();
+    // Ae/le come from get_shape_constants (IEC 63182 form), which already split the legs F / A-E-F,
+    // so the column fix leaves them where they were: 12.26 mm^2 / 53.20 mm, pinned to the printed
+    // digit. TDK publishes 12.1 mm^2 / 52.9 mm for its FT20.6 (UT 20) set, 1.3 % / 0.6 % below.
+    CHECK_THAT(effective.get_effective_area() * 1e6, Catch::Matchers::WithinAbs(12.26, 0.005));
+    CHECK_THAT(effective.get_effective_length() * 1e3, Catch::Matchers::WithinAbs(53.20, 0.005));
 }
 
 TEST_CASE("T_40_24_16", "[constructive-model][core][processed-description][smoke-test]") {
@@ -1982,12 +2021,29 @@ TEST_CASE("Test_Core_Effective_Permeability", "[constructive-model][core][functi
 
     Core core(coreJson, true);
 
-    auto effectivePermeability = core.get_effective_permeability(25);
+    // The expected values are the vendor's mu_e, and the vendor defines mu_e = le / (mu0 Ae R_core) with the
+    // IEC 60205 le (C1^2 / C2, corners booked as quarter circles). Since ABT #1766 MKF's processed le carries the
+    // field-exact corners (Ae unchanged), so Core::get_effective_permeability, which uses the processed le, is not
+    // the vendor's quantity. Compare like with like: the same core reluctance R and processed Ae, with the
+    // IEC-convention le of the same shape.
+    auto corePiece = CorePiece::factory(std::get<CoreShape>(core.get_functional_description().get_shape()));
+    // The piece's IEC le is C1^2 / C2 and its processed (exact) le sits in its partial parameters; the core's le is
+    // the piece's times the number of pieces in the path, so scale the core's processed le by the piece's ratio.
+    auto [c1, c2, minimumArea] = corePiece->get_shape_constants();
+    double pieceIecToExactLengthRatio = (c1 * c1 / c2) / corePiece->get_partial_effective_parameters().get_effective_length();
+    auto processedEffectiveParameters = core.get_processed_description().value().get_effective_parameters();
+    double iecEffectiveLength = processedEffectiveParameters.get_effective_length() * pieceIecToExactLengthRatio;
+    double effectiveArea = processedEffectiveParameters.get_effective_area();
+    auto vendorConventionEffectivePermeability = [&](double temperature) {
+        return iecEffectiveLength / (core.get_reluctance(temperature) * effectiveArea * Constants().vacuumPermeability);
+    };
+
+    auto effectivePermeability = vendorConventionEffectivePermeability(25);
     double expectedEffectivePermeability = 136;
 
     REQUIRE_THAT(expectedEffectivePermeability, Catch::Matchers::WithinAbs(effectivePermeability, expectedEffectivePermeability * maximumError));
 
-    effectivePermeability = core.get_effective_permeability(125);
+    effectivePermeability = vendorConventionEffectivePermeability(125);
     expectedEffectivePermeability = 139;
     REQUIRE_THAT(expectedEffectivePermeability, Catch::Matchers::WithinAbs(effectivePermeability, expectedEffectivePermeability * maximumError));
 }
@@ -2197,8 +2253,9 @@ TEST_CASE("Toroid_Coating_Winding_Window_Offset", "[constructive-model][core][co
     Core epoxy = makeToroid("epoxy");
     Core parylene = makeToroid("parylene");
 
-    // A toroid with no coating field is jacketed in practice, so it falls back to the
-    // default (epoxy) coating; a name-only coating resolves to its datasheet default.
+    // A toroid that declares no coating is bare (0): the catalogue states the coating of every
+    // part that has one, and no single default stands for an unknown one (real rings range from
+    // bare to 0.6 mm). A name-only coating resolves to its datasheet default.
     //
     // ABT #964: this is a FERRITE ring core, and epoxy on ferrite is not the film a powder
     // toroid carries. Fair-Rite's thermo-set plastic adds at most 0.5 mm across a diameter
@@ -2206,8 +2263,9 @@ TEST_CASE("Toroid_Coating_Winding_Window_Offset", "[constructive-model][core][co
     // limits on R 50.0x30.0x20.0 work out to exactly 0.400 mm per surface against the UNCOATED
     // limits, matching the "< 0.4 mm" it states. The old 0.10 mm here was the POWDER-core value,
     // which is still what a powder toroid resolves to.
-    REQUIRE_THAT(defaulted.get_coating_thickness(),
-                 Catch::Matchers::WithinAbs(Defaults().defaultFerriteEpoxyCoreCoatingThickness, 1e-12));
+    REQUIRE(defaulted.get_coating_thickness() == 0.0);
+    REQUIRE(defaulted.get_coating_thickness(DimensionalValues::MAXIMUM) == 0.0);
+    REQUIRE(defaulted.get_coating_thickness(DimensionalValues::MINIMUM) == 0.0);
     REQUIRE_THAT(epoxy.get_coating_thickness(),
                  Catch::Matchers::WithinAbs(Defaults().defaultFerriteEpoxyCoreCoatingThickness, 1e-12));
     REQUIRE_THAT(parylene.get_coating_thickness(), Catch::Matchers::WithinAbs(12.7e-6, 1e-12));
@@ -2221,7 +2279,7 @@ TEST_CASE("Toroid_Coating_Winding_Window_Offset", "[constructive-model][core][co
     uncoatedJson["functionalDescription"]["shape"] = "T 40/24/16";
     uncoatedJson["functionalDescription"]["gapping"] = json::array();
     uncoatedJson["functionalDescription"]["numberStacks"] = 1;
-    uncoatedJson["functionalDescription"]["coating"] = {{"type", "epoxy"}, {"thickness", 0.0}};
+    uncoatedJson["functionalDescription"]["coating"] = {{"type", "epoxy"}, {"thickness", {{"nominal", 0.0}}}};
     Core uncoated(uncoatedJson, true);
     REQUIRE(uncoated.get_coating_thickness() == 0.0);
 
@@ -2254,7 +2312,7 @@ TEST_CASE("Toroid_Coating_Winding_Window_Offset", "[constructive-model][core][co
     explicitJson["functionalDescription"]["shape"] = "T 40/24/16";
     explicitJson["functionalDescription"]["gapping"] = json::array();
     explicitJson["functionalDescription"]["numberStacks"] = 1;
-    explicitJson["functionalDescription"]["coating"] = {{"type", "epoxy"}, {"thickness", 0.0005}};
+    explicitJson["functionalDescription"]["coating"] = {{"type", "epoxy"}, {"thickness", {{"nominal", 0.0005}}}};
     Core explicitCore(explicitJson, true);
     REQUIRE_THAT(explicitCore.get_coating_thickness(), Catch::Matchers::WithinAbs(0.0005, 1e-12));
     double explicitRh = explicitCore.get_processed_description()->get_winding_windows()[0].get_radial_height().value();
@@ -2273,9 +2331,9 @@ TEST_CASE("Toroid_Coating_Winding_Window_Offset", "[constructive-model][core][co
     Core eCore(eCoreJson, true);
     REQUIRE(eCore.get_coating_thickness() == 0.0);
 
-    // A SMALL toroid (OD <= 5.08 mm) defaults to parylene rather than epoxy, mirroring
-    // manufacturer practice (thin film on small bores). The large T 40/24/16 above gets
-    // epoxy (0.1 mm); this small one gets parylene (12.7 um) with no coating field.
+    // A SMALL toroid (OD <= 5.08 mm) is in the parylene size tier (thin film on small bores),
+    // which picks its edge radius, but with no coating field it is still bare: 0, and it has
+    // no coating dielectric to ask about.
     json smallJson;
     smallJson["functionalDescription"] = json();
     smallJson["name"] = "core_T_small_parylene_default";
@@ -2285,8 +2343,9 @@ TEST_CASE("Toroid_Coating_Winding_Window_Offset", "[constructive-model][core][co
     smallJson["functionalDescription"]["gapping"] = json::array();
     smallJson["functionalDescription"]["numberStacks"] = 1;
     Core smallToroid(smallJson, true);
-    REQUIRE_THAT(smallToroid.get_coating_thickness(), Catch::Matchers::WithinAbs(12.7e-6, 1e-12));
-    REQUIRE_THAT(smallToroid.get_coating_relative_permittivity(), Catch::Matchers::WithinAbs(3.1, 1e-9));
+    REQUIRE(smallToroid.get_default_toroid_coating_is_parylene());
+    REQUIRE(smallToroid.get_coating_thickness() == 0.0);
+    REQUIRE_THROWS(smallToroid.get_coating_relative_permittivity());
 }
 
 TEST_CASE("Toroid_Coating_Relative_Permittivity", "[constructive-model][core][coating]") {
@@ -2312,11 +2371,13 @@ TEST_CASE("Toroid_Coating_Relative_Permittivity", "[constructive-model][core][co
     REQUIRE_THAT(makeCore("parylene").get_coating_relative_permittivity(), Catch::Matchers::WithinAbs(3.1, 1e-9));
 
     // An explicit material overrides the per-type default (Kapton HN = 3.4).
-    Core explicitMat = makeCore(json({{"type", "epoxy"}, {"thickness", 0.0003}, {"material", "Kapton HN"}}));
+    Core explicitMat = makeCore(json({{"type", "epoxy"}, {"thickness", {{"nominal", 0.0003}}}, {"material", "Kapton HN"}}));
     REQUIRE_THAT(explicitMat.get_coating_relative_permittivity(), Catch::Matchers::WithinAbs(3.4, 1e-9));
 
-    // A toroid with no coating field falls back to the default epoxy permittivity.
-    REQUIRE_THAT(makeCore(json(nullptr)).get_coating_relative_permittivity(), Catch::Matchers::WithinAbs(3.6, 1e-9));
+    // A toroid with no coating field is bare: it has no coating dielectric, so asking for one
+    // throws, exactly as for a bobbin-wound core.
+    REQUIRE(makeCore(json(nullptr)).get_coating_thickness() == 0.0);
+    REQUIRE_THROWS(makeCore(json(nullptr)).get_coating_relative_permittivity());
 
     // A NON-toroidal core has no coating, so resolving its permittivity throws rather
     // than inventing one (it is wound on a bobbin, not directly on the ferrite).
@@ -2493,7 +2554,7 @@ namespace TestDrumCore {
         coreJson["functionalDescription"] = {
             {"type", "pieceAndPlate"}, {"material", "3C90"}, {"shape", shapeJson},
             {"gapping", json::array()}, {"numberStacks", 1},
-            {"coating", {{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", "Kool Mµ 26"}}}};
+            {"coating", {{"type", "magneticEpoxy"}, {"thickness", {{"nominal", 0.0001}}}, {"material", "Kool Mµ 26"}}}};
         Core core(coreJson);
         core.process_data();
         core.process_gap();
@@ -2679,7 +2740,7 @@ namespace TestNewFamilySaturation {
         semishieldedCoreJson["functionalDescription"] = {
             {"type", "pieceAndPlate"}, {"material", "3C90"}, {"shape", semishieldedShape},
             {"gapping", json::array()}, {"numberStacks", 1},
-            {"coating", {{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", "Kool Mµ 26"}}}};
+            {"coating", {{"type", "magneticEpoxy"}, {"thickness", {{"nominal", 0.0001}}}, {"material", "Kool Mµ 26"}}}};
         Core semishieldedCore(semishieldedCoreJson);
         semishieldedCore.process_data();
         semishieldedCore.process_gap();
@@ -3453,41 +3514,48 @@ TEST_CASE("Toroid_Coating_Is_Resolved_Per_Material_Family", "[core][coating][abt
     // same direction, so the bare core's dimensional tolerance cancels instead of being counted
     // as coating. TDK R 50.0x30.0x20.0 yields 0.400 mm on all three axes that way, matching the
     // "< 0.4 mm" it states; Ferroxcube draws its TN jacket at ~0.3 mm.
-    auto toroid = [](const std::string& shape, const std::string& material) {
+    auto toroid = [](const std::string& shape, const std::string& material, const std::string& coating = "") {
         json coreJson;
         coreJson["functionalDescription"]["type"] = "toroidal";
         coreJson["functionalDescription"]["material"] = material;
         coreJson["functionalDescription"]["shape"] = shape;
         coreJson["functionalDescription"]["gapping"] = json::array();
         coreJson["functionalDescription"]["numberStacks"] = 1;
+        if (!coating.empty()) {
+            coreJson["functionalDescription"]["coating"] = coating;
+        }
         return Core(coreJson, true);
     };
     auto defaults = Defaults();
 
-    // Ferrite past TDK's R 9.53 crossover: epoxy, at the drawn ring-core thickness.
+    // Ferrite past TDK's R 9.53 crossover: the epoxy-sized tier, and an "epoxy" jacket resolves
+    // to the drawn ferrite ring-core thickness.
     auto ferriteLarge = toroid("T 25/15/10", "N97");
     REQUIRE(ferriteLarge.is_ferrite_core());
     REQUIRE_FALSE(ferriteLarge.get_default_toroid_coating_is_parylene());
-    REQUIRE_THAT(ferriteLarge.get_coating_thickness(),
+    REQUIRE_THAT(toroid("T 25/15/10", "N97", "epoxy").get_coating_thickness(),
                  Catch::Matchers::WithinAbs(defaults.defaultFerriteEpoxyCoreCoatingThickness, 1e-12));
 
     // THE CASE A SINGLE SHARED THRESHOLD GOT WRONG. One shape, 6,3 mm across, sits between the
-    // two crossovers: past 0.20" so a POWDER toroid of that size is epoxy, but short of R 9.53 so
-    // a FERRITE one is still parylene. Same geometry, opposite jackets, ~24x apart in thickness.
+    // two crossovers: past 0.20" so a POWDER toroid of that size is in the epoxy tier, but short
+    // of R 9.53 so a FERRITE one is still in the parylene (small, tumbled-edge) tier.
     auto ferriteMid = toroid("T 6.3/3.8/2.5", "N97");
     REQUIRE(ferriteMid.is_ferrite_core());
     REQUIRE(ferriteMid.get_default_toroid_coating_is_parylene());
-    REQUIRE_THAT(ferriteMid.get_coating_thickness(),
-                 Catch::Matchers::WithinAbs(defaults.defaultParyleneCoreCoatingThickness, 1e-12));
 
     auto powderMid = toroid("T 6.3/3.8/2.5", "Kool M\u00b5 26");
     REQUIRE_FALSE(powderMid.is_ferrite_core());
     REQUIRE_FALSE(powderMid.get_default_toroid_coating_is_parylene());
-    REQUIRE_THAT(powderMid.get_coating_thickness(),
+    REQUIRE_THAT(toroid("T 6.3/3.8/2.5", "Kool M\u00b5 26", "epoxy").get_coating_thickness(),
                  Catch::Matchers::WithinAbs(defaults.defaultEpoxyCoreCoatingThickness, 1e-12));
+    REQUIRE_THAT(toroid("T 6.3/3.8/2.5", "N97", "parylene").get_coating_thickness(),
+                 Catch::Matchers::WithinAbs(defaults.defaultParyleneCoreCoatingThickness, 1e-12));
 
-    REQUIRE(ferriteMid.get_coating_thickness() < powderMid.get_coating_thickness());
-    REQUIRE(powderMid.get_coating_thickness() < ferriteLarge.get_coating_thickness());
+    // None of them declares a coating, so all of them are bare: the tier picks the edge radius,
+    // never an invented jacket.
+    REQUIRE(ferriteLarge.get_coating_thickness() == 0.0);
+    REQUIRE(ferriteMid.get_coating_thickness() == 0.0);
+    REQUIRE(powderMid.get_coating_thickness() == 0.0);
 }
 
 TEST_CASE("Unprocessed toroid still resolves its ring edge", "[core][coating][abt964][regression]") {
@@ -3967,4 +4035,171 @@ TEST_CASE("Test_Slab_Core_Rejects_Impossible_Geometry", "[core][slab-core][smoke
     auto boreWiderThanPost = good;
     boreWiderThanPost["H"] = 0.006;
     CHECK_THROWS(build(boreWiderThanPost));
+}
+
+
+// ABT #1950: RM type 1 (RM 6-S family) back plate. The V-notch angle phi of IEC 60205:2016 5.7 Type 1
+// was hardcoded to 90 deg, which put the notch apex 0.5 mm from the centre and gave A_e 12-20 % low
+// (A_e < A_min on RM 6LP and RM 6/ILP). phi now follows from C, G, J (IEC 62317-4 Figure 1, Typ 1).
+// Two references, per SET:
+//  * TDK rm_6.pdf (3/23): B65807 p.3 with / without centre hole (RM 6-S / RM 6/I), B65807P p.11 (RM 6LP).
+//    TDK's own RM 6 sits 3.3-4.2 % above the IEC 62317-4 table in A_e. On the type-3 sizes, where MKF
+//    reproduces the IEC table to 1.3 %, TDK and IEC differ by up to 1.8 % le, 1.7 % A_e and 2.3 % V_e,
+//    with two outliers (RM 14/I A_e +5.8 %, RM 4/I A_e -7.1 %). Bands: 3 % le, 6 % A_e and V_e.
+//  * IEC 62317-4:2005 Tables 3 and 4, computed by the same IEC 60205 method. MKF reproduces the type-3
+//    rows to 1.3 % in C1 (RM 4/ILP), so the band is 2 %.
+// The pre-fix model fails both: A_e -12..-20 % against TDK and -9..-16 % against IEC.
+TEST_CASE("Test_Rm_Type1_Effective_Parameters_Match_Tdk_And_Iec", "[constructive-model][core][effective-parameters][abt-1950]") {
+    settings.reset();
+    clear_databases();
+    struct Row {
+        std::string name;
+        double le, ae, ve;  // mm, mm^2, mm^3 per set
+        double tolLe, tolAe, tolVe;
+        std::string source;
+    };
+    const std::vector<Row> rows = {
+        {"RM 6LP", 21.8, 37.5, 820, 0.03, 0.06, 0.06, "TDK B65807P"},
+        {"RM 6/I", 28.6, 36.6, 1050, 0.03, 0.06, 0.06, "TDK B65807 without centre hole"},
+        {"RM 6-S", 26.9, 31.3, 840, 0.03, 0.06, 0.06, "TDK B65807 with centre hole"},
+        {"RM 6-S", 27.2, 30.3, 830, 0.02, 0.02, 0.02, "IEC 62317-4 Table 3"},
+        {"RM 6/I", 28.9, 35.4, 1020, 0.02, 0.02, 0.02, "IEC 62317-4 Table 3"},
+        {"RM 6/9", 20.7, 31.6, 655, 0.02, 0.02, 0.02, "IEC 62317-4 Table 4"},
+        {"RM 6/ILP", 22.0, 36.0, 791, 0.02, 0.02, 0.02, "IEC 62317-4 Table 4"},
+    };
+    for (const auto& row : rows) {
+        INFO(row.name << " vs " << row.source);
+        auto core = OpenMagneticsTesting::get_quick_core(row.name, json::array(), 1, "Dummy");
+        REQUIRE(core.get_shape_family() == CoreShapeFamily::RM);
+        auto effective = core.get_processed_description()->get_effective_parameters();
+        double le = effective.get_effective_length() * 1e3;
+        double ae = effective.get_effective_area() * 1e6;
+        double ve = effective.get_effective_volume() * 1e9;
+        INFO("le " << le << " vs " << row.le << ", Ae " << ae << " vs " << row.ae << ", Ve " << ve << " vs " << row.ve
+             << ", Amin " << effective.get_minimum_area() * 1e6);
+        CHECK_THAT(le, Catch::Matchers::WithinRel(row.le, row.tolLe));
+        CHECK_THAT(ae, Catch::Matchers::WithinRel(row.ae, row.tolAe));
+        CHECK_THAT(ve, Catch::Matchers::WithinRel(row.ve, row.tolVe));
+        CHECK(effective.get_minimum_area() <= effective.get_effective_area());
+    }
+}
+
+// ABT #1950: RM type 2 (RM 7 family) back plate. IEC 60205:2016 5.7 Type 2 needs the slot-bottom width b and
+// the wall angle phi, which were hardcoded to 0 and 90 deg. They now follow from C, F, G, J (IEC 62317-4
+// Figure 1, Typ 2: slot-bottom corners on the centre-post circle F, walls to the leg tips). C = F in the
+// tables, so b = 0 and phi = 102.8 deg.
+//  * IEC 62317-4:2005 Tables 3 and 4 pin le, A_e and V_e at 5 %, not the 2 % of type 1. The figure draws a flat
+//    slot bottom about 0.27 F wide that C = F cannot reproduce, and the tables themselves need phi ~131 deg
+//    (b ~0.9 mm), which no straight-wall construction from the tabulated dimensions gives. The derived geometry
+//    lands 2.3-4.7 % low in A_e, 2.0-3.7 % high in le and within 2.5 % in V_e (Alf approved 5 % for type 2).
+//    The old b = 0, phi = 90 deg is 4.7-8.7 % low in A_e and fails RM 7/I, RM 7/10 and RM 7/ILP.
+//  * TDK rm_7.pdf (Feb 2024) p.3 with / without centre hole (RM 7 / RM 7/I), LP p.8 (RM 7/ILP, RM 7LP) pins
+//    A_e only, at the type-1 band (6 %, reasons above that test): +1.2, +4.2, +0.1, +0.6 %. TDK's le and V_e are
+//    not pinned: le is +3.0 / +4.7 / +4.3 / +4.1 % and V_e +4.3 / +8.9 / +4.9 / +5.2 % against TDK, and le was
+//    already +3.4 / +4.6 / +4.1 / +3.9 % before this change (the slot geometry hardly moves le). The IEC rows
+//    above carry the le and V_e pins.
+TEST_CASE("Test_Rm_Type2_Effective_Parameters_Match_Tdk_And_Iec", "[constructive-model][core][effective-parameters][abt-1950]") {
+    settings.reset();
+    clear_databases();
+    struct Row {
+        std::string name;
+        std::optional<double> le, ve;  // mm, mm^3 per set; empty = not pinned against this source
+        double ae;                     // mm^2 per set
+        double tolerance;
+        std::string source;
+    };
+    const std::vector<Row> rows = {
+        {"RM 7", std::nullopt, std::nullopt, 40.0, 0.06, "TDK rm_7 p.3 with centre hole"},
+        {"RM 7/I", std::nullopt, std::nullopt, 43.0, 0.06, "TDK rm_7 p.3 without centre hole"},
+        {"RM 7/ILP", std::nullopt, std::nullopt, 45.3, 0.06, "TDK rm_7 LP p.8"},
+        {"RM 7LP", std::nullopt, std::nullopt, 45.3, 0.06, "TDK rm_7 LP p.8"},
+        {"RM 7", 29.8, 1240, 41.4, 0.05, "IEC 62317-4 Table 3"},
+        {"RM 7/I", 31.2, 1450, 46.4, 0.05, "IEC 62317-4 Table 3"},
+        {"RM 7/10", 22.8, 987, 43.2, 0.05, "IEC 62317-4 Table 4"},
+        {"RM 7/ILP", 23.9, 1140, 47.6, 0.05, "IEC 62317-4 Table 4"},
+    };
+    for (const auto& row : rows) {
+        INFO(row.name << " vs " << row.source);
+        auto core = OpenMagneticsTesting::get_quick_core(row.name, json::array(), 1, "Dummy");
+        REQUIRE(core.get_shape_family() == CoreShapeFamily::RM);
+        REQUIRE(std::get<CoreShape>(core.get_functional_description().get_shape()).get_family_subtype().value() == "2");
+        auto effective = core.get_processed_description()->get_effective_parameters();
+        double le = effective.get_effective_length() * 1e3;
+        double ae = effective.get_effective_area() * 1e6;
+        double ve = effective.get_effective_volume() * 1e9;
+        INFO("le " << le << ", Ae " << ae << " vs " << row.ae << ", Ve " << ve << ", Amin " << effective.get_minimum_area() * 1e6);
+        CHECK_THAT(ae, Catch::Matchers::WithinRel(row.ae, row.tolerance));
+        if (row.le) {
+            CHECK_THAT(le, Catch::Matchers::WithinRel(*row.le, row.tolerance));
+        }
+        if (row.ve) {
+            CHECK_THAT(ve, Catch::Matchers::WithinRel(*row.ve, row.tolerance));
+        }
+        CHECK(effective.get_minimum_area() <= effective.get_effective_area());
+    }
+}
+
+// ABT #1950: an RM type 2 shape whose centre post F is narrower than the slot-bottom distance C has no slot
+// bottom on the post, so b = sqrt(F^2 - C^2) does not exist; it throws instead of guessing b.
+TEST_CASE("Test_Rm_Type2_Slot_Bottom_Outside_Centre_Post_Throws", "[constructive-model][core][effective-parameters][abt-1950]") {
+    settings.reset();
+    clear_databases();
+    auto shape = OpenMagnetics::find_core_shape_by_name("RM 7");
+    REQUIRE(shape.get_family_subtype().value() == "2");
+    CHECK_NOTHROW(CorePiece::factory(shape));
+    auto dimensions = shape.get_dimensions().value();
+    dimensions["C"] = 0.0080;  // F stays 6.95-7.25 mm
+    shape.set_dimensions(dimensions);
+    CHECK_THROWS_WITH(CorePiece::factory(shape), Catch::Matchers::ContainsSubstring("slot-bottom corners cannot lie on the centre post"));
+}
+
+// ABT #1950: an RM piece whose computed A_e falls below its A_min throws instead of returning it.
+// RM 6LP with its back plate thinned from 2.1 to 1.2 mm (D 2.35 -> 3.29 mm, same B): A_e 25.8 mm^2 < A_min 27.1 mm^2.
+TEST_CASE("Test_Rm_Effective_Area_Below_Minimum_Area_Throws", "[constructive-model][core][effective-parameters][abt-1950]") {
+    settings.reset();
+    clear_databases();
+    auto shape = OpenMagnetics::find_core_shape_by_name("RM 6LP");
+    REQUIRE(shape.get_family_subtype().value() == "1");
+    CHECK_NOTHROW(CorePiece::factory(shape));
+    auto dimensions = shape.get_dimensions().value();
+    dimensions["D"] = 0.00329;
+    shape.set_dimensions(dimensions);
+    CHECK_THROWS_WITH(CorePiece::factory(shape), Catch::Matchers::ContainsSubstring("exceeds effective area"));
+}
+
+TEST_CASE("Test_Core_Coating_Thickness_Is_A_Dimension_With_Tolerance", "[constructive-model][core][coating]") {
+    // MAS core/coating.thickness is a dimensionWithTolerance. Sources bound it rather than state a
+    // nominal (ACME epoxy: "0.6 mm max"; Easy Magnet LoPs: a minimum per ring size), and an explicit
+    // 0 records a ring checked and found bare.
+    auto makeCore = [](json thickness) {
+        json coreJson;
+        coreJson["name"] = "coating_range";
+        coreJson["functionalDescription"]["type"] = "toroidal";
+        coreJson["functionalDescription"]["material"] = "N97";
+        coreJson["functionalDescription"]["shape"] = "T 40/24/16";
+        coreJson["functionalDescription"]["gapping"] = json::array();
+        coreJson["functionalDescription"]["numberStacks"] = 1;
+        coreJson["functionalDescription"]["coating"] = {{"type", "epoxy"}, {"thickness", thickness}};
+        return Core(coreJson, true);
+    };
+
+    SECTION("a maximum-only thickness resolves to that maximum") {
+        Core core = makeCore({{"maximum", 0.0006}});
+        REQUIRE_THAT(core.get_coating_thickness(), Catch::Matchers::WithinAbs(0.0006, 1e-12));
+        REQUIRE_THAT(core.get_coating_thickness(DimensionalValues::MAXIMUM), Catch::Matchers::WithinAbs(0.0006, 1e-12));
+    }
+    SECTION("a range resolves to its midpoint, and each bound on request") {
+        Core core = makeCore({{"minimum", 0.0001}, {"maximum", 0.0006}});
+        REQUIRE_THAT(core.get_coating_thickness(), Catch::Matchers::WithinAbs(0.00035, 1e-12));
+        REQUIRE_THAT(core.get_coating_thickness(DimensionalValues::MINIMUM), Catch::Matchers::WithinAbs(0.0001, 1e-12));
+        REQUIRE_THAT(core.get_coating_thickness(DimensionalValues::MAXIMUM), Catch::Matchers::WithinAbs(0.0006, 1e-12));
+    }
+    SECTION("an explicit 0 is a bare toroid, NOT the undeclared-toroid default") {
+        Core core = makeCore({{"nominal", 0.0}});
+        REQUIRE(core.get_coating_thickness() == 0.0);
+    }
+    SECTION("a negative thickness throws") {
+        // Processing already reads the thickness (the coated bore), so construction throws.
+        REQUIRE_THROWS_AS(makeCore({{"nominal", -0.0001}}), InvalidInputException);
+    }
 }

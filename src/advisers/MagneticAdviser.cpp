@@ -1,4 +1,5 @@
 #include "processors/Inputs.h"
+#include <algorithm>
 #include <source_location>
 #include <cfloat>
 #include <cmath>
@@ -15,22 +16,6 @@
 
 namespace OpenMagnetics {
 
-namespace {
-// A core counts as wound only when the coil adviser returned at least one coil that passed the
-// validity filters. Its INVALID-marked fallbacks (the best of the failed designs, returned so a
-// caller is never left empty-handed) used to count too: the search then stopped after
-// expectedWoundCores cores whose every coil was invalid, before reaching a core large enough to
-// wind (the simulated PSFB: three undersized ferrites, every coil over the effective current
-// density limit, and nothing to load in the Magnetic Adviser).
-bool core_wound_validly(std::vector<Mas>& masesWithCoil) {
-    for (auto& masWithCoil : masesWithCoil) {
-        if (!coil_failed_validity_filters(masWithCoil)) {
-            return true;
-        }
-    }
-    return false;
-}
-}  // namespace
 
 namespace {
 // Drop coil-invalid fallback designs (CoilAdviser stamps INVALID_COIL_REFERENCE_PREFIX on the best
@@ -186,6 +171,28 @@ WoundCandidateOutcome process_wound_candidate(
         }
     }
 
+    // Final temperature gate on the ASSEMBLED magnetic (ABT #1412). The CoreAdviser's
+    // temperature gate judges the core with core losses only, before any winding exists;
+    // the simulate() above reports the hot-spot of the whole part (core + winding) on every
+    // operating point, which is the temperature the user is shown. A design the core gate
+    // let through can still exceed the limit once its winding losses are in.
+    if (settings.get_core_adviser_enable_temperature_filter()) {
+        const double maximumTemperature = resolve_maximum_design_temperature(mas.get_mutable_inputs());
+        for (const auto& output : mas.get_outputs()) {
+            if (!output.get_temperature()) {
+                throw InvalidInputException(ErrorCode::MISSING_DATA,
+                    "MagneticAdviser: simulate() returned no temperature for '" + mas.get_mutable_magnetic().get_reference()
+                    + "', so the temperature filter cannot judge it");
+            }
+            if (output.get_temperature()->get_maximum_temperature() > maximumTemperature) {
+                logEntry("MagneticAdviser: dropping '" + mas.get_mutable_magnetic().get_reference()
+                         + "' — simulated hot-spot " + std::to_string(output.get_temperature()->get_maximum_temperature())
+                         + " C above the " + std::to_string(maximumTemperature) + " C limit", "MagneticAdviser", 2);
+                return WoundCandidateOutcome::Skipped;
+            }
+        }
+    }
+
     masData.push_back(mas);
     if (masData.size() >= globalCandidateCap) {
         return WoundCandidateOutcome::GlobalCapHit;
@@ -232,10 +239,15 @@ void MagneticAdviser::load_filter_flow(std::vector<MagneticFilterOperation> flow
 }
 
 std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic_fast(Inputs inputs, size_t maximumNumberResults) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
     return get_advised_magnetic_fast(inputs, {}, maximumNumberResults);
 }
 
 std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic_fast(Inputs inputs, std::vector<MagneticFilterOperation> filterFlow, size_t maximumNumberResults) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
+    // ABT #1718: the loss ranking integrates the primary voltage of every wound candidate; an
+    // unbalanced voltage is rejected once, here, before any core is searched or coil wound.
+    Inputs::check_adviser_inputs_volt_second_balance(inputs);
     inputs = pre_process_inputs(inputs);
 
     // Caller-supplied filters (e.g. DC/EFFECTIVE_CURRENT_DENSITY) are evaluated
@@ -391,6 +403,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic_fast(I
 
     // Step 3: Set turns and gap analytically (single pass, no iteration)
     add_initial_turns_by_inductance(&magneticsWithScoring, inputs);
+    coreAdviser.filter_by_window_copper_capacity(&magneticsWithScoring, inputs, " (fast path)");
 
     // Step 3a: Inductance-validity filter — reject cores whose ACHIEVED
     // inductance is outside the required tolerance band. This is the slow
@@ -419,7 +432,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic_fast(I
     coreAdviser.select_inductor_turns_and_gap_by_losses(&magneticsWithScoring, inputs);
 
     // Step 4: Add secondary windings from turns ratios
-    correct_windings(&magneticsWithScoring, inputs);
+    correct_windings(&magneticsWithScoring, inputs, get_application() != MAS::MagneticApplication::INTERFERENCE_SUPPRESSION);
 
     // Multi-winding transformers: prefer an INTERLEAVED winding (primary and
     // secondary split into alternating sections) over the default single
@@ -445,22 +458,26 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic_fast(I
     for (auto& [magnetic, scoring] : magneticsWithScoring) {
         Mas mas;
         try {
-            mas = coreAdviser.post_process_core(magnetic, inputs);
-
             // If the interleaved layout did not fit this core's window, retry the
             // non-interleaved (level-1) layout before giving up — a tighter core
             // may only host the windings as one section each. This preserves the
             // candidate (a valid, if more loosely coupled, design) instead of
-            // dropping it.
-            bool wound = mas.get_magnetic().get_coil().get_turns_description()
-                         && !mas.get_magnetic().get_coil().get_turns_description()->empty();
-            if (!wound && numberWindingsFast > 1
-                && magnetic.get_coil().get_current_repetitions() != 1) {
+            // dropping it. post_process_core refuses a stand-in it cannot wind with
+            // COIL_WINDING_ERROR (ABT #838); any other error is not a layout verdict.
+            try {
+                mas = coreAdviser.post_process_core(magnetic, inputs);
+            }
+            catch (const CoilException& e) {
+                if (e.code() != ErrorCode::COIL_WINDING_ERROR || numberWindingsFast <= 1
+                    || magnetic.get_coil().get_current_repetitions() == 1) {
+                    throw;
+                }
+                logEntry(std::string("MagneticAdviser::get_advised_magnetic_fast: the interleaved layout does not fit, retrying one section per winding: ") + e.what(), "MagneticAdviser", 2);
                 magnetic.get_mutable_coil().set_interleaving_level(1);
                 mas = coreAdviser.post_process_core(magnetic, inputs);
-                wound = mas.get_magnetic().get_coil().get_turns_description()
-                        && !mas.get_magnetic().get_coil().get_turns_description()->empty();
             }
+            bool wound = mas.get_magnetic().get_coil().get_turns_description()
+                         && !mas.get_magnetic().get_coil().get_turns_description()->empty();
 
             // Never surface an un-wound magnetic: if fast_wind could not lay out
             // the turns (window too small for the inductance-driven turn count),
@@ -548,6 +565,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic_fast(I
 }
 
 std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs inputs, size_t maximumNumberResults) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
     return get_advised_magnetic(inputs, _defaultCustomMagneticFilterFlow, maximumNumberResults);
 }
 
@@ -556,6 +574,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(
         size_t maximumNumberResults,
         const LibraryContext* ctx,
         const AdviserConstraints& constraints) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
     auto scope = ctx ? ctx->applyScoped() : LibraryContext::Scope{};
     ConstraintsScope constraintsScope(_constraints, constraints);
     return get_advised_magnetic(inputs, _defaultCustomMagneticFilterFlow, maximumNumberResults);
@@ -567,6 +586,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(
         size_t maximumNumberResults,
         const LibraryContext* ctx,
         const AdviserConstraints& constraints) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
     auto scope = ctx ? ctx->applyScoped() : LibraryContext::Scope{};
     ConstraintsScope constraintsScope(_constraints, constraints);
     return get_advised_magnetic(inputs, weights, maximumNumberResults);
@@ -578,6 +598,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(
         size_t maximumNumberResults,
         const LibraryContext* ctx,
         const AdviserConstraints& constraints) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
     auto scope = ctx ? ctx->applyScoped() : LibraryContext::Scope{};
     ConstraintsScope constraintsScope(_constraints, constraints);
     return get_advised_magnetic(inputs, filterFlow, maximumNumberResults);
@@ -588,21 +609,26 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic_fast(
         size_t maximumNumberResults,
         const LibraryContext* ctx,
         const AdviserConstraints& constraints) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
     auto scope = ctx ? ctx->applyScoped() : LibraryContext::Scope{};
     ConstraintsScope constraintsScope(_constraints, constraints);
     return get_advised_magnetic_fast(inputs, maximumNumberResults);
 }
 
 std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs inputs, std::map<MagneticFilters, double> weights, size_t maximumNumberResults) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
     std::vector<MagneticFilterOperation> customMagneticFilterFlow{
-        MagneticFilterOperation(MagneticFilters::COST, true, true, weights[MagneticFilters::COST]),
-        MagneticFilterOperation(MagneticFilters::LOSSES, true, true, weights[MagneticFilters::LOSSES]),
-        MagneticFilterOperation(MagneticFilters::DIMENSIONS, true, true, weights[MagneticFilters::DIMENSIONS]),
+        MagneticFilterOperation(MagneticFilters::COST, true, true, false, weights[MagneticFilters::COST]),
+        MagneticFilterOperation(MagneticFilters::LOSSES, true, true, false, weights[MagneticFilters::LOSSES]),
+        MagneticFilterOperation(MagneticFilters::DIMENSIONS, true, true, false, weights[MagneticFilters::DIMENSIONS]),
     };
     return get_advised_magnetic(inputs, customMagneticFilterFlow, maximumNumberResults);
 }
 
 std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs inputs, std::vector<MagneticFilterOperation> filterFlow, size_t maximumNumberResults) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
+    // ABT #1718: see get_advised_magnetic_fast.
+    Inputs::check_adviser_inputs_volt_second_balance(inputs);
     clear_scoring();
     _failedScorings.clear();  // stale rejections would mis-rank the next run (ABT #801)
     load_filter_flow(filterFlow, inputs);
@@ -755,6 +781,9 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
     size_t expectedWoundCores = std::min(maximumNumberResults, std::max(size_t(2), size_t(floor(double(maximumNumberResults) / numberWindings))));
     size_t requestedCores = expectedWoundCores;
     std::vector<std::string> evaluatedCores;
+    // Toroids among the evaluated cores: the retry without toroids only has something new to
+    // try when some of the evaluated slots went to toroids.
+    size_t numberEvaluatedToroidalCores = 0;
     size_t previouslyObtainedCores = SIZE_MAX;
     size_t whileIteration = 0;
     const size_t maxWhileIterations = 2;  // Limit exponential growth
@@ -838,6 +867,9 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
             }
             else {
                 evaluatedCores.push_back(coreName);
+                if (mas.get_magnetic().get_core().get_functional_description().get_type() == CoreType::TOROIDAL) {
+                    numberEvaluatedToroidalCores++;
+                }
             }
 
             // Check performance limit
@@ -851,10 +883,13 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
             std::vector<std::pair<size_t, double>> usedNumberSectionsAndMargin;
             auto masMagneticsWithCoreAndCoil = coilAdviser.get_advised_coil(mas, std::max(2.0, ceil(double(maximumNumberResults) / masMagneticsWithCore.size())));
 
-            if (core_wound_validly(masMagneticsWithCoreAndCoil)) {
-                logEntry("Core wound!", "MagneticAdviser", 2);
-                coresWound++;
-            }
+            // A core counts as wound only once one of its valid coils survives
+            // process_wound_candidate's gates (saturation, temperature). Neither the coil
+            // adviser's INVALID-marked fallbacks nor coils the gates drop count: a search that
+            // counted them stopped after expectedWoundCores cores whose every coil was invalid
+            // (the simulated PSFB: three undersized ferrites over the current density limit) or
+            // too hot, before reaching a core large enough to wind cool.
+            bool coreAccepted = false;
             size_t processedCoils = 0;
             defer_invalid_coils(masMagneticsWithCoreAndCoil);
             for (auto mas : masMagneticsWithCoreAndCoil) {
@@ -864,6 +899,9 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
                 auto outcome = process_wound_candidate(
                     mas, magneticSimulator, settings, previousCoilIncludeAdditionalCoordinates,
                     perCoreCoilCap, globalCandidateCap, usedNumberSectionsAndMargin, masData, processedCoils);
+                if (outcome != WoundCandidateOutcome::Skipped) {
+                    coreAccepted = true;
+                }
                 if (outcome == WoundCandidateOutcome::GlobalCapHit) {
                     logEntry("Reached globalCandidateCap (" + std::to_string(globalCandidateCap) + ")", "MagneticAdviser", 2);
                     globalCapReached = true;
@@ -872,6 +910,10 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
                 if (outcome == WoundCandidateOutcome::PerCoreCapHit) {
                     break;
                 }
+            }
+            if (coreAccepted) {
+                logEntry("Core wound!", "MagneticAdviser", 2);
+                coresWound++;
             }
             if (globalCapReached) {
                 break;
@@ -882,8 +924,18 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
         }
     }
 
+    // The retry without toroids evaluates the core list again with the toroids taken out. When no
+    // evaluated core was a toroid it would wind the same cores with the same coil adviser and
+    // fail the same way (psfb-10kw: 40 non-toroidal cores, all INVALID, wound twice), so it
+    // only runs when toroids took some of the evaluated slots.
+    const bool retryWithoutToroids = toroidsOriginallyEnabled && numberEvaluatedToroidalCores > 0;
+    if (toroidsOriginallyEnabled && !retryWithoutToroids && masData.empty()) {
+        logEntry("No magnetics found; none of the " + std::to_string(evaluatedCores.size()) +
+                 " evaluated cores was a toroid, so a retry without toroids would wind the same cores again: not retrying",
+                 "MagneticAdviser", 2);
+    }
     // With toroids to drop, the retry below gets its chance before settling for INVALID designs.
-    if (masData.empty() && !toroidsOriginallyEnabled) {
+    if (masData.empty() && !retryWithoutToroids) {
         add_deferred_invalid_coils();
     }
     logEntry("Found " + std::to_string(masData.size()) + " magnetics", "MagneticAdviser", 2);
@@ -908,7 +960,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
     }
 
     // Retry without toroids if toroids were enabled but no results found
-    if (masMagneticsWithScoring.empty() && toroidsOriginallyEnabled) {
+    if (masMagneticsWithScoring.empty() && retryWithoutToroids) {
         logEntry("No magnetics found with toroids enabled. Retrying without toroids...", "MagneticAdviser", 0);
         settings.set_use_toroidal_cores(false);
         clear_loaded_cores();
@@ -955,10 +1007,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
                 logEntry("Getting coil", "MagneticAdviser", 2);
                 std::vector<std::pair<size_t, double>> usedNumberSectionsAndMargin;
                 auto masMagneticsWithCoreAndCoil = coilAdviser.get_advised_coil(mas, std::max(2.0, ceil(double(maximumNumberResults) / masMagneticsWithCore.size())));
-                if (core_wound_validly(masMagneticsWithCoreAndCoil)) {
-                    logEntry("Core wound!", "MagneticAdviser", 2);
-                    coresWound++;
-                }
+                bool coreAccepted = false;  // see the main loop: counted once a coil survives the gates
                 size_t processedCoils = 0;
 
                 // ABT #105: run retry candidates through the SAME validation path
@@ -973,6 +1022,9 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
                     auto outcome = process_wound_candidate(
                         masWithCoil, magneticSimulator, settings, previousCoilIncludeAdditionalCoordinates,
                         perCoreCoilCap, globalCandidateCap, usedNumberSectionsAndMargin, masData, processedCoils);
+                    if (outcome != WoundCandidateOutcome::Skipped) {
+                        coreAccepted = true;
+                    }
                     if (outcome == WoundCandidateOutcome::GlobalCapHit) {
                         logEntry("Reached globalCandidateCap (" + std::to_string(globalCandidateCap) + ") in retry", "MagneticAdviser", 2);
                         globalCapReached = true;
@@ -981,6 +1033,10 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
                     if (outcome == WoundCandidateOutcome::PerCoreCapHit) {
                         break;
                     }
+                }
+                if (coreAccepted) {
+                    logEntry("Core wound!", "MagneticAdviser", 2);
+                    coresWound++;
                 }
             }
             if (globalCapReached) {
@@ -1043,10 +1099,12 @@ size_t catalogue_number_windings(const Magnetic& magnetic) {
 }  // namespace
 
 std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs inputs, std::vector<Magnetic> catalogueMagnetics, size_t maximumNumberResults, bool strict) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
     return get_advised_magnetic(inputs, catalogueMagnetics, _defaultCatalogueMagneticFilterFlow, maximumNumberResults, strict);
 }
 
 std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs inputs, std::vector<Magnetic> catalogueMagnetics, std::vector<MagneticFilterOperation> filterFlow, size_t maximumNumberResults, bool strict) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
     std::vector<Mas> catalogueMagneticsWithInputs;
     for (auto magnetic : catalogueMagnetics) {
         if (inputs.get_operating_points().size() > 0 && catalogue_number_windings(magnetic) != inputs.get_operating_points()[0].get_excitations_per_winding().size()) {
@@ -1062,6 +1120,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
 }
 
 std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs inputs, const std::map<std::string, Magnetic>& catalogueMagnetics, std::vector<MagneticFilterOperation> filterFlow, size_t maximumNumberResults, bool strict) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
     std::vector<Mas> catalogueMagneticsWithInputs;
     catalogueMagneticsWithInputs.reserve(catalogueMagnetics.size());
     for (const auto& [reference, magnetic] : catalogueMagnetics) {
@@ -1078,6 +1137,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
 }
 
 std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::vector<Mas> catalogueMagneticsWithInputs, std::vector<MagneticFilterOperation> filterFlow, size_t maximumNumberResults, bool strict) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
 
     // No candidate magnetics survived upstream filtering — e.g. the requested
     // winding count has no matching parts in the catalogue (the callers above
@@ -1096,8 +1156,31 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
     // can produce different rankings between runs.
     clear_scoring();
     _failedScorings.clear();  // stale rejections would mis-rank the next run (ABT #801)
+    _lossesNotEvaluable.clear();
+    _failedCandidates.clear();
+    _judgedFrequencies.clear();
+    _measuredFrequencies.clear();
 
     load_filter_flow(filterFlow, catalogueMagneticsWithInputs[0].get_inputs());
+    // ABT #1679: the loss-model frequency-span gate below exists for the computations that need
+    // core losses at the operating frequencies -- a loss-based filter of the flow, or the final
+    // simulation (MagneticSimulator::simulate computes the core losses at every operating point).
+    // A flow that computes none (e.g. a common-mode choke search on impedance and size, whose 50 Hz
+    // mains point lies below many ferrites' loss fits) has no reason to exclude a part for its fit.
+    bool coreLossesComputed = _simulateResults;
+    for (const auto& filterConfiguration : filterFlow) {
+        coreLossesComputed |= _filters[filterConfiguration.get_filter()]->computes_core_losses();
+    }
+    // Records the requirement frequencies a filter judged this candidate on (filters that skip
+    // points their data cannot evaluate, see MagneticFilter::get_judged_frequencies).
+    auto recordJudgedFrequencies = [this](MagneticFilters filterEnum, Magnetic& magnetic, Inputs& inputs) {
+        if (auto judgedFrequencies = _filters[filterEnum]->get_judged_frequencies(&magnetic, &inputs)) {
+            _judgedFrequencies[magnetic.get_reference()][filterEnum] = judgedFrequencies.value();
+        }
+        if (auto measuredFrequencies = _filters[filterEnum]->get_measured_frequencies(&magnetic, &inputs)) {
+            _measuredFrequencies[magnetic.get_reference()][filterEnum] = measuredFrequencies.value();
+        }
+    };
     std::vector<MagneticFilterOperation> strictlyRequiredFilterFlow;
     std::vector<MagneticFilterOperation> nonStrictlyRequiredFilterFlow;
     std::vector<Mas> validMas;
@@ -1134,15 +1217,26 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
         auto magnetic = mas.get_magnetic();
         bool validMagnetic = true;
         // ABT #1456: a part whose core material has no loss coefficients at an operating frequency (outside
-        // its fitted Steinmetz span) is dropped here, before any filter computes losses. The loss filters
+        // its fitted Steinmetz span) is excluded here, before any filter computes losses. The loss filters
         // would throw on it, and 8 identical throws in a row -- a catalogue carries many parts of one
-        // material -- abort the whole run. This gate is always hard, whatever `strict` says, and scores
-        // nothing.
-        if (_lossModelFrequencySpanFilter.applies_to(&magnetic)) {
-            auto [inSpan, spanScoring] = _lossModelFrequencySpanFilter.evaluate_magnetic(&magnetic, &inputs);
-            if (!inSpan) {
-                logEntry("MagneticAdviser: dropping " + magnetic.get_reference() +
-                         ": an operating frequency lies outside its core material's fitted loss span", "MagneticAdviser", 2);
+        // material -- abort the whole run. This gate is hard, whatever `strict` says, and scores
+        // nothing. It applies only when the flow or the final simulation computes core losses (ABT
+        // #1679), and an excluded part is reported in get_failed_candidates() with the reason.
+        // A part whose core material has no core-loss model at all is neither dropped nor allowed to
+        // abort the run: every loss-based filter is not applicable to it (MagneticFilterCoreLossesBased),
+        // it is ranked on the others, and it is flagged with the reason for the caller to show.
+        if (auto reason = MagneticFilter::core_losses_not_evaluable_reason(&magnetic)) {
+            _lossesNotEvaluable[magnetic.get_reference()] = reason.value();
+            logEntry("MagneticAdviser: " + magnetic.get_reference() + ": losses not evaluable: " + reason.value(), "MagneticAdviser", 2);
+        }
+        if (coreLossesComputed && _lossModelFrequencySpanFilter.applies_to(&magnetic)) {
+            if (auto reason = MagneticFilterLossModelFrequencySpan::material_not_evaluable_reason(magnetic.get_core().resolve_material(), inputs)) {
+                std::string computedBy = _simulateResults ? "the final simulation computes core losses at every operating point"
+                                                          : "a filter of the flow computes core losses";
+                logEntry("MagneticAdviser: excluding " + magnetic.get_reference() + ": " + reason.value(), "MagneticAdviser", 2);
+                _failedCandidates.push_back({magnetic.get_reference(),
+                                             std::string(magic_enum::enum_name(MagneticFilters::LOSS_MODEL_FREQUENCY_SPAN)) + ": " +
+                                             reason.value() + " (" + computedBy + ")"});
                 continue;
             }
         }
@@ -1158,6 +1252,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
             try {
                 auto [valid, scoring] = _filters[filterEnum]->evaluate_magnetic(&magnetic, &inputs, &outputs);
                 add_scoring(magnetic.get_reference(), filterEnum, scoring);
+                recordJudgedFrequencies(filterEnum, magnetic, inputs);
                 if (strict) {
                     validMagnetic &= valid;
                     if (!valid) {
@@ -1168,8 +1263,19 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
                 identicalThrowStreak = 0;
                 previousThrowMessage.clear();
             }
+            catch (const RequirementOutsideMaterialDataException& e) {
+                // Not a malformed input: the part's material has no data where the requirement
+                // lies, and every part of that material says the same. It does not count toward
+                // the identical-throw abort below, which would otherwise end the search after 8
+                // parts of one material in a row.
+                logEntry(std::string("MagneticAdviser: strict filter ") + std::string(magic_enum::enum_name(filterEnum)) + " cannot judge magnetic: " + e.what(), "MagneticAdviser", 2);
+                _failedCandidates.push_back({magnetic.get_reference(), std::string(magic_enum::enum_name(filterEnum)) + ": " + e.what()});
+                validMagnetic = false;
+                break;
+            }
             catch (const std::exception& e) {
                 logEntry(std::string("MagneticAdviser: strict filter ") + std::string(magic_enum::enum_name(filterEnum)) + " threw, rejecting magnetic: " + e.what(), "MagneticAdviser", 2);
+                _failedCandidates.push_back({magnetic.get_reference(), std::string(magic_enum::enum_name(filterEnum)) + ": " + e.what()});
                 std::string thisMsg = e.what();
                 if (thisMsg == previousThrowMessage) {
                     ++identicalThrowStreak;
@@ -1235,6 +1341,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
                 // still rejects everything would recurse forever and stack-overflow.
                 auto [filterValid, scoring] = _filters[filterEnum]->evaluate_magnetic(&magnetic, &inputs, &outputs);
                 add_scoring(magnetic.get_reference(), filterEnum, scoring);
+                recordJudgedFrequencies(filterEnum, magnetic, inputs);
                 // A candidate this filter rejected must rank WORST for it, never
                 // best. evaluate_magnetic returns 0.0 on rejection (a sentinel, not
                 // a distance), and with invert=true 0.0 is the top score — so
@@ -1247,6 +1354,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
             }
             catch (const std::exception& e) {
                 logEntry(std::string("MagneticAdviser: non-strict filter ") + std::string(magic_enum::enum_name(filterEnum)) + " threw, rejecting magnetic: " + e.what(), "MagneticAdviser", 2);
+                _failedCandidates.push_back({magnetic.get_reference(), std::string(magic_enum::enum_name(filterEnum)) + ": " + e.what()});
                 valid = false;
                 break;
             }
@@ -1313,10 +1421,17 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
                     masMagneticsWithScoringSimulated.push_back({mas, scoring});
                     continue;
                 }
+                // Nor can a part whose core losses are not evaluable be simulated (the simulation
+                // computes them): it is returned as ranked, and get_losses_not_evaluable() says why.
+                if (_lossesNotEvaluable.contains(mas.get_magnetic().get_reference())) {
+                    masMagneticsWithScoringSimulated.push_back({mas, scoring});
+                    continue;
+                }
                 try {
                     mas = magneticSimulator.simulate(mas, true);
                 } catch (const std::exception& e) {
                     logEntry(std::string("MagneticAdviser: skipping final-simulate candidate: ") + e.what(), "MagneticAdviser", 2);
+                    _failedCandidates.push_back({mas.get_magnetic().get_reference(), std::string("final simulation: ") + e.what()});
                     continue;
                 }
                 masMagneticsWithScoringSimulated.push_back({mas, scoring});
@@ -1343,13 +1458,23 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
         // catalogue (ABT #366/#370): SIGSEGV ~20 frames deep in the saturation filter, which was
         // merely where the exhausted stack happened to land.
         if (strict && catalogueMasWithStriclyRequirementsPassed.size() > 0) {
-            return get_advised_magnetic(catalogueMasWithStriclyRequirementsPassed, filterFlow, maximumNumberResults, false);
+            // The retry starts by clearing the failure report; the candidates that already failed
+            // in this pass are not in the retry's pool, so carry them over.
+            auto failedBeforeRetry = _failedCandidates;
+            auto relaxedResults = get_advised_magnetic(catalogueMasWithStriclyRequirementsPassed, filterFlow, maximumNumberResults, false);
+            for (const auto& failedCandidate : failedBeforeRetry) {
+                if (std::find(_failedCandidates.begin(), _failedCandidates.end(), failedCandidate) == _failedCandidates.end()) {
+                    _failedCandidates.push_back(failedCandidate);
+                }
+            }
+            return relaxedResults;
         }
         return {};
     }
 }
 
 std::vector<std::pair<Mas, double>> MagneticAdviser::score_magnetics(std::vector<Mas> masMagnetics, std::vector<MagneticFilterOperation> filterFlow) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
     std::vector<std::pair<Mas, double>> masMagneticsWithScoring;
 
     // Return early if no magnetics to score
@@ -1357,9 +1482,11 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::score_magnetics(std::vector
         return masMagneticsWithScoring;
     }
 
-    for (auto mas : masMagnetics) {
-        masMagneticsWithScoring.push_back({mas, 0.0});
-    }
+    // ABT #1619: a design a scoring filter rejects (e.g. COST on an unpriced design, reported as
+    // {false, 0}) is dropped, and the remaining scores are normalised over the kept designs only.
+    // The valid flag used to be ignored, so a rejected design was ranked, and its 0 set the scale.
+    std::vector<bool> masValidFlags(masMagnetics.size(), true);
+    std::vector<std::pair<MagneticFilterOperation, std::vector<double>>> scoringsPerFilter;
     for (auto filterConfiguration : filterFlow) {
         MagneticFilters filterEnum = filterConfiguration.get_filter();
 
@@ -1370,14 +1497,49 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::score_magnetics(std::vector
         }
 
         std::vector<double> scorings;
-        for (auto mas : masMagnetics) {
+        for (size_t masIndex = 0; masIndex < masMagnetics.size(); ++masIndex) {
+            // ABT #1699: each filter scores its own COPY of the design. Some filters are design
+            // filters that rework the magnetic they are handed -- CORE_MINIMUM_IMPEDANCE (the core
+            // adviser's turn search for suppression chokes) swaps in an unwound coil with its own
+            // turn count -- and scoring must not change what is being scored: through a reference
+            // the next filter (COST) met that unwound coil and threw COIL_NOT_PROCESSED, and the
+            // design returned to the caller would have been the filter's rework, not the advised one.
+            auto mas = masMagnetics[masIndex];
             auto [valid, scoring] = filterIt->second->evaluate_magnetic(&mas.get_mutable_magnetic(), &mas.get_mutable_inputs());
+            if (!valid) {
+                masValidFlags[masIndex] = false;
+            }
             scorings.push_back(scoring);
             add_scoring(mas.get_mutable_magnetic().get_reference(), filterEnum, scoring);
         }
-        if (masMagneticsWithScoring.size() > 0) {
-            normalize_scoring(&masMagneticsWithScoring, scorings, filterConfiguration);
+        scoringsPerFilter.push_back({filterConfiguration, scorings});
+    }
+
+    // When every design is rejected, they are ranked among themselves, as CoilAdviser ranks its
+    // rejected coils: the same last resort drop_invalid_when_valid_exists keeps for designs whose
+    // coil failed (they reach the caller marked, never mixed with valid ones).
+    bool anyValid = std::find(masValidFlags.begin(), masValidFlags.end(), true) != masValidFlags.end();
+    std::vector<size_t> keptIndexes;
+    for (size_t masIndex = 0; masIndex < masMagnetics.size(); ++masIndex) {
+        if (masValidFlags[masIndex] || !anyValid) {
+            masMagneticsWithScoring.push_back({masMagnetics[masIndex], 0.0});
+            keptIndexes.push_back(masIndex);
         }
+    }
+    if (!anyValid) {
+        logEntry("WARNING: every one of " + std::to_string(masMagnetics.size()) +
+                 " designs was rejected by a scoring filter; they are ranked among themselves", "MagneticAdviser", 1);
+    }
+    else if (keptIndexes.size() < masMagnetics.size()) {
+        logEntry("Scoring dropped " + std::to_string(masMagnetics.size() - keptIndexes.size()) + " of " +
+                 std::to_string(masMagnetics.size()) + " designs rejected by a scoring filter", "MagneticAdviser", 2);
+    }
+    for (auto& [filterConfiguration, scorings] : scoringsPerFilter) {
+        std::vector<double> keptScorings;
+        for (auto masIndex : keptIndexes) {
+            keptScorings.push_back(scorings[masIndex]);
+        }
+        normalize_scoring(&masMagneticsWithScoring, keptScorings, filterConfiguration);
     }
     
     // OPTIMIZATION: Apply stack penalty - prioritize single stack designs

@@ -1,4 +1,6 @@
 #include "advisers/MagneticFilter.h"
+#include "advisers/CoilAdviser.h"
+#include "advisers/WireAdviser.h"
 #include "advisers/MagneticFilterInternal.h"
 #include "constructive_models/Bobbin.h"
 #include "constructive_models/Insulation.h"
@@ -9,7 +11,9 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <set>
 #include <numbers>
 #include <string>
 
@@ -37,7 +41,7 @@ MagneticFilterAreaProduct::MagneticFilterAreaProduct(Inputs inputs) {
     _coreLossesModelSteinmetz = CoreLossesModel::factory(std::map<std::string, std::string>({{"coreLosses", "Steinmetz"}}));
     _coreLossesModelProprietary = CoreLossesModel::factory(std::map<std::string, std::string>({{"coreLosses", "Proprietary"}}));
 
-    if (settings.get_core_adviser_include_margin() && inputs.get_design_requirements().get_insulation()) {
+    if (settings.get_core_adviser_include_margin() && inputs.has_insulation_coordination_requirements()) {
         auto clearanceAndCreepageDistance = InsulationCoordinator().calculate_creepage_distance(inputs, true);
         _averageMarginInWindingWindow = clearanceAndCreepageDistance;
     }
@@ -101,38 +105,43 @@ MagneticFilterAreaProduct::MagneticFilterAreaProduct(Inputs inputs) {
     }
 }
 
+double MagneticFilterAreaProduct::get_bobbin_filling_factor(const Core& core, std::optional<WiringTechnology> wiringTechnology) {
+    if (core.get_winding_windows().size() == 0) {
+        throw CoreNotProcessedException("Bobbin filling factor: core " + core.get_name().value_or("?") + " has no winding window");
+    }
+    auto windingWindow = core.get_winding_windows()[0];
+    if (wiringTechnology && wiringTechnology.value() == WiringTechnology::PRINTED) {
+        return 1;
+    }
+    if (core.get_functional_description().get_type() != CoreType::TOROIDAL) {
+        return Bobbin::get_filling_factor(windingWindow.get_width().value(), windingWindow.get_height().value());
+    }
+    // For toroids: calculate realistic filling factor based on geometry
+    // The inner circumference is smaller than outer, limiting wire packing
+    // Manual winding is less efficient than bobbin-based winding
+    // Typical toroid fill factors are 0.55-0.70 depending on geometry
+    if (windingWindow.get_radial_height()) {
+        double radialHeight = windingWindow.get_radial_height().value();
+        double outerRadius = core.get_width() / 2;
+        double innerRadius = outerRadius - radialHeight;
+        // Ratio of inner to outer circumference limits packing
+        double circumferenceRatio = (innerRadius > 0) ? (innerRadius / outerRadius) : 0.5;
+        // Base filling factor ~0.55, adjusted up to ~0.70 for favorable geometry
+        return 0.55 + 0.15 * circumferenceRatio;
+    }
+    return 0.6;  // Default for toroids without radial height
+}
+
 std::pair<bool, double> MagneticFilterAreaProduct::evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs) {
     const auto& core = magnetic->get_core();
 
-    double bobbinFillingFactor;
     if (core.get_winding_windows().size() == 0)
         return {false, 0.0};
     auto windingWindow = core.get_winding_windows()[0];
     auto windingColumn = core.get_columns()[0];
-    if (inputs->get_wiring_technology() == WiringTechnology::PRINTED) {
-        bobbinFillingFactor = 1;
-    }
-    else if (!_bobbinFillingFactors.contains(core.get_shape_name())) {
-        if (core.get_functional_description().get_type() != CoreType::TOROIDAL) {
-            bobbinFillingFactor = Bobbin::get_filling_factor(windingWindow.get_width().value(), core.get_winding_windows()[0].get_height().value());
-        }
-        else {
-            // For toroids: calculate realistic filling factor based on geometry
-            // The inner circumference is smaller than outer, limiting wire packing
-            // Manual winding is less efficient than bobbin-based winding
-            // Typical toroid fill factors are 0.55-0.70 depending on geometry
-            if (windingWindow.get_radial_height()) {
-                double radialHeight = windingWindow.get_radial_height().value();
-                double outerRadius = core.get_width() / 2;
-                double innerRadius = outerRadius - radialHeight;
-                // Ratio of inner to outer circumference limits packing
-                double circumferenceRatio = (innerRadius > 0) ? (innerRadius / outerRadius) : 0.5;
-                // Base filling factor ~0.55, adjusted up to ~0.70 for favorable geometry
-                bobbinFillingFactor = 0.55 + 0.15 * circumferenceRatio;
-            } else {
-                bobbinFillingFactor = 0.6;  // Default for toroids without radial height
-            }
-        }
+    double bobbinFillingFactor;
+    if (!_bobbinFillingFactors.contains(core.get_shape_name())) {
+        bobbinFillingFactor = get_bobbin_filling_factor(core, inputs->get_wiring_technology());
         _bobbinFillingFactors[core.get_shape_name()] = bobbinFillingFactor;
     }
     else {
@@ -326,6 +335,143 @@ std::pair<bool, double> MagneticFilterAreaWithParallels::evaluate_magnetic(Magne
     return {valid, scoring};
 }
 
+// ABT #1446: whether the winding's physical turns can be laid out in whole turns per layer
+// inside a rectangular (Cartesian) section, using the same packing rules the layer winder
+// (Coil::wind_by_rectangular_layers) applies: turns per layer = floor(section length along the
+// layer / conductor size along the layer), layers = ceil(turns / turns per layer), and the
+// layers' stacked thickness must fit the section's depth. The bulk outer-area comparison alone
+// passed a 0.85 mm litz for 13 turns in a 2.27 x 4.59 mm section (area ratio 0.9), though
+// 5 turns per layer x 3 layers needs 2.55 mm of depth: the winder then rejected every wire the
+// adviser had offered and the coil adviser answered "No coil found".
+static bool fits_in_whole_turns_per_layer(const Wire& wire, const Winding& winding, const Section& section, double numberSections) {
+    if (section.get_dimensions().size() < 2) {
+        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+            "Section " + section.get_name() + " has no width and height to lay turns out in");
+    }
+    if (!(numberSections > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+            "Winding " + winding.get_name() + " is split into a non-positive number of sections");
+    }
+    double sectionWidth = section.get_dimensions()[0];
+    double sectionHeight = section.get_dimensions()[1];
+    bool layersStackAlongWidth = section.get_layers_orientation() == WindingOrientation::OVERLAPPING;
+
+    double conductorAlongLayer;
+    double layerThickness;
+    std::optional<double> fixedTurnsPerLayer;
+    if (wire.get_type() == WireType::ROUND || wire.get_type() == WireType::LITZ) {
+        if (!wire.get_outer_diameter()) {
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Wire " + wire.get_name().value_or("(unnamed)") + " is missing its outer diameter");
+        }
+        double diameter = resolve_dimensional_values(wire.get_outer_diameter().value());
+        conductorAlongLayer = diameter;
+        layerThickness = diameter;
+    }
+    else {
+        if (!wire.get_outer_width() || !wire.get_outer_height()) {
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Wire " + wire.get_name().value_or("(unnamed)") + " is missing its outer width or height");
+        }
+        // A foil's layer is as thick as its wound width, conductor + interleaved film (ABT #1151).
+        double wireWidth = wire.get_type() == WireType::FOIL ? Wire(wire).get_maximum_outer_width()
+                                                             : resolve_dimensional_values(wire.get_outer_width().value());
+        double wireHeight = resolve_dimensional_values(wire.get_outer_height().value());
+        if (layersStackAlongWidth) {
+            conductorAlongLayer = wireHeight;
+            layerThickness = wireWidth;
+            if (wire.get_type() == WireType::FOIL) {
+                fixedTurnsPerLayer = 1;
+            }
+        }
+        else {
+            conductorAlongLayer = wireWidth;
+            layerThickness = wireHeight;
+            if (wire.get_type() == WireType::RECTANGULAR && settings.get_coil_only_one_turn_per_layer_in_contiguous_rectangular()) {
+                fixedTurnsPerLayer = 1;
+            }
+        }
+    }
+    if (!(conductorAlongLayer > 0) || !(layerThickness > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Wire " + wire.get_name().value_or("(unnamed)") + " has a non-positive outer dimension");
+    }
+
+    double lengthAlongLayer = layersStackAlongWidth ? sectionHeight : sectionWidth;
+    double depth = layersStackAlongWidth ? sectionWidth : sectionHeight;
+    double turnsPerLayer = fixedTurnsPerLayer ? fixedTurnsPerLayer.value() : std::floor(lengthAlongLayer / conductorAlongLayer);
+    if (turnsPerLayer < 1) {
+        return false;
+    }
+    double physicalTurns = std::ceil(static_cast<double>(winding.get_number_turns()) * static_cast<double>(winding.get_number_parallels()) / numberSections);
+
+    // ABT #1699: with real winding geometry on, every layer a parallel enters also carries that
+    // parallel's crossing station (ABT #685: a wire making N turns over L layers crosses the
+    // window plane N + L times; Coil::wind_inner's RealWindingCrossingBump charges one extra
+    // cross-section per layer and parallel). A layer of T positions then holds T - P turns of a
+    // P-parallel winding, so N P / S turns need L layers with L (T - P) >= N P / S, which is the
+    // fixpoint the bump iterates to ((N/S + L) P <= L T). With T <= P no number of layers closes
+    // (each new layer brings as many stations as it has room): the real winder refuses it. The
+    // bump charges no station to a foil (ABT #881) or a one-turn winding (the omega), and none in
+    // a toroid's round window, whose sections are polar and never reach this function. With the
+    // setting off nothing changes: the ideal wind charges no station.
+    double stationsPerLayer = 0;
+    if (settings.get_coil_use_real_winding_geometry() && wire.get_type() != WireType::FOIL && winding.get_number_turns() > 1) {
+        stationsPerLayer = static_cast<double>(winding.get_number_parallels());
+    }
+    double turnsPerLayerAfterStations = turnsPerLayer - stationsPerLayer;
+    if (turnsPerLayerAfterStations < 1) {
+        return false;
+    }
+    double numberLayers = std::ceil(physicalTurns / turnsPerLayerAfterStations);
+    return numberLayers * layerThickness <= depth * (1 + 1e-9);
+}
+
+// ABT #1699 (Alf, 2026-10-10: "model lead blocking too"): with real winding geometry on, the real
+// winder also takes slots out of every layer a connection lead crosses -- the blocked={0+1,0+2,...}
+// per layer it reports, which come from the drawn lead routes (per-edge rows, stubs, U landings,
+// Coil::compute_connection_blocked_slots_per_layer) and are iterated to a fixpoint with the
+// crossing stations inside Coil::wind. That geometry exists only once a layout does, so it is not
+// re-derived here: the real winder itself is asked. A probe coil holds this winding alone -- its
+// wire, its parallels and the turns one of its numberSections sections carries -- in a window the
+// size of the section, and is wound with real winding geometry. Its own terminal leads cross its
+// own outer layers exactly as the entrance lead does in the winding's first section (the one that
+// holds the terminal), and the stations are charged by the same code, so the probe packs iff the
+// real winder can close this section with this wire against its own leads. Leads of OTHER windings
+// crossing the section (and their insulation clearance) depend on wires not yet chosen here; the
+// coil adviser's own real wind of the combination and MagneticFilterRealWinding judge those.
+// A COIL_WINDING_ERROR from the probe (stations and blocking do not converge) is the refusal;
+// any other exception propagates.
+static bool real_winder_packs_section_alone(const Wire& wire, const Winding& winding, const Section& section, double numberSections, std::string* refusal) {
+    Winding probeWinding = winding;
+    probeWinding.set_wire(wire);
+    probeWinding.set_number_turns(static_cast<int64_t>(std::ceil(static_cast<double>(winding.get_number_turns()) / numberSections)));
+    probeWinding.set_wound_with(std::nullopt);
+    probeWinding.set_winding_window(std::nullopt);
+    Coil probe;
+    probe.set_functional_description({probeWinding});
+    probe.set_bobbin(Bobbin::create_quick_bobbin(section.get_dimensions()[1], section.get_dimensions()[0]));
+    probe.set_layers_orientation(section.get_layers_orientation());
+    bool wound = false;
+    try {
+        wound = probe.wind();
+    }
+    catch (const CoilException& e) {
+        if (e.code() != ErrorCode::COIL_WINDING_ERROR) {
+            throw;
+        }
+        *refusal = e.what();
+        return false;
+    }
+    if (!wound) {
+        *refusal = probe.get_last_fit_failure().empty() ? std::string("the real winder returned no fitting layout")
+                                                        : probe.get_last_fit_failure();
+        return false;
+    }
+    if (!probe.are_turns_inside_winding_window()) {
+        *refusal = "the real winder puts turns outside the section: " + probe.get_last_fit_failure();
+        return false;
+    }
+    return true;
+}
+
 std::pair<bool, double> MagneticFilterAreaWithParallels::evaluate_magnetic(Winding winding, Section section, double numberSections, double sectionArea, bool allowNotFit) {
     auto wire = Coil::resolve_wire(winding);
     if (!Coil::resolve_wire(winding).get_conducting_area()) {
@@ -335,7 +481,35 @@ std::pair<bool, double> MagneticFilterAreaWithParallels::evaluate_magnetic(Windi
 
     neededOuterAreaNoCompact *= winding.get_number_parallels() * winding.get_number_turns() / numberSections;
 
-    if (neededOuterAreaNoCompact < sectionArea) {
+    // ABT #1446: a strict fit also needs the turns to pack in whole turns per layer. Only
+    // rectangular sections are checked: in a toroid's polar section the turns a layer holds
+    // depend on that layer's radius (the inner circumference shrinks layer by layer), which the
+    // toroidal winder works out turn by turn; a per-layer count here would be a second,
+    // diverging model of it. The allowNotFit pass (taken only when no wire fits strictly) keeps
+    // its existing bulk-area tolerance. Planar wires are not checked either: a planar winding
+    // is laid out per PCB layer by the planar winder (Coil::wind_by_planar_layers), not by the
+    // layer winder whose rules fits_in_whole_turns_per_layer mirrors.
+    bool packs = true;
+    if (!allowNotFit && wire.get_type() != WireType::PLANAR &&
+        (!section.get_coordinate_system() || section.get_coordinate_system().value() == CoordinateSystem::CARTESIAN)) {
+        packs = fits_in_whole_turns_per_layer(wire, winding, section, numberSections);
+    }
+
+    // ABT #1699: with real winding geometry on, the connection leads' blocked slots too, as the
+    // real winder lays them (see real_winder_packs_section_alone). Asked last: it winds a coil.
+    if (packs && !allowNotFit && neededOuterAreaNoCompact < sectionArea && settings.get_coil_use_real_winding_geometry() &&
+        wire.get_type() != WireType::PLANAR &&
+        (!section.get_coordinate_system() || section.get_coordinate_system().value() == CoordinateSystem::CARTESIAN)) {
+        std::string refusal;
+        packs = real_winder_packs_section_alone(wire, winding, section, numberSections, &refusal);
+        if (!packs && _realWindingRefusals++ == 0) {
+            _firstRealWindingRefusal = "winding '" + winding.get_name() + "' with " +
+                std::to_string(winding.get_number_parallels()) + " x " + wire.get_name().value_or("(unnamed wire)") +
+                " in section '" + section.get_name() + "': " + refusal;
+        }
+    }
+
+    if (neededOuterAreaNoCompact < sectionArea && packs) {
         // double scoring = (section.get_dimensions()[0] * section.get_dimensions()[1]) - neededOuterAreaNoCompact;
         return {true, 1.0};
     }
@@ -353,6 +527,337 @@ std::pair<bool, double> MagneticFilterAreaWithParallels::evaluate_magnetic(Windi
     else {
         return {false, 0.0};
     }
+}
+
+std::pair<bool, double> MagneticFilterRealWinding::evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, [[maybe_unused]] std::vector<Outputs>* outputs) {
+    _lastReason.clear();
+    if (!magnetic->has_core() || !magnetic->has_coil()) {
+        throw CoilNotProcessedException("Real winding check: the magnetic has no core and coil to rebuild");
+    }
+    if (magnetic->get_mutable_coil().is_planar()) {
+        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+            "Real winding check: a planar coil has no real-winding model (ABT #492)");
+    }
+    std::optional<Inputs> realWindingInputs;
+    if (inputs) {
+        realWindingInputs = *inputs;
+    }
+    auto refusal = real_winding_refusal(*magnetic, realWindingInputs);
+    if (refusal) {
+        _lastReason = refusal.value();
+        return {false, 0.0};
+    }
+    return {true, 1.0};
+}
+
+bool MagneticFilterWindowCopperCapacity::applies_to(const Inputs& inputs) {
+    return inputs.get_wiring_technology() != WiringTechnology::PRINTED;
+}
+
+MagneticFilterWindowCopperCapacity::MagneticFilterWindowCopperCapacity(Inputs inputs, double maximumEffectiveCurrentDensity)
+    : _maximumEffectiveCurrentDensity(maximumEffectiveCurrentDensity)
+{
+    if (inputs.get_operating_points().empty()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Window copper capacity: the inputs have no operating points");
+    }
+    if (!(maximumEffectiveCurrentDensity > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Window copper capacity: the maximum effective current density must be positive");
+    }
+    const size_t numberWindings = inputs.get_operating_points()[0].get_excitations_per_winding().size();
+    const auto& turnsRatios = inputs.get_design_requirements().get_turns_ratios();
+    if (turnsRatios.size() + 1 != numberWindings) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA,
+            "Window copper capacity: the input has " + std::to_string(numberWindings) + " windings but " +
+            std::to_string(turnsRatios.size()) + " turns ratios; the turns of the windings the stand-in coil lacks cannot be derived");
+    }
+    for (size_t ratioIndex = 0; ratioIndex < turnsRatios.size(); ++ratioIndex) {
+        double turnsRatio = resolve_dimensional_values(turnsRatios[ratioIndex], DimensionalValues::NOMINAL);
+        if (!(turnsRatio > 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "Window copper capacity: turns ratio " + std::to_string(ratioIndex + 1) + " is not positive");
+        }
+        _turnsRatios.push_back(turnsRatio);
+    }
+    _temperature = inputs.get_maximum_temperature();
+}
+
+std::pair<bool, double> MagneticFilterWindowCopperCapacity::evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, [[maybe_unused]] std::vector<Outputs>* outputs) {
+    _lastReason.clear();
+    const auto& core = magnetic->get_core();
+    const std::string coreName = core.get_name().value_or(core.get_shape_name());
+    if (core.get_winding_windows().empty() || !core.get_winding_windows()[0].get_area()) {
+        throw CoreNotProcessedException("Window copper capacity: core " + coreName + " has no winding window area");
+    }
+    auto& coil = magnetic->get_mutable_coil();
+    const auto& windings = coil.get_functional_description();
+    const size_t numberWindings = _turnsRatios.size() + 1;
+    if (windings.empty() || windings.size() > numberWindings) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "Window copper capacity: candidate " + coreName + " carries " + std::to_string(windings.size()) +
+            " windings for an input with " + std::to_string(numberWindings));
+    }
+    const double primaryNumberTurns = static_cast<double>(windings[0].get_number_turns());
+    if (!(primaryNumberTurns >= 1)) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Window copper capacity: candidate " + coreName + " has no seeded turns");
+    }
+
+    // The strand: the stand-in's wire, two skin depths at the highest switching frequency.
+    Wire strand = coil.resolve_wire(0);
+    if (strand.get_type() != WireType::ROUND || !strand.get_conducting_diameter()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "Window copper capacity: the stand-in wire of " + coreName + " is not a round strand with a conducting diameter");
+    }
+    const double strandConductingArea = strand.calculate_conducting_area();
+    const double strandConductingDiameter = resolve_dimensional_values(strand.get_conducting_diameter().value());
+    const double bobbinFillingFactor = MagneticFilterAreaProduct::get_bobbin_filling_factor(core, inputs->get_wiring_technology());
+
+    // Per turn, a winding needs strandsPerTurn stand-in strands: the effective current density
+    // the current would have in ONE stand-in strand over the maximum. Above one, whole strands
+    // (rounded up). At or below one, a single stand-in strand is more copper than the current
+    // needs, and the coil stage is free to pick a thinner round wire: the copper is that of the
+    // round conductor whose own effective current density is the maximum. At line frequency the stand-in strand is two skin
+    // depths at 50 Hz (18.6 mm); counting it whole made a 32 A PFC choke need 272 mm2 of copper
+    // per turn instead of 2.7 mm2, and rejected every core of the catalogue.
+    // Each winding's copper occupies its area over the round-wire filling factor of its own
+    // conductor diameter; the window offers its area times the bobbin filling factor.
+    double requiredCopperArea = 0;
+    double requiredWindowArea = 0;
+    std::string perWinding;
+    const bool standIn = std::holds_alternative<std::string>(coil.get_bobbin());
+    for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
+        double numberTurns;
+        // A stand-in (bobbin still a name) seeds the first winding's turns only: the common-mode
+        // choke stand-in carries every winding, the others at the placeholder 1 turn.
+        if (windingIndex < windings.size() && (windingIndex == 0 || !standIn)) {
+            numberTurns = static_cast<double>(windings[windingIndex].get_number_turns());
+        }
+        else {
+            numberTurns = static_cast<double>(std::max<int64_t>(1, std::llround(primaryNumberTurns / _turnsRatios[windingIndex - 1])));
+        }
+        double strandsPerTurn = 0;
+        for (size_t operatingPointIndex = 0; operatingPointIndex < inputs->get_operating_points().size(); ++operatingPointIndex) {
+            const auto& excitations = inputs->get_operating_points()[operatingPointIndex].get_excitations_per_winding();
+            if (windingIndex >= excitations.size() || !excitations[windingIndex].get_current()) {
+                throw InvalidInputException(ErrorCode::MISSING_DATA,
+                    "Window copper capacity: operating point " + std::to_string(operatingPointIndex) + " has no current for winding " +
+                    std::to_string(windingIndex));
+            }
+            const auto current = excitations[windingIndex].get_current().value();
+            double strandLoad = strand.calculate_effective_current_density(current, _temperature) / _maximumEffectiveCurrentDensity;
+            if (strandLoad > 1) {
+                strandsPerTurn = std::max(strandsPerTurn, std::ceil(strandLoad));
+                continue;
+            }
+            // One strand is more than enough: the copper is that of the round conductor whose own
+            // effective current density is the maximum, not the fraction strandLoad of the strand.
+            // A thinner conductor carries the current's high-frequency harmonics (a PFC choke's
+            // ripple at the switching frequency) no better per unit of copper than the strand, so
+            // the fraction overcounts. The search depends on the inputs only: memoised.
+            const auto cacheKey = std::make_tuple(strandConductingDiameter, windingIndex, operatingPointIndex);
+            auto cached = _conductorAreaCache.find(cacheKey);
+            if (cached == _conductorAreaCache.end()) {
+                const double conductingArea = get_conducting_area_for_current(current, strandConductingArea, _temperature, _maximumEffectiveCurrentDensity);
+                cached = _conductorAreaCache.emplace(cacheKey, conductingArea).first;
+            }
+            strandsPerTurn = std::max(strandsPerTurn, cached->second / strandConductingArea);
+        }
+        if (!(strandsPerTurn > 0)) {
+            throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+                "Window copper capacity: winding " + std::to_string(windingIndex) + " of " + coreName + " carries no current to size its copper");
+        }
+        const double conductorDiameter = strandsPerTurn < 1 ? strandConductingDiameter * std::sqrt(strandsPerTurn) : strandConductingDiameter;
+        double windingCopperArea = numberTurns * strandsPerTurn * strandConductingArea;
+        requiredCopperArea += windingCopperArea;
+        requiredWindowArea += windingCopperArea / Wire::get_filling_factor_round(conductorDiameter);
+        perWinding += (windingIndex == 0 ? "" : ", ") + std::to_string(std::llround(numberTurns)) + " turns x " +
+                      std::to_string(strandsPerTurn) + " strands";
+    }
+
+    const double windingWindowArea = core.get_winding_windows()[0].get_area().value();
+    const double usableWindowArea = windingWindowArea * bobbinFillingFactor;
+    if (!(usableWindowArea > 0)) {
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+            "Window copper capacity: core " + coreName + " has no usable winding window");
+    }
+    const double proportion = requiredWindowArea / usableWindowArea;
+    bool valid = proportion <= 1;
+    if (!valid) {
+        _lastReason = "core " + coreName + ": the windings (" + perWinding + " of " +
+                      std::to_string(strandConductingDiameter * 1e3) + " mm strand at <= " +
+                      std::to_string(_maximumEffectiveCurrentDensity * 1e-6) + " A/mm2) need " +
+                      std::to_string(requiredCopperArea * 1e6) + " mm2 of copper, " +
+                      std::to_string(requiredWindowArea * 1e6) + " mm2 of window at their round-wire fill; it offers " +
+                      std::to_string(usableWindowArea * 1e6) + " mm2 (" + std::to_string(windingWindowArea * 1e6) +
+                      " mm2 x bobbin filling factor " + std::to_string(bobbinFillingFactor) + ")";
+    }
+    return {valid, proportion};
+}
+
+MagneticFilterWireWithinLimits::MagneticFilterWireWithinLimits(double maximumEffectiveCurrentDensity, int maximumNumberParallels)
+    : _maximumEffectiveCurrentDensity(maximumEffectiveCurrentDensity), _maximumNumberParallels(maximumNumberParallels)
+{
+    if (!(maximumEffectiveCurrentDensity > 0) || maximumNumberParallels < 1) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Wire within limits: the current density and parallels limits must be positive");
+    }
+    _coilAdviser = std::make_shared<CoilAdviser>();
+    _wireAdviser = std::make_shared<WireAdviser>();
+    _wireAdviser->set_maximum_effective_current_density(_maximumEffectiveCurrentDensity);
+    _wireAdviser->set_maximum_number_parallels(_maximumNumberParallels);
+    _wireAdviser->set_synthesize_litz(true);
+}
+
+std::pair<bool, double> MagneticFilterWireWithinLimits::evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, [[maybe_unused]] std::vector<Outputs>* outputs) {
+    _lastReason.clear();
+    const auto& core = magnetic->get_core();
+    const std::string coreName = core.get_name().value_or(core.get_shape_name());
+    if (inputs->get_operating_points().empty()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Wire within limits: the inputs have no operating points");
+    }
+    const auto& windings = magnetic->get_coil().get_functional_description();
+    const size_t numberWindings = inputs->get_operating_points()[0].get_excitations_per_winding().size();
+    if (windings.size() != numberWindings) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "Wire within limits: candidate " + coreName + " carries " + std::to_string(windings.size()) +
+            " windings for an input with " + std::to_string(numberWindings) + "; complete its coil first");
+    }
+
+    // The current each winding's wire is chosen for: the operating point with the highest
+    // rms x sqrt(effective frequency), as the coil stage picks it.
+    std::vector<SignalDescriptor> windingCurrents;
+    for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
+        double maximumFigure = -1;
+        SignalDescriptor chosen;
+        for (const auto& operatingPoint : inputs->get_operating_points()) {
+            const auto& current = operatingPoint.get_excitations_per_winding()[windingIndex].get_current();
+            if (!current || !current->get_processed() || !current->get_processed()->get_rms() ||
+                !current->get_processed()->get_effective_frequency()) {
+                throw InvalidInputException(ErrorCode::MISSING_DATA,
+                    "Wire within limits: winding " + std::to_string(windingIndex) + " has no processed current (rms, effective frequency)");
+            }
+            double figure = current->get_processed()->get_rms().value() * sqrt(current->get_processed()->get_effective_frequency().value());
+            if (figure > maximumFigure) {
+                maximumFigure = figure;
+                chosen = current.value();
+            }
+        }
+        windingCurrents.push_back(chosen);
+    }
+    double temperature = -std::numeric_limits<double>::max();
+    for (const auto& operatingPoint : inputs->get_operating_points()) {
+        temperature = std::max(temperature, operatingPoint.get_conditions().get_ambient_temperature());
+    }
+
+    auto coreType = core.get_functional_description().get_type();
+    auto patterns = Coil::get_patterns(*inputs, coreType);
+    auto repetitionsOptions = Coil::get_repetitions(*inputs, coreType);
+    if (patterns.empty() || repetitionsOptions.empty()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Wire within limits: no winding pattern for candidate " + coreName);
+    }
+    // Every pattern and repetition the coil stage tries: the core passes if one of them has a
+    // wire for every winding.
+    std::vector<std::pair<std::vector<size_t>, size_t>> patternsAndRepetitions;
+    for (const auto& repetitionsOption : repetitionsOptions) {
+        for (const auto& pattern : patterns) {
+            patternsAndRepetitions.push_back({pattern, repetitionsOption});
+        }
+    }
+
+    Mas mas;
+    mas.set_inputs(*inputs);
+    mas.set_magnetic(*magnetic);
+
+    std::string reasons;
+    for (auto [pattern, repetitionsOption] : patternsAndRepetitions) {
+        auto [checkedPattern, repetitions] = mas.get_mutable_magnetic().get_mutable_coil().check_pattern_and_repetitions_integrity(pattern, repetitionsOption);
+        // As the coil stage does: each combination of solid insulation per wire is a separate
+        // try, and a combination that needs margin tape narrows the sections by it.
+        std::vector<std::optional<std::vector<WireSolidInsulationRequirements>>> insulationCombinations;
+        if (mas.get_mutable_inputs().get_wiring_technology() == WiringTechnology::WOUND) {
+            for (auto& combination : InsulationCoordinator::get_solid_insulation_requirements_for_wires(mas.get_mutable_inputs(), checkedPattern, repetitions)) {
+                insulationCombinations.push_back(combination);
+            }
+            if (insulationCombinations.empty()) {
+                throw InvalidInputException(ErrorCode::INVALID_INPUT, "Wire within limits: no solid insulation combination for candidate " + coreName);
+            }
+        }
+        else {
+            insulationCombinations.push_back(std::nullopt);
+        }
+        for (auto insulationCombination : insulationCombinations) {
+            bool needsMargin = false;
+            if (insulationCombination) {
+                needsMargin = InsulationCoordinator::needs_margin(insulationCombination.value(), checkedPattern, repetitions,
+                                                                  InsulationCoordinator::insulation_class_for_margin(mas.get_mutable_inputs()));
+                if (needsMargin) {
+                    CoilAdviser::limit_wire_insulation_requirements_for_margin(insulationCombination.value());
+                }
+            }
+            auto sections = _coilAdviser->get_advised_sections(mas, checkedPattern, repetitions, needsMargin);
+            if (sections.empty()) {
+                reasons += (reasons.empty() ? "" : "; ") + std::string("no section layout");
+                continue;
+            }
+            std::set<size_t> checkedWindings;
+            std::string failure;
+            for (const auto& section : sections) {
+                if (section.get_type() != ElectricalType::CONDUCTION) {
+                    continue;
+                }
+                for (const auto& partialWinding : section.get_partial_windings()) {
+                    size_t windingIndex = numberWindings;
+                    for (size_t index = 0; index < numberWindings; ++index) {
+                        if (windings[index].get_name() == partialWinding.get_winding()) {
+                            windingIndex = index;
+                            break;
+                        }
+                    }
+                    if (windingIndex == numberWindings) {
+                        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                            "Wire within limits: section winding '" + partialWinding.get_winding() + "' is not a winding of " + coreName);
+                    }
+                    if (!checkedWindings.insert(windingIndex).second) {
+                        continue;
+                    }
+                    // The coil stage's verdict "within the limits": some wire of the catalogue (or
+                    // litz synthesised for this current) with the insulation this combination asks
+                    // of it fits the section with its parallels.
+                    // The wires the coil stage advises from (preferred standard, insulated kept).
+                    if (!_catalogueWires) {
+                        _catalogueWires = _coilAdviser->get_catalogue_wires();
+                    }
+                    auto dataset = _wireAdviser->create_dataset(windings[windingIndex], &_catalogueWires.value(), section,
+                                                                windingCurrents[windingIndex], temperature);
+                    auto fittingAlone = _wireAdviser->filter_by_area_no_parallels(&dataset, section);
+                    if (insulationCombination) {
+                        if (windingIndex >= insulationCombination->size()) {
+                            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                                "Wire within limits: the solid insulation combination has no entry for winding " + std::to_string(windingIndex));
+                        }
+                        fittingAlone = _wireAdviser->filter_by_solid_insulation_requirements(&fittingAlone, insulationCombination.value()[windingIndex]);
+                    }
+                    auto fittingWithParallels = _wireAdviser->filter_by_area_with_parallels(&fittingAlone, section, static_cast<double>(repetitions), false);
+                    if (fittingWithParallels.empty()) {
+                        failure = "winding '" + windings[windingIndex].get_name() + "' (" + std::to_string(windings[windingIndex].get_number_turns()) +
+                                  " turns, " + std::to_string(windingCurrents[windingIndex].get_processed()->get_rms().value()) +
+                                  " A rms) has no wire within " + std::to_string(_maximumEffectiveCurrentDensity * 1e-6) + " A/mm2 and " +
+                                  std::to_string(_maximumNumberParallels) + " parallels" + (needsMargin ? " (margin taped)" : "") +
+                                  " that fits its " + std::to_string(section.get_dimensions()[0] * 1e3) + " x " +
+                                  std::to_string(section.get_dimensions()[1] * 1e3) + " mm section";
+                        break;
+                    }
+                }
+                if (!failure.empty()) {
+                    break;
+                }
+            }
+            if (failure.empty()) {
+                return {true, 0};
+            }
+            reasons += (reasons.empty() ? "" : "; ") + failure;
+        }
+    }
+    _lastReason = "core " + coreName + ": " + reasons;
+    return {false, 1};
 }
 
 } // namespace OpenMagnetics

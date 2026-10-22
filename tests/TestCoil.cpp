@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <filesystem>
@@ -461,7 +462,14 @@ TEST_CASE("Test_Coil_Json_10", "[constructive-model][coil][bug][smoke-test]") {
     coil.set_functional_description(coilFunctionalDescription);
     coil.set_sections_description(coilSectionsDescription);
     coil.set_layers_description(coilLayersDescription);
+    // The preset is over-full: 'Primary section 0 layer 0' needs 11.126 mm for its turns and has
+    // 6.150 mm. A direct wind_by_turns refuses copper outside its layer by default...
+    settings.reset();
+    REQUIRE_THROWS_WITH(coil.wind_by_turns(), Catch::Matchers::ContainsSubstring("overflows"));
+    // ...and lays it out when the caller opts in, as a front end showing an over-full winding must.
+    settings.set_coil_wind_even_if_not_fit(true);
     coil.wind_by_turns();
+    settings.reset();
 
     // Repro point: winding by turns over preset sections/layers must produce turns.
     REQUIRE(coil.get_turns_description());
@@ -5829,7 +5837,73 @@ TEST_CASE("Test_Wind_By_Section_Pattern", "[constructive-model][coil][rectangula
     settings.reset();
 }
 
-TEST_CASE("Test_Wind_By_Layers_Wind_One_Section_One_Layer", "[constructive-model][coil][rectangular-winding-window][smoke-test]") {
+TEST_CASE("Test_Wind_By_Layers_Exact_Fit_Section_Keeps_Its_Last_Layer_And_Turn", "[constructive-model][coil][rectangular-winding-window][bug][abt-1898]") {
+    // ABT #1898, found on #1896: try_rewind sized a section to exactly two widths of a 1.0525 mm
+    // litz. The width came back 0.0021049999999999997 (one ulp under 2.105 mm), the layer count
+    // was the truncated 0.0021049999999999997 / 0.0010525 = 1.9999999999999998, so 1 layer, and
+    // with wind-even-if-not-fit the 10 turns went into one overflowing layer. The winder must
+    // count what calculate_filling_factor accepts as a fit; a section genuinely short of two
+    // widths must still hold one layer.
+    const double wireOuterDiameter = 0.0010525;
+    // Number of layers wind_by_layers lays in the single section, and the most turns in one of them.
+    auto windSection = [&](double sectionWidth, double sectionHeight) {
+        std::vector<OpenMagnetics::Wire> wires;
+        OpenMagnetics::Wire wire;
+        wire.set_nominal_value_conducting_diameter(0.001);
+        wire.set_nominal_value_outer_diameter(wireOuterDiameter);
+        wire.set_number_conductors(1);
+        wire.set_material("copper");
+        wire.set_type(WireType::ROUND);
+        wires.push_back(wire);
+        auto coil = OpenMagneticsTesting::get_quick_coil({10}, {1}, "PQ 40/40", 1, WindingOrientation::OVERLAPPING,
+                                                         WindingOrientation::OVERLAPPING, CoilAlignment::CENTERED,
+                                                         CoilAlignment::CENTERED, wires);
+        coil.wind_by_sections();
+        auto sections = coil.get_sections_description().value();
+        size_t conductionSections = 0;
+        for (auto& section : sections) {
+            if (section.get_type() == ElectricalType::CONDUCTION) {
+                section.set_dimensions({sectionWidth, sectionHeight});
+                section.set_number_layers(std::nullopt);
+                ++conductionSections;
+            }
+        }
+        REQUIRE(conductionSections == 1);
+        coil.set_sections_description(sections);
+        coil.wind_by_layers();
+        size_t layers = 0;
+        int64_t mostTurns = 0;
+        const auto layersDescription = coil.get_layers_description().value();
+        for (const auto& layer : layersDescription) {
+            if (layer.get_type() == ElectricalType::CONDUCTION) {
+                ++layers;
+                int64_t turns = std::llround(layer.get_partial_windings()[0].get_parallels_proportion()[0] * 10);
+                mostTurns = std::max(mostTurns, turns);
+            }
+        }
+        return std::make_pair(layers, mostTurns);
+    };
+    settings.reset();
+    settings.set_coil_wind_even_if_not_fit(true);
+    const double tallSection = 0.0060;  // 5 turns of 1.0525 mm per layer, 5.7 by plain division
+
+    // The #1896 width: two layers fit exactly, up to floating-point dust.
+    CHECK(0.0021049999999999997 / wireOuterDiameter < 2.0);
+    CHECK(windSection(0.0021049999999999997, tallSection).first == 2);
+    // Genuinely short of two widths, by 1e-8 relative and by 0.1 um: one layer, never rounded up.
+    CHECK(windSection(0.002105 * (1 - 1e-8), tallSection).first == 1);
+    CHECK(windSection(0.0021049, tallSection).first == 1);
+
+    // The same rule along the turn axis: a height one ulp under 5 wire diameters holds 5 turns a
+    // layer (2 layers of 5), and a height genuinely short of it holds 4 (3 layers).
+    const double fiveDiameters = std::nextafter(5 * wireOuterDiameter, 0.0);
+    CHECK(fiveDiameters / wireOuterDiameter < 5.0);
+    CHECK(windSection(0.0060, fiveDiameters) == std::make_pair(size_t(2), int64_t(5)));
+    CHECK(windSection(0.0060, 5 * wireOuterDiameter * (1 - 1e-8)).first == 3);
+    settings.reset();
+}
+
+TEST_CASE("Test_Wind_By_Layers_Wind_One_Section_One_Layer","[constructive-model][coil][rectangular-winding-window][smoke-test]") {
     settings.set_coil_wind_even_if_not_fit(false);
     settings.set_coil_try_rewind(false);
 
@@ -9188,6 +9262,20 @@ TEST_CASE("Test_Abt720_MultiGroup_Toroidal_Margins_Keyed_Per_Group", "[construct
     settings.reset();
 }
 
+// The five Test_Wind_Three_Sections_Two_Layer_Toroidal_Contiguous_*_Margin tests: 60/42/33 turns of
+// 0.509 mm wire in the 5 mm bore of a T 20/10/7, with margins of 0.2/0.2, 0.5/0.5 and 0.1/0.5 mm.
+// A toroid's section margin is the half-thickness of a flat bar across the window. A ring of turn
+// centres at rho clears it at asin((m + r_w) / rho) from the boundary line, so the bar takes
+// asin((m + r_w) / rho) - asin(r_w / rho) of that ring: 2.42/6.07/1.21 deg on the bore ring
+// (rho 4.746 mm) for 0.2/0.5/0.1 mm, more on deeper rings. The pinned angles were re-pinned
+// (2026-10-03) from the previous model, which charged every ring the chord 2 asin(m / 2 r_in) at the
+// section's innermost radius (3.30/9.68/1.93 deg in the top, bottom and centred cases). With the bar
+// charged per ring, the 42- and 33-turn windings of those three cases need three rings instead of
+// four, so their sections widen from 86.1/67.6 to 98.4/79.9 deg, and the aligned blocks shift by the
+// narrower bars plus the wider sections. In the two spread cases the ring counts do not change and the
+// turns move by the narrower bars alone (turn 0: a 2.42 deg bar instead of 3.87 deg, four rings deep).
+// Every turn is checked to clear its bars (perpendicular distance >= m + r_w) and not to overlap
+// another turn.
 TEST_CASE("Test_Wind_Three_Sections_Two_Layer_Toroidal_Contiguous_Top_Top_Margin", "[constructive-model][coil][round-winding-window][margin][smoke-test]") {
     settings.set_coil_equalize_margins(false);
     clear_databases();
@@ -9232,10 +9320,11 @@ TEST_CASE("Test_Wind_Three_Sections_Two_Layer_Toroidal_Contiguous_Top_Top_Margin
     }
     settings.reset();
     coil.convert_turns_to_polar_coordinates();
-    REQUIRE_THAT(6, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[0].get_coordinates()[1], 1));
-    REQUIRE_THAT(161, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[60].get_coordinates()[1], 1));
-    REQUIRE_THAT(258, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[102].get_coordinates()[1], 1));
+    REQUIRE_THAT(5.5, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[0].get_coordinates()[1], 1));
+    REQUIRE_THAT(155.4, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[60].get_coordinates()[1], 1));
+    REQUIRE_THAT(261.1, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[102].get_coordinates()[1], 1));
     OpenMagneticsTesting::check_turns_description(coil);
+    OpenMagneticsTesting::check_turns_clear_toroidal_bars(coil);
 }
 
 TEST_CASE("Test_Wind_Three_Sections_Two_Layer_Toroidal_Contiguous_Bottom_Top_Margin", "[constructive-model][coil][round-winding-window][margin][smoke-test]") {
@@ -9282,10 +9371,11 @@ TEST_CASE("Test_Wind_Three_Sections_Two_Layer_Toroidal_Contiguous_Bottom_Top_Mar
     }
     settings.reset();
     coil.convert_turns_to_polar_coordinates();
-    REQUIRE_THAT(33, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[0].get_coordinates()[1], 1));
-    REQUIRE_THAT(188, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[60].get_coordinates()[1], 1));
-    REQUIRE_THAT(332, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[134].get_coordinates()[1], 1));
+    REQUIRE_THAT(21.5, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[0].get_coordinates()[1], 1));
+    REQUIRE_THAT(171.4, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[60].get_coordinates()[1], 1));
+    REQUIRE_THAT(340.9, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[134].get_coordinates()[1], 1));
     OpenMagneticsTesting::check_turns_description(coil);
+    OpenMagneticsTesting::check_turns_clear_toroidal_bars(coil);
 }
 
 TEST_CASE("Test_Wind_Three_Sections_Two_Layer_Toroidal_Contiguous_Centered_Top_Margin", "[constructive-model][coil][round-winding-window][margin][smoke-test]") {
@@ -9332,10 +9422,11 @@ TEST_CASE("Test_Wind_Three_Sections_Two_Layer_Toroidal_Contiguous_Centered_Top_M
     }
     settings.reset();
     coil.convert_turns_to_polar_coordinates();
-    REQUIRE_THAT(20, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[0].get_coordinates()[1], 1));
-    REQUIRE_THAT(174, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[60].get_coordinates()[1], 1));
-    REQUIRE_THAT(318, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[134].get_coordinates()[1], 1));
+    REQUIRE_THAT(13.5, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[0].get_coordinates()[1], 1));
+    REQUIRE_THAT(163.4, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[60].get_coordinates()[1], 1));
+    REQUIRE_THAT(332.9, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[134].get_coordinates()[1], 1));
     OpenMagneticsTesting::check_turns_description(coil);
+    OpenMagneticsTesting::check_turns_clear_toroidal_bars(coil);
 }
 
 TEST_CASE("Test_Wind_Three_Sections_Two_Layer_Toroidal_Contiguous_Spread_Top_Margin", "[constructive-model][coil][round-winding-window][margin][smoke-test]") {
@@ -9382,10 +9473,11 @@ TEST_CASE("Test_Wind_Three_Sections_Two_Layer_Toroidal_Contiguous_Spread_Top_Mar
     }
     settings.reset();
     coil.convert_turns_to_polar_coordinates();
-    REQUIRE_THAT(7, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[0].get_coordinates()[1], 1));
-    REQUIRE_THAT(131, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[60].get_coordinates()[1], 1));
-    REQUIRE_THAT(341, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[134].get_coordinates()[1], 1));
+    REQUIRE_THAT(5.5, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[0].get_coordinates()[1], 1));
+    REQUIRE_THAT(129.1, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[60].get_coordinates()[1], 1));
+    REQUIRE_THAT(341.2, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[134].get_coordinates()[1], 1));
     OpenMagneticsTesting::check_turns_description(coil);
+    OpenMagneticsTesting::check_turns_clear_toroidal_bars(coil);
 }
 
 TEST_CASE("Test_Wind_Three_Sections_Two_Layer_Toroidal_Contiguous_Spread_Spread_Margin", "[constructive-model][coil][round-winding-window][margin][smoke-test]") {
@@ -9432,10 +9524,11 @@ TEST_CASE("Test_Wind_Three_Sections_Two_Layer_Toroidal_Contiguous_Spread_Spread_
     }
     settings.reset();
     coil.convert_turns_to_polar_coordinates();
-    REQUIRE_THAT(7, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[0].get_coordinates()[1], 1));
-    REQUIRE_THAT(131, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[60].get_coordinates()[1], 1));
-    REQUIRE_THAT(349, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[134].get_coordinates()[1], 1));
+    REQUIRE_THAT(5.6, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[0].get_coordinates()[1], 1));
+    REQUIRE_THAT(129.4, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[60].get_coordinates()[1], 1));
+    REQUIRE_THAT(349.5, Catch::Matchers::WithinAbs(coil.get_turns_description().value()[134].get_coordinates()[1], 1));
     OpenMagneticsTesting::check_turns_description(coil);
+    OpenMagneticsTesting::check_turns_clear_toroidal_bars(coil);
 }
 
 TEST_CASE("Test_Wind_Three_Sections_Two_Layer_Toroidal_Contiguous_Spread_Top_Additional_Coordinates", "[constructive-model][coil][round-winding-window][smoke-test]") {
@@ -13145,6 +13238,47 @@ TEST_CASE("Test_Real_Geometry_Connection_Skin_Losses", "[constructive-model][coi
         }
         settings.reset();
     }
+
+    SECTION("a per-wire-type model choice (model set) reaches the connection copper too") {
+        // ABT #1759: the turns read the model set's per-wire-type skin model, the connection copper read only the
+        // single override (none here) and so used the wire-type default instead.
+        settings.set_coil_use_real_winding_geometry(true);
+        auto coil = OpenMagneticsTesting::get_quick_coil({40, 40}, {1, 1}, "PQ 28/20", 2);
+        REQUIRE(coil.get_turns_description());
+        const auto chosenModel = WindingSkinEffectLossesModels::XI_NAN; // Dowell equivalent-foil, not the default Bessel
+        auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+            400000, 100e-6, temperature, WaveformLabel::TRIANGULAR, 2, 0.5, 0, {1});
+        auto ohmicOutput = OpenMagnetics::WindingOhmicLosses::calculate_ohmic_losses(coil, inputs.get_operating_point(0), temperature);
+        std::map<WireType, WindingSkinEffectLossesModels> modelPerWireType = {{WireType::ROUND, chosenModel}};
+        auto skinOutput = OpenMagnetics::WindingSkinEffectLosses::calculate_skin_effect_losses(
+            coil, temperature, ohmicOutput, Defaults().harmonicAmplitudeThreshold, std::nullopt, modelPerWireType);
+        double connectionSkin = 0;
+        const auto connectionLossesPerWinding = skinOutput.get_winding_losses_per_winding().value();
+        for (const auto& element : connectionLossesPerWinding) {
+            REQUIRE(element.get_skin_effect_losses());
+            const auto connectionElement = element.get_skin_effect_losses().value();
+            for (auto loss : connectionElement.get_losses_per_harmonic()) {
+                connectionSkin += loss;
+            }
+        }
+        auto prunedOperatingPoint = OpenMagnetics::Inputs::prune_harmonics(inputs.get_operating_point(0), Defaults().harmonicAmplitudeThreshold);
+        auto expectedLengths = expected_connection_length_rectangular(coil);
+        double expectedChosen = 0;
+        double expectedDefault = 0;
+        for (size_t windingIndex = 0; windingIndex < coil.get_functional_description().size(); ++windingIndex) {
+            auto windingName = coil.get_functional_description()[windingIndex].get_name();
+            auto current = prunedOperatingPoint.get_excitations_per_winding()[windingIndex].get_current().value();
+            auto wire = coil.resolve_wire(windingIndex);
+            expectedChosen += OpenMagnetics::WindingSkinEffectLosses::calculate_skin_effect_losses_per_meter(wire, current, temperature, 1, chosenModel).first *
+                              expectedLengths.at({windingName, 0});
+            expectedDefault += OpenMagnetics::WindingSkinEffectLosses::calculate_skin_effect_losses_per_meter(wire, current, temperature, 1).first *
+                               expectedLengths.at({windingName, 0});
+        }
+        // The fixture must tell the two models apart, or the guard measures nothing.
+        REQUIRE(std::abs(expectedChosen - expectedDefault) > 0.01 * expectedDefault);
+        CHECK_THAT(connectionSkin, Catch::Matchers::WithinRel(expectedChosen, 1e-6));
+        settings.reset();
+    }
 }
 
 TEST_CASE("Test_Abt967_Autocomplete_Accepts_A_Database_Foil", "[constructive-model][coil][foil][regression]") {
@@ -13169,13 +13303,13 @@ TEST_CASE("Test_Abt967_Autocomplete_Accepts_A_Database_Foil", "[constructive-mod
     auto wire = magnetic.get_mutable_coil().resolve_wire(1);
     REQUIRE(wire.get_type() == WireType::FOIL);
     REQUIRE(wire.get_outer_width());
-    // The width a foil OCCUPIES is its thickness plus the film it is wound with (2026-09-04).
-    // This assertion used to demand outer == conducting, which pinned the behaviour that made a
-    // foil stack short: every sheet touching its neighbour. What this test is actually about is
-    // that autocomplete SURVIVES a database foil stating only its thickness -- it used to
-    // dereference an empty optional -- and that is unchanged.
-    REQUIRE_THAT(resolve_dimensional_values(wire.get_outer_width().value()) -
-                     resolve_dimensional_values(wire.get_conducting_width().value()),
+    // The width a foil OCCUPIES is its thickness plus the film it is wound with (2026-09-04); since
+    // ABT #1151 that is its wound width, while its outerWidth is the conductor (it states no
+    // coating). What this test is actually about is that autocomplete SURVIVES a database foil
+    // stating only its thickness -- it used to dereference an empty optional -- and that is unchanged.
+    REQUIRE_THAT(resolve_dimensional_values(wire.get_outer_width().value()),
+                 Catch::Matchers::WithinAbs(resolve_dimensional_values(wire.get_conducting_width().value()), 1e-12));
+    REQUIRE_THAT(wire.get_maximum_outer_width() - resolve_dimensional_values(wire.get_conducting_width().value()),
                  Catch::Matchers::WithinAbs(25e-6, 1e-9));
     settings.reset();
 }
@@ -13210,6 +13344,56 @@ TEST_CASE("Test_Autocomplete_Of_An_Autocompleted_Foil_Is_Accepted", "[constructi
     settings.reset();
 }
 
+TEST_CASE("Test_Abt1151_Autocompleted_Foil_Outer_Width_Is_Its_Conductor", "[constructive-model][coil][foil][regression][abt-1151]") {
+    // ABT #1151 (Alf, 2026-10-18: "outer = conductor"): autocomplete gave "Foil 0.2" an outerWidth
+    // 25 um past its conductor while leaving its coating null -- a wire that says it has no
+    // insulation and an outer size that only insulation could fill; OMFEM refused it. The film is
+    // the foil's interleaf, counted once in its WOUND width, not in the wire's outer size.
+    settings.reset();
+    clear_databases();
+    auto mas = OpenMagneticsTesting::mas_loader(std::string(__FILE__).substr(0, std::string(__FILE__).rfind('/'))
+                                                + "/../MAS/examples/04_forward_xfmr_e3216_n87.json");
+    auto magneticIn = mas.get_magnetic();
+    auto& windings = magneticIn.get_mutable_coil().get_mutable_functional_description();
+    REQUIRE(windings.size() >= 2);
+    windings[1].set_wire("Foil 0.2");
+    magneticIn.get_mutable_coil().set_turns_description(std::nullopt);
+    magneticIn.get_mutable_coil().set_layers_description(std::nullopt);
+    magneticIn.get_mutable_coil().set_sections_description(std::nullopt);
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(magneticIn);
+    auto wire = magnetic.get_mutable_coil().resolve_wire(1);
+    REQUIRE(wire.get_type() == WireType::FOIL);
+    CHECK_FALSE(wire.get_coating());
+    REQUIRE(wire.get_outer_width());
+    const double foil = resolve_dimensional_values(wire.get_conducting_width().value());
+    CHECK_THAT(resolve_dimensional_values(wire.get_outer_width().value()), Catch::Matchers::WithinAbs(foil, 1e-12));
+    // The film is still there, once, in the width the foil takes in its layer.
+    CHECK_THAT(wire.get_maximum_outer_width() - foil, Catch::Matchers::WithinAbs(25e-6, 1e-9));
+
+    // A design stored before the fix carries MKF's own old value (conductor + film): a re-autocomplete
+    // brings it to the conductor instead of keeping the contradiction.
+    auto stored = magnetic;
+    {
+        auto storedWire = stored.get_mutable_coil().resolve_wire(1);
+        DimensionWithTolerance legacy;
+        legacy.set_nominal(foil + 25e-6);
+        storedWire.set_outer_width(legacy);
+        stored.get_mutable_coil().get_mutable_functional_description()[1].set_wire(storedWire);
+    }
+    auto again = OpenMagnetics::magnetic_autocomplete(stored);
+    auto againWire = again.get_mutable_coil().resolve_wire(1);
+    CHECK_THAT(resolve_dimensional_values(againWire.get_outer_width().value()), Catch::Matchers::WithinAbs(foil, 1e-12));
+
+    // An outerWidth that is neither the conductor nor conductor + film states insulation nothing
+    // accounts for: refused, not silently re-read.
+    auto contradictory = wire;
+    DimensionWithTolerance tooWide;
+    tooWide.set_nominal(foil + 100e-6);
+    contradictory.set_outer_width(tooWide);
+    CHECK_THROWS_AS(contradictory.get_maximum_outer_width(), InvalidInputException);
+    settings.reset();
+}
+
 TEST_CASE("Test_Abt881_Foil_Has_No_Crossing_Station", "[constructive-model][coil][real-geometry][foil][regression]") {
     // ABT #881: the real-winding crossing bump (ABT #685) charges every winding one extra station
     // per layer -- the slot a wire needs where it closes a layer and climbs to the next. A FOIL
@@ -13231,6 +13415,18 @@ TEST_CASE("Test_Abt881_Foil_Has_No_Crossing_Station", "[constructive-model][coil
     windings[1].set_wire("Foil 0.2");
     windings[1].set_number_turns(1);
     windings[1].set_number_parallels(6);
+    // ABT #1496 (Alf, 2026-10-11): an inner foil end that crosses the layers wound over it leaves
+    // through a conductor joined to the sheet, stated here; without one the real winder throws.
+    {
+        std::vector<MAS::ConnectionElement> foilLeads;
+        for (auto end : {MAS::End::START, MAS::End::FINISH}) {
+            MAS::ConnectionElement connection;
+            connection.set_end(end);
+            connection.set_lead_conductor(MAS::WireDataOrNameUnion(std::string("Round 1.00 - Grade 1")));
+            foilLeads.push_back(connection);
+        }
+        windings[1].set_connections(foilLeads);
+    }
     magneticIn.get_mutable_coil().set_turns_description(std::nullopt);
     magneticIn.get_mutable_coil().set_layers_description(std::nullopt);
     magneticIn.get_mutable_coil().set_sections_description(std::nullopt);
@@ -13284,6 +13480,18 @@ TEST_CASE("Test_Foil_Parallels_Are_N_Filar", "[constructive-model][coil][real-ge
     windings[1].set_wire("Foil 0.2");
     windings[1].set_number_turns(2);
     windings[1].set_number_parallels(4);
+    // ABT #1496 (Alf, 2026-10-11): an inner foil end that crosses the layers wound over it leaves
+    // through a conductor joined to the sheet, stated here; without one the real winder throws.
+    {
+        std::vector<MAS::ConnectionElement> foilLeads;
+        for (auto end : {MAS::End::START, MAS::End::FINISH}) {
+            MAS::ConnectionElement connection;
+            connection.set_end(end);
+            connection.set_lead_conductor(MAS::WireDataOrNameUnion(std::string("Round 1.00 - Grade 1")));
+            foilLeads.push_back(connection);
+        }
+        windings[1].set_connections(foilLeads);
+    }
     magneticIn.get_mutable_coil().set_turns_description(std::nullopt);
     magneticIn.get_mutable_coil().set_layers_description(std::nullopt);
     magneticIn.get_mutable_coil().set_sections_description(std::nullopt);
@@ -13337,12 +13545,14 @@ TEST_CASE("Test_Foil_Layer_Pitch_Includes_The_Interleaved_Film", "[constructive-
     REQUIRE(wire.get_conducting_width());
     const double foil = resolve_dimensional_values(wire.get_conducting_width().value());
 
-    // The wire states no coating, so the standard polyester applies and is visible in the pitch.
+    // The wire states no coating, so the standard polyester applies and is visible in the pitch
+    // (the wound width); the wire's own outer width is the conductor (ABT #1151).
     MAS::Section section;
     section.set_dimensions(std::vector<double>{0.005, 0.027});
     wire.cut_foil_wire_to_section(section);
     REQUIRE(wire.get_outer_width());
-    const double pitch = resolve_dimensional_values(wire.get_outer_width().value());
+    CHECK_THAT(resolve_dimensional_values(wire.get_outer_width().value()), Catch::Matchers::WithinRel(foil, 1e-9));
+    const double pitch = wire.get_maximum_outer_width();
     CHECK(pitch > foil);
     CHECK_THAT(pitch - foil, Catch::Matchers::WithinAbs(25e-6, 1e-9));
     // The foil's own height is what it conducts on: the film's extra breadth is the insulation's.
@@ -13359,6 +13569,8 @@ TEST_CASE("Test_Foil_Layer_Pitch_Includes_The_Interleaved_Film", "[constructive-
     film.set_thickness(filmThickness);
     taped.set_coating(film);
     taped.cut_foil_wire_to_section(section);
+    CHECK_THAT(taped.get_maximum_outer_width() - foil, Catch::Matchers::WithinAbs(50e-6, 1e-9));
+    // A DECLARED coating is the wire's own, so its outer width carries it.
     CHECK_THAT(resolve_dimensional_values(taped.get_outer_width().value()) - foil,
                Catch::Matchers::WithinAbs(50e-6, 1e-9));
 
@@ -13368,6 +13580,7 @@ TEST_CASE("Test_Foil_Layer_Pitch_Includes_The_Interleaved_Film", "[constructive-
     bare.cut_foil_wire_to_section(section);
     CHECK_THAT(resolve_dimensional_values(bare.get_outer_width().value()),
                Catch::Matchers::WithinRel(foil, 1e-9));
+    CHECK_THAT(bare.get_maximum_outer_width(), Catch::Matchers::WithinRel(foil, 1e-9));
     settings.reset();
 }
 
@@ -13393,6 +13606,18 @@ TEST_CASE("Test_Foil_Sheets_Of_A_Stack_Share_One_Height", "[constructive-model][
     windings[1].set_wire("Foil 0.2");
     windings[1].set_number_turns(2);
     windings[1].set_number_parallels(6);
+    // ABT #1496 (Alf, 2026-10-11): an inner foil end that crosses the layers wound over it leaves
+    // through a conductor joined to the sheet, stated here; without one the real winder throws.
+    {
+        std::vector<MAS::ConnectionElement> foilLeads;
+        for (auto end : {MAS::End::START, MAS::End::FINISH}) {
+            MAS::ConnectionElement connection;
+            connection.set_end(end);
+            connection.set_lead_conductor(MAS::WireDataOrNameUnion(std::string("Round 1.00 - Grade 1")));
+            foilLeads.push_back(connection);
+        }
+        windings[1].set_connections(foilLeads);
+    }
     magneticIn.get_mutable_coil().set_turns_description(std::nullopt);
     magneticIn.get_mutable_coil().set_layers_description(std::nullopt);
     magneticIn.get_mutable_coil().set_sections_description(std::nullopt);
@@ -13483,6 +13708,76 @@ TEST_CASE("Test_Real_Geometry_Planar_Winds_As_Pcb", "[constructive-model][coil][
     REQUIRE_THROWS_WITH(OpenMagnetics::WindingOhmicLosses::calculate_connection_resistance_per_winding_per_parallel(
                             magnetic.get_coil(), 25.0),
                         Catch::Matchers::ContainsSubstring("no connection length"));
+    settings.reset();
+}
+
+TEST_CASE("Test_Planar_Printed_Group_Sits_At_Its_Pcb_Core_To_Track_Without_Real_Winding", "[constructive-model][coil][planar][abt-1760]") {
+    // ABT #1760: a printed group that carries a pcb is laid out at that pcb's coreToTrack whether or not real
+    // winding geometry is on. It was read only with real winding on, so the board of MAS example 09 (rule
+    // 0.30 mm) was placed at the 0.25 mm its caller passed and MVB++ refused to cut the FR4 around it.
+    // The rule here (0.20 mm) is neither the caller's distance (0.25 mm) nor the example's own, so the
+    // placement can only come from reading the group's pcb.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(false);
+    auto mas = OpenMagneticsTesting::mas_loader(std::string(__FILE__).substr(0, std::string(__FILE__).rfind('/'))
+                                                + "/../MAS/examples/09_planar_xfmr_er2510_3c94.json");
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+    const std::vector<size_t> stackUp = {0, 1, 0, 1, 0, 1};
+    const double callerDistance = 250e-6;
+    const double coreToTrack = 200e-6;
+
+    auto window = magnetic.get_mutable_coil().resolve_bobbin().get_processed_description()->get_winding_windows()[0];
+    const double windowWidth = window.get_width().value();
+    const double windowLeft = window.get_coordinates().value()[0] - windowWidth / 2;
+    const double windowRight = window.get_coordinates().value()[0] + windowWidth / 2;
+
+    auto printedGroupOf = [](OpenMagnetics::Coil& coil) {
+        auto groups = coil.get_groups_description();
+        REQUIRE(groups);
+        REQUIRE(groups->size() == 1);
+        REQUIRE(groups->front().get_type() == WiringTechnology::PRINTED);
+        return groups->front();
+    };
+
+    SECTION("with a pcb, the group and its copper keep the pcb's coreToTrack from both core walls") {
+        auto coil = magnetic.get_coil();
+        auto groups = coil.get_groups_description().value();
+        REQUIRE(groups.front().get_pcb());
+        auto pcb = groups.front().get_pcb().value();
+        pcb.get_mutable_design_rules().set_core_to_track(coreToTrack);
+        groups.front().set_pcb(pcb);
+        coil.set_groups_description(groups);
+
+        REQUIRE(coil.wind_planar(stackUp, std::nullopt, {}, {}, callerDistance));
+        auto group = printedGroupOf(coil);
+        REQUIRE(group.get_pcb());
+        CHECK_THAT(group.get_pcb()->get_design_rules().get_core_to_track(), Catch::Matchers::WithinAbs(coreToTrack, 1e-12));
+        CHECK_THAT(group.get_coordinates()[0] - group.get_dimensions()[0] / 2 - windowLeft, Catch::Matchers::WithinAbs(coreToTrack, 1e-9));
+        CHECK_THAT(windowRight - group.get_coordinates()[0] - group.get_dimensions()[0] / 2, Catch::Matchers::WithinAbs(coreToTrack, 1e-9));
+
+        auto turns = coil.get_turns_description();
+        REQUIRE(turns);
+        REQUIRE(turns->size() == 27);
+        for (auto& turn : turns.value()) {
+            const double halfWidth = turn.get_dimensions().value()[0] / 2;
+            INFO(turn.get_name());
+            CHECK(turn.get_coordinates()[0] - halfWidth - windowLeft >= coreToTrack - 1e-9);
+            CHECK(windowRight - turn.get_coordinates()[0] - halfWidth >= coreToTrack - 1e-9);
+        }
+    }
+
+    SECTION("without a pcb the group states no rule and sits at the distance its caller passes") {
+        auto coil = magnetic.get_coil();
+        auto groups = coil.get_groups_description().value();
+        groups.front().set_pcb(std::nullopt);
+        coil.set_groups_description(groups);
+
+        REQUIRE(coil.wind_planar(stackUp, std::nullopt, {}, {}, callerDistance));
+        auto group = printedGroupOf(coil);
+        CHECK(!group.get_pcb());
+        CHECK_THAT(group.get_coordinates()[0] - group.get_dimensions()[0] / 2 - windowLeft, Catch::Matchers::WithinAbs(callerDistance, 1e-9));
+        CHECK_THAT(windowRight - group.get_coordinates()[0] - group.get_dimensions()[0] / 2, Catch::Matchers::WithinAbs(callerDistance, 1e-9));
+    }
     settings.reset();
 }
 
@@ -13932,6 +14227,33 @@ TEST_CASE("Test_Real_Geometry_Wind_Survives_Transient_Unfit", "[constructive-mod
     settings.reset();
 }
 
+
+// ABT #1626: get_turn_by_name kept a copy of each turn it found and returned it after the turns
+// were replaced; get_winding_index_by_name kept an index after the windings were renamed.
+TEST_CASE("Test_Coil_Name_Caches_Follow_The_Turns_And_Windings", "[constructive-model][coil][abt-1626]") {
+    settings.reset();
+    auto coil = OpenMagneticsTesting::get_quick_coil({10, 5}, {1, 1}, "PQ 28/20");
+    REQUIRE(coil.get_turns_description());
+    auto turns = coil.get_turns_description().value();
+    const std::string turnName = turns[0].get_name();
+    const auto originalCoordinates = coil.get_turn_by_name(turnName).get_coordinates();
+
+    turns[0].set_coordinates({originalCoordinates[0] + 1e-3, originalCoordinates[1] - 1e-3});
+    coil.set_turns_description(turns);
+    const auto movedCoordinates = coil.get_turn_by_name(turnName).get_coordinates();
+    CHECK_THAT(movedCoordinates[0], Catch::Matchers::WithinAbs(originalCoordinates[0] + 1e-3, 1e-12));
+    CHECK_THAT(movedCoordinates[1], Catch::Matchers::WithinAbs(originalCoordinates[1] - 1e-3, 1e-12));
+
+    const std::string primaryName = coil.get_functional_description()[0].get_name();
+    const std::string secondaryName = coil.get_functional_description()[1].get_name();
+    REQUIRE(coil.get_winding_index_by_name(primaryName) == 0);
+    REQUIRE(coil.get_winding_index_by_name(secondaryName) == 1);
+    std::swap(coil.get_mutable_functional_description()[0], coil.get_mutable_functional_description()[1]);
+    CHECK(coil.get_winding_index_by_name(primaryName) == 1);
+    CHECK(coil.get_winding_index_by_name(secondaryName) == 0);
+    settings.reset();
+}
+
 }  // namespace
 
 
@@ -14145,26 +14467,34 @@ TEST_CASE("Test_Core_Window_Winding_Order_Reaches_Autocompleted_Bobbin",
     REQUIRE(reprocessedWindows[0].get_winding_order().has_value());
     CHECK(reprocessedWindows[0].get_winding_order().value() == MAS::WindingOrder::U);
 
-    // (2) create_quick_bobbin carries it onto the autocompleted bobbin, where
-    //     Coil::get_winding_order picks it up for every section of the wind.
-    OpenMagnetics::Magnetic magnetic;
-    magnetic.set_core(core);
-    auto coilJson = masJson["magnetic"]["coil"];
-    coilJson["bobbin"] = "Dummy";
-    magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
-    auto completed = OpenMagnetics::magnetic_autocomplete(magnetic);
-
-    auto bobbin = completed.get_mutable_coil().resolve_bobbin();
+    // (2) create_quick_bobbin carries it onto the bobbin autocomplete builds for "Dummy" (with null
+    //     dimensions), where Coil::get_winding_order picks it up for every section of the wind.
+    //     Built directly: the wind itself is refused below.
+    auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, true);
     auto bobbinWindows = bobbin.get_processed_description().value().get_winding_windows();
     REQUIRE(!bobbinWindows.empty());
     REQUIRE(bobbinWindows[0].get_winding_order().has_value());
     CHECK(bobbinWindows[0].get_winding_order().value() == MAS::WindingOrder::U);
 
-    auto sectionsDescription = completed.get_coil().get_sections_description();
-    REQUIRE(sectionsDescription.has_value());
-    auto sections = sectionsDescription.value();
-    REQUIRE(!sections.empty());
-    CHECK(completed.get_coil().get_winding_order(sections[0].get_name()) == MAS::WindingOrder::U);
+    // (3) Autocompleting the reconstruction with a quick bobbin.
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    auto coilJson = masJson["magnetic"]["coil"];
+    coilJson["bobbin"] = "Dummy";
+    magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
+    // ABT #1496 (Alf, 2026-10-11): the reconstruction's 34 turns do not fit the quick bobbin's
+    // window (turn 14 lands 370 um past it, and further turns ~15 mm outside the core); the old
+    // autocomplete handed that layout back silently. It now refuses it.
+    bool threw = false;
+    try {
+        OpenMagnetics::magnetic_autocomplete(magnetic);
+    }
+    catch (const OpenMagnetics::CoilException& e) {
+        threw = true;
+        INFO(e.what());
+        CHECK(e.code() == OpenMagnetics::ErrorCode::COIL_WINDING_ERROR);
+    }
+    CHECK(threw);
     settings.reset();
 }
 
@@ -14219,10 +14549,16 @@ TEST_CASE("Test_Molded_Small_Body_Refusal_Names_The_Reason", "[constructive-mode
     };
 
     SECTION("a conductor wider than the annulus is refused, and the refusal names the numbers") {
-        // 0.36 mm conductor into (0.70 - 0.50)/2 = 0.10 mm of annulus.
-        auto coil = build(0.00050, 0.00070, 5, 0.00036);
-        REQUIRE_FALSE(coil.get_turns_description().has_value());
-        auto reason = coil.get_last_fit_failure();
+        // 0.36 mm conductor into (0.70 - 0.50)/2 = 0.10 mm of annulus. ABT #1496: autocomplete
+        // no longer hands an unwound coil back; it throws, with the refusal in its message.
+        std::string reason;
+        try {
+            build(0.00050, 0.00070, 5, 0.00036);
+        }
+        catch (const OpenMagnetics::CoilException& e) {
+            CHECK(e.code() == OpenMagnetics::ErrorCode::COIL_WINDING_ERROR);
+            reason = e.what();
+        }
         UNSCOPED_INFO("reason: " << reason);
         REQUIRE_FALSE(reason.empty());
         CHECK(reason.find("winding 0") != std::string::npos);
@@ -14231,9 +14567,17 @@ TEST_CASE("Test_Molded_Small_Body_Refusal_Names_The_Reason", "[constructive-mode
     }
 
     SECTION("turn count is not the lever: one turn fails identically") {
-        auto coil = build(0.00050, 0.00070, 1, 0.00036);
-        REQUIRE_FALSE(coil.get_turns_description().has_value());
-        CHECK_FALSE(coil.get_last_fit_failure().empty());
+        std::string reason;
+        try {
+            build(0.00050, 0.00070, 1, 0.00036);
+        }
+        catch (const OpenMagnetics::CoilException& e) {
+            CHECK(e.code() == OpenMagnetics::ErrorCode::COIL_WINDING_ERROR);
+            reason = e.what();
+        }
+        UNSCOPED_INFO("reason: " << reason);
+        CHECK(reason.find("0.360") != std::string::npos);
+        CHECK(reason.find("0.100") != std::string::npos);
     }
 
     SECTION("widen the annulus and the same part winds") {
@@ -14394,6 +14738,691 @@ TEST_CASE("Test_Toroidal_Ring_To_Ring_Hops_Are_Short_And_Do_Not_Cross", "[coil][
             CHECK_FALSE(segmentsProperlyIntersect(hops[i], hops[j]));
         }
     }
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Bifilar_Ring_Lays_Each_Parallel_Its_Own_Turn_Count", "[coil][toroidal][real-geometry]") {
+    // ABT #1734: a toroidal ring whose capacity is not a multiple of the parallel count splits
+    // its turns unevenly between the parallels (19 slots of a bifilar winding: 10 + 9). The
+    // toroidal placer laid the FIRST parallel's count for every parallel, so the ring got 20
+    // stations for 19 slots, overran its section, parallel 1 ended with 49 turns instead of 45,
+    // and the real-winding outer-crossing sweep threw CALCULATION_INVALID_RESULT ("NO
+    // outer-crossing azimuth ... turn Primary parallel 0 turn 40"), aborting the coil adviser
+    // (Test_CoilAdviser_Random_15/16 inputs with real winding on).
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    // The wires the coil adviser returns first for those inputs on top of ABT #1699. (Round 26.0
+    // x 2, the design first reported, does not fit this quick coil: "90 turns of a 0.431 mm wire
+    // need 13 rings, 5.603 mm deep, in a window of 3.95 mm radial height".)
+    auto primaryWire = OpenMagnetics::find_wire_by_name("Round 29.0 - Single Build");
+    auto secondaryWire = OpenMagnetics::find_wire_by_name("Round 27.5 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({45, 45}, {2, 2}, "T 12.7/7.9/12.7", 1,
+                                                                MAS::WindingOrientation::CONTIGUOUS,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {primaryWire, secondaryWire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    REQUIRE(coil.get_layers_description());
+    const auto turns = coil.get_turns_description().value();
+
+    // Every parallel of every winding carries exactly its own number of turns.
+    std::map<std::pair<std::string, int64_t>, size_t> turnsPerParallel;
+    std::map<std::string, size_t> stationsPerLayer;
+    for (const auto& turn : turns) {
+        turnsPerParallel[{turn.get_winding(), turn.get_parallel()}]++;
+        stationsPerLayer[turn.get_layer().value()]++;
+    }
+    REQUIRE(turnsPerParallel.size() == 4);
+    for (const auto& [key, count] : turnsPerParallel) {
+        INFO(key.first << " parallel " << key.second);
+        CHECK(count == 45);
+    }
+
+    // Every ring holds exactly the physical turns its layer was sized for, and at least one ring
+    // has an uneven split (otherwise this fixture no longer exercises the defect).
+    bool sawUnevenRing = false;
+    const auto layers = coil.get_layers_description().value();
+    for (const auto& layer : layers) {
+        if (layer.get_type() != MAS::ElectricalType::CONDUCTION) {
+            continue;
+        }
+        INFO(layer.get_name());
+        CHECK(stationsPerLayer[layer.get_name()] == coil.get_number_turns(layer));
+        const auto proportions = layer.get_partial_windings()[0].get_parallels_proportion();
+        if (proportions.size() == 2 && std::abs(proportions[0] - proportions[1]) > 1e-9 &&
+            proportions[0] > 0 && proportions[1] > 0) {
+            sawUnevenRing = true;
+        }
+    }
+    CHECK(sawUnevenRing);
+    // And the outer crossings of both windings are laid without a collision.
+    OpenMagneticsTesting::check_turns_description(coil);
+    // And every ring, however deep, stays in its own winding's sector: the align re-spread passes
+    // used to extend a deep ring's territory up to the nearest foreign turn AT ITS OWN RADIUS --
+    // the other winding has fewer rings, so there was none -- and spread it across the other
+    // winding's sector (ABT #1734).
+    OpenMagneticsTesting::check_toroidal_sections_keep_their_sectors(coil);
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Outer_Crossing_Sweep_Stays_In_Its_Ring_Arc", "[coil][toroidal][real-geometry]") {
+    // ABT #1734 (fix C): under real winding a ring is laid where its stations actually are --
+    // the corridor shift moves rings after the first toward the section end -- while the
+    // section's angular extent is rebuilt synthetically (N turn pitches centred on the section).
+    // The phase-2 outer-crossing sweep searched only inside that synthetic extent, which here
+    // does not contain the ring's own stations, so it found no azimuth and refused the wind with
+    // "NO outer-crossing azimuth". The sweep is bounded by the arc the ring OCCUPIES instead.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 21.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({20, 20}, {1, 1}, "T 12.7/7.9/12.7", 1,
+                                                                MAS::WindingOrientation::CONTIGUOUS,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    CHECK(OpenMagneticsTesting::check_toroidal_sections_keep_their_sectors(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Contiguous_Windings_Keep_Their_Sectors_And_Sweep_Crossings_In_Their_Ring_Territory", "[coil][toroidal][real-geometry]") {
+    // ABT #1734: three contiguous bifilar windings of three rings each wind without a collision
+    // and every turn stays in its own winding's sector. Two pieces of the winder keep that true
+    // on this fixture, and the test fails without either:
+    //  - the real-winding sector partition of align_blocked_ring_turns (a contiguous section's
+    //    rings are re-spread inside the sector allocated to the section). Without it 14 turns
+    //    of the three windings end in a neighbouring sector ('winding 1 parallel 0 turn 0' at
+    //    137.431 deg inside 'winding 0 section 0');
+    //  - the outer-crossing sweep bounded by the territory of the ring (the arc its stations
+    //    occupy) instead of the section's synthetic extent. Bounded by the section, 'winding 2
+    //    parallel 0 turn 11' finds no azimuth after the previous crossing and the wind is refused
+    //    with "NO outer-crossing azimuth inside its ring".
+    // (The test was named after the settle loop's outer-crossing comparison, which never fired
+    // on any fixture and was removed, ABT #1819.)
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 29.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({30, 30, 30}, {2, 2, 2}, "T 17.3/9.7/12.7", 1,
+                                                                MAS::WindingOrientation::CONTIGUOUS,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    CHECK(OpenMagneticsTesting::check_toroidal_sections_keep_their_sectors(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Overlapping_Respread_March_Jumps_A_Corridor_From_Its_Start_Edge", "[coil][toroidal][real-geometry]") {
+    // ABT #1734, ABT #1789: two overlapping bifilar windings wind, and without a collision. Two
+    // pieces of align_blocked_ring_turns keep that true on this fixture, and the test fails
+    // without either:
+    //  - the re-spread march treats a corridor as blocked from its start edge (inclusive) to its
+    //    end edge (exclusive). Stepping exactly onto the start edge of the next corridor it used
+    //    to probe 1e-9 deg ahead, an answer decided by rounding, and could walk the rest of its
+    //    step into the corridor. With the probe back, 'winding 0 section 0 layer 0' stays one
+    //    slot short on all 16 re-winds ("toroidal turn blocking did not converge");
+    //  - the sector partition is applied to CONTIGUOUS layouts only. Applied to these concentric
+    //    windings, the three rings of 'winding 0' stay one slot short each on all 16 re-winds.
+    // (The test was named after the settle loop's outer-crossing comparison, which never fired
+    // on any fixture and was removed, ABT #1819.)
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 21.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({45, 45}, {2, 2}, "T 25/15/10", 1,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Overlapping_Sections_Are_Not_Cut_Into_Sectors", "[coil][toroidal][real-geometry]") {
+    // ABT #1734: the real-winding sector partition belongs to CONTIGUOUS layouts only. Overlapping
+    // sections are concentric, but their measured turn arcs classify as "sectors" once a corridor
+    // opens a gap wider than two pitches; partitioned, each of these two windings was cut to about
+    // half the circle and the blocking loop spilled turns until "90 turns ... need 12 rings, 5.001
+    // mm deep, in a window of 3.95 mm radial height" and the wind failed.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 29.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({45, 45}, {2, 2}, "T 12.7/7.9/12.7", 1,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Interleaved_Sections_Keep_Their_Own_Sectors", "[coil][toroidal][real-geometry]") {
+    // ABT #1734 (Alf 2026-10-11): the real-winding sector partition is keyed by SECTION. An
+    // interleaved winding (P S P S) owns two sectors; keyed by winding, its two sections measured
+    // as one arc spanning the other winding's sector between them, and the re-spread marched its
+    // rings across that sector into the other winding's copper.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 29.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({20, 20}, {1, 1}, "T 20/10/7", 2,
+                                                                MAS::WindingOrientation::CONTIGUOUS,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    REQUIRE(coil.get_sections_description());
+    size_t conductionSections = 0;
+    const auto sections = coil.get_sections_description().value();
+    for (const auto& section : sections) {
+        if (section.get_type() == MAS::ElectricalType::CONDUCTION) {
+            ++conductionSections;
+        }
+    }
+    REQUIRE(conductionSections == 4);   // P S P S: the fixture must stay interleaved
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    CHECK(OpenMagneticsTesting::check_toroidal_sections_keep_their_sectors(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Sector_Territories_Are_The_Allocated_Sectors", "[coil][toroidal][real-geometry]") {
+    // ABT #1734 (Alf 2026-10-11): each section of a contiguous toroid is bounded by the sector
+    // wind_by_sections ALLOCATED it (plus half of each adjacent insulation), not by the arc its
+    // turns currently occupy. The measured arc is self-referential: a section whose turns were
+    // spilled to deeper rings occupies a narrower arc, was handed less territory, reported more
+    // deficit and spilled again, until the wind no longer fit (T 25/15/10, 15 x 3 x 2 Round 21.0:
+    // the middle winding's territory fell 110 -> 77 -> 71 deg against its 120 deg sector). None of
+    // these eight contiguous fixtures wound with the measured partition. The sectors are allocated
+    // in proportion to the angle each winding needs (Alf 2026-10-12): with an equal split the last
+    // two fixtures (45 + 25 turns) did not wind, the Primary's turns not fitting their half while
+    // the Secondary left part of its own empty.
+    // ABT #1789: T 20/10/7 with 45 + 25 turns still did not wind. The even re-spread marched onto
+    // the start edge of a lead corridor and, depending on floating-point rounding, walked the
+    // rest of its step into it; the ring re-spread to the same intrusion until the ABT #723
+    // escalation spilled a turn it had room for, one ring per re-wind, to "50 turns need 14 rings,
+    // 7.574 mm deep, in a window of 5 mm".
+    struct Fixture {
+        std::string core;
+        std::vector<int64_t> turns;
+        int64_t parallels;
+        std::vector<std::string> wires;   // cycled over the windings
+    };
+    const std::vector<Fixture> fixtures = {
+        {"T 25/15/10", {15, 15, 15}, 2, {"Round 21.0 - Single Build"}},
+        {"T 20/10/7", {45, 25}, 2, {"Round 24.0 - Single Build"}},
+        {"T 20/10/7", {15, 15, 15}, 2, {"Round 24.0 - Single Build"}},
+        {"T 17.3/9.7/12.7", {15, 15, 15}, 1, {"Round 21.0 - Single Build"}},
+        {"T 17.3/9.7/12.7", {15, 15, 15}, 2, {"Round 24.0 - Single Build"}},
+        {"T 12.7/7.9/12.7", {15, 15, 15}, 2, {"Round 29.0 - Single Build", "Round 27.5 - Single Build"}},
+        {"T 10/6/4", {30, 30, 30}, 1, {"Round 29.0 - Single Build", "Round 27.5 - Single Build"}},
+        {"T 10/6/4", {15, 15, 15}, 2, {"Round 29.0 - Single Build", "Round 27.5 - Single Build"}},
+        {"T 17.3/9.7/12.7", {45, 25}, 1, {"Round 21.0 - Single Build"}},
+        {"T 10/6/4", {45, 25}, 2, {"Round 29.0 - Single Build"}},
+    };
+    for (const auto& fixture : fixtures) {
+        std::string description = fixture.core + " turns";
+        for (auto turns : fixture.turns) {
+            description += " " + std::to_string(turns);
+        }
+        description += " x" + std::to_string(fixture.parallels) + " " + fixture.wires[0];
+        INFO(description);
+        settings.reset();
+        settings.set_coil_use_real_winding_geometry(true);
+        std::vector<OpenMagnetics::Wire> wires;
+        for (size_t w = 0; w < fixture.turns.size(); ++w) {
+            wires.push_back(OpenMagnetics::find_wire_by_name(fixture.wires[w % fixture.wires.size()]));
+        }
+        std::vector<int64_t> parallels(fixture.turns.size(), fixture.parallels);
+        OpenMagnetics::Coil coil;
+        REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil(fixture.turns, parallels, fixture.core, 1,
+                                                                    MAS::WindingOrientation::CONTIGUOUS,
+                                                                    MAS::WindingOrientation::OVERLAPPING,
+                                                                    MAS::CoilAlignment::CENTERED,
+                                                                    MAS::CoilAlignment::CENTERED,
+                                                                    wires));
+        INFO(coil.get_last_fit_failure());
+        CHECK(coil.get_turns_description());
+        if (!coil.get_turns_description()) {
+            continue;
+        }
+        CHECK(OpenMagneticsTesting::check_turns_description(coil));
+        CHECK(OpenMagneticsTesting::check_toroidal_sections_keep_their_sectors(coil));
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Respread_Keeps_The_Ring_Winding_Order", "[coil][toroidal][real-geometry]") {
+    // ABT #1734: a section's allocated sector need not contain all of its turns (the winder lays
+    // rings past their section). The even re-spread ordered a ring's turns from its territory
+    // start, so the Secondary's turns 0 and 1, just behind that start (173.9 and 179.5 deg, the
+    // territory starting at 180 deg), sorted last and were moved to the far end of the sector:
+    // the ring's winding order broke and the regenerated crossings of turns 1 and 11 landed on
+    // the same point. The ring is ordered from the middle of its own largest gap.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({20, 20}, {1, 1}, "T 12.7/7.9/12.7", 1,
+                                                                MAS::WindingOrientation::CONTIGUOUS,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {OpenMagnetics::find_wire_by_name("Round 29.0 - Single Build"),
+                                                                 OpenMagnetics::find_wire_by_name("Round 27.5 - Single Build")}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    CHECK(OpenMagneticsTesting::check_toroidal_sections_keep_their_sectors(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Single_Ring_Section_Closing_Crossing_Clears_Its_Predecessor", "[coil][toroidal][real-geometry]") {
+    // ABT #1789: a section wound in ONE ring was treated as "taped" (the flag is cleared only for
+    // two or more conduction layers) and skipped the outer-crossing rest/collision sweep. Its
+    // ring-closing "_ending" crossing keeps its own azimuth while every crossing before it sits
+    // half a station pitch forward, so the two are half a pitch apart: here winding 1 section 0,
+    // stations 4.697 deg apart, 'turn 8' crossing at 174.94 deg and 'turn 8_ending' at 177.289 deg
+    // on r = 6.5055 mm, 0.267 mm centre to centre for a 0.311 mm wire. Under real winding the
+    // single-ring section runs the sweep, which leans the closing crossing clear.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 29.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({20, 20}, {1, 1}, "T 12.7/7.9/12.7", 2,
+                                                                MAS::WindingOrientation::CONTIGUOUS,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    REQUIRE(coil.get_sections_description());
+    size_t conductionSections = 0;
+    const auto sections = coil.get_sections_description().value();
+    for (const auto& section : sections) {
+        if (section.get_type() == MAS::ElectricalType::CONDUCTION) {
+            ++conductionSections;
+            // The defect needs single-ring sections: the fixture must keep them.
+            size_t conductionLayers = 0;
+            const auto layers = coil.get_layers_by_section(section.get_name());
+            for (const auto& layer : layers) {
+                if (layer.get_type() == MAS::ElectricalType::CONDUCTION) {
+                    ++conductionLayers;
+                }
+            }
+            CHECK(conductionLayers == 1);
+        }
+    }
+    REQUIRE(conductionSections == 4);   // P S P S: the fixture must stay interleaved
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    CHECK(OpenMagneticsTesting::check_toroidal_sections_keep_their_sectors(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Outer_Crossings_Of_Neighbouring_Sections_Clear_Each_Other", "[coil][toroidal][real-geometry]") {
+    // ABT #1803: the outer-crossing rest/collision sweep kept its placed crossings per section, so
+    // the crossings of neighbouring sectors -- which share the one outer ring -- were never checked
+    // against each other. Here 'winding 0 parallel 0 turn 7_ending' (crossing at r = 8.9055 mm,
+    // 89.57 deg) and 'winding 1 parallel 0 turn 12_ending' (same radius, 92.65 deg) sat 0.478 mm
+    // centre to centre for a 0.541 mm wire, each inside its own sector. A section's sweep now also
+    // sees the crossings placed by the sections before it, at the touch distance of each pair.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 24.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({20, 20}, {2, 2}, "T 17.3/9.7/12.7", 2,
+                                                                MAS::WindingOrientation::CONTIGUOUS,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    REQUIRE(coil.get_sections_description());
+    size_t conductionSections = 0;
+    const auto sections = coil.get_sections_description().value();
+    for (const auto& section : sections) {
+        if (section.get_type() == MAS::ElectricalType::CONDUCTION) {
+            ++conductionSections;
+        }
+    }
+    REQUIRE(conductionSections == 4);   // P S P S: the defect is between neighbouring sectors
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    CHECK(OpenMagneticsTesting::check_toroidal_sections_keep_their_sectors(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Blocking_Out_Of_Rewinds_Refuses_The_Wind", "[coil][toroidal][real-geometry]") {
+    // ABT #1805: when the toroidal blocking loop used up its 16 re-winds with ring deficits left it
+    // returned the last attempt anyway. On this fixture the last four re-winds reported the same
+    // three one-slot deficits and the coil shipped with 'winding 0 parallel 1 turn 4' and
+    // 'winding 1 parallel 0 turn 14' 0.227 mm apart for a 0.541 mm wire and two single-turn rings
+    // outside their sector. A wind that runs out of re-winds with deficits left is refused with a
+    // COIL_WINDING_ERROR naming the rings; whatever IS returned must be a valid wind.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 24.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    bool refused = false;
+    try {
+        coil = OpenMagneticsTesting::get_quick_coil({20, 20}, {2, 2}, "T 12.7/7.9/12.7", 2,
+                                                    MAS::WindingOrientation::CONTIGUOUS,
+                                                    MAS::WindingOrientation::OVERLAPPING,
+                                                    MAS::CoilAlignment::CENTERED,
+                                                    MAS::CoilAlignment::CENTERED,
+                                                    {wire, wire});
+    }
+    catch (const OpenMagnetics::CoilException& exception) {
+        refused = true;
+        CHECK(exception.code() == OpenMagnetics::ErrorCode::COIL_WINDING_ERROR);
+        CHECK_THAT(std::string(exception.what()),
+                   Catch::Matchers::ContainsSubstring("toroidal turn blocking did not converge"));
+    }
+    if (!refused && coil.get_turns_description()) {
+        CHECK(OpenMagneticsTesting::check_turns_description(coil));
+        CHECK(OpenMagneticsTesting::check_toroidal_sections_keep_their_sectors(coil));
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Lead_Anchor_Leaves_Its_Corridor_Clear_Of_The_Edge", "[coil][toroidal][real-geometry]") {
+    // ABT #1818: a full-circle ring is re-spread around its lead-attached turn, and an anchor that
+    // sits in a corridor is moved to that corridor's nearest edge. Moved to the edge plus 1e-6 deg,
+    // the 1 nm rounding of the turn coordinates put it back 2e-6 deg inside ('winding 0 parallel 0
+    // turn 0' at 5.43149 deg in the corridor 9.72006 +- 4.28858 deg), the same on every nudge and
+    // re-spread, so the ring escalated the same one-slot deficit on all 16 re-winds and the wind
+    // was refused. The anchor clears the edge by the 1e-6 deg plus 1 nm of arc at the ring radius.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 24.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({15, 15, 15}, {1, 1, 1}, "T 25/15/10", 1,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Lead_Anchor_Holds_For_A_Ring_Classed_As_An_Arc_Of_The_Whole_Circle", "[coil][toroidal][real-geometry]") {
+    // ABT #1818: three overlapping bifilar windings of 30 turns fit the 3 mm window of a T 10/6/4
+    // and wind without a collision. The corridors a ring must clear are cast by the lead-attached
+    // turns of the other rings, so the rings only settle when each is re-spread around its own
+    // lead-attached turn. Three pieces of align_blocked_ring_turns keep that true on this
+    // fixture, and the test fails without any of them:
+    //  - the lead anchor holds for every ring whose territory is the whole circle and that no
+    //    sector bounds, not only for the rings classed "full circle". An anchored re-spread
+    //    jumps the other rings' corridors and so opens a gap wider than two pitches: the ring is
+    //    then classed an arc, was re-spread from the middle of its largest gap, and its lead
+    //    turn, with the corridor it casts, moved again on every pass;
+    //  - the anchor clears its corridor edge by 1e-6 deg plus 1 nm of arc at the ring radius,
+    //    so that it does not read back inside the corridor on the 1 nm coordinate grid.
+    //    Without either of those two the turns are spilled into rings the window does not have
+    //    ("60 turns of a 0.311 mm wire need 13 rings, 5.648 mm deep, in a window of 3 mm radial
+    //    height");
+    //  - the sector partition is applied to CONTIGUOUS layouts only (otherwise: "need 6 rings,
+    //    3.16 mm deep").
+    // (The test was named after a re-measure of the corridors each time an anchor moved; with the
+    // anchor holding as above it changed no fixture and was removed.)
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 29.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({30, 30, 30}, {2, 2, 2}, "T 10/6/4", 1,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Anchored_Respread_Measures_The_Blocked_Arc_Exactly", "[coil][toroidal][real-geometry]") {
+    // ABT #1818: two overlapping bifilar windings of 45 turns fit the 3 mm window of a T 10/6/4
+    // and wind without a collision. Three pieces of align_blocked_ring_turns keep that true on
+    // this fixture, and the test fails without any of them:
+    //  - the arc the corridors block in a ring is the exact length of the merged corridor arcs.
+    //    Counted on 3600 samples of the territory it was off by up to 0.1 deg, and a re-spread
+    //    marched from the lead anchor puts that error in the gap that closes the ring on the
+    //    anchor: two turns of the 0.311 mm wire end 0.310842 mm apart, a 0.16 um overlap;
+    //  - the lead anchor holds for every ring whose territory is the whole circle and that no
+    //    sector bounds, not only for the rings classed "full circle". Without it the lead turns
+    //    and the corridors they cast keep moving and the six rings stay one slot short each on
+    //    all 16 re-winds ("toroidal turn blocking did not converge");
+    //  - the sector partition is applied to CONTIGUOUS layouts only (otherwise: "90 turns of a
+    //    0.311 mm wire need 8 rings, 3.446 mm deep, in a window of 3 mm radial height").
+    // (The test was named after a reservation that held a ring below the turn count it had
+    // already failed with; with the two fixes above it changed no fixture and was removed.)
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 29.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({45, 45}, {2, 2}, "T 10/6/4", 1,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Sector_Respread_Is_Ordered_From_The_Rings_Own_Arc", "[coil][toroidal][real-geometry]") {
+    // ABT #1734 / ABT #1819: a sector ring is re-spread in the order of the arc it occupies, cut in
+    // the middle of its largest gap. Ordered from the march's reference angle instead, a turn lying
+    // just behind it sorts last and is laid at the far end of the sector: on this fixture the
+    // regenerated crossings then find no azimuth and the wind is refused.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 29.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({30, 30, 30}, {1, 1, 1}, "T 20/10/7", 1,
+                                                                MAS::WindingOrientation::CONTIGUOUS,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    CHECK(OpenMagneticsTesting::check_toroidal_sections_keep_their_sectors(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Lead_Anchor_Settles_The_Rings_Of_A_Winding", "[coil][toroidal][real-geometry]") {
+    // ABT #1818: T 25/15/10, 45 + 45 turns x 2 of Round 24.0, overlapping. Re-spread from the end
+    // of the widest corridor, the rings of a winding moved their own lead turns on every pass and
+    // chased each other's leads: the same one-slot escalation on all 16 re-winds, and the wind was
+    // refused. Re-spread around its lead-attached turn, each ring leaves the corridors it casts
+    // where they are and the wind settles.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 24.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({45, 45}, {2, 2}, "T 25/15/10", 1,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_Nudged_Turn_Clears_Its_Corridor_On_The_Coordinate_Grid", "[coil][toroidal][real-geometry]") {
+    // ABT #1818 / ABT #1804: the minimal nudge moved an intruding turn to the corridor edge plus
+    // 1e-6 deg, and the turn is stored on the 1 nm coordinate grid: it read back inside the corridor
+    // and was nudged to the same point until the ring's nudge budget was spent. Here a ring holding
+    // one turn was nudged six times to 328.388 deg, fell through to the re-spread, was measured one
+    // slot short, and a ring of one turn has no turn to give away: the same deficit on all 16
+    // re-winds and the wind was refused. The nudge clears the edge by one grid step of arc as well.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 24.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({30, 30, 30}, {1, 1, 1}, "T 20/10/7", 2,
+                                                                MAS::WindingOrientation::CONTIGUOUS,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    CHECK(OpenMagneticsTesting::check_toroidal_sections_keep_their_sectors(coil));
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_No_Turn_Is_Left_In_A_Lead_Corridor", "[coil][toroidal][real-geometry]") {
+    // ABT #1818: T 25/15/10, 45 + 25 turns x 2 of Round 21.0, overlapping. Without the lead anchor
+    // the rings of a winding chased each other's leads until the blocking loop gave up moving them,
+    // and the wind shipped with turns under the leads (24 lead/turn pairs, the worst 378.5 um inside
+    // a 0.757 mm wire). The rule the winder enforces is angular: on the ring a lead crosses, no turn
+    // centre lies within (lead width + turn width) / 2, as angles at the ring's radius, of the
+    // lead's azimuth. Checked here on the returned wind, and the turns must not collide either: the
+    // anchored re-spread closes the ring on the anchor, where a blocked arc counted to 0.1 deg
+    // left two turns of this fixture closer than a wire.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto wire = OpenMagnetics::find_wire_by_name("Round 21.0 - Single Build");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({45, 25}, {2, 2}, "T 25/15/10", 1,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                {wire, wire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+
+    coil.convert_turns_to_cartesian_coordinates();
+    const auto turns = coil.get_turns_description().value();
+    const auto spaces = coil.get_connection_reserved_spaces();
+    std::map<std::string, std::vector<size_t>> ringTurns;
+    for (size_t t = 0; t < turns.size(); ++t) {
+        ringTurns[turns[t].get_layer().value()].push_back(t);
+    }
+    // Stations are stored on a 1 nm grid: 1 nm of arc at the innermost ring is below 1e-4 deg.
+    const double gridToleranceDegrees = 1e-4;
+    size_t corridorsChecked = 0;
+    double deepestIntrusionDegrees = 0;
+    std::string deepestIntrusion;
+    for (const auto& space : spaces) {
+        if (space.layer.empty() || !ringTurns.count(space.layer)) {
+            continue;
+        }
+        const auto& ring = ringTurns.at(space.layer);
+        double ringRadius = 0;
+        for (size_t t : ring) {
+            ringRadius += std::hypot(turns[t].get_coordinates()[0], turns[t].get_coordinates()[1]) / double(ring.size());
+        }
+        const double turnWidth = turns[ring[0]].get_dimensions().value()[1];
+        const double corridorHalfAngle = OpenMagnetics::wound_distance_to_angle(space.dimensions[1], ringRadius) / 2 +
+                                         OpenMagnetics::wound_distance_to_angle(turnWidth, ringRadius) / 2;
+        REQUIRE(corridorHalfAngle < 180);
+        ++corridorsChecked;
+        for (size_t t : ring) {
+            const double turnAzimuth = std::atan2(turns[t].get_coordinates()[1], turns[t].get_coordinates()[0]) * 180 / std::numbers::pi;
+            const double fromLead = std::abs(std::remainder(turnAzimuth - space.rotation, 360.0));
+            const double intrusion = corridorHalfAngle - fromLead;
+            if (intrusion > deepestIntrusionDegrees) {
+                deepestIntrusionDegrees = intrusion;
+                deepestIntrusion = "'" + turns[t].get_name() + "' at " + std::to_string(turnAzimuth) + " deg, lead of " +
+                                   space.winding + " at " + std::to_string(space.rotation) + " deg on '" + space.layer +
+                                   "', corridor half-angle " + std::to_string(corridorHalfAngle) + " deg";
+            }
+        }
+    }
+    CHECK(corridorsChecked >= 8);   // 4 conductors, an entrance and an exit lead each
+    INFO("deepest turn in a lead corridor: " << deepestIntrusion << ", " << deepestIntrusionDegrees << " deg inside");
+    CHECK(deepestIntrusionDegrees < gridToleranceDegrees);
+    settings.reset();
+}
+
+TEST_CASE("Test_Toroidal_Real_Winding_One_Turn_Pass_Through_Gets_The_Angle_Its_Turn_Needs", "[coil][toroidal][real-geometry]") {
+    // ABT #1860: a current transformer, T 25.3/14.8/10, a ONE-turn primary of Round 6.0 (4.19 mm
+    // outer) beside a 100-turn secondary of Round 0.5, contiguous. The real-winding sector
+    // allocation (ABT #1734) sizes each winding's sector for the angle it needs, counting what its
+    // rings hold. It counted a ring as holding at least one turn at ANY angle, as the winder lays
+    // it, so the one-turn primary "needed" 0 deg: it was given a 0.29 deg layer for a turn that
+    // subtends 46.5 deg (fill factor 158) and the wind failed its fit check before any connection
+    // blocking ran. The primary's sector must hold its turn, and the wind must apply blocking.
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto primaryWire = OpenMagnetics::find_wire_by_name("Round 6.0 - Single Build");
+    auto secondaryWire = OpenMagnetics::find_wire_by_name("Round 0.5 - Grade 1");
+    OpenMagnetics::Coil coil;
+    REQUIRE_NOTHROW(coil = OpenMagneticsTesting::get_quick_coil({1, 100}, {1, 1}, "T 25.3/14.8/10", 1,
+                                                                MAS::WindingOrientation::CONTIGUOUS,
+                                                                MAS::WindingOrientation::OVERLAPPING,
+                                                                MAS::CoilAlignment::CENTERED,
+                                                                MAS::CoilAlignment::SPREAD,
+                                                                {primaryWire, secondaryWire}));
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(coil.get_turns_description());
+    REQUIRE(coil.get_layers_description());
+    CHECK(coil.is_real_winding_blocking_applied());
+
+    // The angle the primary's single turn subtends on its ring (the only ring the window has room
+    // for: 7.4 mm of radial height, a 4.19 mm wire).
+    const auto windingWindows = coil.resolve_bobbin().get_processed_description().value().get_winding_windows();
+    REQUIRE(!windingWindows.empty());
+    REQUIRE(windingWindows[0].get_radial_height());
+    const double windowRadius = windingWindows[0].get_radial_height().value();
+    const double primaryWidth = primaryWire.get_maximum_outer_width();
+    const double primaryHeight = primaryWire.get_maximum_outer_height();
+    const double primaryTurnAngle = OpenMagnetics::wound_distance_to_angle(primaryHeight, windowRadius - primaryWidth / 2);
+    REQUIRE(primaryTurnAngle > 40);   // the fixture must keep a pass-through that needs a wide sector
+
+    size_t primaryLayers = 0;
+    const auto layers = coil.get_layers_description().value();
+    for (const auto& layer : layers) {
+        if (layer.get_type() != MAS::ElectricalType::CONDUCTION) {
+            continue;
+        }
+        INFO(layer.get_name() << " " << layer.get_dimensions()[1] << " deg, fill factor "
+             << layer.get_filling_factor().value_or(-1));
+        REQUIRE(layer.get_filling_factor());
+        CHECK(layer.get_filling_factor().value() <= 1.0 + 1e-6);
+        if (layer.get_partial_windings()[0].get_winding() == coil.get_name(0)) {
+            ++primaryLayers;
+            CHECK(layer.get_dimensions()[1] >= primaryTurnAngle * (1 - 1e-9));
+        }
+    }
+    CHECK(primaryLayers == 1);
+    CHECK(OpenMagneticsTesting::check_turns_description(coil));
+    CHECK(OpenMagneticsTesting::check_toroidal_sections_keep_their_sectors(coil));
     settings.reset();
 }
 
@@ -15931,13 +16960,25 @@ TEST_CASE("Test_Failed_Wind_Does_Not_Poison_The_Coil", "[coil][wind][smoke-test]
     // failed too. A wind that fails and produces no turns must leave the coil as it
     // found it; a margin-free re-wind after clearing the sections must then succeed.
     //
-    // Fixture: WE choke 744821240 as enriched by asgard — a two-winding toroid whose
-    // sheet-specified 3 mm spacer fits the real cased part but not the modelled bare
-    // bore, the exact catalogue case that exposed the poisoning.
+    // Fixture: WE choke 744821240 as enriched by asgard, the catalogue case that exposed the
+    // poisoning: a two-winding toroid, 35 + 35 turns of 0.4 mm wire in a 3.36 mm bore, its
+    // sections separated by the sheet's 3 mm spacer (1.5 mm margin per side). Since the margin
+    // is modelled as a flat bar across the window, those 3 mm fit and the part winds, so the
+    // margins here are widened to a bar that cannot fit: a half-thickness equal to the bore
+    // radius, which leaves no ring any room (bar face plus wire radius beyond every turn centre).
     auto dataDir = std::filesystem::path{__FILE__}.parent_path().append("testData");
     std::ifstream jsonFile((dataDir / "abt850_infeasible_margins_toroid.json").string());
     json magneticJson;
     jsonFile >> magneticJson;
+    const double boreRadius = magneticJson["coil"]["bobbin"]["processedDescription"]["windingWindows"][0]["radialHeight"].get<double>();
+    size_t widenedSections = 0;
+    for (auto& section : magneticJson["coil"]["sectionsDescription"]) {
+        if (section.contains("margin") && !section["margin"].is_null()) {
+            section["margin"] = {boreRadius, boreRadius};
+            ++widenedSections;
+        }
+    }
+    REQUIRE(widenedSections == 2);
     OpenMagnetics::Magnetic magnetic(magneticJson);
     auto coil = magnetic.get_coil();
     REQUIRE(!coil.get_turns_description());
@@ -15945,6 +16986,10 @@ TEST_CASE("Test_Failed_Wind_Does_Not_Poison_The_Coil", "[coil][wind][smoke-test]
     bool sectionedWind = coil.wind();
     CHECK(!sectionedWind);
     CHECK(!coil.get_turns_description());
+    // It fails for the bars, and says so.
+    INFO(coil.get_last_fit_failure());
+    CHECK_THAT(coil.get_last_fit_failure(), Catch::Matchers::ContainsSubstring("flat bars of 3.360 mm and 3.360 mm half-thickness") &&
+                                            Catch::Matchers::ContainsSubstring("has no room"));
 
     // The poisoning regression: clearing the infeasible sections and re-winding fresh
     // must succeed. Before the ABT #850 fix this second wind failed as well, because
@@ -16189,7 +17234,9 @@ TEST_CASE("Test_One_Turn_Winding_Is_Omega_One_Crossing_Terminals_Same_Height", "
 // station per layer in a layer that holds two, minus the slot the primary's exit leads take,
 // leaves every layer holding nothing beside its own station -- L = N / (c - 1) with c = 1. The
 // raise used to run its budget out silently (18 station-only layers on this very design, wind()
-// false, the layout handed on); it must say so instead.
+// false, the layout handed on); it must say so instead. ABT #1890 (Alf, 2026-10-16): c = 1 is
+// known before the raise runs, so the layer fill refuses the section as one that cannot hold its
+// turns -- a no-fit naming the closing station -- instead of raising until the budget throws.
 TEST_CASE("Test_Real_Winding_Station_Raise_That_Cannot_Converge_Throws", "[constructive-model][coil][real-geometry][omega]") {
     settings.reset();
     settings.set_coil_use_real_winding_geometry(true);
@@ -16205,7 +17252,10 @@ TEST_CASE("Test_Real_Winding_Station_Raise_That_Cannot_Converge_Throws", "[const
     coilJson["bobbin"]["processedDescription"]["windingWindows"][0]["coordinates"][0] = 0.006575 + 0.015;
     coilJson["bobbin"]["processedDescription"]["windingWindows"][0]["area"] = 0.03 * 0.004675;
     OpenMagnetics::Coil coil(coilJson, false);
-    REQUIRE_THROWS_WITH(coil.wind(), Catch::Matchers::ContainsSubstring("do not converge"));
+    bool wound = true;
+    REQUIRE_NOTHROW(wound = coil.wind());
+    CHECK_FALSE(wound);
+    CHECK_THAT(coil.get_last_fit_failure(), Catch::Matchers::ContainsSubstring("only its own closing station"));
     settings.reset();
 }
 
@@ -16404,6 +17454,493 @@ TEST_CASE("Test_Wind_Over_Full_Foil_Section_Is_Refused_Not_Corrupting", "[constr
         CHECK(fits);
         CHECK(coil.get_turns_description());
         checkFoilLayersHoldOwnParallel(coil);
+    }
+    settings.reset();
+}
+
+namespace {
+// A WE-CMB XXL-sized common-mode choke (7448261418): two 17-turn windings of 1.5 mm round wire,
+// one per half of a T 36/23/15 ring. Wound once, as a catalogue part is, so its sections exist
+// and a sheet value (spacer, winding order) can be hung on them before the load-time re-wind.
+OpenMagnetics::Magnetic wound_xxl_like_choke(int64_t turnsPerWinding, double conductingDiameter) {
+    json coreJson;
+    coreJson["functionalDescription"] = {{"type", "toroidal"}, {"material", "3C90"}, {"shape", "T 36/23/15"},
+                                         {"gapping", json::array()}, {"numberStacks", 1}};
+    json wireJson = {{"type", "round"}, {"material", "copper"}, {"numberConductors", 1},
+                     {"conductingDiameter", {{"nominal", conductingDiameter}}},
+                     {"coating", {{"type", "enamelled"}, {"grade", 1}}}};
+    json coilJson;
+    coilJson["bobbin"] = "Basic";
+    coilJson["functionalDescription"] = json::array({
+        {{"name", "L1"}, {"numberTurns", turnsPerWinding}, {"numberParallels", 1}, {"isolationSide", "primary"}, {"wire", wireJson}},
+        {{"name", "L2"}, {"numberTurns", turnsPerWinding}, {"numberParallels", 1}, {"isolationSide", "secondary"}, {"wire", wireJson}}});
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(OpenMagnetics::Core(coreJson, false, false, false));
+    magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
+    return OpenMagnetics::magnetic_autocomplete(magnetic);
+}
+
+// What heimdall does with a sheet value: edit the wound sections, drop the cached turns and
+// layers, and let the load-time autocomplete wind again from the sections.
+template <typename EditSection>
+OpenMagnetics::Magnetic rewound_with_sections(OpenMagnetics::Magnetic magnetic, EditSection editSection) {
+    json magneticJson;
+    to_json(magneticJson, magnetic);
+    for (auto& section : magneticJson["coil"]["sectionsDescription"]) {
+        if (section["type"] == "conduction") {
+            editSection(section);
+        }
+    }
+    magneticJson["coil"].erase("turnsDescription");
+    magneticJson["coil"].erase("layersDescription");
+    return OpenMagnetics::magnetic_autocomplete(OpenMagnetics::Magnetic(magneticJson));
+}
+}  // namespace
+
+TEST_CASE("Toroidal wind honours the margins its sections carry (WE-CMB XXL 3 mm spacer)",
+          "[constructive-model][coil][round-winding-window][margin][toroid-section-margin]") {
+    settings.reset();
+    // The WE requirements sheet gives the XXL parts a 3 mm spacer between the two windings,
+    // stored as a 1.5 mm margin on each edge of each conduction section. The spacer is a solid
+    // wall: no copper of one winding may come nearer than 3 mm to copper of the other.
+    //
+    // On the real XXL parts the spacer changes nothing, and that is physics, not an ignored
+    // margin. 17 turns of 1.569 mm wire touching at the inner wall (centre radius 10.42 mm)
+    // take 17 x 2 asin(0.785 / 10.42) = 147 degrees of their 180, so the windings are already
+    // 33 degrees, about 6 mm of arc, apart: more than the spacer. The other three XXL parts
+    // (14 x 1.87, 13 x 2.07, 9 x 2.58 mm) leave 28 to 45 degrees. With 20 turns the packed
+    // windings come within 3 mm of each other, and the margin has to move copper.
+    const double spacer = 3e-3;
+    auto closestCopperBetweenWindings = [](OpenMagnetics::Magnetic& magnetic) {
+        auto coil = magnetic.get_coil();
+        auto turns = coil.get_turns_description().value();
+        double closest = std::numeric_limits<double>::max();
+        for (const auto& a : turns) {
+            for (const auto& b : turns) {
+                if (a.get_winding() != "L1" || b.get_winding() != "L2") continue;
+                double dx = a.get_coordinates()[0] - b.get_coordinates()[0];
+                double dy = a.get_coordinates()[1] - b.get_coordinates()[1];
+                closest = std::min(closest, std::hypot(dx, dy) - a.get_dimensions().value()[0] / 2 -
+                                                b.get_dimensions().value()[0] / 2);
+            }
+        }
+        return closest;
+    };
+
+    for (int64_t turns : {17, 20}) {
+        auto bare = wound_xxl_like_choke(turns, 1.5e-3);
+        auto spaced = rewound_with_sections(bare, [&](json& section) {
+            section["margin"] = json::array({spacer / 2, spacer / 2});
+        });
+        double bareGap = closestCopperBetweenWindings(bare);
+        double spacedGap = closestCopperBetweenWindings(spaced);
+        INFO(turns << " turns: closest L1-L2 copper bare " << bareGap * 1e3 << " mm, with the spacer " << spacedGap * 1e3 << " mm");
+        auto spacedSections = spaced.get_coil().get_sections_description().value();
+        for (auto& section : spacedSections) {
+            if (section.get_type() == ElectricalType::CONDUCTION) {
+                CHECK(OpenMagnetics::Coil::resolve_margin(section)[0] == Catch::Approx(spacer / 2));
+                CHECK(OpenMagnetics::Coil::resolve_margin(section)[1] == Catch::Approx(spacer / 2));
+            }
+        }
+        if (turns == 17) {
+            CHECK(bareGap > spacer);  // the XXL case: the spacer is not binding
+        }
+        else {
+            CHECK(bareGap < spacer);  // packed windings closer than the spacer allows
+        }
+        CHECK(spacedGap >= spacer * (1 - 1e-9));
+    }
+    settings.reset();
+}
+
+TEST_CASE("A section's windingOrder survives the re-wind",
+          "[constructive-model][coil][round-winding-window][winding-order][section-winding-order]") {
+    settings.reset();
+    // Two rings per winding, so the order of the second ring is what U and Z disagree on.
+    auto zWound = wound_xxl_like_choke(40, 1.0e-3);
+    auto uWound = rewound_with_sections(zWound, [](json& section) { section["windingOrder"] = "U"; });
+
+    auto uSections = uWound.get_coil().get_sections_description().value();
+    for (auto& section : uSections) {
+        if (section.get_type() != ElectricalType::CONDUCTION) continue;
+        INFO(section.get_name());
+        CHECK(section.get_winding_order() == std::optional<WindingOrder>(WindingOrder::U));
+        CHECK(uWound.get_coil().get_winding_order(section.get_name()) == WindingOrder::U);
+    }
+
+    // The U wind is not the Z wind. Z drags the wire back, so the second ring starts where the
+    // first one started; U turns around, so it starts where the first one ended.
+    auto anglesOfLayer = [](OpenMagnetics::Magnetic magnetic, const std::string& layerName) {
+        auto coil = magnetic.get_coil();
+        coil.convert_turns_to_polar_coordinates();
+        std::vector<double> angles;
+        auto turns = coil.get_turns_description().value();
+        for (const auto& turn : turns) {
+            if (turn.get_layer() && turn.get_layer().value() == layerName) {
+                angles.push_back(turn.get_coordinates()[1]);
+            }
+        }
+        return angles;
+    };
+    for (auto* wound : {&zWound, &uWound}) {
+        auto firstRing = anglesOfLayer(*wound, "L1 section 0 layer 0");
+        auto secondRing = anglesOfLayer(*wound, "L1 section 0 layer 1");
+        REQUIRE(firstRing.size() >= 2);
+        REQUIRE(secondRing.size() >= 2);
+        double fromFirstStart = std::abs(secondRing.front() - firstRing.front());
+        double fromFirstEnd = std::abs(secondRing.front() - firstRing.back());
+        INFO((wound == &uWound ? "U" : "Z") << ": second ring starts " << fromFirstStart << " deg from the first ring's start, "
+             << fromFirstEnd << " deg from its end");
+        if (wound == &uWound) {
+            CHECK(fromFirstEnd < fromFirstStart);
+        }
+        else {
+            CHECK(fromFirstStart < fromFirstEnd);
+        }
+    }
+    settings.reset();
+}
+
+// A section whose layers are stacked radially (overlapping layers) is wound from the barrel
+// outward, so the compaction pass must leave its first layer on the window's inner side. It used
+// to read turnsAlignment (an along-the-layer setting) as the section's radial position and centre
+// the section in the window, which floated every turn off the column and lengthened it. With
+// compaction off the same sections already start at the inner side; both paths must agree.
+TEST_CASE("Test_Coil_Contiguous_Sections_Start_At_Window_Inner_Side", "[constructive-model][coil][captot][smoke-test]") {
+    auto& settings = Settings::GetInstance();
+    settings.reset();
+    for (bool compact : {true, false}) {
+        settings.set_coil_delimit_and_compact(compact);
+        auto coil = OpenMagneticsTesting::get_quick_coil({12, 12}, {1, 1}, "PQ 28/20", 1,
+                                                         WindingOrientation::CONTIGUOUS, WindingOrientation::OVERLAPPING,
+                                                         CoilAlignment::CENTERED, CoilAlignment::CENTERED);
+        auto bobbin = coil.resolve_bobbin();
+        auto windowDimensions = bobbin.get_winding_window_dimensions(0);
+        auto windowCoordinates = bobbin.get_winding_window_coordinates(0);
+        double windowInnerSide = windowCoordinates[0] - windowDimensions[0] / 2;
+        auto sections = coil.get_sections_description_conduction();
+        REQUIRE(sections.size() == 2);
+        for (auto& section : sections) {
+            INFO((compact ? "compacted " : "not compacted ") << section.get_name());
+            double sectionInnerSide = section.get_coordinates()[0] - section.get_dimensions()[0] / 2;
+            double margin = OpenMagnetics::Coil::resolve_margin(section)[0];
+            // Compacted, the window is far wider than one 12-turn section, so a centred section
+            // would sit mm away. Not compacted, the section spans the window.
+            if (compact) {
+                REQUIRE(windowDimensions[0] > 2 * section.get_dimensions()[0]);
+            }
+            CHECK_THAT(sectionInnerSide, Catch::Matchers::WithinAbs(windowInnerSide + margin, 1e-9));
+        }
+        auto turns = coil.get_turns_description().value();
+        REQUIRE(!turns.empty());
+        double innermostTurnSide = std::numeric_limits<double>::max();
+        for (auto& turn : turns) {
+            innermostTurnSide = std::min(innermostTurnSide, turn.get_coordinates()[0] - turn.get_dimensions().value()[0] / 2);
+        }
+        INFO((compact ? "compacted" : "not compacted"));
+        CHECK_THAT(innermostTurnSide, Catch::Matchers::WithinAbs(windowInnerSide, 1e-9));
+    }
+    settings.reset();
+}
+
+// ABT #1645: 15 turns x 6 parallels of Round 0.19 (0.21 mm over the enamel) on the EPX 7 the core
+// adviser picks for the default buck inductor. The 3.39 mm x 1.28 mm window holds six layers of 16,
+// i.e. 96 physical turns, for 90. The side-by-side parallel split gave each parallel ceil(15 / 6) = 3
+// turns per layer -- layers of 18, 18, 18, 12, 12, 12 -- so three layers overflowed the window and
+// the wind was refused. Each layer must take its even share (15) instead.
+TEST_CASE("Test_Coil_Side_By_Side_Parallels_Take_The_Layer_Share_That_Fits", "[constructive-model][coil][rectangular-winding-window][abt-1645]") {
+    settings.reset();
+    settings.set_coil_delimit_and_compact(true);
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "abt1645_buck_epx7_builder.json");
+    std::ifstream file(path);
+    OpenMagnetics::Mas mas(json::parse(file));
+    auto magnetic = mas.get_magnetic();
+    auto& coil = magnetic.get_mutable_coil();
+    coil.set_turns_description(std::nullopt);
+    coil.set_layers_description(std::nullopt);
+    coil.set_sections_description(std::nullopt);
+    coil.set_groups_description(std::nullopt);
+    coil.get_mutable_functional_description()[0].set_wire("Round 0.19 - Grade 1");
+    coil.get_mutable_functional_description()[0].set_number_parallels(6);
+    REQUIRE(coil.get_functional_description()[0].get_number_turns() == 15);
+
+    bool wound = coil.wind();
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(wound);
+    REQUIRE(coil.get_turns_description());
+    CHECK(coil.get_turns_description()->size() == 90);
+    auto layers = coil.get_layers_description().value();
+    size_t conductionLayers = 0;
+    for (auto& layer : layers) {
+        if (layer.get_type() != ElectricalType::CONDUCTION) {
+            continue;
+        }
+        conductionLayers++;
+        CHECK(layer.get_filling_factor().value() <= 1.0);
+    }
+    CHECK(conductionLayers == 6);
+    settings.reset();
+}
+
+TEST_CASE("Test_Coil_Consecutive_Turns_Refuses_Zero_Slots", "[constructive-model][coil][smoke-test][abt-1613]") {
+    // ABT #1613: the single-layer overload divided by the slot count with no guard (SIGFPE); it
+    // must refuse a zero-slot layer like the multi-winding overload does.
+    OpenMagnetics::Coil coil;
+    REQUIRE_THROWS_AS(coil.wind_by_consecutive_turns(uint64_t(4), uint64_t(1), size_t(0)), InvalidInputException);
+    REQUIRE_THROWS_AS(coil.wind_by_consecutive_turns(std::vector<uint64_t>{4}, std::vector<uint64_t>{1}, std::vector<size_t>{0}), InvalidInputException);
+    REQUIRE(coil.wind_by_consecutive_turns(uint64_t(4), uint64_t(1), size_t(2)) == WindingStyle::WIND_BY_CONSECUTIVE_PARALLELS);
+}
+
+TEST_CASE("Test_Coil_Real_Winding_Section_That_Cannot_Hold_Its_Turns_Does_Not_Fit", "[coil][real-winding][bug][abt-1699]") {
+    // ABT #1699: a coil-adviser candidate on the web flyback core, stored as the web stores it and
+    // rebuilt with real winding geometry. Once the connection corridors are blocked, a secondary
+    // layer has no row left for every parallel, and the layer fill stopped there: 'Secondary 0
+    // section 0' was laid out with 2 of its 9 turns and 'Secondary 0 section 1' with no layer at
+    // all, and delimit_and_compact then threw "No layers in section" (COIL_NOT_PROCESSED). Turns a
+    // section cannot hold are a wind that does not fit, named as such.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/flyback_interleaved_candidate_stored.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    auto stored = json::parse(file).at("magnetic");
+    settings.reset();
+    settings.set_coil_delimit_and_compact(true);
+    settings.set_coil_try_rewind(true);
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(OpenMagnetics::Core(stored.at("core")));
+    magnetic.set_coil(OpenMagnetics::Coil(stored.at("coil"), false));
+
+    std::optional<std::string> refusal;
+    REQUIRE_NOTHROW(refusal = OpenMagnetics::real_winding_refusal(magnetic));
+    REQUIRE(refusal);
+    INFO(refusal.value());
+    CHECK(refusal->find("cannot hold its") != std::string::npos);
+
+    // The web's rebuild of the same stored design: no throw, and no coil with turns missing.
+    OpenMagnetics::Magnetic rebuilt;
+    REQUIRE_NOTHROW(rebuilt = OpenMagneticsTesting::rebuild_with_real_winding_as_web(magnetic));
+    CHECK(!rebuilt.get_coil().get_turns_description());
+    settings.reset();
+}
+
+TEST_CASE("Test_Coil_Rewind_With_A_Section_Left_Without_Layers", "[constructive-model][coil][rewind][bug]") {
+    // Captured from the coil adviser on a 600 W LLC transformer (centre-tapped litz secondary next
+    // to a thick round primary): the first layout leaves a conduction section without any layer,
+    // so it does not fit, and try_rewind then wound turns for it as its fallback and
+    // delimit_and_compact threw "No layers in section: Secondary 0 Half 1 section 2" out of wind().
+    // A coil that does not fit must answer false, not throw.
+    settings.reset();
+    settings.set_coil_try_rewind(true);
+    settings.set_coil_delimit_and_compact(true);
+    settings.set_coil_wind_even_if_not_fit(false);
+    settings.set_coil_allow_margin_tape(true);
+    settings.set_coil_allow_insulated_wire(true);
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "coil_rewind_layerless_section.json");
+    std::ifstream file(path);
+    REQUIRE(file.is_open());
+    auto data = json::parse(file);
+    json coilJson;
+    coilJson["bobbin"] = data["bobbin"];
+    coilJson["functionalDescription"] = data["functionalDescription"];
+    OpenMagnetics::Coil coil(coilJson, false);
+    std::vector<double> proportions = data["proportions"];
+    std::vector<size_t> pattern = data["pattern"];
+    size_t repetitions = data["repetitions"];
+    bool wound = false;
+    REQUIRE_NOTHROW(wound = coil.wind(proportions, pattern, repetitions));
+    if (wound) {
+        for (const auto& section : coil.get_sections_by_type(ElectricalType::CONDUCTION)) {
+            INFO(section.get_name());
+            CHECK(!coil.get_layers_by_section(section.get_name()).empty());
+        }
+    }
+    settings.reset();
+}
+
+// The rough layout (fast_wind, used by the advisers' core-stage loss and temperature screens)
+// split the window between windings by copper AREA. A winding occupies whole layers, though:
+// 15 turns of a 1.872 mm conductor in a 27.3 mm tall window need two layers (14 fit in one,
+// 3.744 mm), but the area split gave the primary 3.52 mm of the 8 mm window and the secondary
+// (8 turns of 2.88 mm, one 2.88 mm layer) 4.45 mm. wind_by_layers then crammed all 15 primary
+// turns into one layer and its end turns sat 0.39 mm inside the yokes, though both windings
+// fit side by side (3.744 + 2.88 + 2 x 0.025 insulation = 6.67 of 8 mm). The thermal network
+// refuses such overlapping turns.
+TEST_CASE("Test_Coil_Fast_Wind_Gives_Each_Winding_Its_Whole_Layers", "[constructive-model][coil][fast-wind]") {
+    settings.reset();
+    settings.set_coil_delimit_and_compact(false);
+    const double windowHeight = 0.0273;
+    const double windowWidth = 0.008;
+    auto coil = OpenMagneticsTesting::get_quick_coil({15, 8}, {1, 1}, windowHeight, windowWidth, {0.01 + windowWidth / 2, 0}, 1,
+                                                     WindingOrientation::OVERLAPPING, WindingOrientation::OVERLAPPING,
+                                                     CoilAlignment::CENTERED, CoilAlignment::CENTERED,
+                                                     {find_wire_by_name("Round 1.80 - Grade 1"), find_wire_by_name("Round 2.80 - Grade 1")});
+    // The case: the primary needs a second layer, and the whole layers fit the window.
+    const double primaryDiameter = coil.get_wires()[0].get_maximum_outer_width();
+    const double secondaryDiameter = coil.get_wires()[1].get_maximum_outer_width();
+    REQUIRE(15 * primaryDiameter > windowHeight);
+    REQUIRE(8 * secondaryDiameter < windowHeight);
+    REQUIRE(2 * primaryDiameter + secondaryDiameter < windowWidth);
+
+    REQUIRE(coil.fast_wind());
+    CHECK(coil.are_sections_and_layers_fitting());
+    const auto conductionSections = coil.get_sections_description_conduction();
+    for (const auto& section : conductionSections) {
+        const double neededWidth = section.get_partial_windings()[0].get_winding() == "winding 0" ? 2 * primaryDiameter : secondaryDiameter;
+        CHECK(section.get_dimensions()[0] >= neededWidth);
+    }
+    // No turn crosses the top or bottom of the window.
+    const auto turns = coil.get_turns_description().value();
+    for (const auto& turn : turns) {
+        CHECK(std::abs(turn.get_coordinates()[1]) + turn.get_dimensions().value()[1] / 2 <= windowHeight / 2 + 1e-9);
+    }
+    settings.reset();
+}
+
+// ABT #1886: the web Magnetic Builder keeps an advised coil's sections and turns and drops its layers;
+// the losses and the thermal network need them, so the layers are rebuilt from the sections by the
+// winder's own layer step. They must be the layers a normal wind of the same coil produces, the
+// insulation between the sections included, and the turns must be left exactly as given.
+TEST_CASE("Test_Coil_Layers_Rebuilt_From_Turns_Match_The_Wound_Twin", "[constructive-model][coil][abt-1886]") {
+    settings.reset();
+    auto twin = OpenMagneticsTesting::get_quick_coil({40, 20}, {1, 2}, "ETD 34/17/11", 2);
+    REQUIRE(twin.get_turns_description());
+    REQUIRE(twin.get_layers_description());
+    const auto expected = twin.get_layers_description().value();
+    REQUIRE_FALSE(twin.get_layers_by_type(ElectricalType::INSULATION).empty());
+
+    json coilJson;
+    to_json(coilJson, twin);
+    coilJson.erase("layersDescription");
+    OpenMagnetics::Coil coil(coilJson, false);
+    REQUIRE_FALSE(coil.get_layers_description());
+    const json turnsBefore = coilJson["turnsDescription"];
+
+    REQUIRE_NOTHROW(coil.rebuild_layers_description_from_turns());
+    REQUIRE(coil.get_layers_description());
+    const auto rebuilt = coil.get_layers_description().value();
+    REQUIRE(rebuilt.size() == expected.size());
+    for (size_t index = 0; index < expected.size(); ++index) {
+        const auto& want = expected[index];
+        const auto& got = rebuilt[index];
+        INFO(want.get_name());
+        CHECK(got.get_name() == want.get_name());
+        CHECK(got.get_type() == want.get_type());
+        CHECK(got.get_section() == want.get_section());
+        CHECK(got.get_orientation() == want.get_orientation());
+        REQUIRE(got.get_partial_windings().size() == want.get_partial_windings().size());
+        for (size_t partialIndex = 0; partialIndex < want.get_partial_windings().size(); ++partialIndex) {
+            CHECK(got.get_partial_windings()[partialIndex].get_winding() == want.get_partial_windings()[partialIndex].get_winding());
+            CHECK(got.get_partial_windings()[partialIndex].get_parallels_proportion() == want.get_partial_windings()[partialIndex].get_parallels_proportion());
+        }
+        REQUIRE(got.get_coordinates().size() >= 2);
+        REQUIRE(got.get_dimensions().size() >= 2);
+        for (size_t axis = 0; axis < 2; ++axis) {
+            CHECK_THAT(got.get_coordinates()[axis], Catch::Matchers::WithinAbs(want.get_coordinates()[axis], 1e-9));
+            CHECK_THAT(got.get_dimensions()[axis], Catch::Matchers::WithinAbs(want.get_dimensions()[axis], 1e-9));
+        }
+        if (want.get_type() == ElectricalType::INSULATION) {
+            REQUIRE(got.get_insulation_material());
+            REQUIRE(want.get_insulation_material());
+            CHECK(coil.resolve_insulation_layer_insulation_material(got).get_name() ==
+                  twin.resolve_insulation_layer_insulation_material(want).get_name());
+        }
+    }
+    json turnsAfter;
+    to_json(turnsAfter, coil.get_turns_description().value());
+    CHECK(turnsAfter == turnsBefore);
+    settings.reset();
+}
+
+TEST_CASE("Test_Coil_Layers_Rebuilt_From_Turns_Refuse_A_Turn_In_A_Layer_The_Sections_Do_Not_Produce", "[constructive-model][coil][abt-1886]") {
+    settings.reset();
+    auto twin = OpenMagneticsTesting::get_quick_coil({40, 20}, {1, 2}, "ETD 34/17/11", 2);
+    json coilJson;
+    to_json(coilJson, twin);
+    coilJson.erase("layersDescription");
+    coilJson["turnsDescription"][3]["layer"] = "No such layer";
+    const std::string turnName = coilJson["turnsDescription"][3]["name"];
+    OpenMagnetics::Coil coil(coilJson, false);
+    REQUIRE_THROWS_WITH(coil.rebuild_layers_description_from_turns(),
+                        Catch::Matchers::ContainsSubstring("Turn '" + turnName + "' lies in layer 'No such layer'"));
+    // A refused rebuild leaves the coil as it was given.
+    CHECK_FALSE(coil.get_layers_description());
+    settings.reset();
+}
+
+// A layer lays side by side the parallels ITS SECTION carries. The PQ 35/40 fixture interleaves a
+// 4-parallel litz primary over four sections, one parallel each; its 6.695 mm sections hold five
+// 1.339 mm bundles per layer. The real-winding fill rounded every layer down to a multiple of the
+// WINDING's four parallels, so no layer ever held more than four and the sections were refused.
+TEST_CASE("Test_Real_Winding_Layer_Holds_The_Parallels_Its_Section_Carries", "[constructive-model][coil][real-geometry][abt1531]") {
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto path = OpenMagneticsTesting::get_test_data_dir(std::source_location::current()) /
+                "thermal_island_pq3540_litz_rect_contiguous_1212121.json";
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    json masJson;
+    file >> masJson;
+    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+    magnetic = OpenMagnetics::magnetic_autocomplete(magnetic);
+    const auto& coil = magnetic.get_coil();
+    REQUIRE(coil.get_turns_description());
+    std::map<std::string, size_t> turnsPerLayer;
+    const auto turns = coil.get_turns_description().value();
+    for (const auto& turn : turns) {
+        if (turn.get_winding() == "Primary" && turn.get_section() == "Primary section 0") {
+            turnsPerLayer[turn.get_layer().value()]++;
+        }
+    }
+    REQUIRE(!turnsPerLayer.empty());
+    size_t fullest = 0;
+    for (const auto& [layer, turns] : turnsPerLayer) {
+        fullest = std::max(fullest, turns);
+    }
+    CHECK(fullest == 5);
+    settings.reset();
+}
+
+// ABT #1531: a litz bundle flattens in a wound layer. Ten served bundles in a one-layer window
+// 9.5 ODs tall do not fit round (nine per layer, and no room for a second layer); squeezed along
+// the layer to 0.95 x OD they do, each an oval of the bundle's own area. With the setting off the
+// wind stays refused, as before.
+TEST_CASE("Test_Wind_Flattens_Litz_Into_Ovals_Only_As_Far_As_The_Window_Needs", "[constructive-model][coil][litz][abt1531]") {
+    settings.reset();
+    settings.set_coil_wind_even_if_not_fit(false);
+    settings.set_coil_try_rewind(false);
+    auto litz = OpenMagnetics::Wire::create_quick_litz_wire(0.0001, 100);
+    const double od = litz.get_maximum_outer_width();
+    REQUIRE(OpenMagnetics::Wire::minimum_litz_flattening(litz) == 0.90);
+    const double windowHeight = 10 * 0.95 * od * 1.0005;
+    const double windowWidth = 1.2 * od;
+    auto wind = [&](bool deformation) {
+        settings.set_coil_litz_deformation(deformation);
+        auto coil = OpenMagneticsTesting::get_quick_coil({10}, {1}, windowHeight, windowWidth, {0.005 + windowWidth / 2, 0, 0},
+                                                         1, WindingOrientation::OVERLAPPING, WindingOrientation::OVERLAPPING,
+                                                         CoilAlignment::CENTERED, CoilAlignment::CENTERED, {litz});
+        const bool fits = coil.wind();
+        return std::make_pair(fits, coil);
+    };
+
+    auto [roundFits, roundCoil] = wind(false);
+    CHECK(!roundFits);
+    CHECK(!roundCoil.get_litz_flattening(0));
+
+    auto [ovalFits, ovalCoil] = wind(true);
+    REQUIRE(ovalFits);
+    REQUIRE(ovalCoil.get_litz_flattening(0));
+    CHECK_THAT(ovalCoil.get_litz_flattening(0).value(), Catch::Matchers::WithinAbs(0.95, 1e-9));
+    const auto [shortSide, longSide] = OpenMagnetics::Wire::flattened_litz_sides(od, 0.95);
+    // Same area as the bundle: short side x (long - short) + pi short^2 / 4.
+    CHECK_THAT(shortSide * (longSide - shortSide) + std::numbers::pi * shortSide * shortSide / 4,
+               Catch::Matchers::WithinRel(std::numbers::pi * od * od / 4, 1e-12));
+    const auto turns = ovalCoil.get_turns_description().value();
+    REQUIRE(turns.size() == 10);
+    for (const auto& turn : turns) {
+        CHECK(turn.get_cross_sectional_shape().value() == TurnCrossSectionalShape::OVAL);
+        // Squeezed along the layer: the turns stack along the window's height.
+        CHECK_THAT(turn.get_dimensions().value()[1], Catch::Matchers::WithinAbs(shortSide, 1e-12));
+        CHECK_THAT(turn.get_dimensions().value()[0], Catch::Matchers::WithinAbs(longSide, 1e-12));
+        CHECK(std::abs(turn.get_coordinates()[1]) + shortSide / 2 <= windowHeight / 2 + 1e-9);
     }
     settings.reset();
 }

@@ -4,11 +4,15 @@
 #include "physical_models/CoreLosses.h"
 #include "support/Painter.h"
 #include "support/Settings.h"
+#include "support/Logger.h"
 #include "processors/Inputs.h"
 #include "physical_models/MagnetizingInductance.h"
+#include "physical_models/LeakageInductance.h"
 #include "processors/CircuitSimulatorInterface.h"
 #include "processors/Sweeper.h"
+#include "processors/MagneticSimulator.h"
 #include "physical_models/Reluctance.h"
+#include "physical_models/InitialPermeability.h"
 #include "support/MaterialValidator.h"
 #include "TestingUtils.h"
 #include "Fixtures.h"
@@ -1943,7 +1947,10 @@ TEST_CASE("Test_IGSE_composite_waveform_low_excitation_frequency", "[physical-mo
     clear_databases();
 
     std::string shapeName = "PQ 20/20";
-    std::string materialName = "3C95";
+    // ABT #1636: this record (1000 switching cycles on a 60 Hz line) is priced cycle by cycle plus its
+    // 60 Hz envelope's loop. 3C95's Steinmetz fit starts at 25 kHz, so its envelope cannot be priced
+    // (MaterialFrequencyOutOfSpanException, checked at the end); PC44's fit starts at 1 Hz.
+    std::string materialName = "PC44";
     Core core = OpenMagneticsTesting::get_quick_core(shapeName, json::array(), 1, materialName);
 
     double excitationFrequency = 60;        // Hz - line frequency
@@ -1999,6 +2006,10 @@ TEST_CASE("Test_IGSE_composite_waveform_low_excitation_frequency", "[physical-mo
     // (within 10x), not 100x-1000x higher as the bug caused
     REQUIRE(volumetricLosses < refVolumetricLosses * 10);
     REQUIRE(volumetricLosses > 0);
+
+    // A ferrite fitted only from 25 kHz refuses the 60 Hz envelope rather than extrapolating it.
+    Core core3C95 = OpenMagneticsTesting::get_quick_core(shapeName, json::array(), 1, "3C95");
+    CHECK_THROWS_AS(coreLossesModel->get_core_losses(core3C95, excitation, temperature), MaterialFrequencyOutOfSpanException);
 }
 
 // ABT #1426 follow-up: the dB/dt core-loss models integrate over the segments of a
@@ -2236,7 +2247,10 @@ TEST_CASE("Only_Current_With_Dc", "[physical-model][core-losses][smoke-test]") {
     auto coreLossesModel = CoreLossesModel::factory(models);
     auto coreLosses = coreLossesModel->get_core_losses(core, excitation, temperature);
 
-    REQUIRE_THAT(magneticFluxDensity.get_processed().value().get_offset(), Catch::Matchers::WithinAbs(1, 1 * 0.1));
+    // 165 A of DC MMF through a 0.2 mm gap drives 3C97 (Bsat about 0.52 T at 37 C) into saturation: the
+    // DC point is the load line on the magnetisation curve, 0.492 T (ABT #1223). The 1.0 T pinned before
+    // was N*I/(R*Ae) with the unbiased permeability, which no 3C97 core can carry.
+    REQUIRE_THAT(magneticFluxDensity.get_processed().value().get_offset(), Catch::Matchers::WithinAbs(0.49, 0.01));
 }
 
 TEST_CASE("Crash_Voltage_Sin", "[physical-model][core-losses][bug][smoke-test]") {
@@ -2413,7 +2427,7 @@ TEST_CASE("Test_Manufacturer_Magnetec", "[physical-model][core-losses][smoke-tes
     auto models =
         json::parse(R"({"coreLosses": "PROPRIETARY", "coreTemperature": "MANIKTALA", "gapReluctance": "ZHANG"})");
     auto core = Core(json::parse(R"({"functionalDescription": {"gapping": [], "material": "Nanoperm 80000", "numberStacks": 1, "shape": {"magneticCircuit": "closed", "type": "custom", "family": "t", "aliases": [], "name": "T 63/50/30", "dimensions": {"A": {"nominal": 0.063}, "B": {"nominal": 0.050}, "C": {"nominal": 0.030}}}, "type": "toroidal"}, "manufacturerInfo": null, "name": "My Core"})"));
-    auto winding = OpenMagnetics::Coil(json::parse(R"({"bobbin": "Dummy", "functionalDescription": [{"isolationSide": "primary", "name": "Primary", "numberParallels": 1, "numberTurns": 1, "wire": "Dummy"}], "layersDescription": null, "sectionsDescription": null, "turnsDescription": null})"));
+    auto winding = OpenMagnetics::Coil(json::parse(R"({"bobbin": "Dummy", "functionalDescription": [{"isolationSide": "primary", "name": "Primary", "numberParallels": 1, "numberTurns": 10, "wire": "Dummy"}], "layersDescription": null, "sectionsDescription": null, "turnsDescription": null})"));
     auto operatingPoint = OperatingPoint(json::parse(R"({"conditions": {"ambientRelativeHumidity": null, "ambientTemperature": 25.0, "cooling": null, "name": null}, "excitationsPerWinding": [{"frequency": 100000.0, "magneticFieldStrength": null, "magneticFluxDensity": null, "magnetizingCurrent": null, "name": "My Operating Point", "voltage": {"harmonics": null, "processed": null, "waveform": {"ancillaryLabel": null, "data": [688.5, 688.5, -229.49999999999995, -229.49999999999995, 688.5], "numberPeriods": null, "time": [0.0, 2.4999999999999998e-06, 2.4999999999999998e-06, 1e-05, 1e-05]}}}], "name": null})"));
 
     MagnetizingInductance magnetizingInductanceModel(std::string{models["gapReluctance"]});
@@ -2429,13 +2443,30 @@ TEST_CASE("Test_Manufacturer_Magnetec", "[physical-model][core-losses][smoke-tes
     auto coreLossesModel = CoreLossesModel::factory(models);
     auto coreLosses = coreLossesModel->get_core_losses(core, excitation, temperature);
 
-    // Expectation updated after fixing mass losses (W/kg) to multiply by the
-    // core MASS instead of its volume (the old pinned 3.09 W captured the
-    // volume-multiplied bug; the absolute number is a plumbing check only —
-    // the 1-turn setup drives B far beyond saturation)
-    // ABT #1491: 29685.6 -> 7421.39 (exactly 1/4): the Magnetec formula now reads its 0.3 T anchor
-    // against the PEAK flux density instead of the peak-to-peak.
-    REQUIRE_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinAbs(7421.39, 7421.39 * maxError));
+    // ABT #1790 (Alf, 2026-10-12): the fixture has 10 turns, 7421.39 W -> 77.497 W. With 1 turn the
+    // 688.5 V x 2.5 us pulse asked for a 11.08 T swing (B_peak 5.5 T on a 1.2 T material), which
+    // MagnetizingInductance now refuses (ABT #1740); 7421.39 W was a loss at a point that cannot exist.
+    // First-principles check of the new value:
+    //   volt-seconds: dB = V t / (N Ae) = 688.5 * 2.5e-6 / (10 * 155.307e-6 m2) = 1.108 T peak to peak,
+    //                 B_peak = 0.554 T, under Nanoperm 80000's B_sat of 1.2 T;
+    //   Magnetec loss (CoreLosses.cpp, anchored at 0.3 T peak / 100 kHz): 80 W/kg * (100k/100k)^1.8 *
+    //                 (0.554 / 0.3)^2 = 272.9 W/kg, times the core mass 0.2544 kg = 69.4 W.
+    // Before ABT #1467 the model gave 77.497 W, 11.6 % above that hand value, and all of the difference
+    // was the flux amplitude it read: peak - mean of the sampled flux waveform = 0.5683 - (-0.0171) =
+    // 0.5854 T, where the swing's half is 0.5513 T; 80 * (0.5854 / 0.3)^2 * 0.2544 = 77.50 W.
+    // ABT #1467 (Alf, 2026-10-13): 77.497 W -> 69.440 W. The sampler closes the open time axis
+    // periodically instead of squeezing it twice by resampling, so the flux is the exact symmetric
+    // triangle the voltage drives: peak 0.5541 T, no offset, and the asymmetric amplitude is gone. The
+    // loss now equals the hand value, 80 * (0.5541 / 0.3)^2 * 0.2544 = 69.44 W.
+    {
+        double effectiveArea = core.get_processed_description()->get_effective_parameters().get_effective_area();
+        double voltSecondsSwing = 688.5 * 2.4999999999999998e-06 / (10 * effectiveArea);
+        CHECK_THAT(magneticFluxDensity.get_processed()->get_peak_to_peak().value(), Catch::Matchers::WithinRel(voltSecondsSwing, 0.01));
+        CHECK(magneticFluxDensity.get_processed()->get_peak().value() < 1.2);
+        double amplitude = magneticFluxDensity.get_processed()->get_peak().value() - magneticFluxDensity.get_processed()->get_offset();
+        CHECK_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinRel(80 * pow(amplitude / 0.3, 2) * core.get_mass(), 1e-9));
+    }
+    REQUIRE_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinAbs(69.440, 69.440 * maxError));
 }
 
 TEST_CASE("Test_Manufacturer_Magnetec_Obfuscated_Manufacturer", "[physical-model][core-losses][smoke-test]") {
@@ -2457,7 +2488,7 @@ TEST_CASE("Test_Manufacturer_Magnetec_Obfuscated_Manufacturer", "[physical-model
     REQUIRE(obfuscatedMaterial.get_manufacturer_info().get_name() == "Würth Elektronik");
     core.set_material(obfuscatedMaterial);
 
-    auto winding = OpenMagnetics::Coil(json::parse(R"({"bobbin": "Dummy", "functionalDescription": [{"isolationSide": "primary", "name": "Primary", "numberParallels": 1, "numberTurns": 1, "wire": "Dummy"}], "layersDescription": null, "sectionsDescription": null, "turnsDescription": null})"));
+    auto winding = OpenMagnetics::Coil(json::parse(R"({"bobbin": "Dummy", "functionalDescription": [{"isolationSide": "primary", "name": "Primary", "numberParallels": 1, "numberTurns": 10, "wire": "Dummy"}], "layersDescription": null, "sectionsDescription": null, "turnsDescription": null})"));
     auto operatingPoint = OperatingPoint(json::parse(R"({"conditions": {"ambientRelativeHumidity": null, "ambientTemperature": 25.0, "cooling": null, "name": null}, "excitationsPerWinding": [{"frequency": 100000.0, "magneticFieldStrength": null, "magneticFluxDensity": null, "magnetizingCurrent": null, "name": "My Operating Point", "voltage": {"harmonics": null, "processed": null, "waveform": {"ancillaryLabel": null, "data": [688.5, 688.5, -229.49999999999995, -229.49999999999995, 688.5], "numberPeriods": null, "time": [0.0, 2.4999999999999998e-06, 2.4999999999999998e-06, 1e-05, 1e-05]}}}], "name": null})"));
 
     MagnetizingInductance magnetizingInductanceModel(std::string{models["gapReluctance"]});
@@ -2471,9 +2502,9 @@ TEST_CASE("Test_Manufacturer_Magnetec_Obfuscated_Manufacturer", "[physical-model
     auto coreLosses = coreLossesModel->get_core_losses(core, excitation, temperature);
 
     // Identical to Test_Manufacturer_Magnetec: obfuscating the manufacturer must not change the physics.
-    // ABT #1491: 29685.6 -> 7421.39 (exactly 1/4): the Magnetec formula now reads its 0.3 T anchor
-    // against the PEAK flux density instead of the peak-to-peak.
-    REQUIRE_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinAbs(7421.39, 7421.39 * maxError));
+    // ABT #1790: 10 turns instead of 1, 7421.39 W -> 77.497 W; the derivation is in that test.
+    // ABT #1467 (Alf, 2026-10-13): 77.497 W -> 69.440 W, the hand value; see that test.
+    REQUIRE_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinAbs(69.440, 69.440 * maxError));
 }
 
 TEST_CASE("Test_XFlux_19", "[physical-model][core-losses][smoke-test]") {
@@ -2589,7 +2620,12 @@ TEST_CASE("Test_NPF_26", "[physical-model][core-losses][smoke-test]") {
     auto json_path_2589 = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "test_npf_26_2589.json");
     std::ifstream json_file_2589(json_path_2589);
     auto winding = OpenMagnetics::Coil(json::parse(json_file_2589));
-    auto operatingPoint = OperatingPoint(json::parse(R"({"name": "Operating Point No. 1", "conditions": {"ambientTemperature": 42 }, "excitationsPerWinding": [{"name": "Primary winding excitation", "frequency": 160000, "current": {"waveform": {"ancillaryLabel": null, "data": [17, 23, 17 ], "numberPeriods": null, "time": [0, 0.000003125, 0.00000625 ] }, "processed": {"dutyCycle": 0.5, "peakToPeak": 6, "offset": 20, "label": "triangular", "acEffectiveFrequency": 177194.24466847413, "effectiveFrequency": 21546.00003771328, "peak": 22.999999999999996, "rms": 20.074896384383905, "thd": 0.1215148744070506 }, "harmonics": {"amplitudes": [20, 2.4321967474991535, 5.024121874684011e-15, 0.2706786341990403, 2.5974016302617224e-15, 0.09775809175532962, 1.0877860477097108e-15, 0.050117879547604785, 1.2646590730292293e-15, 0.030514174880169928, 1.2335641993359796e-15, 0.02059224626965136, 1.2258227940648128e-15, 0.01488719320430654, 1.0764607310101287e-15, 0.01130940060640756, 0, 0.008919979835758483, 8.037893783541347e-16, 0.007246308335735057, 6.662375164413096e-16, 0.006029438250552881, 3.604673414361124e-16, 0.005117850585055619, 7.839803760535096e-16, 0.004418100846423644, 5.774995880218828e-16, 0.0038700274711771683, 2.9615889645109984e-16, 0.003433484276999084, 6.420789804208699e-16, 0.003080858038900569, 0, 0.0027926582542716085, 2.6513173039668365e-16, 0.002554817862838714, 1.8973175313253087e-16, 0.002356986496943279, 2.9367933833466926e-16, 0.0021914202524357307, 1.0419804364661729e-16, 0.0020522412854556225, 2.851132450398795e-16, 0.00193493308907579, 1.2181177477487184e-16, 0.0018359897079305966, 3.267519833402137e-16, 0.001752667766520524, 0, 0.0016828085851076898, 1.3008589992456218e-16, 0.0016247089970805578, 2.5388602966284854e-16, 0.001577026635768735, 3.0923087296718467e-16, 0.001538710070787071, 3.76480653329104e-16, 0.0015089472098712697, 3.3868062731196647e-16, 0.0014871274225975659, 4.193885737201472e-16, 0.0014728142451529425, 3.9756613902672346e-16, 0.001465726515887944 ], "frequencies": [0, 160000, 320000, 480000, 640000, 800000, 960000, 1120000, 1280000, 1440000, 1600000, 1760000, 1920000, 2080000, 2240000, 2400000, 2560000, 2720000, 2880000, 3040000, 3200000, 3360000, 3520000, 3680000, 3840000, 4000000, 4160000, 4320000, 4480000, 4640000, 4800000, 4960000, 5120000, 5280000, 5440000, 5600000, 5760000, 5920000, 6080000, 6240000, 6400000, 6560000, 6720000, 6880000, 7040000, 7200000, 7360000, 7520000, 7680000, 7840000, 8000000, 8160000, 8320000, 8480000, 8640000, 8800000, 8960000, 9120000, 9280000, 9440000, 9600000, 9760000, 9920000, 10080000 ] } }, "voltage": {"waveform": {"ancillaryLabel": null, "data": [-50, 50, 50, -50, -50 ], "numberPeriods": null, "time": [0, 0, 0.000003125, 0.000003125, 0.00000625 ] }, "processed": {"dutyCycle": 0.5, "peakToPeak": 100, "offset": 0, "label": "rectangular", "acEffectiveFrequency": 946376.8576189425, "effectiveFrequency": 946319.072434482, "peak": 50, "rms": 50, "thd": 0.48331514845248497 }, "harmonics": {"amplitudes": [0.78125, 63.64919355013018, 1.5625, 21.18229569117569, 1.5625, 12.668415318245188, 1.5625, 9.004909382998164, 1.5625, 6.958128475647527, 1.5625, 5.646149502042871, 1.5625, 4.729755006746538, 1.5625, 4.050628933965765, 1.5625, 3.524943518639316, 1.5625, 3.104154363036517, 1.5625, 2.7581982345221827, 1.5625, 2.467457137437843, 1.5625, 2.2185795367095267, 1.5625, 2.0021587188071255, 1.5625, 1.8113717302085082, 1.5625, 1.6411450722498175, 1.5625, 1.487623666720196, 1.5625, 1.3478217691511587, 1.5625, 1.2193869682092893, 1.5625, 1.100436657601639, 1.5625, 0.9894422127774558, 1.5625, 0.8851453167661671, 1.5625, 0.7864964059364037, 1.5625, 0.6926086154544899, 1.5625, 0.60272275979863, 1.5625, 0.5161802771005264, 1.5625, 0.43240198459440116, 1.5625, 0.3508711083080249, 1.5625, 0.27111946896540395, 1.5625, 0.192715993963664, 1.5625, 0.11525692425384548, 1.5625, 0.03835722204524927 ], "frequencies": [0, 160000, 320000, 480000, 640000, 800000, 960000, 1120000, 1280000, 1440000, 1600000, 1760000, 1920000, 2080000, 2240000, 2400000, 2560000, 2720000, 2880000, 3040000, 3200000, 3360000, 3520000, 3680000, 3840000, 4000000, 4160000, 4320000, 4480000, 4640000, 4800000, 4960000, 5120000, 5280000, 5440000, 5600000, 5760000, 5920000, 6080000, 6240000, 6400000, 6560000, 6720000, 6880000, 7040000, 7200000, 7360000, 7520000, 7680000, 7840000, 8000000, 8160000, 8320000, 8480000, 8640000, 8800000, 8960000, 9120000, 9280000, 9440000, 9600000, 9760000, 9920000, 10080000 ] } } }, {"name": "Primary winding excitation", "frequency": 100000, "current": {"waveform": {"data": [-5, 5, -5 ], "time": [0, 0.000005, 0.00001 ] }, "processed": {"dutyCycle": 0.5, "peakToPeak": 10, "offset": 0, "label": "triangular" } }, "voltage": {"waveform": {"data": [-20.5, 70.5, 70.5, -20.5, -20.5 ], "time": [0, 0, 0.000005, 0.000005, 0.00001 ] }, "processed": {"dutyCycle": 0.5, "peakToPeak": 100, "offset": 0, "label": "rectangular" } } } ] })"));
+    // One winding, one excitation. The fixture carried a second "Primary winding excitation"
+    // (100 kHz, +-5 A) that is no winding of this one-winding inductor; since the operating
+    // point, not the coil, decides whether the current is the magnetizing current (ABT #1412,
+    // the core adviser's one-winding stand-in for a transformer), that stray entry made this
+    // inductor a two-winding circuit and dropped its 20 A DC bias from the flux.
+    auto operatingPoint = OperatingPoint(json::parse(R"({"name": "Operating Point No. 1", "conditions": {"ambientTemperature": 42 }, "excitationsPerWinding": [{"name": "Primary winding excitation", "frequency": 160000, "current": {"waveform": {"ancillaryLabel": null, "data": [17, 23, 17 ], "numberPeriods": null, "time": [0, 0.000003125, 0.00000625 ] }, "processed": {"dutyCycle": 0.5, "peakToPeak": 6, "offset": 20, "label": "triangular", "acEffectiveFrequency": 177194.24466847413, "effectiveFrequency": 21546.00003771328, "peak": 22.999999999999996, "rms": 20.074896384383905, "thd": 0.1215148744070506 }, "harmonics": {"amplitudes": [20, 2.4321967474991535, 5.024121874684011e-15, 0.2706786341990403, 2.5974016302617224e-15, 0.09775809175532962, 1.0877860477097108e-15, 0.050117879547604785, 1.2646590730292293e-15, 0.030514174880169928, 1.2335641993359796e-15, 0.02059224626965136, 1.2258227940648128e-15, 0.01488719320430654, 1.0764607310101287e-15, 0.01130940060640756, 0, 0.008919979835758483, 8.037893783541347e-16, 0.007246308335735057, 6.662375164413096e-16, 0.006029438250552881, 3.604673414361124e-16, 0.005117850585055619, 7.839803760535096e-16, 0.004418100846423644, 5.774995880218828e-16, 0.0038700274711771683, 2.9615889645109984e-16, 0.003433484276999084, 6.420789804208699e-16, 0.003080858038900569, 0, 0.0027926582542716085, 2.6513173039668365e-16, 0.002554817862838714, 1.8973175313253087e-16, 0.002356986496943279, 2.9367933833466926e-16, 0.0021914202524357307, 1.0419804364661729e-16, 0.0020522412854556225, 2.851132450398795e-16, 0.00193493308907579, 1.2181177477487184e-16, 0.0018359897079305966, 3.267519833402137e-16, 0.001752667766520524, 0, 0.0016828085851076898, 1.3008589992456218e-16, 0.0016247089970805578, 2.5388602966284854e-16, 0.001577026635768735, 3.0923087296718467e-16, 0.001538710070787071, 3.76480653329104e-16, 0.0015089472098712697, 3.3868062731196647e-16, 0.0014871274225975659, 4.193885737201472e-16, 0.0014728142451529425, 3.9756613902672346e-16, 0.001465726515887944 ], "frequencies": [0, 160000, 320000, 480000, 640000, 800000, 960000, 1120000, 1280000, 1440000, 1600000, 1760000, 1920000, 2080000, 2240000, 2400000, 2560000, 2720000, 2880000, 3040000, 3200000, 3360000, 3520000, 3680000, 3840000, 4000000, 4160000, 4320000, 4480000, 4640000, 4800000, 4960000, 5120000, 5280000, 5440000, 5600000, 5760000, 5920000, 6080000, 6240000, 6400000, 6560000, 6720000, 6880000, 7040000, 7200000, 7360000, 7520000, 7680000, 7840000, 8000000, 8160000, 8320000, 8480000, 8640000, 8800000, 8960000, 9120000, 9280000, 9440000, 9600000, 9760000, 9920000, 10080000 ] } }, "voltage": {"waveform": {"ancillaryLabel": null, "data": [-50, 50, 50, -50, -50 ], "numberPeriods": null, "time": [0, 0, 0.000003125, 0.000003125, 0.00000625 ] }, "processed": {"dutyCycle": 0.5, "peakToPeak": 100, "offset": 0, "label": "rectangular", "acEffectiveFrequency": 946376.8576189425, "effectiveFrequency": 946319.072434482, "peak": 50, "rms": 50, "thd": 0.48331514845248497 }, "harmonics": {"amplitudes": [0.78125, 63.64919355013018, 1.5625, 21.18229569117569, 1.5625, 12.668415318245188, 1.5625, 9.004909382998164, 1.5625, 6.958128475647527, 1.5625, 5.646149502042871, 1.5625, 4.729755006746538, 1.5625, 4.050628933965765, 1.5625, 3.524943518639316, 1.5625, 3.104154363036517, 1.5625, 2.7581982345221827, 1.5625, 2.467457137437843, 1.5625, 2.2185795367095267, 1.5625, 2.0021587188071255, 1.5625, 1.8113717302085082, 1.5625, 1.6411450722498175, 1.5625, 1.487623666720196, 1.5625, 1.3478217691511587, 1.5625, 1.2193869682092893, 1.5625, 1.100436657601639, 1.5625, 0.9894422127774558, 1.5625, 0.8851453167661671, 1.5625, 0.7864964059364037, 1.5625, 0.6926086154544899, 1.5625, 0.60272275979863, 1.5625, 0.5161802771005264, 1.5625, 0.43240198459440116, 1.5625, 0.3508711083080249, 1.5625, 0.27111946896540395, 1.5625, 0.192715993963664, 1.5625, 0.11525692425384548, 1.5625, 0.03835722204524927 ], "frequencies": [0, 160000, 320000, 480000, 640000, 800000, 960000, 1120000, 1280000, 1440000, 1600000, 1760000, 1920000, 2080000, 2240000, 2400000, 2560000, 2720000, 2880000, 3040000, 3200000, 3360000, 3520000, 3680000, 3840000, 4000000, 4160000, 4320000, 4480000, 4640000, 4800000, 4960000, 5120000, 5280000, 5440000, 5600000, 5760000, 5920000, 6080000, 6240000, 6400000, 6560000, 6720000, 6880000, 7040000, 7200000, 7360000, 7520000, 7680000, 7840000, 8000000, 8160000, 8320000, 8480000, 8640000, 8800000, 8960000, 9120000, 9280000, 9440000, 9600000, 9760000, 9920000, 10080000 ] } } } ] })"));
 
     OpenMagnetics::Inputs::scale_time_to_frequency(operatingPoint, 50000);
     MagnetizingInductance magnetizingInductanceModel(std::string{models["gapReluctance"]});
@@ -2644,10 +2680,13 @@ TEST_CASE("Test_Core_Losses_Rosano_Forward", "[physical-model][core-losses][smok
     double expectedLosses = 0.438;
     auto maximumError = 0.1;
 
-    // Updated for 617dc492: magnetizing current is now bipolar-centered for AC
-    // excitation (peak = peak_to_peak/2). Previous expected 0.145 was the
-    // pre-fix unipolar value where peak == peak_to_peak.
-    REQUIRE_THAT(0.08, Catch::Matchers::WithinAbs(magneticFluxDensity.get_processed().value().get_peak().value(), 0.08 * maximumError));
+    // A forward's flux is unipolar: it rises from zero over the on-time and the reset brings it back
+    // to zero, where it stays through the dead time (no winding conducts, so by Ampere the
+    // magnetizing current is zero there). The peak is the whole Faraday excursion, 0.1457 T, not
+    // half of it: 617dc492's bipolar centering (peak = peak-to-peak / 2, the old 0.08 pin) put a
+    // negative flux in a converter that never reverses it (ABT #1467, re-pinned with Alf's approval).
+    double expectedMagneticFluxDensityPeak = 0.1456;
+    REQUIRE_THAT(expectedMagneticFluxDensityPeak, Catch::Matchers::WithinAbs(magneticFluxDensity.get_processed().value().get_peak().value(), expectedMagneticFluxDensityPeak * maximumError));
     REQUIRE_THAT(expectedLosses, Catch::Matchers::WithinAbs(calculatedCoreLosses, expectedLosses * maximumError));
 }
 
@@ -2849,6 +2888,154 @@ TEST_CASE("Test_CoreLosses_Above_Curie_Temperature_Throws", "[physical-model][co
         CHECK(exception.code() == ErrorCode::MATERIAL_ABOVE_CURIE_TEMPERATURE);
         CHECK(exception.curie_temperature() == curieTemperature);
     }
+}
+
+// ABT #1497 helpers: a 20-turn E 42/21/15 in `materialName` driven by the quick 100 kHz triangular
+// operating point, and the flux density excitation that point puts through its core.
+static std::pair<Core, OperatingPointExcitation> abt1497_core_and_excitation(const std::string& materialName) {
+    auto inputs = OpenMagneticsTesting::create_quick_test_inputs();
+    auto operatingPoint = inputs.get_operating_points()[0];
+    std::vector<int64_t> numberTurns = {20};
+    auto magnetic = OpenMagneticsTesting::get_quick_magnetic("E 42/21/15", OpenMagneticsTesting::get_ground_gap(0.001), numberTurns, 1, materialName);
+    auto core = magnetic.get_core();
+    auto coil = magnetic.get_coil();
+    MagnetizingInductance magnetizingInductance("ZHANG");
+    auto magneticFluxDensity = magnetizingInductance.calculate_inductance_and_magnetic_flux_density(core, coil, &operatingPoint).second;
+    auto excitation = operatingPoint.get_excitations_per_winding()[0];
+    excitation.set_magnetic_flux_density(magneticFluxDensity);
+    return {core, excitation};
+}
+
+TEST_CASE("Test_CoreLosses_Explicit_Request_Of_A_Model_The_Material_Lacks_Throws", "[physical-model][core-losses][smoke-test][abt-1497]") {
+    // ABT #1497 (and #1485 problem 2): asking STEINMETZ or IGSE of a grade that carries only Roshen data
+    // in MAS returned the Roshen result, visible only in method_used. An explicit request must run
+    // exactly the requested model or throw, naming the model, the material and why. DMR40B is such a
+    // grade; it replaces PC95, which gained a Steinmetz fit in MAS 0ceffb3 (ABT #1512).
+    settings.reset();
+    double temperature = 25;
+    {
+        auto [core, excitation] = abt1497_core_and_excitation("DMR40B");
+        for (auto requested : {CoreLossesModels::STEINMETZ, CoreLossesModels::IGSE, CoreLossesModels::LOSS_FACTOR, CoreLossesModels::PROPRIETARY}) {
+            INFO("requested " << magic_enum::enum_name(requested));
+            CoreLosses coreLosses;
+            coreLosses.set_core_losses_requested_model_name(requested);
+            CHECK_THROWS_AS(coreLosses.calculate_core_losses(core, excitation, temperature), RequestedCoreLossesModelNotAvailableException);
+            CHECK_THROWS_AS(coreLosses.get_core_volumetric_losses(core.resolve_material(), excitation, temperature), RequestedCoreLossesModelNotAvailableException);
+            CHECK_THROWS_AS(coreLosses.get_core_losses_model("DMR40B"), RequestedCoreLossesModelNotAvailableException);
+        }
+        // The same request through the simulator, the path PyOM and the web take.
+        MagneticSimulator magneticSimulator;
+        magneticSimulator.set_core_losses_requested_model_name(CoreLossesModels::IGSE);
+        auto inputs = OpenMagneticsTesting::create_quick_test_inputs();
+        auto operatingPoint = inputs.get_operating_points()[0];
+        std::vector<int64_t> numberTurns = {20};
+        auto magnetic = OpenMagneticsTesting::get_quick_magnetic("E 42/21/15", OpenMagneticsTesting::get_ground_gap(0.001), numberTurns, 1, "DMR40B");
+        CHECK_THROWS_AS(magneticSimulator.calculate_core_losses(operatingPoint, magnetic), RequestedCoreLossesModelNotAvailableException);
+
+        CoreLosses coreLosses;
+        coreLosses.set_core_losses_requested_model_name(CoreLossesModels::STEINMETZ);
+        bool thrown = false;
+        try {
+            coreLosses.calculate_core_losses(core, excitation, temperature);
+        }
+        catch (const RequestedCoreLossesModelNotAvailableException& exception) {
+            thrown = true;
+            CHECK(exception.code() == ErrorCode::MATERIAL_REQUESTED_LOSS_MODEL_NOT_AVAILABLE);
+            CHECK(exception.material_name() == "DMR40B");
+            CHECK(exception.model_name() == "STEINMETZ");
+            std::string message = exception.what();
+            INFO(message);
+            CHECK_THAT(message, Catch::Matchers::ContainsSubstring("DMR40B"));
+            CHECK_THAT(message, Catch::Matchers::ContainsSubstring("STEINMETZ"));
+            CHECK_THAT(message, Catch::Matchers::ContainsSubstring("explicitly requested"));
+            CHECK_THAT(message, Catch::Matchers::ContainsSubstring("steinmetz"));
+            CHECK_THAT(message, Catch::Matchers::ContainsSubstring("ROSHEN"));
+        }
+        CHECK(thrown);
+    }
+    {
+        // A ferrite with Steinmetz and Roshen data has no loss-factor or manufacturer model.
+        auto [core, excitation] = abt1497_core_and_excitation("3C95");
+        for (auto requested : {CoreLossesModels::LOSS_FACTOR, CoreLossesModels::PROPRIETARY}) {
+            INFO("requested " << magic_enum::enum_name(requested));
+            CoreLosses coreLosses;
+            coreLosses.set_core_losses_requested_model_name(requested);
+            CHECK_THROWS_AS(coreLosses.calculate_core_losses(core, excitation, temperature), RequestedCoreLossesModelNotAvailableException);
+        }
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_CoreLosses_Explicit_Request_Of_An_Available_Model_Runs_Exactly_That_Model", "[physical-model][core-losses][smoke-test][abt-1497]") {
+    settings.reset();
+    double temperature = 25;
+    auto [core, excitation] = abt1497_core_and_excitation("3C95");
+    auto availableModels = CoreLossesModel::get_methods(core.resolve_material());
+    // Every model the cascade would never reach with a default preference of IGSE, and IGSE itself.
+    for (auto requested : {CoreLossesModels::IGSE, CoreLossesModels::STEINMETZ, CoreLossesModels::MSE, CoreLossesModels::NSE, CoreLossesModels::ROSHEN}) {
+        INFO("requested " << magic_enum::enum_name(requested));
+        REQUIRE(CoreLosses::can_run_requested_model(requested, availableModels));
+        CoreLosses coreLosses;
+        coreLosses.set_core_losses_requested_model_name(requested);
+        REQUIRE(coreLosses.get_core_losses_requested_model_name() == requested);
+        auto output = coreLosses.calculate_core_losses(core, excitation, temperature);
+        auto direct = CoreLossesModel::factory(requested)->get_core_losses(core, excitation, temperature);
+        CHECK(output.get_method_used() == direct.get_method_used());
+        CHECK(output.get_core_losses() == direct.get_core_losses());
+        CHECK(output.get_core_losses() > 0);
+    }
+    {
+        // A Roshen-only grade asked for Roshen.
+        auto [pc95Core, pc95Excitation] = abt1497_core_and_excitation("PC95");
+        CoreLosses coreLosses;
+        coreLosses.set_core_losses_requested_model_name(CoreLossesModels::ROSHEN);
+        CHECK(coreLosses.calculate_core_losses(pc95Core, pc95Excitation, temperature).get_method_used() == "Roshen");
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_CoreLosses_Default_Preference_Keeps_The_Cascade", "[physical-model][core-losses][smoke-test][abt-1497]") {
+    // Without an explicit request the preference only heads the PROPRIETARY/LOSS_FACTOR/STEINMETZ/ROSHEN
+    // cascade: the default IGSE reaches PC95's and 3C95's iGSE, unchanged by ABT #1497. PC95 read Roshen
+    // here until MAS 0ceffb3 (ABT #1512) gave it a Steinmetz fit, so the cascade now stops at iGSE/Steinmetz.
+    settings.reset();
+    REQUIRE_FALSE(settings.get_core_losses_requested_model());
+    double temperature = 25;
+    auto [pc95Core, pc95Excitation] = abt1497_core_and_excitation("PC95");
+    auto [core, excitation] = abt1497_core_and_excitation("3C95");
+    {
+        CoreLosses coreLosses;
+        REQUIRE_FALSE(coreLosses.get_core_losses_requested_model_name());
+        auto pc95Output = coreLosses.calculate_core_losses(pc95Core, pc95Excitation, temperature);
+        CHECK(pc95Output.get_method_used() == "iGSE");
+        CHECK(pc95Output.get_core_losses() == CoreLossesIGSEModel().get_core_losses(pc95Core, pc95Excitation, temperature).get_core_losses());
+        auto output = coreLosses.calculate_core_losses(core, excitation, temperature);
+        CHECK(output.get_method_used() == "iGSE");
+        CHECK(output.get_core_losses() == CoreLossesIGSEModel().get_core_losses(core, excitation, temperature).get_core_losses());
+    }
+    {
+        // A preference for STEINMETZ reaches PC95's Steinmetz fit (MAS 0ceffb3, ABT #1512).
+        CoreLosses coreLosses;
+        coreLosses.set_core_losses_model_name(CoreLossesModels::STEINMETZ);
+        CHECK(coreLosses.calculate_core_losses(pc95Core, pc95Excitation, temperature).get_method_used() == "Steinmetz");
+        CHECK(coreLosses.calculate_core_losses(core, excitation, temperature).get_method_used() == "Steinmetz");
+    }
+    {
+        // Setting a preference withdraws an explicit request, in the instance and in the Settings, so a
+        // later default call (PyOM calculate_core_losses with no model) does not inherit it.
+        CoreLosses coreLosses;
+        coreLosses.set_core_losses_requested_model_name(CoreLossesModels::STEINMETZ);
+        REQUIRE(settings.get_core_losses_requested_model() == CoreLossesModels::STEINMETZ);
+        CHECK(CoreLosses().get_core_losses_requested_model_name() == CoreLossesModels::STEINMETZ);
+        coreLosses.set_core_losses_model_name(CoreLossesModels::STEINMETZ);
+        CHECK_FALSE(settings.get_core_losses_requested_model());
+        CHECK(coreLosses.calculate_core_losses(pc95Core, pc95Excitation, temperature).get_method_used() == "Steinmetz");
+        coreLosses.set_core_losses_requested_model_name(CoreLossesModels::IGSE);
+        settings.reset();
+        CHECK_FALSE(settings.get_core_losses_requested_model());
+        CHECK_FALSE(CoreLosses().get_core_losses_requested_model_name());
+    }
+    settings.reset();
 }
 
 TEST_CASE("Test_CoreLosses_Nanoperm_Data_Sheet_Bound_Is_Peak", "[physical-model][core-losses][smoke-test][abt-1491]") {
@@ -3272,7 +3459,10 @@ TEST_CASE("Frequency_From_Losses_TDG", "[physical-model][core-losses][smoke-test
 
     auto coreLossesModel = CoreLossesModel::factory(models);
     auto coreLosses = coreLossesModel->get_core_losses(core, excitation, temperature);
-    double expectedLosses = 37.04;
+    // ABT #1467: 37.04 -> 34.08 W. The sampler now closes an open time axis periodically instead of
+    // resampling it twice: the flux was an asymmetric triangle (+5.37 / -5.63 T shape, midpoint -7.4 mT,
+    // peak 0.3252 T) and is now the exact symmetric triangle the voltage drives (peak 0.3203 T).
+    double expectedLosses = 34.08;
     REQUIRE_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinAbs(expectedLosses, expectedLosses * maxError));
 }
 
@@ -3887,7 +4077,7 @@ TEST_CASE("Test_Core_Losses_Drum_Semishielded_Per_Material_Split", "[physical-mo
         coreJson["functionalDescription"] = {
             {"type", "pieceAndPlate"}, {"material", "3C90"}, {"shape", shapeJson},
             {"gapping", json::array()}, {"numberStacks", 1},
-            {"coating", {{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", shellMaterialName}}}};
+            {"coating", {{"type", "magneticEpoxy"}, {"thickness", {{"nominal", 0.0001}}}, {"material", shellMaterialName}}}};
         Core core(coreJson);
         core.process_data();
         core.process_gap();
@@ -4027,6 +4217,72 @@ TEST_CASE("Test_Subcircuit_Export_Accepts_LossFactor_Materials", "[processor][ci
     std::string simbaSubcircuit;
     REQUIRE_NOTHROW(simbaSubcircuit = simbaExporter.export_magnetic_as_subcircuit(completed, 100000, 25, std::nullopt, std::nullopt));
     CHECK(simbaSubcircuit.size() > 50);
+
+    // ABT #1879: one winding has nothing to leak against, so Simba's series leakage element is
+    // 0 H. It used to come from the pairwise leakage of windings (0, 1), read past the end of
+    // this one-winding coil; when that memory held 0 the turns ratio was infinite and the export
+    // threw "knot 0 is not finite" (once in a full suite, never standalone).
+    std::function<std::optional<double>(const json&)> findLeakageInductor = [&](const json& node) -> std::optional<double> {
+        if (node.is_object()) {
+            if (node.contains("Name") && node["Name"].is_string() && node["Name"].get<std::string>() == "winding 0 Leakage inductance") {
+                return std::stod(node["Parameters"]["Value"].get<std::string>());
+            }
+            for (auto& [key, value] : node.items()) {
+                if (auto found = findLeakageInductor(value)) {
+                    return found;
+                }
+            }
+        }
+        else if (node.is_array()) {
+            for (auto& value : node) {
+                if (auto found = findLeakageInductor(value)) {
+                    return found;
+                }
+            }
+        }
+        return std::nullopt;
+    };
+    auto leakageInductorValue = findLeakageInductor(json::parse(simbaSubcircuit));
+    REQUIRE(leakageInductorValue.has_value());
+    CHECK(leakageInductorValue.value() == 0);
+    settings.reset();
+}
+
+// ABT #1879: a leakage inductance is one winding against another. On a one-winding coil the
+// default pair (0, 1) names a winding that does not exist; it must be refused, not read from
+// whatever memory follows the functional description (a heap pointer came back as the turn
+// count, or 0 and an infinite turns ratio).
+TEST_CASE("Test_Leakage_Inductance_Refuses_A_Winding_The_Coil_Does_Not_Have", "[physical-model][leakage-inductance][abt-1879]") {
+    settings.reset();
+    clear_databases();
+    auto core = OpenMagneticsTesting::get_quick_core("DR 2.3 + SRI 3.0", json::array(), 1, "DL5");
+    json coilJson;
+    coilJson["bobbin"] = "Dummy";
+    coilJson["functionalDescription"] = json::array({{
+        {"name", "winding 0"}, {"numberTurns", 8}, {"numberParallels", 1},
+        {"isolationSide", "primary"}, {"wire", "Round 0.1 - Grade 1"}}});
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
+    auto completed = OpenMagnetics::magnetic_autocomplete(magnetic);
+    REQUIRE(completed.get_coil().get_functional_description().size() == 1);
+
+    auto expectInvalidInput = [&](auto&& call) {
+        try {
+            call();
+            FAIL("no exception");
+        }
+        catch (const InvalidInputException& exception) {
+            CHECK(exception.code() == ErrorCode::INVALID_INPUT);
+        }
+    };
+    expectInvalidInput([&] { LeakageInductance().calculate_leakage_inductance(completed, 100000); });
+    expectInvalidInput([&] { LeakageInductance().calculate_leakage_inductance(completed, 100000, 1, 0); });
+    expectInvalidInput([&] { LeakageInductance().calculate_leakage_inductance(completed, 100000, 0, 0); });
+    // The all-windings form never asks for a pair: one winding, one 0 H entry (itself).
+    auto allWindings = LeakageInductance().calculate_leakage_inductance_all_windings(completed, 100000).get_leakage_inductance_per_winding();
+    REQUIRE(allWindings.size() == 1);
+    CHECK(allWindings[0].get_nominal().value() == 0);
     settings.reset();
 }
 
@@ -4174,6 +4430,36 @@ OperatingPointExcitation build_sinusoidal_flux_excitation(double frequency, doub
     return OperatingPointExcitation(excitationJson);
 }
 }  // namespace
+
+// User report 2026-10-09: PC95 (Roshen-only in MAS), sinusoid, 100 kHz, 25 C lost its
+// hysteresis term below ~73 mT — 0.63 kW/m3 at 61 mT against 32.9 kW/m3 at 76 mT, the low
+// side scaling exactly as B^2 f^2 (eddy only). The analytical minor-loop tip has no positive
+// root for a small loop and the code silently used delta = 0, which gives a zero-area loop.
+TEST_CASE("Test_Roshen_Small_Minor_Loop_Keeps_Hysteresis", "[physical-model][core-losses][roshen-core-losses-model][smoke-test]") {
+    settings.reset();
+    clear_databases();
+    double frequency = 100000;
+    double temperature = 25;
+    Core core = OpenMagneticsTesting::get_quick_core("PQ 20/20", json::array(), 1, "PC95");
+    CoreLossesRoshenModel roshen;
+    auto parameters = roshen.get_roshen_parameters(core, build_sinusoidal_flux_excitation(frequency, 0.061), temperature);
+    auto hysteresis = [&](double peak) {
+        return roshen.get_hysteresis_losses_density(parameters, build_sinusoidal_flux_excitation(frequency, peak));
+    };
+
+    // Small loops have hysteresis, growing with the peak.
+    CHECK(hysteresis(0.010) > 0);
+    CHECK(hysteresis(0.030) > hysteresis(0.010));
+    CHECK(hysteresis(0.061) > hysteresis(0.030));
+    // No cliff across the boundary between the small-loop and analytical solutions (~73 mT).
+    CHECK_THAT(hysteresis(0.0725), Catch::Matchers::WithinRel(hysteresis(0.0745), 0.1));
+    // The reported pair: 61 mT is now a smooth step below 76 mT, not a factor of 50.
+    auto low = roshen.get_core_losses(core, build_sinusoidal_flux_excitation(frequency, 0.061), temperature).get_core_losses();
+    auto high = roshen.get_core_losses(core, build_sinusoidal_flux_excitation(frequency, 0.076), temperature).get_core_losses();
+    CHECK(low / high > 0.3);
+    CHECK(low / high < 1);
+    settings.reset();
+}
 
 TEST_CASE("Test_Roshen_Eddy_Current_Ferrite_Uses_Bulk_Cross_Section", "[physical-model][core-losses][roshen-core-losses-model][abt-1344]") {
     settings.reset();
@@ -4661,13 +4947,539 @@ TEST_CASE("Core-loss frequency sweep is clipped to the material's fitted span", 
     auto inputs = OpenMagneticsTesting::create_quick_test_inputs();
     auto [spanMinimum, spanMaximum] = CoreLossesModel::get_steinmetz_fitted_span("P63");
     REQUIRE(spanMinimum > 10000);
-    auto sweep = Sweeper::sweep_core_losses_over_frequency(magnetic, inputs.get_operating_points()[0], 10000, 1200000, 10);
+    auto sweep = Sweeper::sweep_core_losses_over_frequency(magnetic, inputs.get_operating_points()[0], inputs.get_design_requirements().get_topology(), 10000, 1200000, 10);
     CHECK_THAT(sweep.get_x_points().front(), Catch::Matchers::WithinRel(spanMinimum, 1e-9));
     CHECK_THAT(sweep.get_x_points().back(), Catch::Matchers::WithinRel(1200000.0, 1e-9));
     CHECK_THAT(sweep.get_title(), Catch::Matchers::ContainsSubstring("fitted Steinmetz span"));
     auto [inSpanStart, inSpanStop] = Sweeper::core_resistance_frequency_window(magnetic, 400000, 1000000);
     CHECK(inSpanStart == 400000);
     CHECK(inSpanStop == 1000000);
-    CHECK_THROWS_AS(Sweeper::sweep_core_losses_over_frequency(magnetic, inputs.get_operating_points()[0], 10000, 100000, 10),
+    CHECK_THROWS_AS(Sweeper::sweep_core_losses_over_frequency(magnetic, inputs.get_operating_points()[0], inputs.get_design_requirements().get_topology(), 10000, 100000, 10),
                     MaterialFrequencyOutOfSpanException);
+}
+
+// ABT #1467: the core-loss sweep takes its magnetizing current from the shared decision
+// (Inputs::calculate_magnetizing_current on the operating point, reached through
+// MagnetizingInductance since ABT #1754), not from the primary voltage alone. Two CCM flybacks, 1:1, 100 kHz, D = 0.5, the same +-20 V winding voltage, differ only in
+// the windings' currents: 15 -> 17 A and 1 -> 3 A. The voltage gives both the same flux swing; the
+// currents give the first a ~14 A larger magnetizing DC, and on a material with DC-bias
+// permeability data the DPLE correction prices that DC. Integrating the voltage alone gave both
+// the same zero-mean flux and the same losses.
+TEST_CASE("Core-loss frequency sweep carries the flyback's magnetizing DC", "[sweeper][core-losses][abt-1467]") {
+    settings.reset();
+    clear_databases();
+    std::vector<int64_t> numberTurns = {20, 20};
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(OpenMagneticsTesting::get_quick_magnetic(
+        "E 42/21/15", OpenMagneticsTesting::get_ground_gap(0.001), numberTurns, 1, "DMR96"));
+    REQUIRE(InitialPermeability::has_magnetic_field_dc_bias_dependency(magnetic.get_core().resolve_material()));
+    auto flyback = [](double valley, double peak) {
+        json operatingPointJson;
+        operatingPointJson["conditions"]["ambientTemperature"] = 25;
+        json primary;
+        primary["frequency"] = 100000;
+        primary["name"] = "Primary";
+        primary["current"]["waveform"]["time"] = {0, 5e-6, 5e-6, 1e-5};
+        primary["current"]["waveform"]["data"] = {valley, peak, 0, 0};
+        primary["voltage"]["waveform"]["time"] = {0, 5e-6, 5e-6, 1e-5};
+        primary["voltage"]["waveform"]["data"] = {20, 20, -20, -20};
+        json secondary;
+        secondary["frequency"] = 100000;
+        secondary["name"] = "Secondary";
+        secondary["current"]["waveform"]["time"] = {0, 5e-6, 5e-6, 1e-5};
+        secondary["current"]["waveform"]["data"] = {0, 0, peak, valley};
+        secondary["voltage"]["waveform"]["time"] = {0, 5e-6, 5e-6, 1e-5};
+        secondary["voltage"]["waveform"]["data"] = {-20, -20, 20, 20};
+        operatingPointJson["excitationsPerWinding"] = {primary, secondary};
+        return OperatingPoint(operatingPointJson);
+    };
+    auto biased = Sweeper::sweep_core_losses_over_frequency(magnetic, flyback(15, 17), Topology::FLYBACK_CONVERTER, 100000, 200000, 2);
+    auto lightlyBiased = Sweeper::sweep_core_losses_over_frequency(magnetic, flyback(1, 3), Topology::FLYBACK_CONVERTER, 100000, 200000, 2);
+    double biasedLosses = biased.get_y_points().front();
+    double lightlyBiasedLosses = lightlyBiased.get_y_points().front();
+    INFO("core losses at 100 kHz: 15 -> 17 A " << biasedLosses << " W, 1 -> 3 A " << lightlyBiasedLosses << " W");
+    REQUIRE(lightlyBiasedLosses > 0);
+    CHECK(biasedLosses > 1.05 * lightlyBiasedLosses);
+}
+
+// ABT #1602: the core-loss series resistance builds an equivalent winding N = sqrt(L * R). It used to
+// be truncated to an integer, so any L * R < 1 gave N = 0, zero flux and a zero resistance, and the
+// value jumped at every integer N. N is a model quantity and must stay real.
+TEST_CASE("Core-loss series resistance is continuous in the equivalent turns", "[physical-model][core-losses][abt-1602]") {
+    settings.reset();
+    clear_databases();
+    std::vector<int64_t> numberTurns = {20};
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(OpenMagneticsTesting::get_quick_magnetic(
+        "E 42/21/15", OpenMagneticsTesting::get_ground_gap(0.001), numberTurns, 1, "N87"));
+    auto core = magnetic.get_core();
+    double temperature = 25;
+    double frequency = 100000;
+    double initialPermeability = InitialPermeability::get_initial_permeability(core.resolve_material(), temperature);
+    double reluctance = ReluctanceModel::factory()->get_core_reluctance(core, initialPermeability).get_core_reluctance();
+    auto model = CoreLossesModel::factory(std::map<std::string, std::string>({{"coreLosses", "Steinmetz"}}));
+
+    // N = 0.5: was truncated to 0.
+    CHECK(model->get_core_losses_series_resistance(core, frequency, temperature, 0.25 / reluctance) > 0);
+    // Either side of N = 1: was N = 0 below and N = 1 above, a jump from zero to the full value.
+    double below = model->get_core_losses_series_resistance(core, frequency, temperature, 0.98 / reluctance);
+    double above = model->get_core_losses_series_resistance(core, frequency, temperature, 1.02 / reluctance);
+    REQUIRE(above > 0);
+    CHECK_THAT(below / above, Catch::Matchers::WithinAbs(1.0, 0.1));
+    CHECK_THROWS(model->get_core_losses_series_resistance(core, frequency, temperature, 0));
+}
+
+// ABT #1529: how many temperature coefficients a range carries is decided by the range's own
+// points. The fitter decided it from the whole data set, so Micrometals Mix 52 (22.2 C and 25 C
+// overall, one temperature per range) got a full quadratic ct per range: ct(100 C) = -2,085,899.
+TEST_CASE("Calculate_Steinmetz_Coefficients_Temperature_Per_Range", "[physical-model][core-losses][steinmetz-fit][abt-1529]") {
+    const double k = 2.0, alpha = 1.5, beta = 2.7;
+    auto makePoint = [&](double frequency, double peak, double temperature, double factor) {
+        json pointJson;
+        pointJson["temperature"] = temperature;
+        pointJson["value"] = k * pow(frequency, alpha) * pow(peak, beta) * factor;
+        pointJson["origin"] = "manufacturer";
+        pointJson["magneticFluxDensity"]["frequency"] = frequency;
+        pointJson["magneticFluxDensity"]["magneticFluxDensity"]["processed"]["label"] = "sinusoidal";
+        pointJson["magneticFluxDensity"]["magneticFluxDensity"]["processed"]["offset"] = 0;
+        pointJson["magneticFluxDensity"]["magneticFluxDensity"]["processed"]["peak"] = peak;
+        pointJson["magneticFluxDensity"]["magneticFluxDensity"]["processed"]["peakToPeak"] = 2 * peak;
+        return VolumetricLossesPoint(pointJson);
+    };
+    auto block = [&](std::vector<double> frequencies, double temperature, double factor, std::vector<VolumetricLossesPoint>& data) {
+        for (auto frequency : frequencies) {
+            for (auto peak : {0.02, 0.05, 0.1, 0.2, 0.3}) {
+                data.push_back(makePoint(frequency, peak, temperature, factor));
+            }
+        }
+    };
+
+    SECTION("One temperature per range, two overall: no ct is fitted") {
+        std::vector<VolumetricLossesPoint> data;
+        block({20000, 30000, 40000}, 25, 1.0, data);
+        block({200000, 300000, 400000}, 22.2, 1.0, data);
+        auto [coefficientsPerRange, errorPerRange] = OpenMagnetics::CoreLossesSteinmetzModel::calculate_steinmetz_coefficients(data, {{20000, 100000}, {100000, 500000}});
+        REQUIRE(coefficientsPerRange.size() == 2);
+        for (auto& range : coefficientsPerRange) {
+            CHECK_FALSE(range.get_ct0());
+            CHECK_FALSE(range.get_ct1());
+            CHECK_FALSE(range.get_ct2());
+            CHECK_THAT(range.get_k(), Catch::Matchers::WithinRel(k, 0.02));
+        }
+    }
+
+    SECTION("Two temperatures in a range: linear ct, ct2 = 0, exact at both") {
+        // ct(T) linear: 1.0 at 100 C, 1.6 at 25 C.
+        auto factor = [](double temperature) { return 1.0 + 0.008 * (100 - temperature); };
+        std::vector<VolumetricLossesPoint> data;
+        block({50000, 70000, 100000, 140000, 200000}, 25, factor(25), data);
+        block({50000, 70000, 100000, 140000, 200000}, 100, factor(100), data);
+        auto [coefficientsPerRange, errorPerRange] = OpenMagnetics::CoreLossesSteinmetzModel::calculate_steinmetz_coefficients(data, {{10000, 1000000}});
+        REQUIRE(coefficientsPerRange.size() == 1);
+        auto fitted = coefficientsPerRange[0];
+        REQUIRE(fitted.get_ct0());
+        REQUIRE(fitted.get_ct1());
+        REQUIRE(fitted.get_ct2());
+        CHECK(fitted.get_ct2().value() == 0);
+        for (double temperature : {25.0, 100.0}) {
+            double modeled = fitted.get_k() * pow(100000, fitted.get_alpha()) * pow(0.1, fitted.get_beta()) *
+                             OpenMagnetics::CoreLossesSteinmetzModel::get_temperature_factor(fitted, temperature);
+            CHECK_THAT(modeled, Catch::Matchers::WithinRel(k * pow(100000, alpha) * pow(0.1, beta) * factor(temperature), 0.03));
+        }
+    }
+
+    SECTION("Three temperatures in one range, one in the other: only the first gets ct") {
+        auto factor = [](double temperature) { return 0.00015 * temperature * temperature - 0.03 * temperature + 2.5; };
+        std::vector<VolumetricLossesPoint> data;
+        for (double temperature : {25.0, 60.0, 100.0}) {
+            block({20000, 30000, 40000}, temperature, factor(temperature), data);
+        }
+        block({200000, 300000, 400000}, 25, factor(25), data);
+        auto [coefficientsPerRange, errorPerRange] = OpenMagnetics::CoreLossesSteinmetzModel::calculate_steinmetz_coefficients(data, {{20000, 100000}, {100000, 500000}});
+        REQUIRE(coefficientsPerRange.size() == 2);
+        CHECK(coefficientsPerRange[0].get_ct2());
+        CHECK_FALSE(coefficientsPerRange[1].get_ct0());
+    }
+}
+
+// ABT #1636: a boost PFC inductor excited over one line period. The excitation's frequency is the
+// line's; its flux is a switching-frequency triangle ripple riding on the rectified line envelope.
+// The record's core loss is the time average of its switching cycles' minor loops, each at the
+// switching frequency with its own local DC flux, plus the envelope's own line-frequency loop.
+// The references below are built cycle by cycle from the construction itself (exact triangles at
+// the switching frequency) and priced through the same MKF model, independently of how the record
+// is split.
+namespace {
+
+struct BoostPfcLineCycle {
+    OperatingPointExcitation record;
+    std::vector<OperatingPointExcitation> cycles;
+    OperatingPointExcitation envelope;
+};
+
+BoostPfcLineCycle build_boost_pfc_line_cycle(double lineFrequency, size_t cyclesPerLinePeriod, double envelopePeak,
+                                             double maximumRipplePeakToPeak, double inputPeakOverOutputVoltage) {
+    double switchingPeriod = 1 / lineFrequency / static_cast<double>(cyclesPerLinePeriod);
+    double switchingFrequency = 1 / switchingPeriod;
+    auto envelope = [&](double t) { return envelopePeak * std::fabs(sin(2 * std::numbers::pi * lineFrequency * t)); };
+    // Boost: D = 1 - vin / vout, ripple = vin D T / (N Ae), largest (maximumRipplePeakToPeak) at vin = vout / 2.
+    auto inputOverOutput = [&](double t) { return inputPeakOverOutputVoltage * std::fabs(sin(2 * std::numbers::pi * lineFrequency * t)); };
+    auto ripple = [&](double x) { return maximumRipplePeakToPeak * 4 * x * (1 - x); };
+
+    BoostPfcLineCycle result;
+    std::vector<double> time;
+    std::vector<double> data;
+    std::vector<double> envelopeTime;
+    std::vector<double> envelopeData;
+    for (size_t cycleIndex = 0; cycleIndex <= cyclesPerLinePeriod; ++cycleIndex) {
+        double start = static_cast<double>(cycleIndex) * switchingPeriod;
+        double centre = start + switchingPeriod / 2;
+        double x = inputOverOutput(centre);
+        double dutyCycle = 1 - x;
+        double peakToPeak = ripple(x);
+        time.push_back(start);
+        data.push_back(envelope(start) - peakToPeak / 2);
+        if (cycleIndex == cyclesPerLinePeriod) {
+            break;
+        }
+        time.push_back(start + dutyCycle * switchingPeriod);
+        data.push_back(envelope(start + dutyCycle * switchingPeriod) + peakToPeak / 2);
+
+        json cycleJson;
+        cycleJson["frequency"] = switchingFrequency;
+        cycleJson["magneticFluxDensity"]["waveform"]["time"] = {0, dutyCycle * switchingPeriod, switchingPeriod};
+        double offset = envelope(centre);
+        cycleJson["magneticFluxDensity"]["waveform"]["data"] = {offset - peakToPeak / 2, offset + peakToPeak / 2, offset - peakToPeak / 2};
+        cycleJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::TRIANGULAR;
+        cycleJson["magneticFluxDensity"]["processed"]["offset"] = offset;
+        cycleJson["magneticFluxDensity"]["processed"]["peak"] = offset + peakToPeak / 2;
+        cycleJson["magneticFluxDensity"]["processed"]["peakToPeak"] = peakToPeak;
+        cycleJson["magneticFluxDensity"]["processed"]["dutyCycle"] = dutyCycle;
+        result.cycles.push_back(OperatingPointExcitation(cycleJson));
+        envelopeTime.push_back(centre - switchingPeriod / 2);
+        envelopeData.push_back(offset);
+    }
+    json recordJson;
+    recordJson["frequency"] = lineFrequency;
+    recordJson["magneticFluxDensity"]["waveform"]["time"] = time;
+    recordJson["magneticFluxDensity"]["waveform"]["data"] = data;
+    recordJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::CUSTOM;
+    recordJson["magneticFluxDensity"]["processed"]["offset"] = (*std::max_element(data.begin(), data.end()) + *std::min_element(data.begin(), data.end())) / 2;
+    recordJson["magneticFluxDensity"]["processed"]["peak"] = *std::max_element(data.begin(), data.end());
+    recordJson["magneticFluxDensity"]["processed"]["peakToPeak"] = *std::max_element(data.begin(), data.end()) - *std::min_element(data.begin(), data.end());
+    result.record = OperatingPointExcitation(recordJson);
+
+    // The envelope repeats once per line period: it closes one period after its first sample, on the same value.
+    envelopeTime.push_back(1 / lineFrequency);
+    envelopeData.push_back(envelopeData.front());
+    json envelopeJson;
+    envelopeJson["frequency"] = lineFrequency;
+    envelopeJson["magneticFluxDensity"]["waveform"]["time"] = envelopeTime;
+    envelopeJson["magneticFluxDensity"]["waveform"]["data"] = envelopeData;
+    envelopeJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::CUSTOM;
+    envelopeJson["magneticFluxDensity"]["processed"]["offset"] = (*std::max_element(envelopeData.begin(), envelopeData.end()) + *std::min_element(envelopeData.begin(), envelopeData.end())) / 2;
+    envelopeJson["magneticFluxDensity"]["processed"]["peak"] = *std::max_element(envelopeData.begin(), envelopeData.end());
+    envelopeJson["magneticFluxDensity"]["processed"]["peakToPeak"] = *std::max_element(envelopeData.begin(), envelopeData.end()) - *std::min_element(envelopeData.begin(), envelopeData.end());
+    result.envelope = OperatingPointExcitation(envelopeJson);
+    return result;
+}
+
+double reference_line_cycle_losses(const BoostPfcLineCycle& pfc, const std::function<double(const OperatingPointExcitation&)>& evaluate) {
+    double cyclesLosses = 0;
+    for (const auto& cycle : pfc.cycles) {
+        cyclesLosses += evaluate(cycle);
+    }
+    return cyclesLosses / static_cast<double>(pfc.cycles.size()) + evaluate(pfc.envelope);
+}
+
+} // namespace
+
+TEST_CASE("Core losses of a boost PFC line-cycle excitation are priced per switching cycle", "[physical-model][core-losses][line-cycle-core-losses][smoke-test]") {
+    settings.reset();
+    clear_databases();
+    double temperature = 25;
+    // 60 Hz line, 60 kHz switching: 1000 cycles per line period, 0.6 = Vin,peak / Vout.
+    auto pfc = build_boost_pfc_line_cycle(60, 1000, 0.2, 0.1, 0.6);
+
+    SECTION("Ferrite") {
+        // PC44's Steinmetz ranges are fitted from 1 Hz, so both the cycles and the 60 Hz envelope are in span.
+        Core core = OpenMagneticsTesting::get_quick_core("PQ 20/20", json::array(), 1, "PC44");
+        for (auto modelName : {CoreLossesModels::STEINMETZ, CoreLossesModels::IGSE}) {
+            INFO("Model: " << magic_enum::enum_name(modelName));
+            auto model = CoreLossesModel::factory(modelName);
+            double recordLosses = model->get_core_losses(core, pfc.record, temperature).get_core_losses();
+            double reference = reference_line_cycle_losses(pfc, [&](const OperatingPointExcitation& excitation) {
+                return model->get_core_losses(core, excitation, temperature).get_core_losses();
+            });
+            double envelopeLosses = model->get_core_losses(core, pfc.envelope, temperature).get_core_losses();
+            // The 60 Hz envelope of a ferrite loses next to nothing: the loss is the ripple's.
+            CHECK(envelopeLosses < 0.01 * reference);
+            CHECK(reference > 0.01);
+            CHECK_THAT(recordLosses, Catch::Matchers::WithinRel(reference, 0.01));
+        }
+    }
+
+    SECTION("The envelope repeats once per record, and the record is labelled with its line frequency") {
+        // The record spans one 60 Hz line period and is labelled 60 Hz: the envelope is a loop at the
+        // line frequency over that same period (ABT #1467).
+        Core core = OpenMagneticsTesting::get_quick_core("PQ 20/20", json::array(), 1, "PC44");
+        auto model = CoreLossesModel::factory(CoreLossesModels::STEINMETZ);
+        REQUIRE(pfc.record.get_frequency() == 60);
+        auto record = CoreLossesModel::split_into_switching_cycles(pfc.record);
+        REQUIRE(record.has_value());
+        CHECK(record->envelope.get_frequency() == 60);
+        auto envelopeTime = record->envelope.get_magnetic_flux_density()->get_waveform()->get_time().value();
+        CHECK(envelopeTime.front() == 0);
+        CHECK_THAT(envelopeTime.back(), Catch::Matchers::WithinRel(1.0 / 60, 1e-12));
+        auto envelopeData = record->envelope.get_magnetic_flux_density()->get_waveform()->get_data();
+        CHECK(envelopeData.back() == envelopeData.front());
+
+        // A line-cycle record labelled with the switching frequency is mislabelled: its waveform spans
+        // 1000 periods of that frequency, and it is refused, not re-read as one period of something else.
+        auto labelledWithSwitchingFrequency = pfc.record;
+        labelledWithSwitchingFrequency.set_frequency(60000);
+        CHECK_THROWS_AS(CoreLossesModel::split_into_switching_cycles(labelledWithSwitchingFrequency), std::invalid_argument);
+        CHECK_THROWS_AS(model->get_core_losses(core, labelledWithSwitchingFrequency, temperature), std::invalid_argument);
+    }
+
+    SECTION("A ferrite whose fit starts above the line frequency cannot price the envelope's loop") {
+        // 3C95's Steinmetz ranges start at 25 kHz: the switching cycles are in span, the 60 Hz envelope
+        // is not, and an extrapolation of the fit is refused as everywhere else (ABT #1456).
+        Core core = OpenMagneticsTesting::get_quick_core("PQ 20/20", json::array(), 1, "3C95");
+        auto model = CoreLossesModel::factory(CoreLossesModels::STEINMETZ);
+        CHECK_THROWS_AS(model->get_core_losses(core, pfc.record, temperature), MaterialFrequencyOutOfSpanException);
+        // The refusal is the envelope's, and names the material, its fitted span and the frequency asked.
+        CHECK_THROWS_WITH(model->get_core_losses(core, pfc.record, temperature),
+                          Catch::Matchers::ContainsSubstring("3C95") && Catch::Matchers::ContainsSubstring("25000") &&
+                          Catch::Matchers::ContainsSubstring("3000000") && Catch::Matchers::ContainsSubstring("60.000000 Hz is below"));
+        auto record = CoreLossesModel::split_into_switching_cycles(pfc.record);
+        REQUIRE(record.has_value());
+        CHECK_THROWS_AS(model->compute_core_losses(core, record->envelope, temperature), MaterialFrequencyOutOfSpanException);
+        // Every switching cycle alone is in span.
+        for (const auto& cycle : record->cycles) {
+            CHECK(model->compute_core_losses(core, cycle, temperature).get_core_losses() > 0);
+        }
+        CHECK(model->get_core_losses(core, pfc.cycles[250], temperature).get_core_losses() > 0);
+    }
+
+    SECTION("Powder, through the CoreLosses orchestrator with its DC-bias correction per cycle") {
+        Core core = OpenMagneticsTesting::get_quick_core("T 47/24/18.0", json::array(), 1, "Kool Mµ 60");
+        CoreLosses coreLosses;
+        auto powderPfc = build_boost_pfc_line_cycle(60, 1000, 0.4, 0.05, 0.6);
+        double recordLosses = coreLosses.calculate_core_losses(core, powderPfc.record, temperature).get_core_losses();
+        double reference = reference_line_cycle_losses(powderPfc, [&](const OperatingPointExcitation& excitation) {
+            return coreLosses.calculate_core_losses(core, excitation, temperature).get_core_losses();
+        });
+        CHECK(reference > 0);
+        CHECK_THAT(recordLosses, Catch::Matchers::WithinRel(reference, 0.01));
+        // The volumetric entry point prices the record the same way.
+        double effectiveVolume = core.get_processed_description()->get_effective_parameters().get_effective_volume();
+        CHECK_THAT(coreLosses.get_core_volumetric_losses(core.resolve_material(), powderPfc.record, temperature) * effectiveVolume,
+                   Catch::Matchers::WithinRel(reference, 0.01));
+    }
+    settings.reset();
+}
+
+TEST_CASE("A periodic excitation is not split into switching cycles", "[physical-model][core-losses][line-cycle-core-losses][smoke-test]") {
+    settings.reset();
+    double frequency = 100000;
+    double period = 1 / frequency;
+    json excitationJson;
+    excitationJson["frequency"] = frequency;
+    excitationJson["magneticFluxDensity"]["waveform"]["time"] = {0, 0.3 * period, period};
+    excitationJson["magneticFluxDensity"]["waveform"]["data"] = {0.05, 0.15, 0.05};
+    excitationJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::TRIANGULAR;
+    excitationJson["magneticFluxDensity"]["processed"]["offset"] = 0.1;
+    excitationJson["magneticFluxDensity"]["processed"]["peak"] = 0.15;
+    excitationJson["magneticFluxDensity"]["processed"]["peakToPeak"] = 0.1;
+    excitationJson["magneticFluxDensity"]["processed"]["dutyCycle"] = 0.3;
+    CHECK_FALSE(CoreLossesModel::split_into_switching_cycles(OperatingPointExcitation(excitationJson)).has_value());
+
+    // A line-cycle record is split into its switching cycles, each at the switching frequency.
+    // The ripple outruns the envelope everywhere (no cycle without a reversal at the line zero crossing).
+    auto pfc = build_boost_pfc_line_cycle(50, 400, 0.02, 0.1, 0.6);
+    auto record = CoreLossesModel::split_into_switching_cycles(pfc.record);
+    REQUIRE(record.has_value());
+    // The record starts and ends on a valley; a valley is confirmed by the rise after it, so the
+    // two edge cycles are not complete cycles of the record and are left out.
+    CHECK(record->cycles.size() == 398);
+    for (const auto& cycle : record->cycles) {
+        CHECK_THAT(cycle.get_frequency(), Catch::Matchers::WithinRel(20000.0, 1e-9));
+    }
+    CHECK(record->envelope.get_frequency() == 50);
+}
+
+TEST_CASE("A line-cycle magnetizing current on its own grid is split with the flux", "[physical-model][core-losses][line-cycle-core-losses][smoke-test]") {
+    // ABT #1745: the flux of a PFC record is stored compressed to its corners while its magnetizing
+    // current is sampled on a grid of its own. The split dropped a current not on the flux's grid, and
+    // the loss-factor model (which prices the magnetizing current) then threw for every cycle. The
+    // current is read on the flux's time base over the line period.
+    settings.reset();
+    clear_databases();
+    double temperature = 25;
+    double lineFrequency = 50;
+    double amperesPerTesla = 20;
+    size_t cyclesPerLinePeriod = 400;
+    auto pfc = build_boost_pfc_line_cycle(lineFrequency, cyclesPerLinePeriod, 0.2, 0.1, 0.6);
+    auto fluxWaveform = pfc.record.get_magnetic_flux_density()->get_waveform().value();
+    const std::vector<double> cornerTime = fluxWaveform.get_time().value();
+    const auto& cornerData = fluxWaveform.get_data();
+    auto flux_at = [&](double t) {
+        size_t upper = static_cast<size_t>(std::upper_bound(cornerTime.begin(), cornerTime.end(), t) - cornerTime.begin());
+        if (upper == cornerTime.size()) {
+            return cornerData.back();
+        }
+        return cornerData[upper - 1] + (cornerData[upper] - cornerData[upper - 1]) * (t - cornerTime[upper - 1]) / (cornerTime[upper] - cornerTime[upper - 1]);
+    };
+    auto with_magnetizing_current = [&](const std::vector<double>& time) {
+        std::vector<double> current;
+        for (double t : time) {
+            current.push_back(flux_at(t) * amperesPerTesla);
+        }
+        json magnetizingCurrentJson;
+        magnetizingCurrentJson["waveform"]["time"] = time;
+        magnetizingCurrentJson["waveform"]["data"] = current;
+        magnetizingCurrentJson["processed"]["label"] = WaveformLabel::CUSTOM;
+        magnetizingCurrentJson["processed"]["peak"] = *std::max_element(current.begin(), current.end());
+        magnetizingCurrentJson["processed"]["offset"] = (*std::max_element(current.begin(), current.end()) + *std::min_element(current.begin(), current.end())) / 2;
+        auto record = pfc.record;
+        // A record's frequency label is the period its waveform spans (Alf, 2026-10-12, ABT #1467): this
+        // one spans the line period, so it is labelled with the line frequency; the switching frequency
+        // is detected from the waveform.
+        REQUIRE(record.get_frequency() == lineFrequency);
+        record.set_magnetizing_current(SignalDescriptor(magnetizingCurrentJson));
+        REQUIRE(record.get_magnetizing_current()->get_waveform()->get_data().size() != cornerData.size());
+        return record;
+    };
+
+    SECTION("Sampled at the corners and between them, it is read back exactly on the corners") {
+        std::vector<double> time;
+        for (size_t i = 0; i < cornerTime.size(); ++i) {
+            time.push_back(cornerTime[i]);
+            if (i + 1 < cornerTime.size()) {
+                time.push_back((cornerTime[i] + cornerTime[i + 1]) / 2);
+            }
+        }
+        auto record = with_magnetizing_current(time);
+        auto split = CoreLossesModel::split_into_switching_cycles(record);
+        REQUIRE(split.has_value());
+        REQUIRE(split->cycles.size() > 390);
+        for (const auto& cycle : split->cycles) {
+            REQUIRE(cycle.get_magnetizing_current());
+            const std::vector<double> cycleCurrent = cycle.get_magnetizing_current()->get_waveform()->get_data();
+            const std::vector<double> cycleFlux = cycle.get_magnetic_flux_density()->get_waveform()->get_data();
+            REQUIRE(cycleCurrent.size() == cycleFlux.size());
+            for (size_t i = 0; i < cycleFlux.size(); ++i) {
+                CHECK_THAT(cycleCurrent[i], Catch::Matchers::WithinAbs(cycleFlux[i] * amperesPerTesla, 1e-9));
+            }
+        }
+        REQUIRE(split->envelope.get_magnetizing_current());
+    }
+
+    SECTION("Sampled uniformly over the line period, as Kirchhoff stores it, every cycle carries it and a loss-factor material prices the record") {
+        size_t numberPoints = 16384;
+        std::vector<double> time;
+        for (size_t i = 0; i < numberPoints; ++i) {
+            time.push_back(static_cast<double>(i) / static_cast<double>(numberPoints) / lineFrequency);
+        }
+        auto record = with_magnetizing_current(time);
+        auto split = CoreLossesModel::split_into_switching_cycles(record);
+        REQUIRE(split.has_value());
+        REQUIRE(split->cycles.size() > 390);
+        for (const auto& cycle : split->cycles) {
+            REQUIRE(cycle.get_magnetizing_current());
+        }
+        REQUIRE(split->envelope.get_magnetizing_current());
+
+        // 2HM5 has only loss-factor data: the record is priced, not refused.
+        Core core = OpenMagneticsTesting::get_quick_core("E 42/21/15", json::array(), 1, "2HM5");
+        CoreLosses coreLosses;
+        CHECK(coreLosses.calculate_core_losses(core, record, temperature).get_core_losses() > 0);
+    }
+    settings.reset();
+}
+
+TEST_CASE("The envelope of a resampled line-cycle record is the line envelope", "[physical-model][core-losses][line-cycle-core-losses][smoke-test]") {
+    // MKF processes a line-cycle record on a uniform grid of a few samples per switching cycle, so the
+    // record's valleys fall between samples and each cycle's average carries a residue of its ripple.
+    // That residue alternates from cycle to cycle; the envelope priced from it must still be the line
+    // envelope, not a line envelope plus a switching-rate jitter that the dB/dt models price as loss.
+    settings.reset();
+    clear_databases();
+    double temperature = 25;
+    // 60 Hz line, 64.98 kHz switching (1083 cycles), on a 16384-sample grid: ~15 samples per cycle.
+    auto pfc = build_boost_pfc_line_cycle(60, 1083, 0.2, 0.1, 0.6);
+    auto resampledRecord = pfc.record;
+    auto fluxDensity = resampledRecord.get_magnetic_flux_density().value();
+    fluxDensity.set_waveform(OpenMagnetics::Inputs::calculate_sampled_waveform(fluxDensity.get_waveform().value(), 60, 16384));
+    resampledRecord.set_magnetic_flux_density(fluxDensity);
+    auto record = CoreLossesModel::split_into_switching_cycles(resampledRecord);
+    REQUIRE(record.has_value());
+    CHECK(record->cycles.size() > 1070);
+
+    // PC44's Steinmetz ranges are fitted from 1 Hz, so the 60 Hz envelope is in span.
+    Core core = OpenMagneticsTesting::get_quick_core("PQ 20/20", json::array(), 1, "PC44");
+    for (auto modelName : {CoreLossesModels::STEINMETZ, CoreLossesModels::IGSE}) {
+        INFO("Model: " << magic_enum::enum_name(modelName));
+        auto model = CoreLossesModel::factory(modelName);
+        // compute_core_losses prices one loop as it is (the record's own path, after the split).
+        double envelopeLosses = model->compute_core_losses(core, record->envelope, temperature).get_core_losses();
+        double exactEnvelopeLosses = model->compute_core_losses(core, pfc.envelope, temperature).get_core_losses();
+        CHECK(exactEnvelopeLosses > 0);
+        UNSCOPED_INFO("envelope losses " << envelopeLosses << " W, exact " << exactEnvelopeLosses << " W");
+        CHECK_THAT(envelopeLosses, Catch::Matchers::WithinRel(exactEnvelopeLosses, 0.05));
+    }
+    settings.reset();
+}
+
+TEST_CASE("The line envelope's span check follows allowMaterialDataExtrapolation", "[physical-model][core-losses][line-cycle-core-losses][material-extrapolation][smoke-test]") {
+    // 3C95's Steinmetz ranges start at 25 kHz: a PFC record's switching cycles are in span, its 60 Hz
+    // envelope is not. The envelope goes through the same span check as every other Steinmetz lookup, so
+    // it throws with the flag off, is extrapolated with a WARNING with it on, and throws again inside an
+    // adviser (MaterialDataExtrapolationBarrier), whatever the flag says.
+    settings.reset();
+    clear_databases();
+    double temperature = 25;
+    auto pfc = build_boost_pfc_line_cycle(60, 1000, 0.2, 0.1, 0.6);
+    Core core = OpenMagneticsTesting::get_quick_core("PQ 20/20", json::array(), 1, "3C95");
+    auto model = CoreLossesModel::factory(CoreLossesModels::STEINMETZ);
+    auto record = CoreLossesModel::split_into_switching_cycles(pfc.record);
+    REQUIRE(record.has_value());
+
+    SECTION("Off: the envelope throws") {
+        CHECK_THROWS_AS(model->get_core_losses(core, pfc.record, temperature), MaterialFrequencyOutOfSpanException);
+    }
+
+    SECTION("On: the envelope is extrapolated, with a warning naming the material and the frequency") {
+        settings.set_allow_material_data_extrapolation(true);
+        Logger::getInstance().disableCollector();
+        Logger::getInstance().enableCollector(LogLevel::WARNING);
+        double recordLosses = model->get_core_losses(core, pfc.record, temperature).get_core_losses();
+        auto collected = Logger::getInstance().drainCollected();
+        Logger::getInstance().disableCollector();
+
+        double cyclesLosses = 0;
+        double duration = 0;
+        for (size_t index = 0; index < record->cycles.size(); ++index) {
+            cyclesLosses += model->compute_core_losses(core, record->cycles[index], temperature).get_core_losses() * record->durations[index];
+            duration += record->durations[index];
+        }
+        double envelopeLosses = model->compute_core_losses(core, record->envelope, temperature).get_core_losses();
+        CHECK(envelopeLosses > 0);
+        CHECK_THAT(recordLosses, Catch::Matchers::WithinRel(cyclesLosses / duration + envelopeLosses, 1e-9));
+
+        bool warned = false;
+        for (const auto& logRecord : collected) {
+            if (logRecord.moduleOfOrigin == kMaterialDataExtrapolationModule && logRecord.level == LogLevel::WARNING &&
+                logRecord.message.find("3C95") != std::string::npos && logRecord.message.find("60.000000 Hz") != std::string::npos) {
+                warned = true;
+            }
+        }
+        CHECK(warned);
+    }
+
+    SECTION("On, inside an adviser: the envelope still throws") {
+        settings.set_allow_material_data_extrapolation(true);
+        MaterialDataExtrapolationBarrier barrier;
+        CHECK_THROWS_AS(model->get_core_losses(core, pfc.record, temperature), MaterialFrequencyOutOfSpanException);
+    }
+    settings.reset();
 }

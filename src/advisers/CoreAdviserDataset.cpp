@@ -14,6 +14,7 @@
 // and shared helpers in advisers/CoreAdviserInternal.h.
 
 #include "advisers/CoreAdviser.h"
+#include <magic_enum.hpp>
 #include "advisers/CoreAdviserInternal.h"
 #include "advisers/CoreMaterialCrossReferencer.h"
 #include "advisers/MagneticFilter.h"
@@ -114,14 +115,18 @@ Coil get_dummy_coil(const Inputs& inputs, bool sizeParallelsToCurrent) {
         // capacity, so the fast path left high-current windings under-coppered —
         // every winding at ~18 A/mm2 regardless of core (ABT #70). Use the same
         // helper the WireAdviser uses on the full path so both paths agree.
-        // ABT #126: NOT for common-mode chokes — sizing every CMC winding's
+        // ABT #126: NOT for interference suppression — sizing every CMC winding's
         // parallels to the full line current with a skin-depth strand produced
         // N x ~dozens of parallel strands that fit no toroid window, so every
         // suppression candidate died at post-processing (fast_wind: no turns)
-        // and the adviser returned ZERO results. The CMC dummy keeps 1 parallel
-        // (the historical suppression behaviour); real copper sizing for CMCs
-        // is the wire adviser's job downstream.
-        if (sizeParallelsToCurrent && !isCommonModeChoke && !operatingPoints.empty()) {
+        // and the adviser returned ZERO results. The suppression dummy keeps 1
+        // parallel (the historical suppression behaviour); real copper sizing for
+        // CMCs is the wire adviser's job downstream.
+        // ABT #1822: the exemption is the caller's (the adviser's application), not
+        // the shape of the excitation. A 1:1 transformer with equal currents is
+        // CMC-shaped (can_be_common_mode_choke), and exempting it left one skin-depth
+        // strand per winding at 24.8 A/mm2 on a power design.
+        if (sizeParallelsToCurrent && !operatingPoints.empty()) {
             const auto& excitations = operatingPoints[0].get_excitations_per_winding();
             if (w < excitations.size() && excitations[w].get_current()) {
                 auto windingCurrent = excitations[w].get_current().value();
@@ -206,6 +211,10 @@ std::vector<CoreShape> CoreAdviser::create_custom_core_shapes(Inputs inputs) {
 
 std::vector<std::pair<Magnetic, double>> CoreAdviser::create_magnetic_dataset(Inputs inputs, std::vector<Core>* cores, bool includeStacks) {
     std::vector<std::pair<Magnetic, double>> magnetics;
+    // ABT #1785: an upper bound up front (every core, every stack count): a Magnetic has no move
+    // operations, so growing by push_back deep-copied the dataset at each reallocation. Unused slots
+    // are never touched and cost address space only.
+    magnetics.reserve(cores->size() * ((includeStacks && settings.get_core_adviser_include_stacks()) ? defaults.coreAdviserMaximumNumberStacks : 1));
     Coil coil = get_dummy_coil(inputs, get_application() != MAS::MagneticApplication::INTERFERENCE_SUPPRESSION);
     auto includeToroidalCores = settings.get_use_toroidal_cores();
     auto includeConcentricCores = settings.get_use_concentric_cores();
@@ -319,6 +328,10 @@ std::vector<std::pair<Magnetic, double>> CoreAdviser::create_magnetic_dataset(In
 
 std::vector<std::pair<Magnetic, double>> CoreAdviser::create_magnetic_dataset(Inputs inputs, std::vector<CoreShape>* shapes, bool includeStacks) {
     std::vector<std::pair<Magnetic, double>> magnetics;
+    // ABT #1785: an upper bound up front (every core, every stack count): a Magnetic has no move
+    // operations, so growing by push_back deep-copied the dataset at each reallocation. Unused slots
+    // are never touched and cost address space only.
+    magnetics.reserve(shapes->size() * ((includeStacks && settings.get_core_adviser_include_stacks()) ? defaults.coreAdviserMaximumNumberStacks : 1));
     Coil coil = get_dummy_coil(inputs, get_application() != MAS::MagneticApplication::INTERFERENCE_SUPPRESSION);
     auto includeToroidalCores = settings.get_use_toroidal_cores();
     auto includeConcentricCores = settings.get_use_concentric_cores();
@@ -441,13 +454,36 @@ void CoreAdviser::expand_magnetic_dataset_with_stacks(Inputs inputs, std::vector
     Magnetic magnetic;
 
     magnetic.set_coil(std::move(coil));
+
+    // ABT #1785: size the dataset for every stacked variant BEFORE appending any. Grown by
+    // push_back, the vector reallocated as it went, and a Magnetic has no move operations, so each
+    // reallocation deep-copied the whole dataset (inline core material included) and held both
+    // buffers at once: 16 000 -> 60 000 candidates passed through a 32 000 + 65 000 slot peak.
+    // The bound is exact in the family test and an upper bound in the envelope test below; the
+    // slots the envelope rejects are never touched, so they cost address space, not memory.
+    auto isStackable = [](const Core& core) {
+        auto family = core.get_shape_family();
+        return family == CoreShapeFamily::E || family == CoreShapeFamily::PLANAR_E || family == CoreShapeFamily::T ||
+               family == CoreShapeFamily::U || family == CoreShapeFamily::C;
+    };
+    size_t stackedVariantsBound = 0;
+    for (auto& core : *cores) {
+        if (!includeToroidalCores && core.get_type() == CoreType::TOROIDAL) {
+            continue;
+        }
+        if (isStackable(core)) {
+            stackedVariantsBound += defaults.coreAdviserMaximumNumberStacks - 1;
+        }
+    }
+    magnetics->reserve(magnetics->size() + stackedVariantsBound);
+
     for (auto& core : *cores){
         if (!includeToroidalCores && core.get_type() == CoreType::TOROIDAL) {
             continue;
         }
 
 
-        if (core.get_shape_family() == CoreShapeFamily::E || core.get_shape_family() == CoreShapeFamily::PLANAR_E || core.get_shape_family() == CoreShapeFamily::T || core.get_shape_family() == CoreShapeFamily::U || core.get_shape_family() == CoreShapeFamily::C) {
+        if (isStackable(core)) {
 
             core.process_data();
             if (!core.process_gap()) {
@@ -554,6 +590,11 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
     std::vector<size_t> indexesToEraseForSizing;
     for (size_t i = 0; i < (*magneticsWithScoring).size(); ++i){
       try {
+        // ABT #1875: set when the inductor turns solve refused its answer as saturating; the
+        // candidate then lives only if the saturation-aware re-gap clears it (see below).
+        std::optional<SaturationException> turnsSolveRefusal;
+        bool regapAccepted = false;
+        std::string regapOutcome;
 
         Core core = (*magneticsWithScoring)[i].first.get_core();
         if (!core.get_processed_description()) {
@@ -691,8 +732,22 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
                 // inductance model (calculate_number_turns_from_gapping_and_inductance),
                 // which is consistent with the downstream inductance filter.
                 Inputs inputsCopy(inputs);
-                initialNumberTurns = magnetizingInductance.calculate_number_turns_from_gapping_and_inductance(
-                    core, (*magneticsWithScoring)[i].first.get_coil(), &inputsCopy, DimensionalValues::MINIMUM);
+                // ABT #1875: the turns solve refuses an answer that saturates at the seeded gap
+                // (ABT #1855). The saturation-aware re-gap below owns the final (N, gap) and exists to
+                // raise N and re-solve the gap until the design clears saturation, so run it from the
+                // refused turn count before refusing. The refusal carries that count; one that names
+                // none has nothing to re-gap from and drops the candidate as before.
+                try {
+                    initialNumberTurns = magnetizingInductance.calculate_number_turns_from_gapping_and_inductance(
+                        core, (*magneticsWithScoring)[i].first.get_coil(), &inputsCopy, DimensionalValues::MINIMUM);
+                }
+                catch (const SaturationException& e) {
+                    if (!e.number_turns()) {
+                        throw;
+                    }
+                    turnsSolveRefusal.emplace(e);
+                    initialNumberTurns = static_cast<double>(e.number_turns().value());
+                }
 
                 // Energy-storing topologies (flyback / buck / boost / …): the
                 // inductance-determined N minimises turns, which maximises peak flux
@@ -735,7 +790,18 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
                                      core.get_name().value_or("?") + ": " + e.what() +
                                      " — saturation-aware re-gap skipped", "CoreAdviser", 2);
                             seededIsat = std::nullopt;
+                            regapOutcome = std::string("the saturation current at the refused turns could not be calculated (") + e.what() + ")";
                         }
+                    }
+                    else {
+                        regapOutcome = "the inputs give no peak current, so the re-gap has no saturation current to size against";
+                    }
+                    if (seededIsat && seededIsat.value() <= 0) {
+                        regapOutcome = "the saturation current at the refused turns is " + std::to_string(seededIsat.value()) + " A";
+                    }
+                    else if (seededIsat && seededIsat.value() >= requiredIsat) {
+                        regapOutcome = "the saturation current at the refused turns, " + std::to_string(seededIsat.value()) +
+                                       " A, already meets the required " + std::to_string(requiredIsat) + " A, so the re-gap is not entered";
                     }
 
                     if (seededIsat && seededIsat.value() > 0 && seededIsat.value() < requiredIsat) {
@@ -779,8 +845,12 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
                             initialNumberTurns = n;
                             core = acceptedCore;
                             (*magneticsWithScoring)[i].first.set_core(core);
+                            regapAccepted = true;
+                            regapOutcome = "re-gapped to " + std::to_string(std::llround(n)) + " turns, saturation current " +
+                                           std::to_string(isatAtN) + " A against the required " + std::to_string(requiredIsat) + " A";
                         }
                         else {
+                            regapOutcome = "the re-gap search found no gap for more turns than the refused ones";
                             // ABT #121.4: was silent — the candidate proceeds with the
                             // seeded N and an unmet Isat requirement; the saturation
                             // filter downstream is the remaining gate.
@@ -791,12 +861,81 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
                         }
                     }
                 }
+                else {
+                    regapOutcome = "a toroid takes no discrete gap, so there is no re-gap";
+                }
             }
         }
         if (inputs.get_design_requirements().get_turns_ratios().size() > 0) {
             NumberTurns numberTurns(initialNumberTurns, inputs.get_design_requirements());
             auto numberTurnsCombination = numberTurns.get_next_number_turns_combination();
+            double sizedNumberTurns = initialNumberTurns;
             initialNumberTurns = numberTurnsCombination[0];
+
+            // ABT #1542: the snap to a valid turns-ratio combination raises N after the gap was sized
+            // for the unsnapped N, so L grew by (N_snapped / N)^2 and the inductance filter rejected
+            // the candidate (546 of 557 on an isolated buck-boost). Where the design has an
+            // inductance target and a gappable core, re-solve the gap for the snapped N, ground
+            // first and then distributed, and adopt it only when it physically fits the column.
+            auto lmDim = inputs.get_design_requirements().get_magnetizing_inductance();
+            bool hasLmTarget = (lmDim.get_nominal() && lmDim.get_nominal().value() > 0) ||
+                               (lmDim.get_maximum() && lmDim.get_maximum().value() > 0);
+            bool sizesInductance = !isTransformer || hasLmTarget;
+            if (sizesInductance && !isSuppression && core.get_shape_family() != CoreShapeFamily::T &&
+                std::llround(initialNumberTurns) != std::llround(sizedNumberTurns)) {
+                Coil snappedCoil = (*magneticsWithScoring)[i].first.get_coil();
+                snappedCoil.get_mutable_functional_description()[0].set_number_turns(static_cast<int64_t>(std::llround(initialNumberTurns)));
+                Inputs lmInputs;
+                lmInputs.set_design_requirements(inputs.get_design_requirements());
+                bool regapped = false;
+                std::string regapFailure;
+                for (auto gappingType : {GappingType::GROUND, GappingType::DISTRIBUTED}) {
+                    try {
+                        auto gaps = magnetizingInductance.calculate_gapping_from_number_turns_and_inductance(core, snappedCoil, &lmInputs, gappingType);
+                        if (gaps.empty()) {
+                            regapFailure += std::string(magic_enum::enum_name(gappingType)) + ": no gap; ";
+                            continue;
+                        }
+                        Core regappedCore = core;
+                        regappedCore.set_gapping(gaps);
+                        if (regappedCore.process_gap()) {
+                            core = regappedCore;
+                            (*magneticsWithScoring)[i].first.set_core(core);
+                            regapped = true;
+                            break;
+                        }
+                        regapFailure += std::string(magic_enum::enum_name(gappingType)) + ": gap does not fit the column; ";
+                    }
+                    catch (const OpenMagneticsException& e) {
+                        regapFailure += std::string(magic_enum::enum_name(gappingType)) + ": " + e.what() + "; ";
+                    }
+                }
+                if (!regapped) {
+                    logEntry("Turns-ratio snap " + std::to_string(sizedNumberTurns) + " -> " + std::to_string(initialNumberTurns) +
+                             " turns on core " + core.get_name().value_or("?") + " could not be re-gapped (" + regapFailure +
+                             "); the inductance filter decides it at the snapped turns", "CoreAdviser", 2);
+                }
+            }
+        }
+
+        // ABT #1875: a candidate the turns solve refused lives only if the re-gap was accepted and the
+        // final (N, gap) passes the very check the solve refused on. Otherwise the original refusal is
+        // thrown again, with what the re-gap did, and the catch below drops the candidate.
+        if (turnsSolveRefusal) {
+            const std::string refusedAt = turnsSolveRefusal->message() + "; re-gap before refusing: ";
+            if (!regapAccepted) {
+                throw SaturationException(refusedAt + regapOutcome, turnsSolveRefusal->number_turns().value());
+            }
+            Inputs checkInputs(inputs);
+            auto [saturates, saturationMessage] = magnetizingInductance.check_sizing_saturation(
+                core, (*magneticsWithScoring)[i].first.get_coil(), static_cast<int64_t>(std::llround(initialNumberTurns)), &checkInputs);
+            if (saturates) {
+                throw SaturationException(refusedAt + regapOutcome + ", and that design still saturates: " + saturationMessage,
+                                          turnsSolveRefusal->number_turns().value());
+            }
+            logEntry("Inductor seeding: core " + core.get_name().value_or("?") + " refused by the turns solve at " +
+                     std::to_string(turnsSolveRefusal->number_turns().value()) + " turns is kept: " + regapOutcome,
+                     "CoreAdviser", 2);
         }
 
         (*magneticsWithScoring)[i].first.get_mutable_coil().get_mutable_functional_description()[0].set_number_turns(initialNumberTurns);

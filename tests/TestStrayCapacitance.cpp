@@ -1,3 +1,4 @@
+#include "physical_models/ComplexPermeability.h"
 #include <source_location>
 #include "constructive_models/Coil.h"
 #include "constructive_models/Core.h"
@@ -14,6 +15,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <catch2/benchmark/catch_benchmark.hpp>
 
 using namespace MAS;
@@ -35,9 +37,15 @@ TEST_CASE("Calculate capacitance among two windings each with 1 turn and 1 paral
 
     StrayCapacitance strayCapacitance;
 
+    // Re-pinned 2026-10-01 (characterisation constants; no measured or FEA provenance): every entry
+    // is exactly 3x the previous output. The Albach turn-pair element was (2/3)*eps0*lt*Y1: the 1/3
+    // of a linear voltage ramp (Albach 2017 eqs. 3.21-3.22) was applied to a constant-potential pair.
+    // The pair static capacitance is 2*eps0*lt*Y1 (Albach eq. 3.14), checked against the exact
+    // two-cylinder solution in the [albach] tests.
+    // The previous pins here were already 20-37% off the previous output (inside the 40% tolerance); re-pinned to the actual output.
     std::map<std::string, std::map<std::string, double>> expectedValues = {
-        {"Primary", {{"Primary", 2.8708e-12}, {"Secondary", -2.4259e-12}}},
-        {"Secondary", {{"Primary", -2.4259e-12}, {"Secondary", 2.887e-12}}},
+        {"Primary", {{"Primary", 5.7856e-12}, {"Secondary", -5.7856e-12}}},
+        {"Secondary", {{"Primary", -5.7856e-12}, {"Secondary", 5.7856e-12}}},
     };
 
     auto maxwellCapacitanceMatrix = strayCapacitance.calculate_capacitance(coil).get_maxwell_capacitance_matrix().value();
@@ -95,8 +103,16 @@ TEST_CASE("Calculate capacitance of a winding with 8 turns and 1 parallel", "[ph
 
     StrayCapacitance strayCapacitance;
 
+    // Re-pinned 2026-10-01 (characterisation constants; no measured or FEA provenance): every entry
+    // is exactly 3x the previous output. The Albach turn-pair element was (2/3)*eps0*lt*Y1: the 1/3
+    // of a linear voltage ramp (Albach 2017 eqs. 3.21-3.22) was applied to a constant-potential pair.
+    // The pair static capacitance is 2*eps0*lt*Y1 (Albach eq. 3.14), checked against the exact
+    // two-cylinder solution in the [albach] tests. Like-for-like check for the RM 10/I mutual entries:
+    // Biela/Kolar 2008 eq. (6), STATIC interlayer capacitance ~60 pF/m * lw * z, gives ~22-26 pF for
+    // two adjacent 8-turn layers (lw ~45-55 mm on the 10.7 mm column); the old ~7 pF was 1/3 of that.
+    // The previous pins here were already 20-37% off the previous output (inside the 40% tolerance); re-pinned to the actual output.
     std::map<std::string, std::map<std::string, double>> expectedValues = {
-        {"Primary", {{"Primary", 10.166e-12 - 9.8337e-12}}},
+        {"Primary", {{"Primary", 0.78887e-12}}},
     };
 
 
@@ -132,9 +148,17 @@ TEST_CASE("Calculate capacitance among two windings each with 8 turns and 1 para
 
     StrayCapacitance strayCapacitance;
 
+    // Re-pinned 2026-10-01 (characterisation constants; no measured or FEA provenance): every entry
+    // is exactly 3x the previous output. The Albach turn-pair element was (2/3)*eps0*lt*Y1: the 1/3
+    // of a linear voltage ramp (Albach 2017 eqs. 3.21-3.22) was applied to a constant-potential pair.
+    // The pair static capacitance is 2*eps0*lt*Y1 (Albach eq. 3.14), checked against the exact
+    // two-cylinder solution in the [albach] tests. Like-for-like check for the RM 10/I mutual entries:
+    // Biela/Kolar 2008 eq. (6), STATIC interlayer capacitance ~60 pF/m * lw * z, gives ~22-26 pF for
+    // two adjacent 8-turn layers (lw ~45-55 mm on the 10.7 mm column); the old ~7 pF was 1/3 of that.
+    // The previous pins here were already 20-37% off the previous output (inside the 40% tolerance); re-pinned to the actual output.
     std::map<std::string, std::map<std::string, double>> expectedValues = {
-        {"Primary", {{"Primary", 10.166e-12}, {"Secondary", -9.8337e-12}}},
-        {"Secondary", {{"Primary", -9.8337e-12}, {"Secondary", 10.199e-12}}},
+        {"Primary", {{"Primary", 19.511e-12}, {"Secondary", -18.722e-12}}},
+        {"Secondary", {{"Primary", -18.722e-12}, {"Secondary", 19.632e-12}}},
     };
 
 
@@ -170,14 +194,21 @@ TEST_CASE("Calculate capacitance among two windings one with 16 and another with
 
     StrayCapacitance strayCapacitance;
 
+    // Re-pinned 2026-10-01 (characterisation constants; no measured or FEA provenance): every entry
+    // is exactly 3x the previous output. The Albach turn-pair element was (2/3)*eps0*lt*Y1: the 1/3
+    // of a linear voltage ramp (Albach 2017 eqs. 3.21-3.22) was applied to a constant-potential pair.
+    // The pair static capacitance is 2*eps0*lt*Y1 (Albach eq. 3.14), checked against the exact
+    // two-cylinder solution in the [albach] tests. Like-for-like check for the RM 10/I mutual entries:
+    // Biela/Kolar 2008 eq. (6), STATIC interlayer capacitance ~60 pF/m * lw * z, gives ~22-26 pF for
+    // two adjacent 8-turn layers (lw ~45-55 mm on the 10.7 mm column); the old ~7 pF was 1/3 of that.
     std::map<std::string, std::map<std::string, double>> expectedValues = {
     // Re-pinned 2026-08-22 for ABT #851: preprocess_data_for_round_wires passed an average
     // DIAMETER as the conducting radius, which put touching turns nearer contact than they are
     // and inflated every round-wire pair static ~2x. The old values characterised that bug;
     // the corrected ones sit next to Biela/Kolar's rule-of-thumb for this fixture (~5-6 pF
     // equivalent for the 2-layer RM 10/I winding, eq. (6) of their 2008 review).
-        {"Primary", {{"Primary", 7.4086e-12}, {"Secondary", -7.2859e-12}}},
-        {"Secondary", {{"Primary", -7.2859e-12}, {"Secondary", 7.5890e-12}}},
+        {"Primary", {{"Primary", 22.226e-12}, {"Secondary", -21.858e-12}}},
+        {"Secondary", {{"Primary", -21.858e-12}, {"Secondary", 22.767e-12}}},
     };
 
     auto maxwellCapacitanceMatrix = strayCapacitance.calculate_capacitance(coil).get_maxwell_capacitance_matrix().value();
@@ -202,15 +233,22 @@ TEST_CASE("Calculate capacitance among three windings each with 8 turns and 1 pa
 
     StrayCapacitance strayCapacitance;
 
+    // Re-pinned 2026-10-01 (characterisation constants; no measured or FEA provenance): every entry
+    // is exactly 3x the previous output. The Albach turn-pair element was (2/3)*eps0*lt*Y1: the 1/3
+    // of a linear voltage ramp (Albach 2017 eqs. 3.21-3.22) was applied to a constant-potential pair.
+    // The pair static capacitance is 2*eps0*lt*Y1 (Albach eq. 3.14), checked against the exact
+    // two-cylinder solution in the [albach] tests. Like-for-like check for the RM 10/I mutual entries:
+    // Biela/Kolar 2008 eq. (6), STATIC interlayer capacitance ~60 pF/m * lw * z, gives ~22-26 pF for
+    // two adjacent 8-turn layers (lw ~45-55 mm on the 10.7 mm column); the old ~7 pF was 1/3 of that.
     std::map<std::string, std::map<std::string, double>> expectedValues = {
     // Re-pinned 2026-08-22 for ABT #851: preprocess_data_for_round_wires passed an average
     // DIAMETER as the conducting radius, which put touching turns nearer contact than they are
     // and inflated every round-wire pair static ~2x. The old values characterised that bug;
     // the corrected ones sit next to Biela/Kolar's rule-of-thumb for this fixture (~5-6 pF
     // equivalent for the 2-layer RM 10/I winding, eq. (6) of their 2008 review).
-        {"Primary", {{"Primary", 6.5037e-12}, {"Secondary", -6.2407e-12}, {"Tertiary", -0.12966e-12}}},
-        {"Secondary", {{"Primary", -6.2407e-12}, {"Secondary", 13.671e-12}, {"Tertiary", -7.1275e-12}}},
-        {"Tertiary", {{"Primary", -0.12966e-12}, {"Secondary", -7.1275e-12}, {"Tertiary", 7.4709e-12}}},
+        {"Primary", {{"Primary", 19.511e-12}, {"Secondary", -18.722e-12}, {"Tertiary", -0.12966e-12}}},
+        {"Secondary", {{"Primary", -18.722e-12}, {"Secondary", 41.014e-12}, {"Tertiary", -21.383e-12}}},
+        {"Tertiary", {{"Primary", -0.12966e-12}, {"Secondary", -21.383e-12}, {"Tertiary", 22.413e-12}}},
     };
 
     auto maxwellCapacitanceMatrix = strayCapacitance.calculate_capacitance(coil).get_maxwell_capacitance_matrix().value();
@@ -356,13 +394,18 @@ TEST_CASE("Calculate capacitance of an automatic buck produced in OM with three 
 
     StrayCapacitance strayCapacitance;
 
+    // Re-pinned 2026-10-01 (characterisation constants; no measured or FEA provenance): every entry
+    // is exactly 3x the previous output. The Albach turn-pair element was (2/3)*eps0*lt*Y1: the 1/3
+    // of a linear voltage ramp (Albach 2017 eqs. 3.21-3.22) was applied to a constant-potential pair.
+    // The pair static capacitance is 2*eps0*lt*Y1 (Albach eq. 3.14), checked against the exact
+    // two-cylinder solution in the [albach] tests.
     std::map<std::string, std::map<std::string, double>> expectedValues = {
     // Re-pinned 2026-08-22 for ABT #851: preprocess_data_for_round_wires passed an average
     // DIAMETER as the conducting radius, which put touching turns nearer contact than they are
     // and inflated every round-wire pair static ~2x. The old values characterised that bug;
     // the corrected ones sit next to Biela/Kolar's rule-of-thumb for this fixture (~5-6 pF
     // equivalent for the 2-layer RM 10/I winding, eq. (6) of their 2008 review).
-        {"Primary", {{"Primary", 1.5876e-12}}},
+        {"Primary", {{"Primary", 4.7629e-12}}},
     };
 
     auto maxwellCapacitanceMatrix = strayCapacitance.calculate_capacitance(coil).get_maxwell_capacitance_matrix().value();
@@ -397,8 +440,14 @@ TEST_CASE("Calculate capacitance of an automatic buck produced in OM with two la
 
     StrayCapacitance strayCapacitance;
 
+    // Re-pinned 2026-10-01 (characterisation constants; no measured or FEA provenance): every entry
+    // is exactly 3x the previous output. The Albach turn-pair element was (2/3)*eps0*lt*Y1: the 1/3
+    // of a linear voltage ramp (Albach 2017 eqs. 3.21-3.22) was applied to a constant-potential pair.
+    // The pair static capacitance is 2*eps0*lt*Y1 (Albach eq. 3.14), checked against the exact
+    // two-cylinder solution in the [albach] tests.
+    // The previous pins here were already 20-37% off the previous output (inside the 40% tolerance); re-pinned to the actual output.
     std::map<std::string, std::map<std::string, double>> expectedValues = {
-        {"Primary", {{"Primary", 2.8e-12}}},
+        {"Primary", {{"Primary", 5.3699e-12}}},
     };
 
     auto maxwellCapacitanceMatrix = strayCapacitance.calculate_capacitance(coil).get_maxwell_capacitance_matrix().value();
@@ -551,14 +600,19 @@ TEST_CASE("Calculate capacitance of a tranformers with low filling factor", "[ph
 
     StrayCapacitance strayCapacitance(OpenMagnetics::StrayCapacitanceModels::ALBACH);
 
+    // Re-pinned 2026-10-01 (characterisation constants; no measured or FEA provenance): every entry
+    // is exactly 3x the previous output. The Albach turn-pair element was (2/3)*eps0*lt*Y1: the 1/3
+    // of a linear voltage ramp (Albach 2017 eqs. 3.21-3.22) was applied to a constant-potential pair.
+    // The pair static capacitance is 2*eps0*lt*Y1 (Albach eq. 3.14), checked against the exact
+    // two-cylinder solution in the [albach] tests.
     std::map<std::string, std::map<std::string, double>> expectedValues = {
     // Re-pinned 2026-08-22 for ABT #851: preprocess_data_for_round_wires passed an average
     // DIAMETER as the conducting radius, which put touching turns nearer contact than they are
     // and inflated every round-wire pair static ~2x. The old values characterised that bug;
     // the corrected ones sit next to Biela/Kolar's rule-of-thumb for this fixture (~5-6 pF
     // equivalent for the 2-layer RM 10/I winding, eq. (6) of their 2008 review).
-        {"Primary", {{"Primary", 6.3143e-12}, {"Secondary", -3.5186e-12}}},
-        {"Secondary", {{"Primary", -3.5186e-12}, {"Secondary", 3.8247e-12}}},
+        {"Primary", {{"Primary", 18.943e-12}, {"Secondary", -10.556e-12}}},
+        {"Secondary", {{"Primary", -10.556e-12}, {"Secondary", 11.474e-12}}},
     };
 
     auto maxwellCapacitanceMatrix = strayCapacitance.calculate_capacitance(coil).get_maxwell_capacitance_matrix().value();
@@ -596,13 +650,18 @@ TEST_CASE("Calculate capacitance of a one layer inductor", "[physical-model][str
 
     StrayCapacitance strayCapacitance(OpenMagnetics::StrayCapacitanceModels::ALBACH);
 
+    // Re-pinned 2026-10-01 (characterisation constants; no measured or FEA provenance): every entry
+    // is exactly 3x the previous output. The Albach turn-pair element was (2/3)*eps0*lt*Y1: the 1/3
+    // of a linear voltage ramp (Albach 2017 eqs. 3.21-3.22) was applied to a constant-potential pair.
+    // The pair static capacitance is 2*eps0*lt*Y1 (Albach eq. 3.14), checked against the exact
+    // two-cylinder solution in the [albach] tests.
     std::map<std::string, std::map<std::string, double>> expectedValues = {
     // Re-pinned 2026-08-22 for ABT #851: preprocess_data_for_round_wires passed an average
     // DIAMETER as the conducting radius, which put touching turns nearer contact than they are
     // and inflated every round-wire pair static ~2x. The old values characterised that bug;
     // the corrected ones sit next to Biela/Kolar's rule-of-thumb for this fixture (~5-6 pF
     // equivalent for the 2-layer RM 10/I winding, eq. (6) of their 2008 review).
-        {"Secondary", {{"Secondary", 0.32274e-12}}},
+        {"Secondary", {{"Secondary", 0.96823e-12}}},
     };
 
     auto maxwellCapacitanceMatrix = strayCapacitance.calculate_capacitance(coil).get_maxwell_capacitance_matrix().value();
@@ -1692,7 +1751,11 @@ TEST_CASE("ABT31 sweep_impedance_over_frequency capacitance NaN repro", "[physic
 
     for (auto title : {std::string("Impedance over frequency"), std::string("Common-mode impedance")}) {
         try {
-            auto sweep = Sweeper().sweep_impedance_over_frequency(magnetic, 1e3, 1e9, 100, "log", title);
+            // 1 kHz..1 GHz, limited to the core material's complex-permeability table (3C98:
+            // 100 kHz..30 MHz): outside it there is no data and the sweep throws, which is not
+            // the NaN this repro is about.
+            auto [minimumMaterialFrequency, maximumMaterialFrequency] = ComplexPermeability().get_frequency_range(magnetic.get_core().resolve_material());
+            auto sweep = Sweeper().sweep_impedance_over_frequency(magnetic, std::max(1e3, minimumMaterialFrequency), std::min(1e9, maximumMaterialFrequency), 100, "log", title);
             bool finite = true;
             for (auto y : sweep.get_y_points()) if (!std::isfinite(y)) finite = false;
             UNSCOPED_INFO(title << " => sweep finite=" << finite);
@@ -1901,7 +1964,7 @@ TEST_CASE("Test_Stray_Capacitance_New_Core_Families",
     cores.emplace_back("drumSemishielded", buildCustomCore(
         {{"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "drumSemishielded"},
          {"aliases", json::array()}, {"name", "LQS-like 4018"}, {"dimensions", semishieldedDimensions}},
-        "pieceAndPlate", {{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", "Kool M\u00b5 26"}}, "3C90"));
+        "pieceAndPlate", {{"type", "magneticEpoxy"}, {"thickness", {{"nominal", 0.0001}}}, {"material", "Kool M\u00b5 26"}}, "3C90"));
     cores.emplace_back("molded", buildCustomCore(
         {{"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
          {"aliases", json::array()}, {"name", "MAPI-like 4020"},
@@ -2219,7 +2282,7 @@ TEST_CASE("Magnetic epoxy shield is not a winding-to-core dielectric", "[physica
         magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
         return OpenMagnetics::magnetic_autocomplete(magnetic);
     };
-    auto shielded = buildMagnetic({{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", "Kool Mµ 26"}});
+    auto shielded = buildMagnetic({{"type", "magneticEpoxy"}, {"thickness", {{"nominal", 0.0001}}}, {"material", "Kool Mµ 26"}});
     auto bare = buildMagnetic(nlohmann::json());
 
     StrayCapacitanceOutput shieldedOutput;
@@ -2282,7 +2345,7 @@ TEST_CASE("Core image factor follows the core material's complex permittivity", 
 TEST_CASE("Full-model capacitance carries the core image factor when a frequency is given", "[physical-model][stray-capacitance][image-factor]") {
     settings.reset();
     for (auto [material, expectBelow] : std::vector<std::pair<std::string, bool>>{{"K07", true}, {"A07", false}}) {
-        auto coreJsonStr = std::string(R"({"name": "abt848", "functionalDescription": {"type": "toroidal", "material": ")") + material + R"(", "shape": "T 14/8/9", "coating": {"type": "epoxy", "thickness": 0.0006}, "gapping": [], "numberStacks": 1}})";
+        auto coreJsonStr = std::string(R"({"name": "abt848", "functionalDescription": {"type": "toroidal", "material": ")") + material + R"(", "shape": "T 14/8/9", "coating": {"type": "epoxy", "thickness": {"maximum": 0.0006}}, "gapping": [], "numberStacks": 1}})";
         auto coilJsonStr = R"({"bobbin": "Basic", "functionalDescription":[{"name": "Primary", "numberTurns": 8, "numberParallels": 1, "isolationSide": "primary", "wire": "Round 1.00 - Grade 1"}]})";
         OpenMagnetics::Core core(nlohmann::json::parse(coreJsonStr));
         core.process_data();
@@ -2573,9 +2636,10 @@ TEST_CASE("Choke corpus: corrected model against measured RedExpert curves", "[.
                 std::string type = coatingRecord.contains("type") && coatingRecord["type"].is_string()
                                        ? coatingRecord["type"].get<std::string>()
                                        : "untyped";
-                double thickness = coatingRecord.contains("thickness") && coatingRecord["thickness"].is_number()
-                                       ? coatingRecord["thickness"].get<double>()
-                                       : 0.0;
+                // thickness is required by MAS and is a dimensionWithTolerance: resolve it, and let
+                // .at() throw on a record that lacks it instead of labelling it 0 mm.
+                double thickness = OpenMagnetics::resolve_dimensional_values(
+                    coatingRecord.at("thickness").get<MAS::DimensionWithTolerance>());
                 std::ostringstream label;
                 label << type << " case " << std::fixed << std::setprecision(2) << thickness * 1e3 << " mm";
                 row.jacket = label.str();
@@ -2935,19 +2999,32 @@ TEST_CASE("ABT1163_Toroid_Turn_Screened_In_The_Bore_Still_Faces_The_Outside", "[
     // is split into what the extra first-layer turns explain (a full element each, the same as in
     // the single-layer coil) and what is left for the second-layer turns. Bore-only screening
     // leaves them ~0; the segments must return at least a tenth of an element per turn.
+    //
+    // The ring is a COATED one: 0.3 mm of epoxy, declared on the core. The premise is a turn
+    // that lies on a dielectric jacket over the ferrite; since an undeclared coating reads as
+    // bare ferrite, the fixture states its coating, and the coil is wound on that same coated
+    // ring so the winding geometry and the dielectric path agree.
     settings.reset();
     const std::string shapeName = "T 17/10.7/6.8";
-    auto core = OpenMagneticsTesting::get_quick_core(shapeName, json::parse("[]"), 1, "80");
-    std::vector<OpenMagnetics::Wire> wires = {OpenMagnetics::find_wire_by_name("Round 0.5 - Grade 1")};
+    auto core = OpenMagnetics::Core(json::parse(R"({"functionalDescription": {"name": "abt1163 coated ring", "type": "toroidal", "material": "80", "shape": ")"
+        + shapeName + R"(", "coating": {"type": "epoxy", "thickness": {"nominal": 0.0003}}, "gapping": [], "numberStacks": 1}})"));
+    REQUIRE(core.get_coating_thickness() == Catch::Approx(0.0003));
+    json bobbinJson;
+    to_json(bobbinJson, OpenMagnetics::Bobbin::create_quick_bobbin(core, true));
+    json wireJson;
+    to_json(wireJson, OpenMagnetics::find_wire_by_name("Round 0.5 - Grade 1"));
 
     struct Wound { double capacitance; size_t layers; size_t boreLayerTurns; size_t otherTurns; };
     auto wind = [&](int64_t numberTurns) {
-        auto coil = OpenMagneticsTesting::get_quick_coil({numberTurns}, {1}, shapeName, 1,
-                                                          MAS::WindingOrientation::CONTIGUOUS,
-                                                          MAS::WindingOrientation::OVERLAPPING,
-                                                          MAS::CoilAlignment::CENTERED,
-                                                          MAS::CoilAlignment::CENTERED,
-                                                          wires, false);
+        json coilJson;
+        coilJson["bobbin"] = bobbinJson;
+        coilJson["functionalDescription"] = json::array();
+        coilJson["functionalDescription"].push_back({{"name", "winding 0"}, {"numberTurns", numberTurns},
+                                                     {"numberParallels", 1}, {"isolationSide", "primary"},
+                                                     {"wire", wireJson}});
+        OpenMagnetics::Coil coil(coilJson, 1, MAS::WindingOrientation::CONTIGUOUS,
+                                 MAS::WindingOrientation::OVERLAPPING, MAS::CoilAlignment::CENTERED,
+                                 MAS::CoilAlignment::CENTERED);
         REQUIRE(coil.get_turns_description());
         auto turns = coil.get_turns_description().value();
         // The bore-adjacent layer is the one lying furthest from the ring axis.
@@ -3011,13 +3088,20 @@ TEST_CASE("ABT1163_Toroid_Turn_Screened_In_The_Bore_Still_Faces_The_Outside", "[
 //   floating (core at the charge-balanced mean V/2):  C = C0 (N+1) / (12 (N-1))
 //   tied to either end (core at V or at 0):           C = C0 (2N-1) / ( 6 (N-1))
 // whose ratio is 2(2N-1)/(N+1) — exactly 4 in the continuum limit, 3.85 at N = 40.
-// A TOROID is used because its turn-to-core element depends only on the turn's radius from
-// the axis, so a single-layer winding really does have uniform C_i and the closed forms
-// above are exact rather than approximate.
+// The closed forms need UNIFORM elements. Since the turn-to-core element is screened by the
+// neighbouring turns (each neighbour takes the field on its side, see [turn-to-core]), the two
+// END turns of a close-wound single layer, which have one neighbour, carry larger elements than
+// the interior ones: 1.734 vs 1.647 pF floating here (5%), ratio 3.71 instead of 3.85. So the
+// test reads every per-turn element C_i through the same public energy path and checks the
+// EXACT discrete sums
+//   floating: C = sum C_i (V_i - Vc)^2 / V^2, Vc = sum C_i V_i / sum C_i (charge balance)
+//   tied:     C = sum C_i (V_i - Vt)^2 / V^2, Vt = V or 0
+// and checks the closed forms' premise where it holds: the interior elements are uniform (a
+// TOROID turn-to-core element depends only on the turn's radius and its neighbours' pitch).
 TEST_CASE("A bonded core turns C0/12 into C0/3 on a linear potential ramp", "[physical-model][stray-capacitance][abt1167]") {
     settings.reset();
     const int64_t numberTurns = 40;
-    auto coreJsonStr = R"({"name": "abt1167", "functionalDescription": {"type": "toroidal", "material": "A07", "shape": "T 14/8/9", "coating": {"type": "epoxy", "thickness": 0.0006}, "gapping": [], "numberStacks": 1}})";
+    auto coreJsonStr = R"({"name": "abt1167", "functionalDescription": {"type": "toroidal", "material": "A07", "shape": "T 14/8/9", "coating": {"type": "epoxy", "thickness": {"maximum": 0.0006}}, "gapping": [], "numberStacks": 1}})";
     auto coilJsonStr = std::string(R"({"bobbin": "Basic", "functionalDescription":[{"name": "Primary", "numberTurns": )")
         + std::to_string(numberTurns) + R"(, "numberParallels": 1, "isolationSide": "primary", "wire": "Round 0.2 - Grade 1"}]})";
     OpenMagnetics::Core core(nlohmann::json::parse(coreJsonStr));
@@ -3049,8 +3133,37 @@ TEST_CASE("A bonded core turns C0/12 into C0/3 on a linear potential ramp", "[ph
     double tiedToEnd = terminalCapacitance(0.0);               // the return end
 
     double N = static_cast<double>(numberTurns);
-    double expectedFloating = C0 * (N + 1.0) / (12.0 * (N - 1.0));
-    double expectedTied = C0 * (2.0 * N - 1.0) / (6.0 * (N - 1.0));
+    // Per-turn elements through the same public energy path: turn i alone at 1 V against a core
+    // held at 0 V stores C_i / 2.
+    std::vector<double> turnElements(numberTurns);
+    for (int64_t i = 0; i < numberTurns; ++i) {
+        std::vector<double> indicator(numberTurns, 0.0);
+        indicator[i] = 1.0;
+        turnElements[i] = 2.0 * StrayCapacitance::calculate_winding_to_core_self_energy(coil, core, "Primary", indicator, std::nullopt, 0.0);
+    }
+    double sumElements = 0, sumChargeAtRamp = 0;
+    for (int64_t i = 0; i < numberTurns; ++i) {
+        sumElements += turnElements[i];
+        sumChargeAtRamp += turnElements[i] * voltagesPerTurn[i];
+    }
+    CHECK(sumElements == Catch::Approx(C0).epsilon(1e-9));
+    // The closed forms' premise holds in the interior: uniform elements between the two ends.
+    auto [interiorMin, interiorMax] = std::minmax_element(turnElements.begin() + 1, turnElements.end() - 1);
+    CHECK(*interiorMax == Catch::Approx(*interiorMin).epsilon(1e-6));
+    // An end turn has one neighbour, so less of its field is screened.
+    CHECK(turnElements.front() > *interiorMax);
+    CHECK(turnElements.back() > *interiorMax);
+    auto shunt = [&](double corePotential) {
+        double sum = 0;
+        for (int64_t i = 0; i < numberTurns; ++i) {
+            sum += turnElements[i] * (voltagesPerTurn[i] - corePotential) * (voltagesPerTurn[i] - corePotential);
+        }
+        return sum / (windingVoltage * windingVoltage);
+    };
+    double expectedFloating = shunt(sumChargeAtRamp / sumElements);
+    double expectedTied = shunt(windingVoltage);
+    UNSCOPED_INFO("uniform-element closed forms (not exact here): floating " << C0 * (N + 1.0) / (12.0 * (N - 1.0))
+                  << ", tied " << C0 * (2.0 * N - 1.0) / (6.0 * (N - 1.0)));
     UNSCOPED_INFO("C0 = " << C0 << " F; floating " << floatingCore << " (expected " << expectedFloating
                   << "), tied to start " << tiedToStart << ", tied to end " << tiedToEnd
                   << " (expected " << expectedTied << ")");
@@ -3061,16 +3174,18 @@ TEST_CASE("A bonded core turns C0/12 into C0/3 on a linear potential ramp", "[ph
     // The headline ratio, against the analytic discrete value and against its continuum limit.
     double ratio = tiedToStart / floatingCore;
     UNSCOPED_INFO("tied/floating = " << ratio << ", analytic 2(2N-1)/(N+1) = " << 2.0 * (2.0 * N - 1.0) / (N + 1.0));
-    CHECK(ratio == Catch::Approx(2.0 * (2.0 * N - 1.0) / (N + 1.0)).epsilon(1e-6));
-    CHECK(ratio > 3.8);
-    CHECK(ratio < 4.0);
+    CHECK(ratio == Catch::Approx(expectedTied / expectedFloating).epsilon(1e-6));
+    // The extra end-turn charge dC adds dC*V^2/2 to the floating shunt (both ends at V/2 from the
+    // core) and dC*V^2 to the tied one (the far end only): 1:2, against 1:4 for the whole ramp, so
+    // the ratio falls below the uniform-element 2(2N-1)/(N+1).
+    CHECK(ratio < 2.0 * (2.0 * N - 1.0) / (N + 1.0));
 }
 
 // The same physics through the PUBLIC path, driven by magnetic.coreElectricalReference, and
 // the invariant the whole ticket rests on: ABSENT MEANS FLOATING and changes nothing.
 TEST_CASE("coreElectricalReference drives the core node, and absent means floating", "[physical-model][stray-capacitance][abt1167]") {
     settings.reset();
-    auto coreJsonStr = R"({"name": "abt1167", "functionalDescription": {"type": "toroidal", "material": "A07", "shape": "T 14/8/9", "coating": {"type": "epoxy", "thickness": 0.0006}, "gapping": [], "numberStacks": 1}})";
+    auto coreJsonStr = R"({"name": "abt1167", "functionalDescription": {"type": "toroidal", "material": "A07", "shape": "T 14/8/9", "coating": {"type": "epoxy", "thickness": {"maximum": 0.0006}}, "gapping": [], "numberStacks": 1}})";
     auto coilJsonStr = R"({"bobbin": "Basic", "functionalDescription":[{"name": "Primary", "numberTurns": 20, "numberParallels": 1, "isolationSide": "primary", "wire": "Round 0.2 - Grade 1"}]})";
     OpenMagnetics::Core core(nlohmann::json::parse(coreJsonStr));
     core.process_data();
@@ -3491,12 +3606,23 @@ TEST_CASE("ABT #1166: case C -- all legs gapped with a split bobbin puts Cgap in
     }
     std::cout << "\n";
 
-    // The magnitude the design note is about: at 1 mm the single-node model is several times
-    // too high. (Its worked ETD49, Cpc = Csc = 50 pF, gives 7.7x; the ratio here is set by this
-    // coil's own Cpc/Csc, but it must be a large factor, not a rounding correction.)
+    // The magnitude the design note is about. In this idealisation the single-node model is too
+    // high by exactly ungapped / total = 1 + Cser / Cgap (Cser = Cpc Csc / (Cpc + Csc)), so the
+    // factor is set by this coil's own Cpc/Csc against Cgap. (The design note's worked ETD49,
+    // Cpc = Csc = 50 pF, gives 7.7x.) This used to be asserted as "> 2", which held only while
+    // Cpc was 28.7 pF: that was the ISOLATED cylinder-over-plane element charged for every turn
+    // of a close-wound layer, which double-counts the flank field the turn-to-turn elements
+    // carry. With the Maxwell row element (pitch = the wire OD) and the yoke charged only across
+    // the core's depth, Cpc = 8.64 pF and the factor is 1 + 4.32/4.83 = 1.89. Cross-check of that
+    // Cpc: the 20-turn layer as a parallel plate on the column, eps0 l H / (t_e/eps_e + t_c/eps_b)
+    // = 8.2 pF, the 5 % above it being the two end turns' outer-flank fringe and the end turn
+    // facing the yoke; the old 28.7 pF was 2.6x that plate (36.0 pF, 4.4x, once the section sits
+    // on the column). The identity is asserted exactly instead of the bare "> 2".
     auto core = OpenMagneticsTesting::get_quick_core("ETD 49/25/16", abt1166_all_legs_ground_gap(0.001), 1, "N87");
     double atOneMillimetre = StrayCapacitance::calculate_through_core_capacitance(coil, core, "winding 0", "winding 1", voltages);
-    CHECK(ungapped / atOneMillimetre > 2.0);
+    auto splitAtOneMillimetre = StrayCapacitance::core_gap_topology(core, coil, "winding 0", "winding 1");
+    CHECK_THAT(ungapped / atOneMillimetre, WithinRel(1 + ungapped / splitAtOneMillimetre.gapCapacitance, 1e-9));
+
 }
 
 TEST_CASE("ABT #1166: the gap does not touch a winding's own through-core self term",
@@ -3718,4 +3844,490 @@ TEST_CASE("ABT #1200: spacer or air is decided by the gap type, not by the geome
         CHECK(message.find("abt1200 spacer core") != std::string::npos);
         CHECK(message.find("additive gap") != std::string::npos);
     }
+}
+
+// Neighbour screening of the turn-to-core element. The element is the Maxwell row sum of a turn
+// (its charge with every neighbour at its potential), solved as one conductor of a periodic row
+// over the core plane. Its two closed-form limits are checked here; the row solver is numerical
+// (charge simulation), so these are the analytical anchors.
+TEST_CASE("Conductor row over a plane reproduces its closed-form limits", "[physical-model][stray-capacitance][turn-to-core][smoke-test]") {
+    const double eps0 = Constants().vacuumPermittivity;
+    const double r = 0.25e-3;
+    auto smythe = [&](double H) { return 2 * std::numbers::pi * eps0 / std::acosh(H / r); };
+
+    SECTION("an isolated conductor (no neighbour, or a very distant one) is the cylinder over a plane") {
+        for (double H : {1.001 * r, 1.03 * r, 1.66 * r, 5.0 * r}) {
+            double infinitePitch = StrayCapacitance::calculate_conductor_row_over_plane_capacitance_per_length(r, H, std::numeric_limits<double>::infinity());
+            CHECK_THAT(infinitePitch, WithinRel(smythe(H), 1e-12));
+            double distant = StrayCapacitance::calculate_conductor_row_over_plane_capacitance_per_length(r, H, 1e4 * r);
+            CHECK_THAT(distant, WithinRel(smythe(H), 1e-5));
+        }
+    }
+    SECTION("thin wires (r << p, H) are the wire grid 2 pi eps0 / ln(sinh(2 pi H/p) / sinh(pi r/p))") {
+        const double p = 1e-3;
+        const double thin = 1e-3 * p;
+        for (double H : {0.3 * p, 1.0 * p, 2.0 * p}) {
+            double grid = 2 * std::numbers::pi * eps0 / std::log(std::sinh(2 * std::numbers::pi * H / p) / std::sinh(std::numbers::pi * thin / p));
+            CHECK_THAT(StrayCapacitance::calculate_conductor_row_over_plane_capacitance_per_length(thin, H, p), WithinRel(grid, 1e-4));
+        }
+    }
+    SECTION("a close-wound row screens: WE 744822222 bore geometry, 0.25 mm wire under a 0.6 mm case") {
+        // H = 1.66 r (air-equivalent stack 0.165 mm), pitch 2.1 r (wire OD). Independent charge
+        // simulation with 96 ring charges: 23.628 pF/m, against 50.871 pF/m isolated -- the
+        // thin-wire grid formula (15.8 pF/m) is NOT valid here, r is comparable to p and H.
+        double closeWound = StrayCapacitance::calculate_conductor_row_over_plane_capacitance_per_length(r, 1.66 * r, 2.1 * r);
+        CHECK_THAT(closeWound, WithinRel(23.628e-12, 1e-3));
+        CHECK_THAT(smythe(1.66 * r), WithinRel(50.871e-12, 1e-4));
+        double wider = StrayCapacitance::calculate_conductor_row_over_plane_capacitance_per_length(r, 1.66 * r, 4.0 * r);
+        CHECK(closeWound < wider);
+        CHECK(wider < smythe(1.66 * r));
+    }
+    SECTION("overlapping conductors and a conductor touching the plane are refused") {
+        CHECK_THROWS_AS(StrayCapacitance::calculate_conductor_row_over_plane_capacitance_per_length(r, 1.5 * r, 1.9 * r), InvalidInputException);
+        CHECK_THROWS_AS(StrayCapacitance::calculate_conductor_row_over_plane_capacitance_per_length(r, r, 3 * r), InvalidInputException);
+    }
+}
+
+TEST_CASE("Turn-to-core element: each side's neighbour screens half the turn", "[physical-model][stray-capacitance][turn-to-core][smoke-test]") {
+    const double eps0 = Constants().vacuumPermittivity;
+    const double r = 0.25e-3, L = 30e-3, tEnamel = 17e-6, epsEnamel = 3.5, tCase = 0.6e-3, epsCase = 3.6;
+    const double gap = tEnamel / epsEnamel + tCase / epsCase;
+    double isolated = StrayCapacitance::calculate_turn_to_core_capacitance(r, L, tEnamel, epsEnamel, 0.0, tCase, epsCase);
+    // No neighbour: exactly the former (Smythe) element.
+    CHECK_THAT(isolated, WithinRel(2 * std::numbers::pi * eps0 * L / std::acosh(1 + gap / r), 1e-12));
+    const double pitch = 0.534e-3;
+    double row = StrayCapacitance::calculate_conductor_row_over_plane_capacitance_per_length(r, r + gap, pitch);
+    double oneSide = StrayCapacitance::calculate_turn_to_core_capacitance(r, L, tEnamel, epsEnamel, 0.0, tCase, epsCase, 0.0, 1.0, pitch);
+    double bothSides = StrayCapacitance::calculate_turn_to_core_capacitance(r, L, tEnamel, epsEnamel, 0.0, tCase, epsCase, 0.0, 1.0, pitch, pitch);
+    CHECK_THAT(bothSides, WithinRel(row * L, 1e-12));
+    CHECK_THAT(oneSide, WithinRel(0.5 * (isolated + bothSides), 1e-12));
+    CHECK(bothSides < 0.5 * isolated);
+}
+
+// =====================================================================================
+// The elementary turn-pair capacitance of the flux-line models (Albach, Koch) against the
+// exact electrostatics of two parallel cylinders.
+//
+// Two cylinders of radius R, centres D apart: C' = pi eps0 / acosh(D / 2R) exactly (image
+// solution). With D / 2R = 1 + e this behaves near contact as pi eps0 / sqrt(2e). Albach's
+// straight-flux-line integral (Albach 2017, Eqs. 3.11-3.16; Koch's is the same construction,
+// Biela & Kolar 2008 Sec. III-C) over |phi| < pi/2 is, for a bare conductor,
+//     C'_model = eps0 * int_{-pi/2}^{pi/2} cos(phi) / (beta - cos(phi)) / 2 dphi = 2 eps0 (V - pi/4),
+// beta = 1 + e, whose expansion is pi eps0 / sqrt(2e) - (1 + pi/2) eps0 + O(sqrt(e)). The
+// singular term is the exact one; the constant (1 + pi/2) eps0 is the stated approximation
+// (the fringe beyond |phi| = pi/2 and the bending of the flux lines are neglected). So:
+//     C_model / C_exact - 1 = -(1 + pi/2) sqrt(2e) / pi + O(e),
+// and the test allows exactly the O(e) remainder, |.| <= e. With Albach's lumped two-layer 2/3
+// (applied per pair before this fix) the ratio is ~1/3, with Koch as printed by Biela & Kolar
+// ~1/2: both miss the singular term and fail by an order of magnitude more than the tolerance.
+// e >= 0.003 keeps beta above the 1.001 below which the models switch to a plate formula.
+// =====================================================================================
+TEST_CASE("Albach and Koch turn-pair elements reproduce the exact two-cylinder singular term near contact", "[physical-model][stray-capacitance][albach][koch]") {
+    const double eps0 = Constants().vacuumPermittivity;
+    const double radius = 0.25e-3;
+    const double turnLength = 1.0;
+    StrayCapacitanceAlbachModel albach;
+    StrayCapacitanceKochModel koch;
+    for (double e : {0.01, 0.003}) {
+        double gap = 2 * radius * e;
+        double exact = std::numbers::pi * eps0 * turnLength / std::acosh(1 + e);
+        double predictedRelativeError = -(1 + std::numbers::pi / 2) * std::sqrt(2 * e) / std::numbers::pi;
+        // Bare conductors: coating 0 (its permittivity then does not enter), air gap only.
+        double albachC = albach.calculate_static_capacitance_between_two_turns(0.0, turnLength, radius, 0.0, gap, 3.0, 1.0);
+        double kochC = koch.calculate_static_capacitance_between_two_turns(0.0, turnLength, radius, 0.0, gap, 3.0, 1.0);
+        UNSCOPED_INFO("e=" << e << " exact=" << exact << " albach=" << albachC << " koch=" << kochC
+                      << " predicted rel. error=" << predictedRelativeError);
+        CHECK(std::abs(albachC / exact - 1 - predictedRelativeError) <= e);
+        CHECK(std::abs(kochC / exact - 1 - predictedRelativeError) <= e);
+    }
+}
+
+// The same comparison with an enamel coating, for a touching pair of 0.5 mm grade-1 wire. Near
+// contact the field crosses the thin coating along its normal, so the coating acts as an
+// air-equivalent gap of delta / eps_D per side: the exact reference is the two-cylinder solution
+// for the OUTER radius R_o with the gap g = h + 2 delta / eps_D, pi eps0 / acosh(1 + g / 2R_o).
+// Albach's beta - 1 reduces to the same g / 2R_o to first order; the model then differs from the
+// reference by (a) the neglected fringe, -(1 + pi/2) sqrt(2e) / pi as above, (b) the 1/zeta
+// prefactor, 1 + delta / (eps_D R_o), which is the thin-coating order the model is stated to, and
+// (c) O(e). The tolerance is the sum of those three magnitudes, nothing fitted.
+TEST_CASE("Albach turn-pair element for a touching enamelled pair against the exact two-cylinder solution", "[physical-model][stray-capacitance][albach]") {
+    const double eps0 = Constants().vacuumPermittivity;
+    auto wire = OpenMagnetics::find_wire_by_name("Round 0.5 - Grade 1");
+    double conductingRadius = wire.get_maximum_conducting_width() / 2;
+    double outerRadius = wire.get_maximum_outer_width() / 2;
+    double coating = outerRadius - conductingRadius;
+    const double coatingPermittivity = 3.5;
+    const double turnLength = 1.0;
+    REQUIRE(coating > 0);
+
+    StrayCapacitanceAlbachModel albach;
+    double model = albach.calculate_static_capacitance_between_two_turns(coating, turnLength, conductingRadius, 0.0, 0.0, coatingPermittivity, 1.0);
+    double equivalentGap = 2 * coating / coatingPermittivity;
+    double e = equivalentGap / (2 * outerRadius);
+    double exact = std::numbers::pi * eps0 * turnLength / std::acosh(1 + e);
+    double tolerance = (1 + std::numbers::pi / 2) * std::sqrt(2 * e) / std::numbers::pi
+                       + coating / (coatingPermittivity * outerRadius) + e;
+    UNSCOPED_INFO("coating=" << coating << " e=" << e << " exact=" << exact << " model=" << model
+                  << " ratio=" << model / exact << " tolerance=" << tolerance);
+    CHECK(std::abs(model / exact - 1) <= tolerance);
+}
+
+// =====================================================================================
+// Toroid turn pair: half of the pair's length at the bore separation, half at the outer
+// crossing's (the bore run C/P plus half of each flat run (A-B)/2P gives exactly 1/2, the same
+// face shares as the turn-to-core model). The pair used to be evaluated over its whole length at
+// the minimum separation over both crossings, i.e. at the bore, where turns are crowded.
+// =====================================================================================
+TEST_CASE("Toroid turn-pair capacitance is split between the bore and the outer crossing", "[physical-model][stray-capacitance][toroid][toroid-pair-split]") {
+    settings.reset();
+    const std::string shapeName = "T 17/10.7/6.8";
+    std::vector<OpenMagnetics::Wire> wires = {OpenMagnetics::find_wire_by_name("Round 0.5 - Grade 1")};
+    auto coil = OpenMagneticsTesting::get_quick_coil({40}, {1}, shapeName, 1,
+                                                      MAS::WindingOrientation::CONTIGUOUS,
+                                                      MAS::WindingOrientation::OVERLAPPING,
+                                                      MAS::CoilAlignment::CENTERED,
+                                                      MAS::CoilAlignment::CENTERED,
+                                                      wires, false);
+    REQUIRE(coil.get_turns_description());
+    auto turns = coil.get_turns_description().value();
+    auto wire = coil.resolve_wire(0);
+    double outerDiameter = wire.get_maximum_outer_width();
+
+    // Consecutive turns of the (single) bore layer: in contact at the bore, apart outside.
+    const Turn& first = turns[0];
+    const Turn& second = turns[1];
+    REQUIRE(first.get_additional_coordinates());
+    REQUIRE(second.get_additional_coordinates());
+    // Rounded to the micrometre exactly as preprocess_data_for_round_wires rounds separations.
+    auto gapBetween = [&](const std::vector<double>& a, const std::vector<double>& b) {
+        return roundFloat(std::hypot(a[0] - b[0], a[1] - b[1]) - outerDiameter, 6);
+    };
+    double boreGap = gapBetween(first.get_coordinates(), second.get_coordinates());
+    double outerGap = gapBetween(first.get_additional_coordinates()->at(0), second.get_additional_coordinates()->at(0));
+    UNSCOPED_INFO("bore gap=" << boreGap << " outer gap=" << outerGap);
+    // The premise of the split: the outer circumference has room the bore does not.
+    REQUIRE(outerGap > boreGap + outerDiameter / 10);
+
+    StrayCapacitanceAlbachModel model;
+    // Dielectric data exactly as the pair model sees it (coating, radius, permittivities).
+    Turn boreOnly = first;
+    boreOnly.set_additional_coordinates(std::nullopt);
+    Turn boreOnlySecond = second;
+    boreOnlySecond.set_additional_coordinates(std::nullopt);
+    auto aux = model.preprocess_data_for_round_wires(boreOnly, wire, boreOnlySecond, wire, coil);
+    REQUIRE(aux[3] == 0);  // no insulation layers between the two turns in this coil
+    double coating = aux[0], conductingRadius = aux[2], coatingPermittivity = aux[5], layerPermittivity = aux[6];
+    double pairLength = (first.get_length() + second.get_length()) / 2;
+    auto element = [&](double length, double gap) {
+        return model.calculate_static_capacitance_between_two_turns(coating, length, conductingRadius, 0.0, gap, coatingPermittivity, layerPermittivity);
+    };
+    double expected = element(pairLength / 2, std::max(boreGap, 0.0)) + element(pairLength / 2, outerGap);
+    double wholeLengthAtBore = element(pairLength, std::max(boreGap, 0.0));
+
+    OpenMagnetics::StrayCapacitance strayCapacitance(StrayCapacitanceModels::ALBACH);
+    double computed = strayCapacitance.calculate_static_capacitance_between_two_turns(first, wire, second, wire, coil);
+    UNSCOPED_INFO("computed=" << computed << " expected split=" << expected << " whole length at bore=" << wholeLengthAtBore);
+    CHECK_THAT(computed, WithinRel(expected, 1e-9));
+    CHECK(computed < wholeLengthAtBore);
+}
+
+TEST_CASE("Toroid turn pair refuses a turn with no outer crossing that is not its conductor's last station", "[physical-model][stray-capacitance][toroid][toroid-pair-split]") {
+    settings.reset();
+    std::vector<OpenMagnetics::Wire> wires = {OpenMagnetics::find_wire_by_name("Round 0.5 - Grade 1")};
+    auto coil = OpenMagneticsTesting::get_quick_coil({40}, {1}, "T 17/10.7/6.8", 1,
+                                                      MAS::WindingOrientation::CONTIGUOUS,
+                                                      MAS::WindingOrientation::OVERLAPPING,
+                                                      MAS::CoilAlignment::CENTERED,
+                                                      MAS::CoilAlignment::CENTERED,
+                                                      wires, false);
+    auto turns = coil.get_turns_description().value();
+    auto wire = coil.resolve_wire(0);
+    Turn stripped = turns[0];
+    stripped.set_additional_coordinates(std::nullopt);
+    OpenMagnetics::StrayCapacitance strayCapacitance(StrayCapacitanceModels::ALBACH);
+    REQUIRE_THROWS_AS(strayCapacitance.calculate_static_capacitance_between_two_turns(stripped, wire, turns[1], wire, coil), InvalidInputException);
+}
+
+// Coil::fast_wind and the MagneticAdviser wind with the include-additional-coordinates setting off,
+// so the toroids they return carry no outer crossings. The capacitance must not throw on them, nor
+// drop their outer runs: it generates the crossings with the winder's own routine, and gives exactly
+// what the same coil gives with its crossings generated explicitly.
+TEST_CASE("Toroid capacitance generates the outer crossings a speed-wound coil left out", "[physical-model][stray-capacitance][toroid][toroid-pair-split]") {
+    settings.reset();
+    settings.set_coil_include_additional_coordinates(false);
+    std::vector<OpenMagnetics::Wire> wires = {OpenMagnetics::find_wire_by_name("Round 0.5 - Grade 1")};
+    auto coil = OpenMagneticsTesting::get_quick_coil({40}, {1}, "T 17/10.7/6.8", 1,
+                                                      MAS::WindingOrientation::CONTIGUOUS,
+                                                      MAS::WindingOrientation::OVERLAPPING,
+                                                      MAS::CoilAlignment::CENTERED,
+                                                      MAS::CoilAlignment::CENTERED,
+                                                      wires, false);
+    settings.set_coil_include_additional_coordinates(true);
+    REQUIRE(coil.get_turns_description());
+    // The premise: the speed wind recorded no outer crossing at all.
+    auto speedWoundTurns = coil.get_turns_description().value();
+    for (const auto& turn : speedWoundTurns) {
+        REQUIRE_FALSE(turn.get_additional_coordinates());
+    }
+
+    OpenMagnetics::Coil crossed = coil;
+    crossed.generate_toroidal_additional_coordinates();
+    REQUIRE(crossed.get_turns_description().value()[0].get_additional_coordinates());
+
+    OpenMagnetics::StrayCapacitance strayCapacitance(StrayCapacitanceModels::ALBACH);
+    auto windingName = coil.get_functional_description()[0].get_name();
+    double fromSpeedWound = strayCapacitance.calculate_capacitance(coil).get_capacitance_among_windings().value()[windingName][windingName];
+    double fromCrossed = strayCapacitance.calculate_capacitance(crossed).get_capacitance_among_windings().value()[windingName][windingName];
+    CHECK(fromSpeedWound > 0);
+    CHECK_THAT(fromSpeedWound, WithinRel(fromCrossed, 1e-12));
+    // Generated on the call's own copy: the caller's coil is untouched.
+    CHECK_FALSE(coil.get_turns_description().value()[0].get_additional_coordinates());
+    // And with the setting off, as the advisers leave it, the result is the same.
+    settings.set_coil_include_additional_coordinates(false);
+    double withSettingOff = strayCapacitance.calculate_capacitance(coil).get_capacitance_among_windings().value()[windingName][windingName];
+    CHECK_THAT(withSettingOff, WithinRel(fromCrossed, 1e-12));
+    CHECK_FALSE(settings.get_coil_include_additional_coordinates());
+    settings.reset();
+}
+
+// A turn pair with no finite separation, or a coil whose every turn pair overlaps, used to get a
+// 1e-6 placeholder: 1 µF as the pair's capacitance, 1 µm as the coil's minimum gap. Both entered
+// the result as if computed. They are refused now, by name where the turns are known.
+TEST_CASE("Turn-pair capacitance refuses a pair with no finite separation instead of returning 1 uF",
+          "[physical-model][stray-capacitance][albach][koch][no-placeholder-capacitance]") {
+    StrayCapacitanceAlbachModel albach;
+    StrayCapacitanceKochModel koch;
+    const double inf = std::numeric_limits<double>::infinity();
+    CHECK_THROWS_WITH(albach.calculate_static_capacitance_between_two_turns(20e-6, 0.05, 0.25e-3, inf, 0.0, 3.5, 3.0),
+                      Catch::Matchers::ContainsSubstring("finite separation"));
+    CHECK_THROWS_WITH(koch.calculate_static_capacitance_between_two_turns(20e-6, 0.05, 0.25e-3, 0.0, inf, 3.5, 3.0),
+                      Catch::Matchers::ContainsSubstring("finite separation"));
+}
+
+TEST_CASE("Turn-to-turn capacitance names the turns of a coil whose every pair overlaps",
+          "[physical-model][stray-capacitance][no-placeholder-capacitance]") {
+    settings.reset();
+    auto coil = OpenMagneticsTesting::get_quick_coil({2}, {1}, "PQ 28/20");
+    auto turns = coil.get_turns_description().value();
+    REQUIRE(turns.size() == 2);
+
+    // One turn alone has no pair: no capacitance, and no error.
+    {
+        auto single = coil;
+        single.set_turns_description(std::vector<Turn>{turns[0]});
+        CHECK(StrayCapacitance().calculate_capacitance_among_turns(single).empty());
+    }
+
+    // Lay the second turn over the first, half a diameter away: the only pair overlaps.
+    double outerDiameter = turns[0].get_dimensions().value()[0];
+    auto coordinates = turns[0].get_coordinates();
+    coordinates[1] += outerDiameter / 2;
+    turns[1].set_coordinates(coordinates);
+    coil.set_turns_description(turns);
+    CHECK_THROWS_WITH(StrayCapacitance().calculate_capacitance_among_turns(coil),
+                      Catch::Matchers::ContainsSubstring(turns[0].get_name()) &&
+                      Catch::Matchers::ContainsSubstring(turns[1].get_name()) &&
+                      Catch::Matchers::ContainsSubstring("overlap"));
+    settings.reset();
+}
+
+// Albach Eq. (3.16) and Koch Eqs. (5)-(6) are exact for every beta > 1. Below beta = 1.001 the
+// code used to switch to a parallel-plate estimate; the formulas themselves hold there and carry
+// the two-cylinder singular term, so the same reference as the near-contact test above applies:
+// pi eps0 / acosh(1 + e) with the predicted fringe error -(1 + pi/2) sqrt(2e) / pi, tolerance e.
+// For bare conductors beta - 1 = h / 2r0 = e, so e = 5e-4 and 1e-4 are inside the old cut-off.
+TEST_CASE("Albach and Koch use their exact formula below beta = 1.001 and refuse beta <= 1",
+          "[physical-model][stray-capacitance][albach][koch][beta-domain]") {
+    const double eps0 = Constants().vacuumPermittivity;
+    const double radius = 0.25e-3;
+    const double turnLength = 1.0;
+    StrayCapacitanceAlbachModel albach;
+    StrayCapacitanceKochModel koch;
+    for (double e : {5e-4, 1e-4}) {
+        double gap = 2 * radius * e;
+        double exact = std::numbers::pi * eps0 * turnLength / std::acosh(1 + e);
+        double predictedRelativeError = -(1 + std::numbers::pi / 2) * std::sqrt(2 * e) / std::numbers::pi;
+        double albachC = albach.calculate_static_capacitance_between_two_turns(0.0, turnLength, radius, 0.0, gap, 3.0, 1.0);
+        double kochC = koch.calculate_static_capacitance_between_two_turns(0.0, turnLength, radius, 0.0, gap, 3.0, 1.0);
+        UNSCOPED_INFO("e=" << e << " exact=" << exact << " albach=" << albachC << " koch=" << kochC);
+        CHECK(std::abs(albachC / exact - 1 - predictedRelativeError) <= e);
+        CHECK(std::abs(kochC / exact - 1 - predictedRelativeError) <= e);
+    }
+    // beta = 1 (bare conductors in contact) and beta < 1 (overlapping) have no capacitance.
+    for (double gap : {0.0, -0.1 * radius}) {
+        CHECK_THROWS_WITH(albach.calculate_static_capacitance_between_two_turns(0.0, turnLength, radius, 0.0, gap, 3.0, 1.0),
+                          Catch::Matchers::ContainsSubstring("beta > 1"));
+        CHECK_THROWS_WITH(koch.calculate_static_capacitance_between_two_turns(0.0, turnLength, radius, 0.0, gap, 3.0, 1.0),
+                          Catch::Matchers::ContainsSubstring("beta > 1"));
+    }
+}
+
+// A wound turn rests on the surface it was wound against; it is never inside the core. The
+// toroid branch of the turn-to-core gaps used to clamp a negative gap to zero (std::max(0, gap)),
+// so a turn half a millimetre inside a ring's epoxy jacket was evaluated as "touching". It throws
+// now, naming the turn and the overlap. WE-CMB 744821110 (T 12.7/7.92/4.9, A07, 0.6 mm epoxy,
+// 56 + 56 turns) is wound against its coated bore, so it is the clean reference; each case below breaks
+// one surface on purpose.
+TEST_CASE("Toroid turn-to-core gap refuses a turn that lies inside the coated core", "[physical-model][stray-capacitance][toroid][turn-inside-core]") {
+    settings.reset();
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "cmc_we_coated_anchor/744821110.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    const auto reference = nlohmann::json::parse(file);
+    auto windingToCore = [](const nlohmann::json& json) {
+        OpenMagnetics::Magnetic magnetic(json);
+        return StrayCapacitance::calculate_winding_to_core_capacitance(magnetic.get_coil(), magnetic.get_core(), "primary");
+    };
+
+    SECTION("the record as wound: every turn clears both surfaces") {
+        CHECK(windingToCore(reference) > 0);
+    }
+    SECTION("a thicker jacket than the winding was laid for: the bore turns are inside the epoxy") {
+        // The ring is T 12.7/7.92/4.9: bare bore B/2 = 3.96 mm, winding window 3.36 mm (B/2 minus
+        // the 0.6 mm jacket), and the bore turns rest on that window. A 0.9 mm jacket puts the
+        // coated bore at 3.06 mm, 0.3 mm inside the window: the turns sit in epoxy although they
+        // still clear the window they were laid in. That is the defect the stored 744821039 had
+        // (turns laid in the bare 3.95 mm bore of a ring whose jacket leaves 3.36 mm).
+        auto json = reference;
+        json["core"]["functionalDescription"]["coating"]["thickness"] = {{"nominal", 0.0009}};
+        REQUIRE_THROWS_WITH(windingToCore(json), Catch::Matchers::ContainsSubstring("lies inside the core at the bore") &&
+                                                 Catch::Matchers::ContainsSubstring("primary parallel 0 turn 0") &&
+                                                 Catch::Matchers::ContainsSubstring("0.300000 mm past the bore surface"));
+    }
+    SECTION("one turn moved 0.2 mm radially outward at the bore") {
+        auto json = reference;
+        auto& coordinates = json["coil"]["turnsDescription"][3]["coordinates"];
+        double x = coordinates[0], y = coordinates[1];
+        double r = std::hypot(x, y);
+        coordinates[0] = x * (r + 0.0002) / r;
+        coordinates[1] = y * (r + 0.0002) / r;
+        REQUIRE_THROWS_WITH(windingToCore(json), Catch::Matchers::ContainsSubstring("primary parallel 0 turn 3") &&
+                                                 Catch::Matchers::ContainsSubstring("lies inside the core at the bore"));
+    }
+    SECTION("one turn's outer crossing moved 0.2 mm radially inward") {
+        auto json = reference;
+        auto& crossing = json["coil"]["turnsDescription"][3]["additionalCoordinates"][0];
+        double x = crossing[0], y = crossing[1];
+        double r = std::hypot(x, y);
+        crossing[0] = x * (r - 0.0002) / r;
+        crossing[1] = y * (r - 0.0002) / r;
+        REQUIRE_THROWS_WITH(windingToCore(json), Catch::Matchers::ContainsSubstring("primary parallel 0 turn 3") &&
+                                                 Catch::Matchers::ContainsSubstring("lies inside the core at its outer crossing"));
+    }
+}
+
+// Rectangular-window turn-to-core: (1) the yoke above and below an E-core window is ferrite only
+// across the core's depth D, so of a turn wound round the centre leg only the two runs along the
+// depth face it -- length 2 D, not the whole turn (classic sharp-cornered racetrack, no bobbin
+// wall: L_z = D/2, so the in-footprint length is 4 min(D/2, L_z) = 2 D); (2) the column face of a
+// close-wound layer is the Maxwell row element with the centre distance to each neighbour as its
+// pitch, as in the toroid branch. The expectation is built from calculate_turn_to_core_capacitance
+// with the geometry read off the wound turns, so it is the model's own element evaluated on the
+// faces the physics says are there.
+TEST_CASE("Test_StrayCapacitance_Rectangular_Window_Turn_To_Core_Yoke_Share_And_Row_Screening", "[physical-model][stray-capacitance][captot][smoke-test]") {
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(false);
+    const std::string shapeName = "E 42/21/15";
+    auto wire = find_wire_by_name("Round 0.5 - Grade 1");
+    const double conductingRadius = wire.get_maximum_conducting_width() / 2;
+    const double coatingThickness = wire.get_coating_thickness();
+    const double coatingPermittivity = get_wire_insulation_relative_permittivity(wire);
+    auto core = OpenMagneticsTesting::get_quick_core(shapeName, json::parse("[]"), 1, "Dummy");
+    const double depth = core.get_depth();
+    auto element = [&](double length, double gap, double leftPitch, double rightPitch) {
+        return StrayCapacitance::calculate_turn_to_core_capacitance(conductingRadius, length, coatingThickness, coatingPermittivity,
+                                                                    gap, 0.0, 1.0, 0.0, 1.0, leftPitch, rightPitch);
+    };
+    const double inf = std::numeric_limits<double>::infinity();
+
+    for (int64_t numberTurns : {1, 8}) {
+        INFO(numberTurns << " turns");
+        auto coil = OpenMagneticsTesting::get_quick_coil({numberTurns}, {1}, shapeName, 1, WindingOrientation::OVERLAPPING,
+                                                         WindingOrientation::OVERLAPPING, CoilAlignment::CENTERED,
+                                                         CoilAlignment::CENTERED, {wire}, false);
+        coil.wind();
+        auto turns = coil.get_turns_description().value();
+        REQUIRE(turns.size() == static_cast<size_t>(numberTurns));
+        auto bobbin = coil.resolve_bobbin();
+        REQUIRE(bobbin.get_processed_description()->get_column_thickness() == 0);
+        REQUIRE(bobbin.get_processed_description()->get_wall_thickness() == 0);
+        auto windowDimensions = bobbin.get_winding_window_dimensions(0);
+        auto windowCoordinates = bobbin.get_winding_window_coordinates(0);
+        const double windowInnerEdge = windowCoordinates[0] - windowDimensions[0] / 2;
+        const double windowUpperEdge = windowCoordinates[1] + windowDimensions[1] / 2;
+        const double windowLowerEdge = windowCoordinates[1] - windowDimensions[1] / 2;
+        const double outerRadius = wire.get_maximum_outer_width() / 2;
+
+        std::sort(turns.begin(), turns.end(), [](const Turn& a, const Turn& b) { return a.get_coordinates()[1] < b.get_coordinates()[1]; });
+        double expected = 0;
+        for (size_t i = 0; i < turns.size(); ++i) {
+            auto c = turns[i].get_coordinates();
+            // One layer: every turn shares x, so all face the column.
+            REQUIRE_THAT(c[0], Catch::Matchers::WithinAbs(turns[0].get_coordinates()[0], 1e-12));
+            double below = i == 0 ? inf : std::hypot(c[0] - turns[i - 1].get_coordinates()[0], c[1] - turns[i - 1].get_coordinates()[1]);
+            double above = i + 1 == turns.size() ? inf : std::hypot(c[0] - turns[i + 1].get_coordinates()[0], c[1] - turns[i + 1].get_coordinates()[1]);
+            expected += element(turns[i].get_length(), std::max(0.0, c[0] - outerRadius - windowInnerEdge), above, below);
+        }
+        // Only the top turn faces the upper yoke, only the bottom one the lower; nothing beside them.
+        expected += element(2 * depth, windowUpperEdge - (turns.back().get_coordinates()[1] + outerRadius), inf, inf);
+        expected += element(2 * depth, (turns.front().get_coordinates()[1] - outerRadius) - windowLowerEdge, inf, inf);
+
+        double computed = StrayCapacitance::calculate_winding_to_core_capacitance(coil, core, coil.get_functional_description()[0].get_name());
+        CHECK_THAT(computed, Catch::Matchers::WithinRel(expected, 1e-9));
+    }
+
+    // The row continues only through the SAME conductor (same winding, same section). Configuration
+    // of the 13_current_sense example: 80 turns of Round 0.1 wound first, one turn of Round 0.5
+    // outside them. The thin wire's outer layer sits radially beside the thick turn, its centre
+    // closer than the thick turn's 0.5 mm conducting diameter without touching it (the two outer
+    // radii sum to ~0.32 mm). It is not a neighbour in a row of identical cylinders, so the thick
+    // turn's yoke faces are the isolated cylinder's (no neighbour on either side); taking the
+    // thin turn as a row neighbour threw "pitch is below the conductor diameter".
+    {
+        INFO("mixed-wire radial row");
+        auto thinWire = find_wire_by_name("Round 0.1 - Grade 1");
+        auto coil = OpenMagneticsTesting::get_quick_coil({80, 1}, {1, 1}, shapeName, 1, WindingOrientation::OVERLAPPING,
+                                                         WindingOrientation::OVERLAPPING, CoilAlignment::CENTERED,
+                                                         CoilAlignment::CENTERED, {thinWire, wire}, false);
+        coil.wind();
+        auto turns = coil.get_turns_description().value();
+        auto bobbin = coil.resolve_bobbin();
+        REQUIRE(bobbin.get_processed_description()->get_wall_thickness() == 0);
+        auto windowDimensions = bobbin.get_winding_window_dimensions(0);
+        auto windowCoordinates = bobbin.get_winding_window_coordinates(0);
+        const double windowUpperEdge = windowCoordinates[1] + windowDimensions[1] / 2;
+        const double windowLowerEdge = windowCoordinates[1] - windowDimensions[1] / 2;
+        const std::string thickName = coil.get_functional_description()[1].get_name();
+        std::vector<Turn> thickTurns;
+        for (const auto& t : turns) {
+            if (t.get_winding() == thickName) {
+                thickTurns.push_back(t);
+            }
+        }
+        REQUIRE(thickTurns.size() == 1);
+        auto c = thickTurns[0].get_coordinates();
+        const double outerRadius = wire.get_maximum_outer_width() / 2;
+        // The configuration under test: a thin turn on the thick turn's radial row, closer than its diameter.
+        double nearestRadial = inf;
+        bool screenedRadially = false;
+        for (const auto& t : turns) {
+            if (t.get_winding() == thickName) {
+                continue;
+            }
+            auto o = t.get_coordinates();
+            if (std::abs(o[1] - c[1]) < outerRadius) {
+                nearestRadial = std::min(nearestRadial, std::hypot(o[0] - c[0], o[1] - c[1]));
+                screenedRadially = true;
+            }
+        }
+        REQUIRE(screenedRadially);
+        REQUIRE(nearestRadial < 2 * conductingRadius);
+        double expected = element(2 * depth, windowUpperEdge - (c[1] + outerRadius), inf, inf) +
+                          element(2 * depth, (c[1] - outerRadius) - windowLowerEdge, inf, inf);
+        double computed = 0;
+        REQUIRE_NOTHROW(computed = StrayCapacitance::calculate_winding_to_core_capacitance(coil, core, thickName));
+        CHECK_THAT(computed, Catch::Matchers::WithinRel(expected, 1e-9));
+        REQUIRE_NOTHROW(StrayCapacitance().calculate_capacitance(coil));
+    }
+    settings.reset();
 }

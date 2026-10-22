@@ -426,6 +426,25 @@ namespace {
         }
     }
 
+    // The fringing-factor inverse scans gap lengths from the residual gap to the column height.
+    // A central column no taller than the residual gap is broken core data; it used to come back
+    // as "maximum gap = residual gap", which made the fringing filter reject every gapped design
+    // on that core without saying why. It must name the data instead.
+    TEST_CASE("Test_Gap_By_Fringing_Factor_Refuses_A_Column_Shorter_Than_The_Residual_Gap", "[physical-model][reluctance][gap][residual-gap]") {
+        auto reluctanceModel = ReluctanceModel::factory(ReluctanceModels::ZHANG);
+        auto core = OpenMagneticsTesting::get_quick_core("E 42/21/20", OpenMagneticsTesting::get_ground_gap(0.5e-3));
+        auto processedDescription = core.get_processed_description().value();
+        auto columns = processedDescription.get_columns();
+        for (auto& column : columns) {
+            if (column.get_type() == ColumnType::CENTRAL) {
+                column.set_height(Constants().residualGap / 2);
+            }
+        }
+        processedDescription.set_columns(columns);
+        core.set_processed_description(processedDescription);
+        CHECK_THROWS_AS(reluctanceModel->get_gapping_by_fringing_factor(core, 1.2), InvalidInputException);
+    }
+
     TEST_CASE("Test_Reluctance_3C96", "[physical-model][reluctance][smoke-test]") {
         double dcCurrent = 10;
         double ambientTemperature = 50;
@@ -467,6 +486,26 @@ namespace {
         REQUIRE(calculatedReluctanceAt50 > calculatedReluctanceAt100);
         REQUIRE(calculatedReluctanceAt150 > calculatedReluctanceAt100);
         REQUIRE(calculatedReluctanceAt150 > calculatedReluctanceAt200);
+    }
+
+    // ABT #1766: the ungapped ferrite reluctance of a rectangular-limbed core is its 2D field-solve value. IEC 60205
+    // books every limb-to-yoke corner as pi/4 squares of mean area, which put these cores 5.9-7.7 % above OMFEM 2D
+    // (ungapped runs, 1/L_m with only the residual gaps subtracted); the exact Schwarz-Christoffel bend brings them
+    // within 0.3 %. C1 = R_core * mu0 * mu_r = le / Ae, so le itself must carry it. References (1/m, OMFEM 2D):
+    // E 42/21/20 393.88, E 64/10/50 (planar E) 144.50, U 100/57/25 485.46.
+    TEST_CASE("Test_Reluctance_Ungapped_Rectangular_Limb_Cores_Match_OMFEM", "[physical-model][reluctance][smoke-test]") {
+        auto reluctanceModel = ReluctanceModel::factory(ReluctanceModels::ZHANG);
+        double mu0 = Constants().vacuumPermeability;
+        for (auto [shapeName, omfemC1] : std::vector<std::pair<std::string, double>>{
+                 {"E 42/21/20", 393.88}, {"E 64/10/50", 144.50}, {"U 100/57/25", 485.46}}) {
+            INFO(shapeName);
+            auto core = OpenMagneticsTesting::get_quick_core(shapeName, json::array());
+            auto effectiveParameters = core.get_processed_description()->get_effective_parameters();
+            double c1FromEffectiveParameters = effectiveParameters.get_effective_length() / effectiveParameters.get_effective_area();
+            double c1FromReluctance = reluctanceModel->get_ungapped_core_reluctance(core, 1.0) * mu0;
+            CHECK_THAT(c1FromEffectiveParameters, Catch::Matchers::WithinRel(omfemC1, 0.005));
+            CHECK_THAT(c1FromReluctance, Catch::Matchers::WithinRel(omfemC1, 0.005));
+        }
     }
 
     TEST_CASE("Test_Web_0", "[physical-model][reluctance][gap][bug][smoke-test]") {

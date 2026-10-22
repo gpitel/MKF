@@ -25,6 +25,13 @@ namespace OpenMagnetics {
 std::vector<double> design_turns_ratios(const Inputs& inputs);
 std::vector<IsolationSide> design_isolation_sides(const Inputs& inputs, Magnetic* magnetic);
 
+// Key of the per-advise inductance/flux cache (cache_inductance_flux): the reference plus what
+// the inductance and flux depend on that a candidate can change without changing its reference
+// (turns of every winding, every gap length, the core material). Keyed on the reference alone, a
+// candidate whose turns or gap an adviser step moved (the loss-optimal turns) read the flux of
+// its earlier design.
+std::string inductance_flux_cache_key(const Magnetic& magnetic);
+
 class MagneticFilter {
     public: 
         static std::shared_ptr<MagneticFilter> factory(MagneticFilters filterName, std::optional<Inputs> inputs = std::nullopt);
@@ -39,6 +46,97 @@ class MagneticFilter {
         // filter -- never a made-up one -- and ranks the part on the filters that do apply to it.
         // Filters that can read their answer from the datasheet override this.
         virtual bool applies_to(Magnetic* magnetic) const { return magnetic->has_core() && magnetic->has_coil(); }
+
+        // Why the core losses of `magnetic` cannot be evaluated at all, or nullopt when they can: its
+        // core material carries no core-loss data any model can run (e.g. `volumetricLosses: {}`).
+        // Such a part is outside what every filter built on core losses can say -- they do not apply
+        // to it (MagneticFilterCoreLossesBased) -- and the catalogue adviser flags it with this
+        // reason instead of aborting the search on it or dropping it. Nullopt for a part without a
+        // core: that is the datasheet-only case, which applies_to already answers.
+        static std::optional<std::string> core_losses_not_evaluable_reason(Magnetic* magnetic);
+
+        // Whether evaluating this filter computes core losses at the operating points. The catalogue
+        // adviser applies its loss-model frequency-span gate (MagneticFilterLossModelFrequencySpan)
+        // only when some filter of the flow, or its final simulation, computes them: a flow that
+        // computes no losses has no reason to exclude a part for its loss fit (ABT #1679).
+        virtual bool computes_core_losses() const { return false; }
+
+        // The requirement frequencies this filter judged `magnetic` on, or nullopt for a filter
+        // whose requirement is not frequency-wise. A filter that skips the points its data cannot
+        // evaluate (MagneticFilterImpedance outside the material's mu(f) range) lists only the
+        // points it judged, so the caller can say what the ranking rests on.
+        virtual std::optional<std::vector<double>> get_judged_frequencies(Magnetic* magnetic, Inputs* inputs) const { return std::nullopt; }
+
+        // The subset of get_judged_frequencies judged on the part's own measured data instead of the
+        // model (MagneticFilterImpedance: points outside the material's mu(f) range judged on the
+        // datasheet common-mode |Z|), or nullopt for a filter whose requirement is not frequency-wise.
+        virtual std::optional<std::vector<double>> get_measured_frequencies(Magnetic* magnetic, Inputs* inputs) const { return std::nullopt; }
+
+        // A copy of `magnetic` whose coil carries every winding the inputs excite. At the core
+        // stage a multi-winding candidate carries a one-winding stand-in coil; the windings it
+        // lacks are added exactly as the core adviser completes its results (correct_windings:
+        // turns from the turns ratios, each winding's parallels sized to its own current). A
+        // coil that already has every winding is returned as is, except a stand-in (its bobbin
+        // still a name): the common-mode choke stand-in carries every winding, but only the first
+        // has its seeded turns (the others hold the placeholder 1), so it is completed the same
+        // way. One with more windings than the inputs excite throws.
+        // The added windings' parallels are sized to their current unless the application is
+        // interference suppression, the rule the core and magnetic advisers apply (ABT #1822).
+        static Magnetic with_every_winding(const Magnetic& magnetic, const Inputs& inputs, MAS::MagneticApplication application);
+        // True when with_every_winding has windings to add or re-derive on this candidate.
+        static bool lacks_windings(const Magnetic& magnetic, const Inputs& inputs);
+
+        // Conducting area of the round conductor whose own effective current density for
+        // `current` is maximumEffectiveCurrentDensity: log bisection between rms / maximum (the
+        // effective density is never below the DC one) and upperArea (a conductor known to be
+        // enough). Throws when the current has no processed rms.
+        static double get_conducting_area_for_current(const SignalDescriptor& current, double upperArea, double temperature,
+                                                      double maximumEffectiveCurrentDensity);
+
+        // A copy of a stand-in `magnetic` whose single-strand windings carry their current with
+        // copper to spare (one stand-in strand, two skin depths: 18.6 mm at 50 Hz, below the
+        // maximum effective current density at every operating point) are wound with a round
+        // conductor the coil stage could pick: at least the copper MagneticFilterWindowCopperCapacity
+        // counts (get_conducting_area_for_current), at most the strand, and as thick as the window
+        // holds (filled at the capacity screen's utilisation, then the largest that fast_wind lays
+        // out as whole layers). The core-stage losses and temperature then lay out and score copper
+        // the coil stage can wind, not a strand no window can hold, nor the thinnest wire allowed
+        // (a 32 A PFC choke at 12 A/mm2 dissipates ~200 W in its copper). Windings needing more
+        // than one strand get more parallels of it by the same window-filling scale. With
+        // fillWindow false only the spare strands are replaced, by the minimum copper (no layout
+        // is tried). The coil must carry every winding the inputs excite.
+        static Magnetic with_copper_sized_to_current(const Magnetic& magnetic, const Inputs& inputs, double maximumEffectiveCurrentDensity,
+                                                     bool fillWindow = true);
+
+        // A copy of `magnetic` whose windings' parallel strands are merged into one round
+        // conductor of their copper area (same turns, same copper, one bundle): the coil the
+        // core-stage thermal network is solved on, one node per merged turn.
+        static Magnetic with_merged_strands(const Magnetic& magnetic, double temperature);
+};
+
+// Completes each candidate's one-winding stand-in coil with the windings the inputs excite
+// (turns from the requirement turns ratios, parallels sized to each winding's current).
+// sizeParallelsToCurrent: each added winding's parallels are sized to its own current. The core
+// and magnetic advisers and MagneticFilter::with_every_winding pass "the application is not
+// interference suppression" (ABT #126, ABT #1822).
+void correct_windings(std::vector<std::pair<Magnetic, double>> *magneticsWithScoring, const Inputs& inputs, bool sizeParallelsToCurrent);
+
+// A filter whose verdict is built on the core losses. It applies to what MagneticFilter does, and
+// only when the core material has a core-loss model: for a part whose material has none it records
+// no score (never a stand-in loss), and the part is ranked on the filters that do apply.
+class MagneticFilterCoreLossesBased : public MagneticFilter {
+    public:
+        bool applies_to(Magnetic* magnetic) const override {
+            return MagneticFilter::applies_to(magnetic) && !core_losses_not_evaluable_reason(magnetic);
+        }
+        bool computes_core_losses() const override { return true; }
+        // The adviser's application. A filter that completes a stand-in coil from the turns ratios
+        // needs it to size the added windings as the adviser does (ABT #1822); it is not derived
+        // from the excitation, and completing a stand-in without it throws.
+        void set_application(MAS::MagneticApplication value) { _application = value; }
+    protected:
+        std::optional<MAS::MagneticApplication> _application;
+        Magnetic complete_stand_in(const Magnetic& magnetic, const Inputs& inputs) const;
 };
 
 class MagneticFilterAreaProduct : public MagneticFilter {
@@ -58,6 +156,81 @@ class MagneticFilterAreaProduct : public MagneticFilter {
         MagneticFilterAreaProduct(Inputs inputs);
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
         double get_estimated_area_product_required(Inputs inputs);
+        // The required area product reads the flux density from the material's loss model at each
+        // operating frequency.
+        bool computes_core_losses() const override { return true; }
+        // The share of a core's winding window the bobbin leaves to the winding: the bobbin
+        // model's factor for bobbin-wound cores, the inner-to-outer circumference rule for
+        // toroids, 1 for printed windings.
+        static double get_bobbin_filling_factor(const Core& core, std::optional<WiringTechnology> wiringTechnology);
+};
+
+/**
+ * @class MagneticFilterWindowCopperCapacity
+ * @brief Core-stage copper screen: can the winding window hold the copper of every winding?
+ *
+ * At the core stage a candidate carries a one-winding stand-in coil; the other windings
+ * follow from the turns ratios. Each winding needs, per turn, the strands of the stand-in's
+ * wire (two skin depths, the finest round strand the wire adviser's litz is built from)
+ * that keep its effective current density at or below the maximum
+ * (the effective current density of one strand over the maximum, rounded up). When one
+ * strand is more than enough (always at line frequency, where two skin depths are
+ * centimetres) the coil stage can pick a thinner wire, so only that fraction of a strand is
+ * counted. The window holds that copper at the utilisation MagneticFilterAreaProduct sizes
+ * cores with: the round-wire filling factor of each winding's conductor times the bobbin
+ * filling factor. A core whose
+ * window cannot hold all windings' copper cannot be wound by the coil stage within its
+ * current-density limit, whatever wire it picks, and is rejected here with its numbers.
+ * This is a necessary condition only (litz of the finest strands at the bobbin's best fill):
+ * it never rejects a core the coil stage could wind.
+ * Printed windings are not screened: their copper is the PCB's, not strands in a window.
+ */
+class MagneticFilterWindowCopperCapacity : public MagneticFilter {
+    private:
+        std::vector<double> _turnsRatios;
+        double _temperature = 0;
+        double _maximumEffectiveCurrentDensity = 0;
+        std::string _lastReason;
+        // Copper area of the conductor sized to one winding's current, by (strand diameter, winding, operating point).
+        std::map<std::tuple<double, size_t, size_t>, double> _conductorAreaCache;
+    public:
+        MagneticFilterWindowCopperCapacity() {};
+        MagneticFilterWindowCopperCapacity(Inputs inputs, double maximumEffectiveCurrentDensity);
+        std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        // Why the last evaluated candidate was rejected (empty when it passed).
+        const std::string& get_last_reason() const { return _lastReason; }
+        static bool applies_to(const Inputs& inputs);
+};
+
+/**
+ * @class MagneticFilterWireWithinLimits
+ * @brief Can every winding of a completed coil get a wire within the coil stage's limits?
+ *
+ * The window copper capacity is necessary, not sufficient: the coil stage gives each winding a
+ * section of the window (CoilAdviser::get_advised_sections) and looks for a wire that carries
+ * the winding's current at or below the maximum effective current density with at most the
+ * maximum number of parallels and fits that section (WireAdviser, with litz synthesis, as the
+ * coil stage runs it). A 2-turn 33 A secondary in half an E 20 window found no such wire, so
+ * every coil the coil stage made for that core came back INVALID. This filter runs that same
+ * search for each winding on each pattern the coil stage would try, at its fewest repetitions
+ * and without margin tape (the roomiest sections): a core where no pattern gives every winding
+ * a wire is rejected, naming the winding. The candidate's coil must carry every winding.
+ */
+class CoilAdviser;
+class WireAdviser;
+class MagneticFilterWireWithinLimits : public MagneticFilter {
+    private:
+        double _maximumEffectiveCurrentDensity = 0;
+        int _maximumNumberParallels = 0;
+        std::string _lastReason;
+        std::shared_ptr<CoilAdviser> _coilAdviser;
+        std::shared_ptr<WireAdviser> _wireAdviser;
+        // The wires the coil stage advises from (CoilAdviser::get_catalogue_wires), built once.
+        std::optional<std::vector<Wire>> _catalogueWires;
+    public:
+        MagneticFilterWireWithinLimits(double maximumEffectiveCurrentDensity, int maximumNumberParallels);
+        std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        const std::string& get_last_reason() const { return _lastReason; }
 };
 
 class MagneticFilterEnergyStored : public MagneticFilter {
@@ -73,10 +246,63 @@ class MagneticFilterEnergyStored : public MagneticFilter {
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 };
 
+// Unit-cost basis of the COST filter: US$ per piece at a 1000-piece production quantity. Every value
+// carries the source it was read from; a quantity with no source is marked as an assumption.
+struct CostBasis {
+    // Refined copper, LME cash settlement US$14,737/t on 2026-09-08 (Cochilco, reported by Reporte Minero,
+    // https://www.reporteminero.cl/noticia/noticias/2026/09/precio-cobre-nuevo-record-alza-lme-septiembre-2026).
+    // The magnet-wire conversion premium over refined copper has no source yet and is not added.
+    double copperPricePerKg = 14.737;
+    // Litz strand premium per unit copper mass, C_m(d) = 1 + k1/d^6 + k2/d^2: Sullivan, "Cost-constrained
+    // selection of strand diameter and number in a litz-wire transformer winding", IEEE TPEL 16(2) 2001,
+    // eq. 4, with the constants refit to newer prices in Sullivan & Zhang, "Simplified design method for
+    // litz wire", APEC 2014 (https://www.ryz.web.illinois.edu/pdf/simplitz_apec2014.pdf).
+    double litzK1 = 6e-26;   // m^6
+    double litzK2 = 2.7e-9;  // m^2
+    // Labour rate: Mexico, semi-skilled, fully loaded, US$7.27/h (Tetakawi, 2026, a shelter-services vendor).
+    double laborRatePerHour = 7.27;
+    // Winding time: 1.05 min for a 2 x 5-turn machine-assisted toroid (Kamil et al., IJIM 2021), i.e.
+    // 0.105 min per turn. ASSUMPTION (unsourced): the time scales linearly with the number of turns and
+    // applies to bobbin winding too.
+    double windingMinutesPerTurn = 0.105;
+    // Winding is 50 % of the labour (termination 40 %, encapsulation 10 %): US patent 5,781,091 (1995).
+    double windingShareOfLabour = 0.5;
+    // Core price per set (or per toroid) as a power law of the core mass, price = c * mass^k (US$, kg),
+    // one law per MAS material type and materialComposition, keyed "type/composition" (e.g. "ferrite/MnZn",
+    // "powder/FeSiAl"; a "proprietary" composition adds the manufacturer, e.g. "powder/proprietary/Micrometals",
+    // since the word names no alloy). Price does not
+    // scale with mass: small cores cost several times more per kg, so a flat US$/kg misprices them. The
+    // values are fitted where they are set. A composition with no fitted law throws.
+    struct PowerLaw {
+        double coefficient;  // c, US$ for a 1 kg core
+        double exponent;     // k
+    };
+    std::map<std::string, PowerLaw> corePrice;
+};
+
+struct CostBreakdown {
+    // Empty when the core has no price law (its material has no composition, or no law is fitted for its
+    // type and composition); coreUnpricedReason then says why. Never estimated.
+    std::optional<double> core;
+    double conductor;
+    double labour;
+    std::string coreUnpricedReason;
+    bool priced() const { return core.has_value(); }
+    // The unit cost; throws for an unpriced core, whose cost is unknown.
+    double total() const;
+};
+
 class MagneticFilterCost : public MagneticFilter {
     public:
         MagneticFilterCost() {};
+        explicit MagneticFilterCost(CostBasis basis) : _basis(std::move(basis)) {};
+        // Scores the unit cost in US$. A core with no price law is not dropped and not estimated: it returns
+        // {false, 0}, which a non-strict adviser flow ranks worst for cost (the ABT #801 failed-scoring rule).
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        CostBreakdown calculate_cost(Magnetic& magnetic) const;
+        static CostBasis default_basis();
+    private:
+        std::optional<CostBasis> _basis;
 };
 
 class MagneticFilterEstimatedCost : public MagneticFilter {
@@ -93,7 +319,7 @@ class MagneticFilterEstimatedCost : public MagneticFilter {
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 };
 
-class MagneticFilterCoreAndDcLosses : public MagneticFilter {
+class MagneticFilterCoreAndDcLosses : public MagneticFilterCoreLossesBased {
     private:
         MagnetizingInductance _magnetizingInductance;
         WindingOhmicLosses _windingOhmicLosses;
@@ -109,7 +335,7 @@ class MagneticFilterCoreAndDcLosses : public MagneticFilter {
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 };
 
-class MagneticFilterCoreDcAndSkinLosses : public MagneticFilter {
+class MagneticFilterCoreDcAndSkinLosses : public MagneticFilterCoreLossesBased {
     private:
         MagnetizingInductance _magnetizingInductance;
         WindingOhmicLosses _windingOhmicLosses;
@@ -124,9 +350,14 @@ class MagneticFilterCoreDcAndSkinLosses : public MagneticFilter {
         MagneticFilterCoreDcAndSkinLosses(Inputs inputs);
         MagneticFilterCoreDcAndSkinLosses(Inputs inputs, std::map<std::string, std::string> models);
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        // A multi-winding candidate still carrying its one-winding stand-in coil: core losses plus
+        // the DC and skin-effect losses of EVERY winding, on the coil completed from the turns
+        // ratios (with_every_winding) and fast-wound. No turns sweep (the ratios fix the turns)
+        // and the candidate keeps its stand-in coil.
+        std::pair<bool, double> evaluate_stand_in_with_every_winding(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 };
 
-class MagneticFilterLosses : public MagneticFilter {
+class MagneticFilterLosses : public MagneticFilterCoreLossesBased {
     private:
         std::map<std::string, std::string> _models;
         MagneticSimulator _magneticSimulator;
@@ -136,7 +367,7 @@ class MagneticFilterLosses : public MagneticFilter {
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 };
 
-class MagneticFilterLossesNoProximity : public MagneticFilter {
+class MagneticFilterLossesNoProximity : public MagneticFilterCoreLossesBased {
     private:
         std::map<std::string, std::string> _models;
         WindingOhmicLosses _windingOhmicLosses;
@@ -199,7 +430,9 @@ class MagneticFilterCoreMinimumImpedance : public MagneticFilter {
         // Rank the catalogue with the fast model; analyse the chosen design with the full one.
         Impedance _impedanceModel{/*fastCapacitance=*/true};
     public:
-        MagneticFilterCoreMinimumImpedance() {};
+        // The filter selects parts on data: the complex permeability only inside the material's
+        // tabulated range, as before the estimator existed (ABT #1861, proposal D5).
+        MagneticFilterCoreMinimumImpedance() { _impedanceModel.set_tabulated_complex_permeability_only(true); };
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 };
 
@@ -240,10 +473,38 @@ class MagneticFilterLayerParity : public MagneticFilter {
 };
 
 class MagneticFilterAreaWithParallels : public MagneticFilter {
+    private:
+        // ABT #1699: wires the real winder refused in the strict pass (real winding on only).
+        size_t _realWindingRefusals = 0;
+        std::string _firstRealWindingRefusal;
     public:
         MagneticFilterAreaWithParallels() {};
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
         std::pair<bool, double> evaluate_magnetic(Winding winding, Section section, double numberSections, double sectionArea, bool allowNotFit);
+        size_t get_real_winding_refusals() const { return _realWindingRefusals; }
+        const std::string& get_first_real_winding_refusal() const { return _firstRealWindingRefusal; }
+};
+
+/**
+ * @class MagneticFilterRealWinding
+ * @brief Does the real winder build this wound magnetic as it is stored? (ABT #1699)
+ *
+ * A coil an adviser returns is stored and rebuilt downstream from its JSON with real winding
+ * geometry (the web's 3D view, MVB++ magnetic_autocomplete_safe). This filter asks the real
+ * winder itself, through real_winding_refusal: the magnetic rebuilt from its stored form (its
+ * functional and section description; layers and turns are laid out again) must
+ * wind, apply its connection blocking and keep every turn inside the winding window. The
+ * refusal the real winder gives is kept as the last reason. Planar coils have no real-winding
+ * model (ABT #492): evaluating one throws.
+ */
+class MagneticFilterRealWinding : public MagneticFilter {
+    private:
+        std::string _lastReason;
+    public:
+        MagneticFilterRealWinding() {};
+        std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        // Why the last evaluated magnetic was refused (empty when it passed).
+        const std::string& get_last_reason() const { return _lastReason; }
 };
 
 class MagneticFilterEffectiveResistance : public MagneticFilter {
@@ -303,18 +564,31 @@ class MagneticFilterWindability : public MagneticFilter {
  * Only the Steinmetz family (Steinmetz, iGSE, ciGSE, Barg, Albach, MSE, NSE) has a declared span. The other
  * methods (Magnetics / Micrometals / Poco / TDG closed forms, Roshen, loss factor) declare none in the
  * schema, so a material evaluated with one of them always passes.
+ *
+ * With Settings::allowMaterialDataExtrapolation on (explicit opt-in, off by default) the span does not
+ * gate: the losses are evaluated outside it and every such evaluation logs a WARNING. Never under an
+ * adviser (ABT #1652): while any adviser object exists the flag reads false and the span gates as usual.
  */
 class MagneticFilterLossModelFrequencySpan : public MagneticFilter {
     public:
         MagneticFilterLossModelFrequencySpan() {};
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
-        // Needs only the core's material, so it judges parts without a coil too.
-        bool applies_to(Magnetic* magnetic) const override { return magnetic->has_core(); }
+        // Needs only the core's material, so it judges parts without a coil too. A material with no
+        // core-loss model at all has no span to judge: the loss filters do not apply to it
+        // (core_losses_not_evaluable_reason) and the catalogue adviser flags the part, rather than
+        // this gate dropping it.
+        bool applies_to(Magnetic* magnetic) const override { return magnetic->has_core() && !core_losses_not_evaluable_reason(magnetic); }
         // The same verdict for a bare material. `model` is the caller's requested core loss model; like
         // CoreLosses, it heads the settings' model order and the first model the material supports is
-        // the one judged. A material no model can evaluate is not evaluable (false).
+        // the one judged. A material no model can evaluate is not evaluable (false). When the Settings
+        // carry an explicitly requested model (ABT #1497), a material that cannot run that model, or
+        // not at every operating frequency, is not evaluable either.
         static bool is_material_evaluable(const CoreMaterial& material, const Inputs& inputs,
                                           std::optional<CoreLossesModels> model = std::nullopt);
+        // Why the material is not evaluable (the model, its fitted span and the operating frequencies
+        // outside it), or nullopt when it is. is_material_evaluable is its negation.
+        static std::optional<std::string> material_not_evaluable_reason(const CoreMaterial& material, const Inputs& inputs,
+                                                                        std::optional<CoreLossesModels> model = std::nullopt);
 };
 
 class MagneticFilterSolidInsulationRequirements : public MagneticFilter {
@@ -410,8 +684,41 @@ class MagneticFilterDatasheetLimits : public MagneticFilter {
 
 class MagneticFilterImpedance : public MagneticFilter {
     public:
+        // Measured common-mode |Z| of a part, (frequency Hz, |Z| Ohm), strictly increasing in frequency.
+        using MeasuredImpedanceCurve = std::vector<std::pair<double, double>>;
+
         MagneticFilterImpedance() {};
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        // The minimumImpedance frequencies the filter judges: those inside the core material's
+        // tabulated mu(f) range (judged on the model), and those outside it but inside the part's
+        // measured common-mode |Z| curve (judged on the measurement). Nullopt without a
+        // minimumImpedance requirement.
+        std::optional<std::vector<double>> get_judged_frequencies(Magnetic* magnetic, Inputs* inputs) const override;
+        // The judged frequencies judged on the measured curve (outside the material's mu(f) range).
+        std::optional<std::vector<double>> get_measured_frequencies(Magnetic* magnetic, Inputs* inputs) const override;
+
+        // The part's zero-bias common-mode |Z| from its datasheet: the impedancePoints of the
+        // manufacturerInfo.datasheetInfo.electrical entry with subtype commonModeChoke, keeping only
+        // the points without a DC-bias current (or with current 0). Nullopt when the part carries
+        // none. Throws InvalidDatasheetImpedanceException on a malformed point, two values at one
+        // frequency, or more than one zero-bias curve (several entries, or per-winding curves).
+        static std::optional<MeasuredImpedanceCurve> get_measured_impedance_curve(const Magnetic& magnetic);
+        // |Z| at `frequency` from the measured curve: linear interpolation of log|Z| against log f
+        // between the two bracketing measured points (the point itself when measured there). Throws
+        // outside the measured frequency range: the curve is never extrapolated.
+        static double interpolate_measured_impedance(const MeasuredImpedanceCurve& curve, double frequency);
+
+    private:
+        // Per requirement point: judged on the model (inside the material's mu(f) range), on the
+        // measured curve (outside it, inside the curve's range), or not judged.
+        enum class ImpedanceSource { MODEL, MEASURED, NOT_JUDGED };
+        struct RequirementCoverage {
+            std::vector<ImpedanceSource> sources;  // one per minimumImpedance point, in order
+            std::optional<MeasuredImpedanceCurve> measuredCurve;
+            double minimumMaterialFrequency;
+            double maximumMaterialFrequency;
+        };
+        static RequirementCoverage classify_requirement(Magnetic* magnetic, Inputs* inputs);
 };
 
 class MagneticFilterMagnetizingInductance : public MagneticFilter {
@@ -498,7 +805,7 @@ class MagneticFilterFringingFactor : public MagneticFilter {
  * the model and the search). The returned score is the estimated mean total loss (W) of
  * the pair it settled on, 0 when the candidate is outside its scope.
  */
-class MagneticFilterInductorTurnsAndGapByLosses : public MagneticFilter {
+class MagneticFilterInductorTurnsAndGapByLosses : public MagneticFilterCoreLossesBased {
     private:
         std::map<std::string, std::string> _models;
         MagnetizingInductance _magnetizingInductance;
@@ -553,7 +860,7 @@ class MagneticFilterHeight : public MagneticFilter {
         bool applies_to(Magnetic* magnetic) const override;
 };
 
-class MagneticFilterTemperatureRise : public MagneticFilter {
+class MagneticFilterTemperatureRise : public MagneticFilterCoreLossesBased {
     private:
         MagneticFilterLossesNoProximity _magneticFilterLossesNoProximity;
     public:
@@ -561,13 +868,13 @@ class MagneticFilterTemperatureRise : public MagneticFilter {
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 };
 
-class MagneticFilterLossesTimesVolume : public MagneticFilter {
+class MagneticFilterLossesTimesVolume : public MagneticFilterCoreLossesBased {
     public:
         MagneticFilterLossesTimesVolume() {};
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 };
 
-class MagneticFilterVolumeTimesTemperatureRise : public MagneticFilter {
+class MagneticFilterVolumeTimesTemperatureRise : public MagneticFilterCoreLossesBased {
     private:
         MagneticFilterTemperatureRise _magneticFilterTemperatureRise;
     public:
@@ -575,7 +882,7 @@ class MagneticFilterVolumeTimesTemperatureRise : public MagneticFilter {
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 };
 
-class MagneticFilterLossesTimesVolumeTimesTemperatureRise : public MagneticFilter {
+class MagneticFilterLossesTimesVolumeTimesTemperatureRise : public MagneticFilterCoreLossesBased {
     private:
         MagneticFilterTemperatureRise _magneticFilterTemperatureRise;
     public:
@@ -583,7 +890,7 @@ class MagneticFilterLossesTimesVolumeTimesTemperatureRise : public MagneticFilte
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 };
 
-class MagneticFilterLossesNoProximityTimesVolume : public MagneticFilter {
+class MagneticFilterLossesNoProximityTimesVolume : public MagneticFilterCoreLossesBased {
     private:
         MagneticFilterLossesNoProximity _magneticFilterLossesNoProximity;
     public:
@@ -591,7 +898,7 @@ class MagneticFilterLossesNoProximityTimesVolume : public MagneticFilter {
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 };
 
-class MagneticFilterLossesNoProximityTimesVolumeTimesTemperatureRise : public MagneticFilter {
+class MagneticFilterLossesNoProximityTimesVolumeTimesTemperatureRise : public MagneticFilterCoreLossesBased {
     private:
         MagneticFilterTemperatureRise _magneticFilterTemperatureRise;
         MagneticFilterLossesNoProximity _magneticFilterLossesNoProximity;
@@ -614,17 +921,41 @@ class MagnetomotiveForce : public MagneticFilter {
 //         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
 // };
 
-class MagneticFilterTemperature : public MagneticFilter {
+/**
+ * @class MagneticFilterTemperature
+ * @brief Core-stage temperature gate: the ThermalNetwork's hottest point at each operating point.
+ *
+ * The solve carries the core losses AND the copper: the DC and skin-effect losses of every
+ * winding, on the candidate's coil completed from the turns ratios (with_every_winding) and
+ * fast-wound, per turn. It used to solve the core alone, so a transformer whose copper dominates
+ * (a 10 kW PSFB) looked cool here and every candidate then failed hot after the 8-12 s coil
+ * stage. Proximity losses are not included (they need the coil stage's real layout), so the
+ * estimate is still a lower bound on the final temperature. PQI / UI shapes, whose integrated
+ * windings fast_wind() does not lay out, are solved core-only (the loss filters' policy).
+ */
+class MagneticFilterTemperature : public MagneticFilterCoreLossesBased {
     double _maximumTemperature = 130.0;
     // Orchestrator, not a fixed model: selects per material from its available
     // volumetric-losses methods (Steinmetz family, proprietary, loss factor)
     CoreLosses _coreLosses;
     MagnetizingInductance _magnetizingInductance;
+    WindingOhmicLosses _windingOhmicLosses;
+    WindingSkinEffectLosses _windingSkinEffectLosses;
+    bool _sizeStandInCopper = false;
 public:
     MagneticFilterTemperature() {};
     MagneticFilterTemperature(Inputs inputs, double maximumTemperature);
+    // The core adviser's candidates carry a placeholder stand-in coil: their copper is laid out
+    // and scored as the coil stage could wind it (with_copper_sized_to_current). Off by default:
+    // a real coil is solved with its own wires.
+    void set_size_stand_in_copper(bool value) { _sizeStandInCopper = value; }
     std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs,
                                               std::vector<Outputs>* outputs = nullptr);
+    // ABT #1802: the gate's verdict on a part whose losses have been solved at their operating
+    // temperature (MagneticSimulator::calculate_core_losses): the hottest point over the
+    // operating points, as that solve published it in each Outputs' temperature, against the
+    // limit. Throws when an operating point carries no solved temperature.
+    std::pair<bool, double> evaluate_solved_outputs(const std::vector<Outputs>& outputs) const;
 };
 
 // // Nice to have in the future

@@ -12,6 +12,156 @@ namespace OpenMagnetics {
 // SurfaceOrientation is now defined in ThermalNode.h
 
 /**
+ * @brief Where a core material's heat conductivity came from (see
+ * resolve_core_material_heat_conductivity). Alf, 2026-10-11: "always keep an approved fallback; we
+ * should not lose temperature models because of this, there are too many materials with missing
+ * data" — so absence never throws; it walks these tiers, and every tier after MATERIAL is flagged.
+ */
+enum class CoreHeatConductivityTier {
+    MATERIAL,     // the material's own MAS value
+    CLASS,        // the sourced members of its class (material type + composition)
+    FAMILY,       // the sourced members of its broader family (ferrites; metal powders and alloys;
+                  // for a proprietary or missing composition, its material type)
+    ALL_SOURCED   // every sourced core material in MAS (last resort)
+};
+
+/**
+ * @brief How a heat conductivity that MAS does not carry was estimated.
+ */
+struct CoreHeatConductivityEstimate {
+    CoreHeatConductivityTier tier;
+    // The pool the estimate was drawn from, e.g. "class FERRITE MN_ZN", "ferrite family
+    // (material type FERRITE)", "metal family (material types POWDER, AMORPHOUS, ...)".
+    std::string pool;
+    // The pool members whose heatConductivity carries a provenance entry and fed the estimate.
+    std::vector<std::string> sourceMaterials;
+    // The documents those values come from.
+    size_t numberDocuments = 0;
+    // Independent data points after collapsing family values: a document that gives one value to
+    // all its grades is ONE point, a document that gives each grade its own value is one per grade.
+    size_t numberDataPoints = 0;
+    // Human-readable method: the median of N points, or the trend that was followed.
+    std::string method;
+    // Engaged when the estimate follows a statistically significant trend inside the CLASS (never
+    // in a broader pool): "density" (kg/m³) or "initialPermeability" (at the default ambient
+    // temperature). A trend is only followed INSIDE the predictor span of its sourced points.
+    std::optional<std::string> predictor;
+    std::optional<double> predictorValue;
+    std::optional<double> predictorMinimum;  // span of the predictor over the trend points
+    std::optional<double> predictorMaximum;
+    // Engaged when the class has a significant trend but the material lies outside its sourced
+    // span, so the class median was used instead; says which predictor, value and span.
+    std::optional<std::string> trendNotFollowedReason;
+};
+
+/**
+ * @brief A core material's heat conductivity in W/(m·K), where it came from, and whether it is
+ * backed by a document.
+ */
+struct CoreHeatConductivity {
+    double value;
+    CoreHeatConductivityTier tier;
+    // Tier MATERIAL only: the document a provenance entry cites for the material's own value.
+    // Disengaged for a value MAS carries without a source (e.g. Magnetics' powder values): it is
+    // still the material's value, but flagged unsourced (WARNING) and never pooled for others.
+    std::optional<std::string> source;
+    // Engaged if and only if MAS carries no heatConductivity for the material.
+    std::optional<CoreHeatConductivityEstimate> estimate;
+    bool is_estimated() const { return estimate.has_value(); }
+    bool is_unsourced() const { return tier == CoreHeatConductivityTier::MATERIAL && !source; }
+};
+
+/**
+ * @brief THE resolver of a core material's heat conductivity (thermal network, OMFEM, ...).
+ *
+ * Tiers, first that applies:
+ * 1. MATERIAL: MAS has heatConductivity: that value, collapsed with resolve_dimensional_values
+ *    (flagged unsourced, with a WARNING, when no provenance entry cites it).
+ * 2. CLASS: the sourced members of the same material type + composition. Follows density or
+ *    initial permeability only where the per-grade sourced data show a significant linear trend
+ *    (slope beyond its two-sided 95 % Student-t interval) AND the material lies inside the
+ *    predictor span of those data; otherwise the median of the class's data points.
+ * 3. FAMILY: the class has no sourced member (or the composition is proprietary or missing): the
+ *    median of the broader family — ferrites (material type FERRITE), metal powders and alloys
+ *    (every other material type) — or, for a proprietary or missing composition, of the
+ *    materials of the same material type.
+ * 4. ALL_SOURCED: the family has no sourced member: the median of every sourced core material.
+ * Only values a non-retracted provenance entry cites are pooled; every number comes from MAS at
+ * call time, nothing is hardcoded. Tiers 2-4 log a WARNING naming the material, tier, pool, number
+ * of materials/documents and method, once per material.
+ * Throws MaterialException(MATERIAL_INVALID_PROPERTY) only for MALFORMED data (a heatConductivity
+ * present but not a finite positive number, here or in a pooled material), and
+ * MATERIAL_DATA_MISSING only when MAS carries no sourced heatConductivity at all. Absence of the
+ * material's own value never throws.
+ */
+CoreHeatConductivity resolve_core_material_heat_conductivity(const CoreMaterial& coreMaterial);
+
+/**
+ * @brief Where a bobbin material's thermal conductivity came from (see
+ * resolve_bobbin_material_thermal_conductivity). ABT #1643, Alf 2026-10-18: bobbin plastics with
+ * no published conductivity take a class-based ESTIMATE, like the approved core-material one
+ * (ABT #1752/#1753), flagged as an estimate; MAS itself keeps only sourced values.
+ */
+enum class BobbinThermalConductivityTier {
+    MATERIAL,  // the material's own MAS value
+    CLASS      // the sourced data points of its polymer class (polymer + glass-fibre reinforcement)
+};
+
+/**
+ * @brief How a bobbin thermal conductivity that MAS does not carry was estimated.
+ */
+struct BobbinThermalConductivityEstimate {
+    // The class the material was put in from its MAS composition, e.g. "PA66, glass-fibre reinforced".
+    std::string polymerClass;
+    // The MAS insulation materials of that class whose thermalConductivity a provenance entry cites.
+    std::vector<std::string> sourceMaterials;
+    // The datasheet grades of that class cited in MKF (ThermalResistance.cpp), for classes MAS has
+    // no sourced member of.
+    std::vector<std::string> datasheetGrades;
+    // The documents all those values come from.
+    size_t numberDocuments = 0;
+    // Independent data points: a document giving one value to several grades is ONE point.
+    size_t numberDataPoints = 0;
+    // Human-readable method, e.g. "the median of its 2 sourced data points".
+    std::string method;
+};
+
+/**
+ * @brief A bobbin material's thermal conductivity in W/(m·K), where it came from, and whether it
+ * is backed by a document.
+ */
+struct BobbinThermalConductivity {
+    double value;
+    BobbinThermalConductivityTier tier;
+    // Tier MATERIAL only: the document a provenance entry cites for the material's own value.
+    // Disengaged for a value MAS carries without a source (PET, PBT today): it is still the
+    // material's value, but flagged unsourced (WARNING) and never pooled for others.
+    std::optional<std::string> source;
+    // Engaged if and only if MAS carries no thermalConductivity for the material.
+    std::optional<BobbinThermalConductivityEstimate> estimate;
+    bool is_estimated() const { return estimate.has_value(); }
+    bool is_unsourced() const { return tier == BobbinThermalConductivityTier::MATERIAL && !source; }
+};
+
+/**
+ * @brief THE resolver of a bobbin material's thermal conductivity (thermal network).
+ *
+ * 1. MATERIAL: MAS has thermalConductivity: that value (flagged unsourced, with a WARNING, when no
+ *    provenance entry cites it). Sourced data always wins.
+ * 2. CLASS: the polymer class is read from the material's MAS composition (PA66, PET/PBT
+ *    thermoplastic polyester, LCP, PPS, phenolic; glass-fibre reinforced or not), and the value is
+ *    the median of the class's data points: every MAS insulation material of the class whose
+ *    thermalConductivity a provenance entry cites, plus the datasheet grades of the class cited in
+ *    ThermalResistance.cpp. A WARNING names the material, class, pool, documents and method, once
+ *    per material.
+ * Throws MaterialException(MATERIAL_DATA_MISSING) when the class cannot be determined (no
+ * composition, or one naming no known polymer, or glass in a form other than fibre) or when the
+ * class has no sourced data point; MATERIAL_INVALID_PROPERTY when a value present is not a finite
+ * positive number. Never a built-in default.
+ */
+BobbinThermalConductivity resolve_bobbin_material_thermal_conductivity(const InsulationMaterial& material);
+
+/**
  * @brief Air and fluid properties for convection calculations
  */
 struct FluidProperties {
@@ -140,12 +290,24 @@ public:
     static double getWireMaterialThermalConductivity(const WireMaterial& wireMaterial, double temperature);
     
     /**
-     * @brief Get thermal conductivity from core material
+     * @brief Thermal conductivity of a core material, in W/(m·K): resolve_core_material_heat_conductivity(...).value.
      */
     static double getCoreMaterialThermalConductivity(const CoreMaterial& coreMaterial);
+
+    /**
+     * @brief Specific heat capacity of a core material, J/(kg·K)
+     *
+     * The material's own MAS heatCapacity when it has one; otherwise the approved fallback: the
+     * median heatCapacity over the MAS materials of the same materialComposition. Throws
+     * MATERIAL_DATA_MISSING when neither exists (no or proprietary composition, or no material of
+     * that composition carries the value). (Conductivity uses the tiered resolver instead.)
+     */
+    static double getCoreMaterialHeatCapacity(const CoreMaterial& coreMaterial);
     
     /**
-     * @brief Get thermal conductivity from insulation material
+     * @brief Thermal conductivity of an insulation material's own MAS record, W/(m·K); throws
+     * MATERIAL_DATA_MISSING when the record has none (bobbins go through
+     * resolve_bobbin_material_thermal_conductivity, which estimates from the polymer class).
      */
     static double getInsulationMaterialThermalConductivity(const InsulationMaterial& material);
     
@@ -166,6 +328,19 @@ public:
         }
     }
     
+    /**
+     * @brief View factor from the inner wall of an open cylinder (a toroid's bore) to its two
+     * end openings, i.e. to the room (ABT #1735).
+     *
+     * Closed form from the coaxial equal-disk view factor and reciprocity: with
+     * X = 2 + (H/r)^2, F_disk-disk = (X - sqrt(X^2 - 4)) / 2, each opening sees the wall with
+     * 1 - F_disk-disk, and A_wall F_wall-openings = 2 A_disk (1 - F_disk-disk) gives
+     * F = (r/H) (1 - F_disk-disk). The same expression OMFEM's thermal solver uses for the bore
+     * (ABT #1751). The rest of the wall's view, 1 - F, lands on the wall itself.
+     * Throws when the radius or the height is not positive.
+     */
+    static double calculateCylinderWallToOpeningsViewFactor(double radius, double height);
+
     // IMP-NEW-08: View-factor-aware radiation coefficient
     static double calculateRadiationCoefficientWithViewFactor(
         double surfaceTemperature, double ambientTemperature,

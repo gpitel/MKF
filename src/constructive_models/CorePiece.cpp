@@ -38,6 +38,9 @@ void CorePiece::process() {
             throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
                 "IEC 63182 effective parameters cannot be negative or 0");
         }
+        if (auto exactC1 = get_exact_shape_constant_c1()) {
+            le = exact_effective_length(exactC1.value(), Ae);
+        }
         EffectiveParameters ep;
         ep.set_effective_length(le);
         ep.set_effective_area(Ae);
@@ -53,12 +56,60 @@ void CorePiece::process() {
                 "Shape constants cannot be negative or 0");
         }
         EffectiveParameters ep;
-        ep.set_effective_length(pow(c1, 2) / c2);
-        ep.set_effective_area(c1 / c2);
-        ep.set_effective_volume(pow(c1, 3) / pow(c2, 2));
+        if (auto exactC1 = get_exact_shape_constant_c1()) {
+            double Ae = c1 / c2;
+            double le = exact_effective_length(exactC1.value(), Ae);
+            ep.set_effective_length(le);
+            ep.set_effective_area(Ae);
+            ep.set_effective_volume(le * Ae);
+        }
+        else {
+            ep.set_effective_length(pow(c1, 2) / c2);
+            ep.set_effective_area(c1 / c2);
+            ep.set_effective_volume(pow(c1, 3) / pow(c2, 2));
+        }
         ep.set_minimum_area(minimumArea);
         set_partial_effective_parameters(ep);
     }
+}
+
+// ABT #1766: le of a piece whose exact core factor C1 is known, at the Ae the selected standard gives.
+// Why Ae stays the standard's and only le moves:
+//  * le / Ae = C1 is the only constraint the reluctance (and so inductance) puts on the pair; any split gives the
+//    same L. With C1 exact, so is the linear stored energy and every loss that is quadratic in B:
+//    integral(B^2 dV) = Phi^2 * mu0 mu_r * R_core = Phi^2 * C1 = (Phi / Ae)^2 * le * Ae, whatever Ae is.
+//  * Ae is where B = Phi / Ae is read (saturation, Steinmetz). The corner fix changes no limb section, so the
+//    section that sets the flux density does not move: Ae stays the standard's l/A^2-weighted mean section (for
+//    an E core within a few % of the centre-leg area, and the value vendors publish).
+//  * Ve = le * Ae then follows, so B^2-quadratic core loss integrates to the exact field energy rather than the
+//    IEC corners' +6 %.
+// Equivalently C2 = C1 / Ae: the IEC C2 scaled by C1_exact / C1_IEC.
+double CorePiece::exact_effective_length(double exactC1, double effectiveArea) {
+    if (!(exactC1 > 0) || !(effectiveArea > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Exact core factor C1 (" + std::to_string(exactC1) + " 1/m) and effective area (" +
+            std::to_string(effectiveArea) + " m2) must be positive");
+    }
+    return exactC1 * effectiveArea;
+}
+
+// ABT #1766: excess reluctance of a right-angle bend joining two rectangular limbs of widths a and b, in squares
+// (divide by mu times the depth), with both straight arms measured from the a x b corner rectangle. The bend is the
+// L channel of the Schwarz-Christoffel map dz/dzeta = (b/pi) sqrt((zeta - q)/(zeta + 1)) / zeta, q = (a/b)^2 (the
+// re-entrant window corner at zeta = q, the core's outer corner at zeta = -1), the limb flux entering at zeta = 0
+// and leaving at infinity; the potential difference between the two far arms, less their straight lengths, is
+//     c(r) = (1/pi) [2 r atan(1/r) + (2/r) atan(r) - 2 ln(4 r / (1 + r^2))],   r = a / b,
+// symmetric in r <-> 1/r, c(1) = 1 - ln(4)/pi = 0.5587, where IEC 60205 books pi/4 = 0.785 for every corner.
+// Exact for an isolated bend; two bends one limb apart interact through the limb's first mode, exp(-pi l / a):
+// over every E / planar-E shape in MAS the composite is within 0.15 % of a finite-volume solve of the whole loop,
+// and within 0.3 % of OMFEM 2D (ungapped E 25/13/7, E 42/21/20, E 18/4/10, E 32/6/20, E 64/10/50, U 100/57/25).
+static double right_angle_bend_squares(double a, double b) {
+    if (!(a > 0) || !(b > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Core corner reluctance: limb widths must be positive, got " + std::to_string(a) + " and " + std::to_string(b));
+    }
+    double r = a / b;
+    return (2 * r * atan(1 / r) + 2 / r * atan(r) - 2 * log(4 * r / (1 + r * r))) / std::numbers::pi;
 }
 
 
@@ -168,10 +219,28 @@ class CorePieceE : public CorePiece {
         for (size_t i=0;i<L.size();++i){ le+=L[i]; sla+=L[i]/A[i]; }
         return {le, le/sla, *min_element(A.begin(),A.end())};
     }
+
+    // ABT #1766: the limbs of get_shape_constants (half centre post s, outer leg p, yoke h, window span w; areas
+    // 2 q x width because the piece is two mirrored half loops) with both corners as exact right-angle bends.
+    // Inherited by planar E and EF (same rectangular section); the round/shaped-post children override it back.
+    std::optional<double> get_exact_shape_constant_c1() override {
+        auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
+        double h = dimensions["B"] - dimensions["D"];
+        double q = dimensions["C"];
+        double s = dimensions["F"] / 2;
+        double p = (dimensions["A"] - dimensions["E"]) / 2;
+        double w = (dimensions["E"] - dimensions["F"]) / 2;
+        return (dimensions["D"] / p + w / h + dimensions["D"] / s +
+                right_angle_bend_squares(p, h) + right_angle_bend_squares(s, h)) / (2 * q);
+    }
 };
 
 class CorePieceEtd : public CorePieceE {
   public:
+    // ABT #1766: round centre post (ETD, ER, planar ER, EQ, EC, EER): a 3D path with no closed form, so le stays
+    // the standard's (IEC corners) -- ABT #1772. Deliberately NOT CorePieceE's exact rectangular path.
+    std::optional<double> get_exact_shape_constant_c1() override { return std::nullopt; }
+
     double get_lateral_leg_area() {
         auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
         double tetha;
@@ -270,6 +339,10 @@ class CorePieceEtd : public CorePieceE {
 
 class CorePieceEl : public CorePieceE {
   public:
+    // ABT #1766: oval / chamfered centre post (EL, planar EL, EFD): 3D path, le stays the standard's (ABT #1772).
+    // Deliberately NOT CorePieceE's exact rectangular path.
+    std::optional<double> get_exact_shape_constant_c1() override { return std::nullopt; }
+
     void process_winding_window() {
         auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
         WindingWindowElement windingWindow;
@@ -485,6 +558,10 @@ class CorePieceEq : public CorePieceEtd {};
 
 class CorePieceEp : public CorePieceE {
   public:
+    // ABT #1766: round post in a shaped back (EP, LP, EPX, EPQ, EPW, EPT, LEP): 3D path, le stays the standard's
+    // (ABT #1772). Deliberately NOT CorePieceE's exact rectangular path.
+    std::optional<double> get_exact_shape_constant_c1() override { return std::nullopt; }
+
     double get_lateral_leg_area() {
         auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
 
@@ -796,12 +873,53 @@ class CorePieceRm : public CorePiece {
         double a7;
         double a8 = alpha / 8 * (pow(d2, 2) - pow(d3, 2));
         if (familySubtype == "1") {
+            // IEC 60205:2016 clause 5.7, Figure 7 Type 1 (RM 6-S, RM 6/9): each wire slot is a V-notch of
+            // opening angle phi (gamma here) cut into the back plate. phi is not a tabulated dimension, so it
+            // comes from the IEC 62317-4 Figure 1 (Typ 1) dimensions: C runs between the two notch apexes
+            // (apex at C/2 on the slot axis) and G is the slot width between the leg tips, which sit on the
+            // J faces (at J/sqrt(2) - G/2 along the slot axis). A straight wall from apex to tip gives
+            // tan(phi/2) = (G/2) / (J/sqrt(2) - G/2 - C/2). The old phi = pi/2 put the apex 0.5 mm from the
+            // centre on RM 6, counting only 43 % of the back plate (A_e 12-20 % low; ABT #1950).
+            double apexToTip = a / sqrt(2) - e / 2 - c / 2;
+            if (!(apexToTip > 0)) {
+                throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                    "RM type 1 shape " + get_shape().get_name().value_or("<unnamed>") +
+                    ": slot apex (C/2) does not lie inside the leg tips (J/sqrt(2) - G/2), J/sqrt(2) - G/2 - C/2 = " +
+                    std::to_string(apexToTip));
+            }
+            gamma = 2 * atan(e / 2 / apexToTip);
             lmax = sqrt(1. / 4 * (pow(d2, 2) + pow(d3, 2)) - 1. / 2 * d2 * d3 * cos(alpha - beta));
             a7 = 1. / 4 *
                  (beta / 2 * pow(d2, 2) + 1. / 2 * pow(e, 2) * tan(beta) - 1. / 2 * pow(e, 2) * tan(alpha - gamma / 2) -
                   pi / 4 * pow(d3, 2));
         }
         else if (familySubtype == "2") {
+            // IEC 60205:2016 clause 5.7, Figure 7 Type 2 (RM 7, RM 7/10): each wire slot has a flat bottom of width
+            // b, square to the slot axis, and straight walls opening at angle phi (gamma here). Neither b nor phi is a
+            // tabulated dimension; both come from IEC 62317-4 Figure 1 (Typ 2). There C runs between the two slot
+            // bottoms (bottom at C/2 on the slot axis) and the corners of each bottom sit on the centre-post circle
+            // F, so b = sqrt(F^2 - C^2). The walls run from those corners to the leg tips on the J faces, where the
+            // slot is G wide (at J/sqrt(2) - G/2 along the slot axis), so
+            // tan(phi/2) = (G/2 - b/2) / (J/sqrt(2) - G/2 - C/2).
+            // The drawing shows a flat about 0.27 F wide, which the tables cannot reproduce: IEC 62317-4 Tables 1
+            // and 2 give C = F for RM 7 and RM 7/10, so b = 0 and phi = 102.8 deg. The old b = 0, phi = pi/2 gave
+            // A_e 4.6-8.7 % below IEC 62317-4 Tables 3/4; this gives 2.3-4.7 % below (ABT #1950).
+            if (d3 < c) {
+                throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                    "RM type 2 shape " + get_shape().get_name().value_or("<unnamed>") +
+                    ": centre-post diameter F (" + std::to_string(d3) + " m) is smaller than the slot-bottom distance C (" +
+                    std::to_string(c) + " m), so the slot-bottom corners cannot lie on the centre post");
+            }
+            b = sqrt(pow(d3, 2) - pow(c, 2));
+            double bottomToTip = a / sqrt(2) - e / 2 - c / 2;
+            double wallSpread = (e - b) / 2;
+            if (!(bottomToTip > 0) || !(wallSpread > 0)) {
+                throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                    "RM type 2 shape " + get_shape().get_name().value_or("<unnamed>") +
+                    ": slot walls cannot run from the slot bottom to the leg tips, J/sqrt(2) - G/2 - C/2 = " +
+                    std::to_string(bottomToTip) + " m, (G - b)/2 = " + std::to_string(wallSpread) + " m");
+            }
+            gamma = 2 * atan(wallSpread / bottomToTip);
             lmax = sqrt(1. / 4 * (pow(d2, 2) + pow(d3, 2)) - 1. / 2 * d2 * d3 * cos(alpha - beta)) -
                    b / (2 * sin(gamma / 2));
             a7 = 1. / 4 *
@@ -860,6 +978,16 @@ class CorePieceRm : public CorePiece {
             c2 += lengths_areas_2[i] / 2;
         }
         auto minimumArea = *min_element(areas.begin(), areas.end());
+
+        // A_e = C1/C2 is the (l/A^2)-weighted mean of the five segment areas. A_min is the smallest of
+        // A1, A3, A4, A5 (IEC 60205:2016 4.2), so A_e < A_min means the back-plate segment came out narrower
+        // than every one of them. No RM geometry does that; the type-1 slot model did before ABT #1950.
+        // Checked here, not in get_shape_constants_iec63182: the default IEC 60205 path only calls this.
+        if (minimumArea > c1 / c2 * (1 + 1e-9)) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "RM shape " + get_shape().get_name().value_or("<unnamed>") + ": minimum area " +
+                std::to_string(minimumArea) + " m2 exceeds effective area " + std::to_string(c1 / c2) + " m2");
+        }
 
         return {c1, c2, minimumArea};
     }
@@ -1685,6 +1813,26 @@ class CorePieceU : public CorePiece {
         return {c1, c2, minimumArea};
     }
 
+    // ABT #1766: the limbs of get_shape_constants (per piece: legs s and p of height D, yoke h of span E, one
+    // corner of each kind) with the corners as exact right-angle bends. UI overrides it with its own plate path.
+    std::optional<double> get_exact_shape_constant_c1() override {
+        auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
+        double h = dimensions["B"] - dimensions["D"];
+        double q = dimensions["C"];
+        double s;
+        double p;
+        if (dimensions.find("H") == dimensions.end() || (roundFloat(dimensions["H"]) == 0)) {
+            s = (dimensions["A"] - dimensions["E"]) / 2;
+            p = (dimensions["A"] - dimensions["E"]) / 2;
+        }
+        else {
+            s = dimensions["H"];
+            p = dimensions["A"] - dimensions["E"] - dimensions["H"];
+        }
+        return (dimensions["D"] / p + dimensions["E"] / h + dimensions["D"] / s +
+                right_angle_bend_squares(p, h) + right_angle_bend_squares(s, h)) / q;
+    }
+
     std::tuple<double, double, double> get_shape_constants_iec63182() override {
         auto [c1, c2, minimumArea] = get_shape_constants();
         double le = pow(c1, 2) / c2;
@@ -1875,9 +2023,11 @@ class CorePieceUt : public CorePiece {
         windingWindow.set_height(dimensions["D"]);
         windingWindow.set_width(dimensions["E"]);
         windingWindow.set_area(windingWindow.get_height().value() * windingWindow.get_width().value());
-        // ABT #107: coordinates[0] is the winding-window CENTRE = innerEdge (A-E)/2 + width/2
-        // (width = E). Previously stored only the inner edge; the U/Ur/C pieces already centre.
-        windingWindow.set_coordinates(std::vector<double>({(dimensions["A"] - dimensions["E"]) / 2 + dimensions["E"] / 2, 0}));
+        // ABT #107: coordinates[0] is the winding-window CENTRE, in the column frame (origin on the
+        // wound leg's axis, as process_columns places it). A UT's legs are NOT equal: the wound leg
+        // is F wide and the return leg A - E - F, so the window's inner edge is the wound leg's face
+        // at F/2 -- not the symmetric (A - E)/2 this used, which put it 1.25 mm off on UT 20.
+        windingWindow.set_coordinates(std::vector<double>({dimensions["F"] / 2 + dimensions["E"] / 2, 0}));
         set_winding_window(windingWindow);
     }
 
@@ -1895,12 +2045,16 @@ class CorePieceUt : public CorePiece {
         ColumnElement lateralColumn;
         mainColumn.set_type(ColumnType::LATERAL);
         mainColumn.set_shape(ColumnShape::RECTANGULAR);
-        if (dimensions.find("H") == dimensions.end() || (roundFloat(dimensions["H"]) == 0)) {
-            mainColumn.set_width(roundFloat((dimensions["A"] - dimensions["E"]) / 2));
+        // A UT's two legs differ: the wound leg is F wide and the return leg takes the rest of
+        // the width, A - E - F (UT 20: 4.1 mm and 2.5 mm). Both used to get the symmetric
+        // (A - E)/2 = 3.3 mm, which get_shape_constants (and so Ae/le) never assumed.
+        double returnLegWidth = dimensions["A"] - dimensions["E"] - dimensions["F"];
+        if (dimensions["F"] <= 0 || returnLegWidth <= 0) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "UT shape: the wound leg F (" + std::to_string(dimensions["F"]) + " m) and the return leg A - E - F (" +
+                std::to_string(returnLegWidth) + " m) must both be positive");
         }
-        else {
-            mainColumn.set_width(roundFloat(dimensions["H"]));
-        }
+        mainColumn.set_width(roundFloat(dimensions["F"]));
         mainColumn.set_depth(roundFloat(dimensions["C"]));
         mainColumn.set_height(roundFloat(dimensions["D"]));
         mainColumn.set_area(roundFloat(mainColumn.get_width() * mainColumn.get_depth()));
@@ -1908,12 +2062,14 @@ class CorePieceUt : public CorePiece {
         windingWindows.push_back(mainColumn);
         lateralColumn.set_type(ColumnType::LATERAL);
         lateralColumn.set_shape(ColumnShape::RECTANGULAR);
-        lateralColumn.set_width(mainColumn.get_width());
+        lateralColumn.set_width(roundFloat(returnLegWidth));
         lateralColumn.set_depth(roundFloat(dimensions["C"]));
         lateralColumn.set_height(roundFloat(dimensions["D"]));
         lateralColumn.set_area(roundFloat(lateralColumn.get_width() * lateralColumn.get_depth()));
+        // Axis-to-axis distance: half the wound leg, the window, half the return leg,
+        // F/2 + E + (A - E - F)/2 = (A + E)/2 -- the same value the symmetric form gave.
         lateralColumn.set_coordinates({
-            roundFloat((dimensions["A"] + dimensions["E"]) / 2), 0, 0});
+            roundFloat(dimensions["F"] / 2 + dimensions["E"] + returnLegWidth / 2), 0, 0});
         windingWindows.push_back(lateralColumn);
         set_columns(windingWindows);
     }
@@ -2067,6 +2223,11 @@ class CorePieceT : public CorePiece {
 
 class CorePieceC : public CorePiece {
   public:
+    // ABT #1766: NOT the exact rectangular bend. MAS's C cores are tape-wound (Metglas 2605SA1, FT-3M): the
+    // flux runs along each ribbon turn, not as isotropic potential flow, and the ribbon is wound on a rounded
+    // mandrel, so a Schwarz-Christoffel corner would be the wrong physics. le stays IEC 60205's mean path.
+    std::optional<double> get_exact_shape_constant_c1() override { return std::nullopt; }
+
     void process_winding_window() {
         auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
         WindingWindowElement windingWindow;
@@ -2410,6 +2571,28 @@ class CorePieceUi : public CorePieceU {
                                                dimensions["B"] - dimensions["D"], dimensions["B2"]);
     }
 
+    // ABT #1766: the sections of piece_and_plate_shape_constants (two legs of height D, the piece's yoke and the
+    // plate of span E, four corners) with the corners as exact right-angle bends. Whole core, like those constants.
+    std::optional<double> get_exact_shape_constant_c1() override {
+        auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
+        double legWidthOne, legWidthTwo;
+        if (dimensions.find("H") == dimensions.end() || (roundFloat(dimensions["H"]) == 0)) {
+            legWidthOne = (dimensions["A"] - dimensions["E"]) / 2;
+            legWidthTwo = (dimensions["A"] - dimensions["E"]) / 2;
+        }
+        else {
+            legWidthOne = dimensions["H"];
+            legWidthTwo = dimensions["A"] - dimensions["E"] - dimensions["H"];
+        }
+        double pieceYoke = dimensions["B"] - dimensions["D"];
+        double plate = dimensions["B2"];
+        return (dimensions["D"] / legWidthOne + dimensions["D"] / legWidthTwo +
+                dimensions["E"] / pieceYoke + dimensions["E"] / plate +
+                right_angle_bend_squares(legWidthOne, pieceYoke) + right_angle_bend_squares(legWidthTwo, pieceYoke) +
+                right_angle_bend_squares(legWidthOne, plate) + right_angle_bend_squares(legWidthTwo, plate)) /
+               dimensions["C"];
+    }
+
     std::tuple<double, double, double> get_shape_constants_iec63182() override {
         auto [c1, c2, minimumArea] = get_shape_constants();
         return {pow(c1, 2) / c2, c1 / c2, minimumArea};
@@ -2494,6 +2677,22 @@ class CorePieceEi : public CorePieceE {
         double yokeSpan = (dimensions["E"] - dimensions["F"]) / 2;
         return e_piece_and_plate_shape_constants(dimensions["D"], yokeSpan, depth, outerLegWidth,
                                                  halfPostWidth, pieceYokeThickness, dimensions["B2"]);
+    }
+
+    // ABT #1766: the sections of e_piece_and_plate_shape_constants (outer leg and half post of height D, the
+    // piece's yoke and the plate of span (E-F)/2, four corners; areas 2 x depth x width) with exact bends.
+    std::optional<double> get_exact_shape_constant_c1() override {
+        auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
+        double pieceYoke = dimensions["B"] - dimensions["D"];
+        double plate = dimensions["B2"];
+        double halfPost = dimensions["F"] / 2;
+        double outerLeg = (dimensions["A"] - dimensions["E"]) / 2;
+        double yokeSpan = (dimensions["E"] - dimensions["F"]) / 2;
+        return (dimensions["D"] / outerLeg + dimensions["D"] / halfPost +
+                yokeSpan / pieceYoke + yokeSpan / plate +
+                right_angle_bend_squares(outerLeg, pieceYoke) + right_angle_bend_squares(halfPost, pieceYoke) +
+                right_angle_bend_squares(outerLeg, plate) + right_angle_bend_squares(halfPost, plate)) /
+               (2 * dimensions["C"]);
     }
 
     std::tuple<double, double, double> get_shape_constants_iec63182() override {

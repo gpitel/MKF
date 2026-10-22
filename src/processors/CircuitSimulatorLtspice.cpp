@@ -18,6 +18,7 @@ namespace OpenMagnetics {
 
 // Forward declarations for free functions defined in CircuitSimulatorInterface.cpp.
 std::string to_string(double d, size_t precision);
+std::string to_string_round_trip(double d);
 std::vector<std::string> to_string(std::vector<double> v, size_t precision);
 
 // Emit saturating magnetizing inductance for LTspice using Flux= syntax.
@@ -67,7 +68,7 @@ static std::string emit_saturating_inductor_ltspice(
 
 std::string CircuitSimulatorExporterLtspiceModel::export_magnetic_as_subcircuit(Magnetic magnetic, double frequency, double temperature, std::optional<std::string> filePathOrFile, CircuitSimulatorExporterCurveFittingModes mode) {
     std::string headerString = "* Magnetic model made with OpenMagnetics\n";
-    headerString += "* " + magnetic.get_reference() + "\n\n";
+    headerString += "* " + require_single_line_text(magnetic.get_reference(), "magnetic reference") + "\n\n";
     headerString += ".subckt " + fix_filename(magnetic.get_reference());
     std::string circuitString = "";
     std::string parametersString = "";
@@ -108,18 +109,19 @@ std::string CircuitSimulatorExporterLtspiceModel::export_magnetic_as_subcircuit(
         }
     }
 
-    // For 3+ windings, replace the star coupling (each secondary to the primary only, which
-    // ignores secondary-to-secondary coupling) and the leakage-derived coefficients with the
-    // consistent full inductance matrix L = M + Λ: inductors are emitted as the self-inductances
+    // Every multi-winding magnetic takes its coupling from the consistent full inductance
+    // matrix L = M + Λ (the one Inductance::calculate_coupling_coefficient reads). For 3+
+    // windings this replaces the star coupling (each secondary to the primary only, which
+    // ignores secondary-to-secondary coupling): inductors are emitted as the self-inductances
     // L_ii and every pair is coupled by k_ij = L_ij/sqrt(L_ii·L_jj). LTspice has no 3-inductor
     // subckt bug, so a full pairwise coupling is emitted after the winding loop.
     size_t numWindingsLt = coil.get_functional_description().size();
     std::vector<std::vector<double>> inductanceMatrix;
-    if (numWindingsLt >= 3) {
+    if (numWindingsLt >= 2) {
         inductanceMatrix = ExtendedCantilever::calculate_inductance_matrix(magnetic, Defaults().measurementFrequency);
     }
     auto magnetizingInductorValue = [&](size_t windingIdx, const std::string& is) -> std::string {
-        if (numWindingsLt >= 3) {
+        if (numWindingsLt >= 2) {
             return to_string(inductanceMatrix[windingIdx][windingIdx], 12);  // full self-inductance L_ii
         }
         return "NumberTurns_" + is + "**2*Permeance";
@@ -135,12 +137,25 @@ std::string CircuitSimulatorExporterLtspiceModel::export_magnetic_as_subcircuit(
             if (leakageInductance < 0 || leakageInductance >= magnetizingInductance) {
                 throw std::runtime_error("Unphysical leakage inductance (" + std::to_string(leakageInductance) + " H vs Lmag " + std::to_string(magnetizingInductance) + " H) for winding " + is);
             }
-            // Clamp below 1: a coupling that rounds/prints as exactly 1 makes the SPICE
-            // coupling matrix singular (ngspice already clamps in the multi-winding path;
-            // the param emission and LTspice did not).
-            double couplingCoefficient = std::min(0.999999, sqrt((magnetizingInductance - leakageInductance) / magnetizingInductance));
+            // Coupling to winding 1 from the same inductance matrix the inductors are emitted
+            // from (L = M + Λ, the matrix Inductance::calculate_coupling_coefficient reads):
+            // k = L_1i/sqrt(L_11·L_ii). It used to be sqrt((Lm − Llk)/Lm) on inductors of Lm,
+            // which reproduces the short-circuit leakage but drops the self-leakage Λ_ii from
+            // the open-circuit inductances and the mutual leakage from the coupling.
+            double selfPrimary = inductanceMatrix[0][0];
+            double selfThis = inductanceMatrix[index][index];
+            if (!(selfPrimary > 0) || !(selfThis > 0)) {
+                throw std::runtime_error("Non-positive self-inductance building coupling for windings 1-" + is);
+            }
+            double matrixCoupling = inductanceMatrix[0][index] / std::sqrt(selfPrimary * selfThis);
+            if (std::abs(matrixCoupling) >= 1.0) {
+                throw std::runtime_error("Inconsistent coupling coefficient (|k|=" + std::to_string(std::abs(matrixCoupling)) + " >= 1) for windings 1-" + is + "; inductance matrix is not positive-definite");
+            }
+            // No clamp: L is positive definite, so |k| < 1 strictly (checked above), and the
+            // value is printed round-trip exact so it cannot round up to a singular 1.
+            double couplingCoefficient = matrixCoupling;
             parametersString += ".param Llk_" + is + "_Value=" + to_string(leakageInductance, 15) + "\n";
-            parametersString += ".param CouplingCoefficient_1" + is + "_Value=" + to_string(couplingCoefficient, 12) + "\n";
+            parametersString += ".param CouplingCoefficient_1" + is + "_Value=" + to_string_round_trip(couplingCoefficient) + "\n";
         }
 
         std::vector<std::string> c = to_string(acResistanceCoefficientsPerWinding[index], 12);
@@ -227,7 +242,7 @@ std::string CircuitSimulatorExporterLtspiceModel::export_magnetic_as_subcircuit(
                 circuitString += "Lmag_" + is + " Node_R_Lmag_" + is + " P" + is + "- {" + magnetizingInductorValue(index, is) + "}\n";
             }
         }
-        // 2-winding: keep the validated star coupling (single secondary to primary). For 3+
+        // 2-winding: a single K statement carrying the matrix coupling param. For 3+
         // windings the full pairwise coupling is emitted after the loop from the inductance matrix.
         if (index > 0 && numWindingsLt == 2) {
             circuitString += "K" + is + " Lmag_1 Lmag_" + is + " {CouplingCoefficient_1" + is + "_Value}\n";
@@ -252,7 +267,7 @@ std::string CircuitSimulatorExporterLtspiceModel::export_magnetic_as_subcircuit(
                     throw std::runtime_error("Inconsistent coupling coefficient (|k|=" + std::to_string(std::abs(kij)) + " >= 1) for windings " + std::to_string(i) + "-" + std::to_string(j) + "; inductance matrix is not positive-definite");
                 }
                 std::string kName = "K" + std::to_string(i + 1) + std::to_string(j + 1);
-                circuitString += kName + " Lmag_" + std::to_string(i + 1) + " Lmag_" + std::to_string(j + 1) + " " + std::to_string(kij) + "\n";
+                circuitString += kName + " Lmag_" + std::to_string(i + 1) + " Lmag_" + std::to_string(j + 1) + " " + to_string_round_trip(kij) + "\n";
             }
         }
     }
@@ -325,7 +340,7 @@ std::string CircuitSimulatorExporterLtspiceModel::export_magnetic_as_symbol(Magn
     int rectangleHeight = std::max(leftSideSize, rightSideSize);
 
 
-    symbolString += "TEXT " + std::to_string(-rectangleSemiWidth + 8) + " " + std::to_string(-rectangleHeight / 2 + 8) + " Left 0 " + magnetic.get_reference() + "\n";
+    symbolString += "TEXT " + std::to_string(-rectangleSemiWidth + 8) + " " + std::to_string(-rectangleHeight / 2 + 8) + " Left 0 " + require_single_line_text(magnetic.get_reference(), "magnetic reference") + "\n";
     symbolString += "TEXT " + std::to_string(-rectangleSemiWidth + 8) + " " + std::to_string(rectangleHeight / 2 - 8) + " Left 0 Made with OpenMagnetics\n";
 
 

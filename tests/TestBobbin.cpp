@@ -12,6 +12,8 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <filesystem>
+#include <functional>
+#include <optional>
 #include <fstream>
 #include <iostream>
 #include <magic_enum.hpp>
@@ -330,6 +332,52 @@ TEST_CASE("Unresolvable bobbin catalogue rows are skipped without throwing (ABT 
             CHECK_THROWS_AS(bobbin.get_winding_window_shape(), OpenMagnetics::InvalidInputException);
         }
     }
+}
+
+// ABT #986: MAS makes a rectangular winding window's `area` OPTIONAL -- width and height are
+// what define it. A catalogue former that declares width and height but omits the area is a
+// legal record, and the interpolator fit must USE it (deriving the area as width * height,
+// the same as Bobbin::get_winding_window_area), not throw bad_optional_access and not drop it
+// into the "could not be used" list.
+TEST_CASE("A catalogue bobbin whose window omits the optional area still feeds the fit (ABT #986)",
+          "[constructive-model][bobbin][abt986]") {
+    auto arealess = OpenMagnetics::find_bobbin_by_name("Bobbin ETD 49");
+    REQUIRE(arealess.get_processed_description());
+    auto processedDescription = arealess.get_processed_description().value();
+    auto windingWindows = processedDescription.get_winding_windows();
+    REQUIRE(!windingWindows.empty());
+    REQUIRE(windingWindows[0].get_width());
+    REQUIRE(windingWindows[0].get_height());
+    windingWindows[0].set_area(std::nullopt);
+    processedDescription.set_winding_windows(windingWindows);
+    arealess.set_processed_description(processedDescription);
+    REQUIRE_FALSE(arealess.get_processed_description()->get_winding_windows()[0].get_area());
+
+    const std::string arealessName = "Bobbin ABT986 Arealess";
+    OpenMagnetics::bobbinDatabase[arealessName] = arealess;
+    OpenMagnetics::read_log();  // drain, so the assertions below see only this fit
+
+    // Fresh thread: the interpolators are thread_local (ABT #113), so only a new thread refits.
+    double fillingFactor = 0;
+    std::string threadError;
+    std::thread fitter([&] {
+        try {
+            fillingFactor = OpenMagnetics::Bobbin::get_filling_factor(0.01, 0.01);
+        }
+        catch (const std::exception& e) {
+            threadError = e.what();
+        }
+    });
+    fitter.join();
+    OpenMagnetics::bobbinDatabase.erase(arealessName);
+
+    INFO("fit threw: " << threadError);
+    CHECK(threadError.empty());
+    CHECK(fillingFactor > 0);
+    auto log = OpenMagnetics::read_log();
+    INFO(log);
+    // The row was usable, so the fit must not report it as dropped.
+    CHECK(log.find(arealessName) == std::string::npos);
 }
 
 // ABT #763: Bobbin::process_data() used to be non-deterministic on a bobbin json that
@@ -881,6 +929,18 @@ json bobbin_json_as_family(const std::string& catalogueName, const std::string& 
 }
 }  // namespace
 
+TEST_CASE("An EI former reads as an E former around a rectangular column", "[constructive-model][bobbin][ei-bobbin]") {
+    // MAS bobbin family 'ei' (formers of the ET 20 / ET 35 cores, an E piece closed by a flat plate)
+    // was refused as an unknown family. CorePieceEi inherits CorePieceE's rectangular central column,
+    // so the former reads the E labels around that rectangle. The catalogue has no EI former; this
+    // uses the E42/15 labels (c = 15.7 mm, f = 12.6 mm, s1 = 0.9 mm) under the EI family.
+    OpenMagnetics::Bobbin bobbin(bobbin_json_as_family("Bobbin E42/15", "ei", "E42/15 labels as EI"));
+    auto processed = bobbin.get_processed_description().value();
+    CHECK(processed.get_column_shape() == ColumnShape::RECTANGULAR);
+    CHECK_THAT(processed.get_column_width().value(), Catch::Matchers::WithinAbs(0.0126 / 2 + 0.0009, 1e-12));
+    CHECK_THAT(processed.get_column_depth(), Catch::Matchers::WithinAbs(0.0157 / 2 + 0.0009, 1e-12));
+}
+
 TEST_CASE("Catalogue E-family bobbins carry the column depth of their own labels (ABT #1210)",
           "[constructive-model][bobbin][abt1210]") {
     SECTION("E: Bobbin E42/15, depth c/2 + s1 differs from width f/2 + s1") {
@@ -1166,5 +1226,167 @@ TEST_CASE("Pin rails: no pins -> none; pins but a missing or contradicting rail 
         auto core = OpenMagneticsTesting::get_quick_core("ETD 34/17/11", json::parse("[]"), 1, "N87");
         auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, false, MAS::OrientationEnum::HORIZONTAL);
         CHECK_THROWS_WITH(bobbin.get_pin_rails(), Catch::Matchers::ContainsSubstring("horizontal pins"));
+    }
+}
+
+// ABT #761: a molded core with a SQUARE footprint (A == C, the norm for WE-MAPI/MXGI 1610 ...
+// 6060) was reported to get a zero-width bobbin winding window. A zero-width (or zero-height)
+// window is never a valid answer -- MAS rejects the magnetic -- so create_quick_bobbin must
+// either return the molded cavity (width (E - F)/2, height D, both > 0) or THROW, never clamp a
+// negative leftover to 0 and return it.
+TEST_CASE("A square-footprint molded core never gets a zero-size quick bobbin window (ABT #761)",
+          "[constructive-model][bobbin][molded][abt761]") {
+    settings.reset();
+    // The reporter's IndMAPI 744383130033 reconstruction: A = C = 1.6 mm.
+    json shapeJson = {
+        {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+        {"aliases", json::array()}, {"name", "MAPI-like 1610 square"},
+        {"dimensions", {
+            {"A", {{"nominal", 0.0016}}}, {"B", {{"nominal", 0.0009}}}, {"C", {{"nominal", 0.0016}}},
+            {"D", {{"nominal", 0.00024}}}, {"E", {{"nominal", 0.001219}}}, {"F", {{"nominal", 0.000899}}}}}
+    };
+    json coreJson;
+    coreJson["functionalDescription"] = {
+        {"type", "closedShape"}, {"material", "Kool Mµ 26"}, {"shape", shapeJson},
+        {"gapping", json::array()}, {"numberStacks", 1}};
+    OpenMagnetics::Core core(coreJson);
+    core.process_data();
+
+    // MKF's own molded window is the cavity annulus, whatever the footprint.
+    auto coreWindow = core.get_processed_description()->get_winding_windows()[0];
+    CHECK_THAT(coreWindow.get_width().value(), Catch::Matchers::WithinAbs((0.001219 - 0.000899) / 2, 1e-12));
+    CHECK_THAT(coreWindow.get_height().value(), Catch::Matchers::WithinAbs(0.00024, 1e-12));
+
+    // nullDimensions (the "Dummy"/"None" path): the bobbin IS the cavity.
+    auto dummy = OpenMagnetics::Bobbin::create_quick_bobbin(core, true);
+    auto dummyWindow = dummy.get_processed_description()->get_winding_windows()[0];
+    CHECK_THAT(dummyWindow.get_width().value(), Catch::Matchers::WithinAbs((0.001219 - 0.000899) / 2, 1e-12));
+    CHECK_THAT(dummyWindow.get_height().value(), Catch::Matchers::WithinAbs(0.00024, 1e-12));
+
+    // The "Basic" path (create_simple_bobbin_from_core): either a real window or a throw.
+    auto checkNonZeroOrThrow = [](const std::function<OpenMagnetics::Bobbin()>& make) {
+        std::optional<OpenMagnetics::Bobbin> bobbin;
+        try {
+            bobbin = make();
+        }
+        catch (const OpenMagnetics::InvalidInputException& e) {
+            INFO("threw: " << e.what());
+            SUCCEED();
+            return;
+        }
+        auto window = bobbin->get_processed_description()->get_winding_windows()[0];
+        INFO("width " << window.get_width().value() << " height " << window.get_height().value());
+        CHECK(window.get_width().value() > 0);
+        CHECK(window.get_height().value() > 0);
+        REQUIRE(window.get_area());
+        CHECK(window.get_area().value() > 0);
+    };
+    checkNonZeroOrThrow([&] { return OpenMagnetics::Bobbin::create_quick_bobbin(core); });
+    // Explicit thicknesses that eat the whole cavity width must throw, not return width 0.
+    checkNonZeroOrThrow([&] { return OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.00001, 0.0002); });
+    CHECK_THROWS_AS(OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.00001, 0.0002), OpenMagnetics::InvalidInputException);
+    // ... and so must walls that eat the whole cavity height.
+    CHECK_THROWS_AS(OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.00013, 0.00001), OpenMagnetics::InvalidInputException);
+}
+
+// ABT #761 (Alf, 2026-10-03): "drum and drum rings never have a bobbin, the whole point of this
+// shape is that the wire can be wound on top of the core, as the drum looks like a bobbin." The
+// quick bobbin of EVERY drum family, at every size, is the bobbinless one: the core's own winding
+// window, zero wall and column thickness -- the same representation nullDimensions builds. (An
+// EXPLICIT wall/column thickness is still honoured: that is the caller asking for one.)
+TEST_CASE("Drum families never take a bobbin: the quick bobbin is the core's own window (ABT #761)",
+          "[constructive-model][bobbin][drum][abt761]") {
+    settings.reset();
+    for (const std::string shapeName : {"DR 3.5x1.0", "DR 10/18/5/2.75/12.5/2.75", "DRH-18X22-4C",
+                                        "DR 2.3 + SRI 3.0", "DRS 8/3.9/3.75/1/1.9/1/8/8/4.2"}) {
+        INFO("Shape: " << shapeName);
+        auto core = OpenMagneticsTesting::get_quick_core(shapeName, json::parse("[]"), 1, "Dummy");
+        auto family = core.get_shape_family();
+        REQUIRE((family == MAS::CoreShapeFamily::DRUM || family == MAS::CoreShapeFamily::DRUM_RING ||
+                 family == MAS::CoreShapeFamily::DRUM_SEMISHIELDED));
+        auto coreWindow = core.get_processed_description()->get_winding_windows()[0];
+
+        auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core);
+        auto processed = bobbin.get_processed_description().value();
+        CHECK(processed.get_wall_thickness() == 0);
+        CHECK(processed.get_column_thickness() == 0);
+        auto window = processed.get_winding_windows()[0];
+        CHECK_THAT(window.get_width().value(), Catch::Matchers::WithinAbs(coreWindow.get_width().value(), 1e-12));
+        CHECK_THAT(window.get_height().value(), Catch::Matchers::WithinAbs(coreWindow.get_height().value(), 1e-12));
+
+        // Identical to the explicit bobbinless ("Dummy") bobbin.
+        auto dummy = OpenMagnetics::Bobbin::create_quick_bobbin(core, true);
+        auto dummyWindow = dummy.get_processed_description()->get_winding_windows()[0];
+        CHECK(window.get_width().value() == dummyWindow.get_width().value());
+        CHECK(window.get_height().value() == dummyWindow.get_height().value());
+        CHECK(window.get_coordinates().value() == dummyWindow.get_coordinates().value());
+
+    }
+    // A family that does take a former is unaffected.
+    auto etd = OpenMagneticsTesting::get_quick_core("ETD 49/25/16", json::parse("[]"), 1, "Dummy");
+    CHECK(OpenMagnetics::Bobbin::create_quick_bobbin(etd).get_processed_description()->get_wall_thickness() > 0);
+}
+
+// ABT #761 (Alf, 2026-10-03): molded cores are wound before pressing and never take a former, and
+// the tiny standard UI/EI shapes that are specific bobbinless Wurth products (WE-FLAT / FeFlat /
+// FeSplit flat-cable ferrites, e.g. 7427807 = UI 56/5/12; WE-HCM 4035 = EI 3.02/...) never take
+// one either. Their quick bobbin is the core's own window with zero wall and column thickness,
+// identical to the explicit bobbinless ("Dummy") bobbin. Regular E/ETD/UI cores keep their walls.
+TEST_CASE("Molded cores and the bobbinless WE UI/EI products never take a bobbin (ABT #761)",
+          "[constructive-model][bobbin][molded][abt761]") {
+    settings.reset();
+    auto checkBobbinless = [](OpenMagnetics::Core& core) {
+        auto coreWindow = core.get_processed_description()->get_winding_windows()[0];
+        auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core);
+        auto processed = bobbin.get_processed_description().value();
+        CHECK(processed.get_wall_thickness() == 0);
+        CHECK(processed.get_column_thickness() == 0);
+        auto window = processed.get_winding_windows()[0];
+        CHECK(window.get_width().value() > 0);
+        CHECK(window.get_height().value() > 0);
+        CHECK_THAT(window.get_width().value(), Catch::Matchers::WithinAbs(coreWindow.get_width().value(), 1e-12));
+        CHECK_THAT(window.get_height().value(), Catch::Matchers::WithinAbs(coreWindow.get_height().value(), 1e-12));
+        auto dummy = OpenMagnetics::Bobbin::create_quick_bobbin(core, true);
+        auto dummyWindow = dummy.get_processed_description()->get_winding_windows()[0];
+        CHECK(window.get_width().value() == dummyWindow.get_width().value());
+        CHECK(window.get_height().value() == dummyWindow.get_height().value());
+        CHECK(window.get_coordinates().value() == dummyWindow.get_coordinates().value());
+    };
+
+    SECTION("Molded: the reporter's square-footprint 1610 cavity") {
+        json shapeJson = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
+            {"aliases", json::array()}, {"name", "MAPI-like 1610 square"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0016}}}, {"B", {{"nominal", 0.0009}}}, {"C", {{"nominal", 0.0016}}},
+                {"D", {{"nominal", 0.00024}}}, {"E", {{"nominal", 0.001219}}}, {"F", {{"nominal", 0.000899}}}}}
+        };
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", "closedShape"}, {"material", "Kool Mµ 26"}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1}};
+        OpenMagnetics::Core core(coreJson);
+        core.process_data();
+        REQUIRE(core.get_shape_family() == MAS::CoreShapeFamily::MOLDED);
+        checkBobbinless(core);
+    }
+
+    SECTION("The bobbinless WE UI/EI products") {
+        for (const std::string shapeName : {"UI 56/5/12", "UI 13.5/2/4", "UI 40/3.3/12", "UI 16/5/19",
+                                            "EI 3.02/1.95/1.35/4.87/1/2.5/2.3"}) {
+            INFO("Shape: " << shapeName);
+            auto core = OpenMagneticsTesting::get_quick_core(shapeName, json::parse("[]"), 1, "Dummy");
+            checkBobbinless(core);
+        }
+    }
+
+    SECTION("Regular cores with a former keep their walls") {
+        for (const std::string shapeName : {"ETD 49/25/16", "E 42/21/15", "UI 93/76/30"}) {
+            INFO("Shape: " << shapeName);
+            auto core = OpenMagneticsTesting::get_quick_core(shapeName, json::parse("[]"), 1, "Dummy");
+            auto processed = OpenMagnetics::Bobbin::create_quick_bobbin(core).get_processed_description().value();
+            CHECK(processed.get_wall_thickness() > 0);
+            CHECK(processed.get_column_thickness() > 0);
+        }
     }
 }

@@ -1,15 +1,25 @@
 #include "RandomUtils.h"
 #include <source_location>
 #include "support/Painter.h"
+#include "support/Utils.h"
 #include "processors/MagneticSimulator.h"
+#include "physical_models/Temperature.h"
+#include "physical_models/InitialPermeability.h"
+#include "physical_models/MagnetizingInductance.h"
+#include "physical_models/Reluctance.h"
+#include "advisers/MagneticFilter.h"
 #include "advisers/MagneticAdviser.h"
 #include "processors/Inputs.h"
+#include "processors/ResultsAnalyzer.h"
 #include "support/Exceptions.h"
 #include "TestingUtils.h"
 #include "Fixtures.h"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
+#include <catch2/matchers/catch_matchers_predicate.hpp>
+#include <catch2/matchers/catch_matchers_exception.hpp>
 #include <cmath>
 #include <vector>
 
@@ -685,26 +695,39 @@ namespace {
         json windingLossesJson;
         to_json(windingLossesJson, windingLosses);
 
-        auto simulator = MagneticSimulator();
-        auto operatingPoint = inputs.get_operating_point(0);
-        auto coreLosses = simulator.calculate_core_losses(operatingPoint, magnetic);
-        auto mas = simulator.simulate(inputs, magnetic);
-        json coreLossesJson;
-        to_json(coreLossesJson, coreLosses);
-
-        check_simulation_outputs_sane(mas);
         CHECK(std::isfinite(windingLosses.get_winding_losses()));
         CHECK(windingLosses.get_winding_losses() > 0);
-        CHECK(std::isfinite(coreLosses.get_core_losses()));
-        CHECK(coreLosses.get_core_losses() > 0);
 
-        // MagneticAdviser::preview_magnetic(mas);
-
-        {
-            auto outFile = outputFilePath;
-            outFile.append("Test_IEEE_Article_Simulation_2.mas.json");
-            to_file(outFile, mas);
+        // At 80 C ambient in still air this PQ 60/52 dissipates ~61 W (14 W core, 47 W copper at
+        // 80 C), which drives the core to ~270 C; with the core just below 3C95F's Curie
+        // temperature (210 C) its losses still drive it to ~300 C. No operating point exists below
+        // the ceiling. Rewritten for ABT #1855, Alf approved 2026-10-14: both loss entry points hold
+        // the core at the last temperature its material's data covers and give their numbers there,
+        // and ResultsAnalyzer reports CORE_ABOVE_MATERIAL_DATA_LIMIT for the operating point.
+        auto simulator = MagneticSimulator();
+        auto operatingPoint = inputs.get_operating_point(0);
+        const auto ceiling = InitialPermeability::get_maximum_ferromagnetic_data_temperature(magnetic.get_core().resolve_material());
+        REQUIRE(ceiling);
+        CoreLossesOutput heldCoreLosses;
+        REQUIRE_NOTHROW(heldCoreLosses = simulator.calculate_core_losses(operatingPoint, magnetic));
+        INFO("core losses at " << heldCoreLosses.get_temperature() << " C, ceiling " << ceiling.value() << " C");
+        CHECK(heldCoreLosses.get_temperature() <= ceiling.value());
+        CHECK(heldCoreLosses.get_temperature() > ceiling.value() - MagneticSimulator::kOperatingTemperatureTolerance);
+        OpenMagnetics::Mas simulated;
+        REQUIRE_NOTHROW(simulated = simulator.simulate(inputs, magnetic));
+        REQUIRE(simulated.get_outputs().size() == 1);
+        REQUIRE(simulated.get_outputs()[0].get_core_losses());
+        REQUIRE(simulated.get_outputs()[0].get_temperature());
+        CHECK(simulated.get_outputs()[0].get_core_losses()->get_temperature() > ceiling.value() - MagneticSimulator::kOperatingTemperatureTolerance);
+        CHECK(simulated.get_outputs()[0].get_temperature()->get_maximum_temperature() > ceiling.value());
+        size_t dataLimitFindings = 0;
+        for (const auto& finding : ResultsAnalyzer::analyze_results(simulated)) {
+            INFO(finding.message);
+            if (finding.code == ResultFindingCode::CORE_ABOVE_MATERIAL_DATA_LIMIT && finding.operatingPointIndex == 0) {
+                ++dataLimitFindings;
+            }
         }
+        CHECK(dataLimitFindings == 1);
 
 
         {
@@ -768,9 +791,12 @@ namespace {
         }
     }
 
-    TEST_CASE("Test_IEEE_Article_Simulation_3", "[processor][magnetic-simulator][heavy]") {
-
-        double temperature = 20;
+    // The IEEE article's ETD 29/16/10 3C95 transformer at 100 C ambient. forcedAir: the 2 m/s fan
+    // Test_IEEE_Article_Simulation_3 runs it with; without it, the still-air design the fan was added for.
+    // `coreMaterial` and `frequency` default to the article's; ABT #1908 drives the same design with other grades
+    // and frequencies.
+    std::pair<OpenMagnetics::Inputs, OpenMagnetics::Magnetic> build_ieee_article_3(bool forcedAir, std::string coreMaterial = "3C95",
+                                                                                   double frequency = 115000) {
         std::vector<int64_t> numberTurns = {32, 2};
         std::vector<int64_t> numberParallels = {1, 1};
         std::vector<double> turnsRatios = {16};
@@ -821,7 +847,6 @@ namespace {
         coil.wind({0, 1}, 1);
 
         int64_t numberStacks = 1;
-        std::string coreMaterial = "3C95";
         auto gapping = OpenMagneticsTesting::get_ground_gap(0.0004);
         auto core = OpenMagneticsTesting::get_quick_core(shapeName, gapping, numberStacks, coreMaterial);
         OpenMagnetics::Magnetic magnetic;
@@ -835,11 +860,26 @@ namespace {
         operatingPointJson["name"] = "Nominal";
         operatingPointJson["conditions"] = json();
         operatingPointJson["conditions"]["ambientTemperature"] = 100;
+        // Forced air (ABT #838, Alf 2026-10-10; raised from 2 to 4 m/s with Alf's approval of
+        // 2026-10-13, "change the fixture so it solves"): this ETD 29 is thermally overloaded at
+        // 100 C ambient. main never fed the temperature back into the losses and itself published
+        // 224-233 C for it in still air, from the losses at 100 C, without checking it. With the
+        // loss-temperature loop it has no operating point in still air (it sheds ~7 W at 3C95's
+        // limit and dissipates ~9 W), and at 2 m/s the core is driven to 186.6 C, past the 180 C
+        // end of 3C95's measured mu_i(T) table (5.69 W of copper at 100 C under the ABT #1759
+        // default winding-loss set). Solved at 100 C ambient: 2.5 m/s still refuses (181.6 C),
+        // 3 m/s settles at 174.9 C, 4 m/s at 168.2 C (2.10 W core, 6.10 W copper, hottest point
+        // 181.8 C), 5 m/s at 163.3 C. 4 m/s keeps 12 K to the table end, twice what ABT #1759
+        // moved this core by; ambient and drive stay the article's.
+        if (forcedAir) {
+            operatingPointJson["conditions"]["cooling"]["velocity"] = {4.0, 0.0, 0.0};
+            operatingPointJson["conditions"]["cooling"]["temperature"] = 100;
+        }
 
         operatingPointJson["excitationsPerWinding"] = json::array();
         {
             json windingExcitation = json();
-            windingExcitation["frequency"] = 115000;
+            windingExcitation["frequency"] = frequency;
             windingExcitation["current"]["processed"]["label"] = "sinusoidal";
             windingExcitation["current"]["processed"]["peakToPeak"] = 4 * 2;
             windingExcitation["current"]["processed"]["offset"] = 0;
@@ -852,7 +892,7 @@ namespace {
         }
         {
             json windingExcitation = json();
-            windingExcitation["frequency"] = 115000;
+            windingExcitation["frequency"] = frequency;
             windingExcitation["current"]["processed"]["label"] = "sinusoidal";
             windingExcitation["current"]["processed"]["peakToPeak"] = 64 * 2;
             windingExcitation["current"]["processed"]["offset"] = 0;
@@ -873,7 +913,13 @@ namespace {
         // set" (ABT #190). turnsRatios entries are dimensionWithTolerance objects.
         inputsJson["designRequirements"]["turnsRatios"].push_back(json({{"nominal", 16}}));
 
-        OpenMagnetics::Inputs inputs(inputsJson);
+        return {OpenMagnetics::Inputs(inputsJson), magnetic};
+    }
+
+    TEST_CASE("Test_IEEE_Article_Simulation_3", "[processor][magnetic-simulator][heavy]") {
+
+        double temperature = 20;
+        auto [inputs, magnetic] = build_ieee_article_3(true);
 
 
 
@@ -965,6 +1011,284 @@ namespace {
             settings.reset();
         }
     }
+
+    // ABT #838 x #1739: 3C95's measured mu_i(T) table ends at 180 C, below its 244 C Curie point, and
+    // mu_i(T) refuses between the two (MaterialTemperatureOutOfRangeException). In still air at 100 C
+    // this ETD 29 has no operating point. The loss-temperature loop used to cap its core iterate only at
+    // the Curie point, so the iterate landed in that gap and the MaterialException escaped every
+    // adviser's catch (coil adviser's loss ranking included). The loop is capped where mu_i(T) still
+    // answers. Rewritten for ABT #1855 (Alf approved 2026-10-14): it no longer refuses there; the core is
+    // held at the table's end, 180 C, with its last tabulated permeability, the loss solve and the loss
+    // filter give their numbers, and analyze_results reports the data limit for that operating point.
+    TEST_CASE("Loss-temperature loop is capped where the core's mu_i(T) data ends, holds the core there and reports the data limit", "[processor][magnetic-simulator]") {
+        auto [inputs, magnetic] = build_ieee_article_3(false);
+        auto coreMaterial = magnetic.get_mutable_core().resolve_material();
+        REQUIRE(coreMaterial.get_name() == "3C95");
+        REQUIRE(coreMaterial.get_curie_temperature());
+        auto ceiling = InitialPermeability::get_maximum_ferromagnetic_data_temperature(coreMaterial);
+        REQUIRE(ceiling);
+        // The table ends below Curie: the ceiling is its last point, where mu_i(T) still answers,
+        // and just above it mu_i(T) refuses.
+        CHECK(ceiling.value() < coreMaterial.get_curie_temperature().value());
+        CHECK_NOTHROW(InitialPermeability::get_initial_permeability(coreMaterial, ceiling.value()));
+        CHECK_THROWS_AS(InitialPermeability::get_initial_permeability(coreMaterial, ceiling.value() + 1), MaterialTemperatureOutOfRangeException);
+
+        // The loss solve holds the core exactly at the table's end, with the last tabulated permeability
+        // (the solved magnetizing current is the real material's there).
+        auto operatingPoint = inputs.get_operating_point(0);
+        MagneticSimulator simulator;
+        CoreLossesOutput coreLosses;
+        REQUIRE_NOTHROW(coreLosses = simulator.calculate_core_losses(operatingPoint, magnetic));
+        CHECK_THAT(coreLosses.get_temperature(), Catch::Matchers::WithinAbs(ceiling.value(), 1e-9));
+        {
+            auto operatingPointAtCeiling = inputs.get_operating_point(0);
+            operatingPointAtCeiling.get_mutable_conditions().set_ambient_temperature(ceiling.value());
+            MagnetizingInductance magnetizingInductanceModel;
+            magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(magnetic, &operatingPointAtCeiling);
+            CHECK_THAT(operatingPoint.get_excitations_per_winding()[0].get_magnetizing_current()->get_processed()->get_peak_to_peak().value(),
+                       Catch::Matchers::WithinRel(operatingPointAtCeiling.get_excitations_per_winding()[0].get_magnetizing_current()->get_processed()->get_peak_to_peak().value(), 1e-6));
+        }
+        // The loss filter the advisers evaluate a candidate with gives its verdict instead of throwing.
+        MagneticFilterLosses lossesFilter;
+        REQUIRE_NOTHROW(lossesFilter.evaluate_magnetic(&magnetic, &inputs));
+
+        // simulate gives the numbers of the held core, and analyze_results names the data limit.
+        OpenMagnetics::Mas mas;
+        mas.set_inputs(inputs);
+        mas.set_magnetic(magnetic);
+        OpenMagnetics::Mas simulated;
+        REQUIRE_NOTHROW(simulated = simulator.simulate(mas));
+        REQUIRE(simulated.get_outputs().size() == 1);
+        CHECK_THAT(simulated.get_outputs()[0].get_core_losses()->get_temperature(), Catch::Matchers::WithinAbs(ceiling.value(), 1e-9));
+        auto findings = ResultsAnalyzer::analyze_results(simulated);
+        size_t dataLimitFindings = 0;
+        for (const auto& finding : findings) {
+            INFO(to_string(finding.code) << ": " << finding.message);
+            CHECK(finding.operatingPointIndex == 0);
+            if (finding.code == ResultFindingCode::CORE_ABOVE_MATERIAL_DATA_LIMIT) {
+                ++dataLimitFindings;
+                CHECK_THAT(finding.message, Catch::Matchers::ContainsSubstring("last tabulated permeability"));
+                CHECK_THAT(finding.message, Catch::Matchers::ContainsSubstring("the core's real temperature is higher"));
+            }
+        }
+        CHECK(dataLimitFindings == 1);
+    }
+
+    // ABT #1855 (Alf, 2026-10-14): the same ETD 29 in still air at 100 C. Its 3C95 mu_i(T) table ends at
+    // 180 C, below the 244 C Curie point: the material is still magnetic there. Driven to the table's end,
+    // the core is held exactly at its last tabulated temperature and keeps its last tabulated permeability
+    // (mu_r = 1 is only for a core above its real Curie temperature).
+    TEST_CASE("A core driven to the end of a mu_i(T) table that stops below Curie is held there with its last tabulated permeability", "[processor][magnetic-simulator][abt-1855]") {
+        auto [inputs, magnetic] = build_ieee_article_3(false);
+        auto coreMaterial = magnetic.get_mutable_core().resolve_material();
+        REQUIRE(coreMaterial.get_name() == "3C95");
+        auto ceiling = InitialPermeability::get_maximum_ferromagnetic_data_temperature(coreMaterial);
+        REQUIRE(ceiling);
+        REQUIRE(ceiling.value() < coreMaterial.get_curie_temperature().value());
+
+        auto operatingPoint = inputs.get_operating_point(0);
+        MagneticSimulator simulator;
+        std::optional<TemperatureOutput> temperature;
+        CoreLossesOutput coreLosses;
+        REQUIRE_NOTHROW(coreLosses = simulator.calculate_core_losses(operatingPoint, magnetic, nullptr, &temperature));
+        CHECK_THAT(coreLosses.get_temperature(), Catch::Matchers::WithinAbs(ceiling.value(), 1e-9));
+        REQUIRE(temperature);
+        CHECK(temperature->get_maximum_temperature() > ceiling.value());
+        CHECK(MagneticSimulator::is_core_held_at_data_ceiling(coreMaterial, coreLosses.get_temperature(), temperature->get_maximum_temperature()));
+
+        // Voltage-driven, the flux density does not depend on the permeability; the magnetizing current
+        // the magnetizing model derives (and stamps into the solved excitation) does. The solved one is
+        // the real material's at the table's end (its last tabulated permeability), not the paramagnetic
+        // core's.
+        auto solvedMagnetizingCurrent = operatingPoint.get_excitations_per_winding()[0].get_magnetizing_current();
+        REQUIRE(solvedMagnetizingCurrent);
+        double solvedPeakToPeak = solvedMagnetizingCurrent->get_processed()->get_peak_to_peak().value();
+        auto operatingPointAtCeiling = inputs.get_operating_point(0);
+        operatingPointAtCeiling.get_mutable_conditions().set_ambient_temperature(ceiling.value());
+        auto paramagneticOperatingPoint = operatingPointAtCeiling;
+        MagnetizingInductance magnetizingInductanceModel;
+        magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(magnetic, &operatingPointAtCeiling);
+        magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(MagneticSimulator::make_paramagnetic_magnetic(magnetic), &paramagneticOperatingPoint);
+        double realPeakToPeak = operatingPointAtCeiling.get_excitations_per_winding()[0].get_magnetizing_current()->get_processed()->get_peak_to_peak().value();
+        double paramagneticPeakToPeak = paramagneticOperatingPoint.get_excitations_per_winding()[0].get_magnetizing_current()->get_processed()->get_peak_to_peak().value();
+        INFO("solved magnetizing current " << solvedPeakToPeak << " A pk-pk; real material at " << ceiling.value() << " C " << realPeakToPeak
+             << " A; mu_r = 1 " << paramagneticPeakToPeak << " A");
+        CHECK_THAT(solvedPeakToPeak, Catch::Matchers::WithinRel(realPeakToPeak, 1e-6));
+        CHECK(paramagneticPeakToPeak > 1.5 * realPeakToPeak);
+    }
+
+    // ABT #1908: the loss <-> temperature solve kept the core below the end of its mu_i(T) / Curie data only,
+    // and the other temperature-dependent data of a grade can end lower. DMR71's saturation points stop at
+    // 120 C and the monotonic Hermite spline through them, extrapolated, reached zero at 211.2 C, below its
+    // 255 C Curie point (its mu_i(T) table runs to 260 C). The IEEE article 3 ETD 29 in still air at 100 C is
+    // driven past that: the magnetizing model's magnetisation curve then threw INVALID_INPUT ("no positive
+    // saturation field strength"), which ended Henry's grade ranking. Past its data the saturation field
+    // strength now goes linearly to zero at Curie (Alf, 2026-10-17), so it sets no ceiling of its own: the core
+    // settles inside its data (about 233 C), and analyze_results reports no data limit. Rewritten from the
+    // hold at the saturation field strength end (11b51471), Alf approved 2026-10-17.
+    TEST_CASE("Loss-temperature loop settles a core past its saturation field strength points inside its data", "[processor][magnetic-simulator][abt-1908]") {
+        auto [inputs, magnetic] = build_ieee_article_3(false, "DMR71");
+        auto coreMaterial = magnetic.get_mutable_core().resolve_material();
+        REQUIRE(coreMaterial.get_name() == "DMR71");
+        REQUIRE(coreMaterial.get_curie_temperature());
+        const double curieTemperature = coreMaterial.get_curie_temperature().value();
+        auto ferromagneticCeiling = InitialPermeability::get_maximum_ferromagnetic_data_temperature(coreMaterial);
+        REQUIRE(ferromagneticCeiling);
+        REQUIRE(ferromagneticCeiling.value() == curieTemperature);
+
+        auto operatingPoint = inputs.get_operating_point(0);
+        MagneticSimulator simulator;
+        std::optional<TemperatureOutput> temperature;
+        CoreLossesOutput coreLosses;
+        REQUIRE_NOTHROW(coreLosses = simulator.calculate_core_losses(operatingPoint, magnetic, nullptr, &temperature));
+        const double coreTemperature = coreLosses.get_temperature();
+        REQUIRE(temperature);
+        INFO("core losses " << coreLosses.get_core_losses() << " W at " << coreTemperature << " C, hottest point "
+             << temperature->get_maximum_temperature() << " C");
+        // Past where the extrapolated saturation points used to reach zero, and below Curie: inside the data,
+        // with a positive saturation field strength, and not held at any ceiling.
+        CHECK(coreTemperature > 211.2);
+        CHECK(coreTemperature < curieTemperature - MagneticSimulator::kOperatingTemperatureTolerance);
+        CHECK(Core::get_magnetic_field_strength_saturation(coreMaterial, coreTemperature) > 0);
+        CHECK_NOTHROW(InitialPermeability::get_magnetisation_curve(coreMaterial, coreTemperature, std::nullopt));
+        CHECK(!MagneticSimulator::is_core_held_at_data_ceiling(coreMaterial, coreTemperature, temperature->get_maximum_temperature()));
+
+        // The loss filter the advisers rank a candidate with gives its verdict instead of throwing.
+        MagneticFilterLosses lossesFilter;
+        REQUIRE_NOTHROW(lossesFilter.evaluate_magnetic(&magnetic, &inputs));
+
+        OpenMagnetics::Mas mas;
+        mas.set_inputs(inputs);
+        mas.set_magnetic(magnetic);
+        OpenMagnetics::Mas simulated;
+        REQUIRE_NOTHROW(simulated = simulator.simulate(mas));
+        REQUIRE(simulated.get_outputs().size() == 1);
+        CHECK_THAT(simulated.get_outputs()[0].get_core_losses()->get_temperature(), Catch::Matchers::WithinAbs(coreTemperature, 1e-9));
+        std::vector<ResultFinding> findings;
+        REQUIRE_NOTHROW(findings = ResultsAnalyzer::analyze_results(simulated));
+        for (const auto& finding : findings) {
+            INFO(to_string(finding.code) << ": " << finding.message);
+            CHECK(finding.operatingPointIndex == 0);
+            CHECK(finding.code != ResultFindingCode::CORE_ABOVE_MATERIAL_DATA_LIMIT);
+        }
+    }
+
+    // ABT #1908: DMR24's Steinmetz range for 400 kHz to 999.3 kHz has ct(T) = 1.137 - 0.0055 T, which stops being
+    // positive at 206.9 C, below its 280 C Curie point and before its saturation field strength data end. The
+    // same ETD 29 at 500 kHz in still air at 100 C is driven past it: the core-loss model then threw
+    // INVALID_LOSS_DATA ("Steinmetz temperature factor ... <= 0"). The core is now held below where ct(T) ends,
+    // and analyze_results reports the data limit.
+    TEST_CASE("Loss-temperature loop holds the core where its Steinmetz ct(T) data end and reports the data limit", "[processor][magnetic-simulator][abt-1908]") {
+        const double frequency = 500000;
+        auto [inputs, magnetic] = build_ieee_article_3(false, "DMR24", frequency);
+        auto coreMaterial = magnetic.get_mutable_core().resolve_material();
+        REQUIRE(coreMaterial.get_name() == "DMR24");
+        auto ferromagneticCeiling = InitialPermeability::get_maximum_ferromagnetic_data_temperature(coreMaterial);
+        REQUIRE(ferromagneticCeiling);
+        auto steinmetzRange = CoreLossesModel::get_steinmetz_coefficients(coreMaterial, frequency);
+        REQUIRE(steinmetzRange.get_ct0());
+        REQUIRE(steinmetzRange.get_ct1());
+        REQUIRE(steinmetzRange.get_ct2().value_or(0) == 0);
+        const double temperatureFactorEnd = steinmetzRange.get_ct0().value() / steinmetzRange.get_ct1().value();
+        REQUIRE(temperatureFactorEnd < ferromagneticCeiling.value());
+        REQUIRE(Core::get_magnetic_field_strength_saturation(coreMaterial, temperatureFactorEnd + MagneticSimulator::kOperatingTemperatureTolerance) > 0);
+        // A direct query past the end of ct(T) still refuses.
+        try {
+            CoreLossesModel::get_temperature_factor(steinmetzRange, temperatureFactorEnd + 1);
+            FAIL("ct(T) past the end of its positive range must throw");
+        }
+        catch (const CalculationException& error) {
+            CHECK(error.code() == ErrorCode::INVALID_LOSS_DATA);
+        }
+
+        auto operatingPoint = inputs.get_operating_point(0);
+        MagneticSimulator simulator;
+        std::optional<TemperatureOutput> temperature;
+        CoreLossesOutput coreLosses;
+        REQUIRE_NOTHROW(coreLosses = simulator.calculate_core_losses(operatingPoint, magnetic, nullptr, &temperature));
+        const double heldTemperature = coreLosses.get_temperature();
+        INFO("core held at " << heldTemperature << " C, ct(T) ends at " << temperatureFactorEnd << " C");
+        CHECK(heldTemperature < temperatureFactorEnd);
+        CHECK(heldTemperature > temperatureFactorEnd - MagneticSimulator::kOperatingTemperatureTolerance);
+        REQUIRE(temperature);
+        CHECK(temperature->get_maximum_temperature() > temperatureFactorEnd);
+
+        MagneticFilterLosses lossesFilter;
+        REQUIRE_NOTHROW(lossesFilter.evaluate_magnetic(&magnetic, &inputs));
+
+        OpenMagnetics::Mas mas;
+        mas.set_inputs(inputs);
+        mas.set_magnetic(magnetic);
+        OpenMagnetics::Mas simulated;
+        REQUIRE_NOTHROW(simulated = simulator.simulate(mas));
+        REQUIRE(simulated.get_outputs().size() == 1);
+        std::vector<ResultFinding> findings;
+        REQUIRE_NOTHROW(findings = ResultsAnalyzer::analyze_results(simulated));
+        size_t dataLimitFindings = 0;
+        for (const auto& finding : findings) {
+            INFO(to_string(finding.code) << ": " << finding.message);
+            if (finding.code == ResultFindingCode::CORE_ABOVE_MATERIAL_DATA_LIMIT) {
+                ++dataLimitFindings;
+                CHECK(finding.operatingPointIndex == 0);
+                CHECK_THAT(finding.message, Catch::Matchers::ContainsSubstring("Steinmetz temperature factor ct(T)"));
+            }
+        }
+        CHECK(dataLimitFindings == 1);
+    }
+
+    // ABT-1908-API-BEGIN
+    // ABT #1908: the ceiling's parts are the material's own data ends, found on the models that evaluate them.
+    // The saturation field strength part was removed (Alf, 2026-10-17): past its data H_sat goes linearly to zero
+    // at Curie, so it never ends below the Curie part.
+    TEST_CASE("The core data ceiling covers the Steinmetz ct(T) data ends", "[processor][magnetic-simulator][abt-1908]") {
+        {
+            SteinmetzCoreLossesMethodRangeDatum linear;
+            linear.set_k(1); linear.set_alpha(1); linear.set_beta(2);
+            linear.set_ct0(1.137); linear.set_ct1(0.0055); linear.set_ct2(0.0);
+            CHECK_THAT(CoreLossesModel::get_temperature_factor_data_end(linear, 25).value(), Catch::Matchers::WithinRel(1.137 / 0.0055, 1e-12));
+            SteinmetzCoreLossesMethodRangeDatum parabola;
+            parabola.set_k(1); parabola.set_alpha(1); parabola.set_beta(2);
+            // ct = (T - 150)(T - 250) / 37500: positive below 150 C, refused between 150 C and 250 C.
+            parabola.set_ct0(1.0); parabola.set_ct1(400.0 / 37500); parabola.set_ct2(1.0 / 37500);
+            CHECK_THAT(CoreLossesModel::get_temperature_factor_data_end(parabola, 25).value(), Catch::Matchers::WithinRel(150.0, 1e-9));
+            CHECK(CoreLossesModel::get_temperature_factor_data_end(parabola, 200).value() == 200);
+            CHECK(!CoreLossesModel::get_temperature_factor_data_end(parabola, 260));
+            SteinmetzCoreLossesMethodRangeDatum positive;
+            positive.set_k(1); positive.set_alpha(1); positive.set_beta(2);
+            positive.set_ct0(1.2564); positive.set_ct1(0.0114); positive.set_ct2(4.58e-5);
+            CHECK(!CoreLossesModel::get_temperature_factor_data_end(positive, 25));
+        }
+        {
+            // The solve's ceiling names the datum that ends first, on the excitation the solve prices.
+            auto ceilingOf = [](std::pair<OpenMagnetics::Inputs, OpenMagnetics::Magnetic> design) {
+                auto& [inputs, magnetic] = design;
+                auto operatingPoint = inputs.get_operating_point(0);
+                MagnetizingInductance magnetizingInductanceModel;
+                auto magneticFluxDensity = magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(magnetic, &operatingPoint).second;
+                auto excitation = operatingPoint.get_excitations_per_winding()[0];
+                excitation.set_magnetic_flux_density(magneticFluxDensity);
+                CoreLosses coreLossesModel;
+                return MagneticSimulator::get_core_data_ceiling(magnetic.get_core(), excitation,
+                                                                operatingPoint.get_conditions().get_ambient_temperature(), coreLossesModel);
+            };
+            auto ceiling = ceilingOf(build_ieee_article_3(false, "DMR24", 500000));
+            REQUIRE(ceiling);
+            CHECK(ceiling->source == CoreDataCeilingSource::STEINMETZ_TEMPERATURE_FACTOR_END);
+            CHECK_THAT(ceiling->temperature, Catch::Matchers::WithinRel(1.1374362023251179 / 0.005497448093004713, 1e-9));
+            // At 115 kHz DMR24's range has a ct(T) that stays positive, and the saturation field strength sets no
+            // ceiling of its own (it reaches zero at Curie): the ceiling is the Curie temperature.
+            auto ceilingLow = ceilingOf(build_ieee_article_3(false, "DMR24"));
+            REQUIRE(ceilingLow);
+            CHECK(ceilingLow->source == CoreDataCeilingSource::CURIE_TEMPERATURE);
+            CHECK(ceilingLow->temperature == find_core_material_by_name("DMR24").get_curie_temperature().value());
+            // 3C95 keeps its mu_i(T) table end.
+            auto ceiling3C95 = ceilingOf(build_ieee_article_3(false));
+            REQUIRE(ceiling3C95);
+            CHECK(ceiling3C95->source == CoreDataCeilingSource::PERMEABILITY_TABLE_END);
+            CHECK(ceiling3C95->temperature == InitialPermeability::get_maximum_ferromagnetic_data_temperature(find_core_material_by_name("3C95")).value());
+        }
+    }
+    // ABT-1908-API-END
 
     TEST_CASE("Test_Flyback_Simulation", "[processor][magnetic-simulator]") {
 
@@ -1222,6 +1546,9 @@ namespace {
     // The fixtures are trimmed to the excitations MKF actually consumed, so these repros are
     // byte-for-byte the same simulation they always were; only the ignored padding is gone.
 
+        // ABT #1567: the core material is DMR95 (Steinmetz fitted 25 kHz to 500 kHz), not the capture's
+        // DMR51W, whose data start at 500 kHz: at this fixture's 100 kHz its losses would be an
+        // extrapolation, which MKF refuses since ABT #1456. The contiguous-winding repro is unchanged.
         auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "bug_contiguous.json");
         auto mas = OpenMagneticsTesting::mas_loader(path);
 
@@ -1247,6 +1574,9 @@ namespace {
     }
 
     TEST_CASE("Test_Simulator_Web_4", "[processor][magnetic-simulator][bug]") {
+        // ABT #1567: the capture embedded an old snapshot of DMR96 whose placeholder Steinmetz ranges
+        // (1 Hz to 1 GHz) carried a fit with ct(100 C) = -4380 (the ABT #1529 under-determined ct fit).
+        // The fixture now names DMR96, so the material comes from MAS (fitted 100 kHz to 500 kHz).
         auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "bug_empty_field.json");
         auto mas = OpenMagneticsTesting::mas_loader(path);
 
@@ -1348,10 +1678,10 @@ namespace {
         run_example_simulation("06_llc_xfmr_eq4128_3c97.json");
     }
     TEST_CASE("Example_07_cmc", "[example][magnetic-simulator][smoke-test]") {
-        // ABT #1456: its operating point is at 50 Hz, below the fitted span of its ferrite's loss data. MKF no longer extrapolates a
-        // Steinmetz fit outside the frequencies it was fitted on, so simulating this example must fail
-        // with that specific error, not with any other. (Materials without low-frequency data: ABT #1494.)
-        CHECK_THROWS_AS(run_example_simulation("07_cmc_t2515_w800.json"), MaterialFrequencyOutOfSpanException);
+        // ABT #1848: the example states a proper common-mode choke operating point at 150 kHz, inside the fitted span of its
+        // ferrite's loss data, so it runs like the other examples. The refusal of a frequency outside a material's fitted span
+        // (ABT #1456) stays guarded in TestCoreLosses.cpp and TestMaterialDataExtrapolation.cpp.
+        run_example_simulation("07_cmc_t2515_w800.json");
     }
     TEST_CASE("Example_08_pq_inductor", "[example][magnetic-simulator][smoke-test]") {
         run_example_simulation("08_pq_inductor_pq5050_n27.json");
@@ -1384,10 +1714,9 @@ namespace {
         run_example_simulation("17_cllc_xfmr_e5528_3c92a.json");
     }
     TEST_CASE("Example_18_stacked_inductor", "[example][magnetic-simulator][smoke-test]") {
-        // ABT #1456: its operating point is at 20 kHz, below N27's published loss data (25 kHz). MKF no longer extrapolates a
-        // Steinmetz fit outside the frequencies it was fitted on, so simulating this example must fail
-        // with that specific error, not with any other. (Materials without low-frequency data: ABT #1494.)
-        CHECK_THROWS_AS(run_example_simulation("18_stacked_inductor_e7033_n27.json"), MaterialFrequencyOutOfSpanException);
+        // ABT #1567: the example ran at 20 kHz, below N27's published loss data (25 kHz), which MKF
+        // refuses (ABT #1456). The example now runs at 25 kHz, inside the fitted span, and must simulate.
+        run_example_simulation("18_stacked_inductor_e7033_n27.json");
     }
     TEST_CASE("Example_19_multi_op_xfmr", "[example][magnetic-simulator][smoke-test]") {
         run_example_simulation("19_multi_op_xfmr_etd3920_pc95.json");
@@ -1406,6 +1735,311 @@ namespace {
     }
     TEST_CASE("Example_24_margin_interleaved_flyback", "[example][magnetic-simulator][smoke-test]") {
         run_example_simulation("24_margin_interleaved_flyback_pq3230_3c94.json");
+    }
+
+    // ABT #838: the published core temperature counts the winding's heat, and every published
+    // loss is evaluated at the temperature the COMBINED dissipation produces. Checked by
+    // re-solving the same thermal network from the published losses, in both simulate modes:
+    //   1. coreLosses.temperature is the hottest CORE node of the full network for those losses
+    //      (not the whole part's hot spot, which is normally a turn, and not a core-only network);
+    //   2. removing the winding's losses from that network cools the core: the published value
+    //      is above the core-losses-only (P_cu = 0) core temperature;
+    //   3. the core losses are the core-loss model evaluated at the published core temperature;
+    //   4. the winding losses were evaluated at the network's mean turn temperature.
+    TEST_CASE("Simulated core temperature includes the winding losses", "[processor][magnetic-simulator][smoke-test]") {
+        const double tolerance = MagneticSimulator::kOperatingTemperatureTolerance;
+        for (const std::string filename : {"01_simple_inductor_etd34_n87.json", "03_buck_inductor_pq3230_n95.json"}) {
+            for (bool fastMode : {false, true}) {
+                INFO(filename << " fastMode=" << fastMode);
+                auto path = get_examples_dir() / filename;
+                REQUIRE(std::filesystem::exists(path));
+                auto mas = OpenMagneticsTesting::mas_loader(path.string());
+                auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+                auto inputs = OpenMagnetics::inputs_autocomplete(mas.get_inputs(), magnetic);
+                if (!magnetic.get_coil().get_turns_description()) {
+                    magnetic.get_mutable_coil().wind();
+                }
+
+                MagneticSimulator simulator;
+                auto simulated = simulator.simulate(inputs, magnetic, fastMode);
+                REQUIRE(simulated.get_outputs().size() == inputs.get_operating_points().size());
+
+                for (size_t opIdx = 0; opIdx < simulated.get_outputs().size(); ++opIdx) {
+                    const auto& output = simulated.get_outputs()[opIdx];
+                    const auto& operatingPoint = simulated.get_inputs().get_operating_points()[opIdx];
+                    // The simulator must not hand back its internal core temperature as the ambient.
+                    REQUIRE(operatingPoint.get_conditions().get_ambient_temperature() ==
+                            inputs.get_operating_points()[opIdx].get_conditions().get_ambient_temperature());
+                    const double publishedCoreTemperature = output.get_core_losses()->get_temperature();
+                    const double windingLosses = output.get_winding_losses()->get_winding_losses();
+                    REQUIRE(windingLosses > 0);
+
+                    auto fullConfig = TemperatureConfig::fromSimulatedOutput(operatingPoint, output);
+                    auto full = Temperature(magnetic, fullConfig).calculateTemperatures();
+                    REQUIRE(full.maximumCoreTemperature);
+                    REQUIRE(full.averageTurnTemperature);
+                    CAPTURE(publishedCoreTemperature, full.maximumCoreTemperature.value(), full.maximumTemperature,
+                            output.get_core_losses()->get_core_losses(), windingLosses);
+                    // 1.
+                    CHECK(std::fabs(publishedCoreTemperature - full.maximumCoreTemperature.value()) < tolerance);
+
+                    // 2.
+                    auto coreOnlyLossesConfig = fullConfig;
+                    coreOnlyLossesConfig.windingLosses = 0;
+                    coreOnlyLossesConfig.windingLossesOutput = std::nullopt;
+                    auto withoutWinding = Temperature(magnetic, coreOnlyLossesConfig).calculateTemperatures();
+                    REQUIRE(withoutWinding.maximumCoreTemperature);
+                    CAPTURE(withoutWinding.maximumCoreTemperature.value());
+                    CHECK(publishedCoreTemperature > withoutWinding.maximumCoreTemperature.value() + tolerance);
+
+                    // 3.
+                    auto excitation = operatingPoint.get_excitations_per_winding()[0];
+                    REQUIRE(excitation.get_magnetic_flux_density());
+                    double coreLossesAtPublishedTemperature = CoreLosses().calculate_core_losses(
+                        magnetic.get_core(), excitation, publishedCoreTemperature).get_core_losses();
+                    CHECK_THAT(output.get_core_losses()->get_core_losses(),
+                               Catch::Matchers::WithinRel(coreLossesAtPublishedTemperature, 1e-9));
+
+                    // 4.
+                    REQUIRE(output.get_winding_losses()->get_temperature());
+                    CAPTURE(output.get_winding_losses()->get_temperature().value(), full.averageTurnTemperature.value());
+                    CHECK(std::fabs(output.get_winding_losses()->get_temperature().value() -
+                                    full.averageTurnTemperature.value()) < tolerance);
+                }
+            }
+        }
+    }
+
+    // ABT #838: the 2-argument calculate_core_losses (core advisers' loss filters, PyOM/WASM
+    // calculate_core_losses) runs the SAME loss <-> temperature solve as simulate():
+    //   - wound coil: identical core losses and core temperature to simulate(), above the
+    //     core-losses-only core temperature (the winding's heat is counted);
+    //   - coil with no turns: the core-only network, converged: re-solving that network from the
+    //     returned losses gives back the returned temperature, and the losses are the model at it.
+    TEST_CASE("calculate_core_losses solves the same loss-temperature loop as simulate", "[processor][magnetic-simulator][smoke-test]") {
+        const double tolerance = MagneticSimulator::kOperatingTemperatureTolerance;
+        // 05 (PFC inductor, T 40/20) replaces 03 (buck inductor, PQ 32/30): 03's core-only rise is
+        // 0.6 K, inside the 2 K loop tolerance, so its core-only solve stops at ambient and the
+        // "above ambient" check has nothing to measure. 05's core-only rise is ~15 K (Alf's decision).
+        for (const std::string filename : {"01_simple_inductor_etd34_n87.json", "05_pfc_inductor_t4020_hf60.json"}) {
+            INFO(filename);
+            auto path = get_examples_dir() / filename;
+            REQUIRE(std::filesystem::exists(path));
+            auto mas = OpenMagneticsTesting::mas_loader(path.string());
+            auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+            auto inputs = OpenMagnetics::inputs_autocomplete(mas.get_inputs(), magnetic);
+            if (!magnetic.get_coil().get_turns_description()) {
+                magnetic.get_mutable_coil().wind();
+            }
+            MagneticSimulator simulator;
+            auto simulated = simulator.simulate(inputs, magnetic, true);
+            const CoreLossesOutput simulatedCoreLosses = simulated.get_outputs()[0].get_core_losses().value();
+
+            // Wound coil.
+            auto operatingPoint = inputs.get_operating_points()[0];
+            const double ambientTemperature = operatingPoint.get_conditions().get_ambient_temperature();
+            auto wound = simulator.calculate_core_losses(operatingPoint, magnetic);
+            CAPTURE(wound.get_temperature(), simulatedCoreLosses.get_temperature(), wound.get_core_losses(),
+                    simulatedCoreLosses.get_core_losses());
+            REQUIRE(operatingPoint.get_conditions().get_ambient_temperature() == ambientTemperature);
+            CHECK_THAT(wound.get_temperature(), Catch::Matchers::WithinAbs(simulatedCoreLosses.get_temperature(), 1e-9));
+            CHECK_THAT(wound.get_core_losses(), Catch::Matchers::WithinRel(simulatedCoreLosses.get_core_losses(), 1e-9));
+
+            // Coil with no turns: core-only network, converged.
+            OpenMagnetics::Magnetic unwoundMagnetic = magnetic;
+            unwoundMagnetic.get_mutable_coil().set_turns_description(std::nullopt);
+            unwoundMagnetic.get_mutable_coil().set_layers_description(std::nullopt);
+            unwoundMagnetic.get_mutable_coil().set_sections_description(std::nullopt);
+            auto unwoundOperatingPoint = inputs.get_operating_points()[0];
+            auto coreOnly = simulator.calculate_core_losses(unwoundOperatingPoint, unwoundMagnetic);
+            REQUIRE(unwoundOperatingPoint.get_conditions().get_ambient_temperature() == ambientTemperature);
+            auto coreOnlyConfig = TemperatureConfig::fromMasOperatingConditions(unwoundOperatingPoint.get_conditions());
+            coreOnlyConfig.plotSchematic = false;
+            coreOnlyConfig.coreOnly = true;
+            coreOnlyConfig.coreLosses = coreOnly.get_core_losses();
+            auto coreOnlyNetwork = Temperature(unwoundMagnetic, coreOnlyConfig).calculateTemperatures();
+            REQUIRE(coreOnlyNetwork.maximumCoreTemperature);
+            CAPTURE(coreOnly.get_temperature(), coreOnlyNetwork.maximumCoreTemperature.value(), coreOnly.get_core_losses());
+            CHECK(coreOnly.get_temperature() > ambientTemperature + tolerance);
+            CHECK(std::fabs(coreOnly.get_temperature() - coreOnlyNetwork.maximumCoreTemperature.value()) < tolerance);
+            auto excitation = unwoundOperatingPoint.get_excitations_per_winding()[0];
+            REQUIRE(excitation.get_magnetic_flux_density());
+            CHECK_THAT(coreOnly.get_core_losses(), Catch::Matchers::WithinRel(CoreLosses().calculate_core_losses(
+                unwoundMagnetic.get_core(), excitation, coreOnly.get_temperature()).get_core_losses(), 1e-9));
+            // The winding's heat warms the core.
+            CHECK(wound.get_temperature() > coreOnly.get_temperature() + tolerance);
+        }
+    }
+
+    TEST_CASE("The loss-temperature solve computes the winding's magnetic field once", "[processor][magnetic-simulator][smoke-test]") {
+        // ABT #838: H at every turn follows from the currents and the geometry, not from the
+        // temperature, so the solve computes it once and evaluates only the per-turn kernels at each
+        // iterate's winding temperature. Counted through the field's turn-sum lookups: one solve must
+        // make exactly the lookups of ONE winding-loss evaluation, although it iterates.
+        const double tolerance = MagneticSimulator::kOperatingTemperatureTolerance;
+        for (const std::string filename : {"01_simple_inductor_etd34_n87.json", "03_buck_inductor_pq3230_n95.json"}) {
+            INFO(filename);
+            auto path = get_examples_dir() / filename;
+            REQUIRE(std::filesystem::exists(path));
+            auto mas = OpenMagneticsTesting::mas_loader(path.string());
+            auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+            auto inputs = OpenMagnetics::inputs_autocomplete(mas.get_inputs(), magnetic);
+            if (!magnetic.get_coil().get_turns_description()) {
+                magnetic.get_mutable_coil().wind();
+            }
+            MagneticSimulator simulator;
+            auto lookups = []() {
+                auto statistics = MagneticField::get_turn_sums_cache_statistics();
+                return statistics.hits + statistics.misses;
+            };
+
+            auto operatingPoint = inputs.get_operating_points()[0];
+            const double ambientTemperature = operatingPoint.get_conditions().get_ambient_temperature();
+            size_t before = lookups();
+            auto windingLossesAtAmbient = simulator.calculate_winding_losses(operatingPoint, magnetic, ambientTemperature);
+            const size_t lookupsPerEvaluation = lookups() - before;
+            REQUIRE(windingLossesAtAmbient.get_winding_losses() > 0);
+            REQUIRE(lookupsPerEvaluation > 0);
+
+            std::optional<WindingLossesOutput> solvedWindingLosses;
+            before = lookups();
+            auto solved = simulator.calculate_core_losses(operatingPoint, magnetic, &solvedWindingLosses);
+            const size_t lookupsPerSolve = lookups() - before;
+            REQUIRE(solvedWindingLosses);
+            CAPTURE(solved.get_temperature(), lookupsPerEvaluation, lookupsPerSolve);
+            // The first iterate is at ambient; a converged temperature this far from it took more
+            // than one iterate, so a field computed per iterate would show up as extra lookups.
+            REQUIRE(solved.get_temperature() > ambientTemperature + tolerance);
+            CHECK(lookupsPerSolve == lookupsPerEvaluation);
+
+            // The field AND the current split between a winding's parallels (ABT #1314) are those
+            // of ambient at every iterate; only the conductors' resistance follows the iterate
+            // (decided by Alf 2026-10-13). The solved winding temperature is read back from the
+            // solved DC losses, which are linear in it.
+            auto& settings = Settings::GetInstance();
+            SettingsGuard<int> mirroringGuard(settings, &Settings::get_magnetic_field_mirroring_dimension,
+                                              &Settings::set_magnetic_field_mirroring_dimension, 1);
+            auto dcLosses = [&](double temperature) {
+                double total = 0;
+                const auto ohmicLosses = WindingOhmicLosses::calculate_ohmic_losses(magnetic.get_coil(), operatingPoint, temperature);
+                const auto lossesPerWinding = ohmicLosses.get_winding_losses_per_winding().value();
+                for (auto& winding : lossesPerWinding) {
+                    total += winding.get_ohmic_losses()->get_losses();
+                }
+                return total;
+            };
+            double solvedDcLosses = 0;
+            const auto solvedLossesPerWinding = solvedWindingLosses->get_winding_losses_per_winding().value();
+            for (auto& winding : solvedLossesPerWinding) {
+                solvedDcLosses += winding.get_ohmic_losses()->get_losses();
+            }
+            const double dcLossesAtAmbient = dcLosses(ambientTemperature);
+            const double dcLossesPerKelvin = dcLosses(ambientTemperature + 100) / 100 - dcLossesAtAmbient / 100;
+            const double solvedWindingTemperature = ambientTemperature + (solvedDcLosses - dcLossesAtAmbient) / dcLossesPerKelvin;
+            REQUIRE(solvedWindingTemperature > ambientTemperature + tolerance);
+            REQUIRE_THAT(dcLosses(solvedWindingTemperature), Catch::Matchers::WithinRel(solvedDcLosses, 1e-12));
+
+            WindingLosses windingLossesModel;
+            auto fieldAtAmbient = windingLossesModel.calculate_magnetic_field(magnetic, operatingPoint, ambientTemperature);
+            const double lossesFieldAtAmbient = windingLossesModel.calculate_losses(magnetic, fieldAtAmbient, solvedWindingTemperature).get_winding_losses();
+            const double lossesFieldAtSolved = windingLossesModel.calculate_losses(magnetic, operatingPoint, solvedWindingTemperature).get_winding_losses();
+            CAPTURE(solvedWindingTemperature, solvedWindingLosses->get_winding_losses(), lossesFieldAtAmbient, lossesFieldAtSolved);
+            CHECK_THAT(solvedWindingLosses->get_winding_losses(), Catch::Matchers::WithinRel(lossesFieldAtAmbient, 1e-9));
+            bool hasParallels = false;
+            for (auto& winding : magnetic.get_coil().get_functional_description()) {
+                hasParallels = hasParallels || winding.get_number_parallels() > 1;
+            }
+            // 03_buck (12 turns x 2 parallels) must be able to tell the two choices apart.
+            CHECK(hasParallels == (filename == "03_buck_inductor_pq3230_n95.json"));
+            if (hasParallels) {
+                CHECK(std::fabs(lossesFieldAtSolved - lossesFieldAtAmbient) > 1e-7 * lossesFieldAtAmbient);
+                CHECK(std::fabs(lossesFieldAtSolved - lossesFieldAtAmbient) < 1e-4 * lossesFieldAtAmbient);
+            }
+        }
+    }
+
+    TEST_CASE("Inside a loss-solve memo scope an exact repeat returns the stored solve", "[processor][magnetic-simulator][smoke-test]") {
+        // ABT #838: an adviser run solves the same candidate at the same operating point more than
+        // once. Inside a LossSolveMemoScope the repeat returns the stored solve, which must be exactly
+        // what a fresh solve returns; any difference in the inputs, the models or the Settings is a
+        // different solve.
+        auto path = get_examples_dir() / "01_simple_inductor_etd34_n87.json";
+        REQUIRE(std::filesystem::exists(path));
+        auto mas = OpenMagneticsTesting::mas_loader(path.string());
+        auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+        auto inputs = OpenMagnetics::inputs_autocomplete(mas.get_inputs(), magnetic);
+        if (!magnetic.get_coil().get_turns_description()) {
+            magnetic.get_mutable_coil().wind();
+        }
+        const auto operatingPoint = inputs.get_operating_points()[0];
+        const double ambientTemperature = operatingPoint.get_conditions().get_ambient_temperature();
+        struct Solve {
+            json coreLosses, windingLosses, temperature, excitation;
+        };
+        auto solve = [&magnetic](OperatingPoint thisOperatingPoint) {
+            MagneticSimulator simulator;  // a fresh simulator each time, as different filters hold
+            std::optional<WindingLossesOutput> windingLosses;
+            std::optional<TemperatureOutput> temperature;
+            auto coreLosses = simulator.calculate_core_losses(thisOperatingPoint, magnetic, &windingLosses, &temperature);
+            REQUIRE(windingLosses);
+            REQUIRE(temperature);
+            Solve result;
+            to_json(result.coreLosses, coreLosses);
+            to_json(result.windingLosses, windingLosses.value());
+            to_json(result.temperature, temperature.value());
+            to_json(result.excitation, thisOperatingPoint.get_excitations_per_winding()[0]);
+            return result;
+        };
+        auto same = [](const Solve& a, const Solve& b) {
+            return a.coreLosses.dump() == b.coreLosses.dump() && a.windingLosses.dump() == b.windingLosses.dump() &&
+                   a.temperature.dump() == b.temperature.dump() && a.excitation.dump() == b.excitation.dump();
+        };
+
+        REQUIRE(LossSolveMemoScope::get_statistics().entries == 0);
+        auto fresh = solve(operatingPoint);
+        {
+            LossSolveMemoScope scope;
+            auto first = solve(operatingPoint);
+            auto repeat = solve(operatingPoint);
+            auto statistics = LossSolveMemoScope::get_statistics();
+            CHECK(statistics.misses == 1);
+            CHECK(statistics.hits == 1);
+            CHECK(same(first, fresh));
+            CHECK(same(repeat, fresh));
+
+            // A different operating point is a different solve.
+            auto warmer = operatingPoint;
+            warmer.get_mutable_conditions().set_ambient_temperature(ambientTemperature + 1);
+            auto warmerSolve = solve(warmer);
+            CHECK(!same(warmerSolve, fresh));
+            statistics = LossSolveMemoScope::get_statistics();
+            CHECK(statistics.misses == 2);
+            CHECK(statistics.hits == 1);
+
+            // So is a different setting.
+            {
+                auto& settings = Settings::GetInstance();
+                SettingsGuard<bool> fringingGuard(settings, &Settings::get_magnetic_field_include_fringing,
+                                                  &Settings::set_magnetic_field_include_fringing,
+                                                  !settings.get_magnetic_field_include_fringing());
+                solve(operatingPoint);
+                statistics = LossSolveMemoScope::get_statistics();
+                CHECK(statistics.misses == 3);
+                CHECK(statistics.hits == 1);
+            }
+
+            // A nested scope uses the outer memo.
+            {
+                LossSolveMemoScope inner;
+                auto nestedRepeat = solve(operatingPoint);
+                CHECK(same(nestedRepeat, fresh));
+                statistics = LossSolveMemoScope::get_statistics();
+                CHECK(statistics.hits == 2);
+                CHECK(statistics.entries == 3);
+            }
+        }
+        // The memo ends with the outermost scope.
+        CHECK(LossSolveMemoScope::get_statistics().entries == 0);
     }
 
     // =========================================================================
@@ -1551,7 +2185,7 @@ TEST_CASE("Test_Magnetic_Simulator_New_Core_Families",
     cores.emplace_back("drumSemishielded", buildCustomCore(
         {{"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "drumSemishielded"},
          {"aliases", json::array()}, {"name", "LQS-like 4018"}, {"dimensions", semishieldedDimensions}},
-        "pieceAndPlate", {{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", "Kool M\u00b5 26"}}));
+        "pieceAndPlate", {{"type", "magneticEpoxy"}, {"thickness", {{"nominal", 0.0001}}}, {"material", "Kool M\u00b5 26"}}));
     // Molded bodies are a low-permeability metal composite, NOT ferrite: building this fixture
     // with a mu_i~2000 ferrite drove B (and hence core loss) an order of magnitude high for a
     // 4 mm part. Use a powder grade in the family's real permeability class instead.
@@ -1574,8 +2208,10 @@ TEST_CASE("Test_Magnetic_Simulator_New_Core_Families",
         magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
         auto completed = OpenMagnetics::magnetic_autocomplete(magnetic);
 
+        // ABT #1567: 400 kHz, inside 3C90's fitted Steinmetz span (25 kHz to 446.69 kHz); at the
+        // former 500 kHz core losses are an extrapolation, which MKF refuses since ABT #1456.
         auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
-            500000, 5e-6, 25, WaveformLabel::TRIANGULAR, 0.2, 0.5, 0.2);
+            400000, 5e-6, 25, WaveformLabel::TRIANGULAR, 0.2, 0.5, 0.2);
         auto completedInputs = OpenMagnetics::inputs_autocomplete(inputs, completed);
 
         OpenMagnetics::MagneticSimulator simulator;
@@ -1629,3 +2265,755 @@ TEST_CASE("MagneticSimulator names an unprocessed core instead of dividing by a 
         CHECK(std::string(e.what()).find("processedDescription") != std::string::npos);
     }
 }
+
+// ABT #1855 (Alf, 2026-10-14): a saturating operating point gets its numbers and a saturation finding
+// for THAT point; it no longer stops the simulation of the others. The MAS example flyback (EFD 25, 3C95),
+// whose operating point simulates cool (about 69 C, B_pk 0.28 T), with a second operating point that is
+// the first with twice its winding currents (the flyback's magnetizing current is its winding currents'):
+// simulate used to throw for the whole design.
+TEST_CASE("Simulate gives every operating point its numbers and analyze_results names the saturating one",
+          "[processor][magnetic-simulator][abt-1855]") {
+    settings.reset();
+    auto path = std::filesystem::path{std::source_location::current().file_name()}
+                    .parent_path().append("..").append("MAS").append("examples").append("02_flyback_efd25_3c95.json");
+    REQUIRE(std::filesystem::exists(path));
+    auto mas = OpenMagneticsTesting::mas_loader(path.string());
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+    json inputsJson;
+    to_json(inputsJson, mas.get_inputs());
+    REQUIRE(inputsJson["operatingPoints"].size() == 1);
+    json saturatingJson = inputsJson["operatingPoints"][0];
+    saturatingJson["name"] = "Twice the winding currents";
+    for (auto& excitation : saturatingJson["excitationsPerWinding"]) {
+        for (auto& value : excitation["current"]["waveform"]["data"]) {
+            value = 2.0 * value.get<double>();
+        }
+        excitation["current"].erase("processed");
+        excitation["current"].erase("harmonics");
+        excitation.erase("magnetizingCurrent");
+        excitation.erase("magneticFluxDensity");
+    }
+    inputsJson["operatingPoints"].push_back(saturatingJson);
+    auto inputs = OpenMagnetics::inputs_autocomplete(OpenMagnetics::Inputs(inputsJson), magnetic);
+    REQUIRE(inputs.get_operating_points().size() == 2);
+
+    MagneticSimulator magneticSimulator;
+    OpenMagnetics::Mas simulated;
+    REQUIRE_NOTHROW(simulated = magneticSimulator.simulate(inputs, magnetic));
+    REQUIRE(simulated.get_outputs().size() == 2);
+    for (size_t index = 0; index < 2; ++index) {
+        INFO("operating point " << index);
+        auto solvedExcitation = simulated.get_inputs().get_operating_points()[index].get_excitations_per_winding()[0];
+        UNSCOPED_INFO("operating point " << index << ": core losses at " << simulated.get_outputs()[index].get_core_losses()->get_temperature()
+             << " C, Bpk " << (solvedExcitation.get_magnetic_flux_density() ? solvedExcitation.get_magnetic_flux_density()->get_processed()->get_peak().value() : -1.0) << " T");
+        REQUIRE(simulated.get_outputs()[index].get_core_losses());
+        CHECK(std::isfinite(simulated.get_outputs()[index].get_core_losses()->get_core_losses()));
+        REQUIRE(simulated.get_outputs()[index].get_temperature());
+    }
+
+    auto findings = ResultsAnalyzer::analyze_results(simulated);
+    std::vector<ResultFinding> saturationFindings;
+    std::string allFindings;
+    for (const auto& finding : findings) {
+        allFindings += "\n" + to_string(finding.code) + ": " + finding.message;
+        if (finding.code == ResultFindingCode::CORE_SATURATES) {
+            saturationFindings.push_back(finding);
+        }
+    }
+    INFO("findings:" << allFindings);
+    REQUIRE(saturationFindings.size() == 1);
+    CHECK(saturationFindings[0].operatingPointIndex == 1);
+    REQUIRE(saturationFindings[0].operatingPointName);
+    CHECK(saturationFindings[0].operatingPointName.value() == "Twice the winding currents");
+    CHECK_THAT(saturationFindings[0].message, Catch::Matchers::ContainsSubstring("The core saturates") &&
+                                              Catch::Matchers::ContainsSubstring("operating point 1"));
+
+    // As JSON, the web's form: one object per finding naming its operating point.
+    json findingsJson;
+    to_json(findingsJson, findings);
+    REQUIRE(findingsJson.is_array());
+    REQUIRE(findingsJson.size() == findings.size());
+    for (const auto& entry : findingsJson) {
+        CHECK(entry.contains("operatingPointIndex"));
+        CHECK(entry.contains("code"));
+        CHECK(entry.contains("message"));
+    }
+    settings.reset();
+}
+
+// ABT #1855, second saturation criterion (Alf, 2026-10-14): a DC bias that drives the material's
+// permeability model to or below the vacuum's (main's SaturationException condition until #1855) is a
+// saturation even when the flux density on the material's magnetisation curve stays under B_sat. 3C95
+// on an ER 28 with a 1 mm gap and 12 turns: the model takes mu_r = 1 from ~44.6 A, while B stays under
+// 0.53 T up to 260 A, so the B criterion alone would let the air-core point pass.
+TEST_CASE("A DC bias that collapses the permeability to mu_r = 1 is a saturation with B under B_sat",
+          "[processor][magnetic-simulator][abt-1855]") {
+    settings.reset();
+    std::string shapeName = "ER 28";
+    auto coil = OpenMagneticsTesting::get_quick_coil({12}, {1}, shapeName, 1, WindingOrientation::OVERLAPPING,
+                                                     WindingOrientation::OVERLAPPING, CoilAlignment::SPREAD,
+                                                     CoilAlignment::CENTERED, {find_wire_by_name("Round 0.25 - FIW 6")}, true);
+    auto core = OpenMagneticsTesting::get_quick_core(shapeName, OpenMagneticsTesting::get_ground_gap(0.001), 1, "3C95");
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(coil);
+    auto coreMaterial = core.resolve_material();
+    const double temperature = 25;
+    const double frequency = 100000;
+
+    MagnetizingInductance model;
+    double staticInductance = resolve_dimensional_values(model.calculate_inductance_from_number_turns_and_gapping(core, coil).get_magnetizing_inductance());
+    auto evaluate = [&](double currentOffset) {
+        auto operatingPoint = OpenMagnetics::Inputs::create_operating_point_with_sinusoidal_current_mask(
+            frequency, staticInductance, temperature, {}, {sqrt(2)}, currentOffset);
+        auto fluxDensity = model.calculate_inductance_and_magnetic_flux_density(core, coil, &operatingPoint).second;
+        return std::make_tuple(operatingPoint, fluxDensity, model.get_last_dc_bias_point());
+    };
+
+    SECTION("check_saturation: B alone passes the collapsed point, the DC bias point flags it") {
+        auto [operatingPoint, fluxDensity, dcBiasPoint] = evaluate(100);
+        REQUIRE(dcBiasPoint);
+        double peak = ResultsAnalyzer::get_peak_flux_density(fluxDensity);
+        INFO("B peak " << peak << " T at 100 A, H_dc " << dcBiasPoint->magneticFieldDcBias << " A/m");
+        auto byFluxDensity = ResultsAnalyzer::check_saturation(coreMaterial, peak, temperature);
+        CHECK_FALSE(byFluxDensity.saturates);
+        auto verdict = ResultsAnalyzer::check_saturation(coreMaterial, peak, temperature, 1.0, dcBiasPoint);
+        INFO(verdict.message);
+        CHECK(verdict.saturates);
+        CHECK(verdict.permeabilityCollapsed);
+        CHECK_FALSE(verdict.fluxDensityAboveSaturation);
+        REQUIRE(verdict.biasedPermeability);
+        CHECK(verdict.biasedPermeability.value() <= 1);
+        CHECK_THAT(verdict.message, Catch::Matchers::ContainsSubstring("permeability model"));
+        // The model's own answer there is the air core.
+        double airCoreInductance = 144 / ReluctanceModel::factory()->get_core_reluctance(core, 1.0).get_core_reluctance();
+        auto output = model.calculate_inductance_from_number_turns_and_gapping(core, coil, &operatingPoint);
+        CHECK_THAT(resolve_dimensional_values(output.get_magnetizing_inductance()), Catch::Matchers::WithinRel(airCoreInductance, 1e-9));
+    }
+
+    SECTION("analyze_saturation reads the DC point itself and names the operating point; an unsaturated bias has no finding") {
+        for (double currentOffset : {100.0, 5.0}) {
+            auto [operatingPoint, fluxDensity, dcBiasPoint] = evaluate(currentOffset);
+            CoreLossesOutput coreLosses;
+            coreLosses.set_core_losses(0);
+            coreLosses.set_method_used("test");
+            coreLosses.set_origin(ResultOrigin::SIMULATION);
+            coreLosses.set_temperature(temperature);
+            coreLosses.set_magnetic_flux_density(fluxDensity);
+            OpenMagnetics::Outputs output;
+            output.set_core_losses(coreLosses);
+            auto findings = ResultsAnalyzer::analyze_saturation(magnetic, operatingPoint, output, 3);
+            INFO("offset " << currentOffset << " A");
+            if (currentOffset > 50) {
+                REQUIRE(findings.size() == 1);
+                CHECK(findings[0].code == ResultFindingCode::CORE_SATURATES);
+                CHECK(findings[0].operatingPointIndex == 3);
+                CHECK_THAT(findings[0].message, Catch::Matchers::ContainsSubstring("mu_r = 1"));
+            }
+            else {
+                CHECK(findings.empty());
+            }
+        }
+    }
+    settings.reset();
+}
+
+// ABT #1876 (Alf decision 2026-10-14): an operating point with no thermal operating point (the thermal
+// network does not converge on its losses inside the loss loop, or its winding runs away) affects only
+// that point: its core and winding losses are those at ambient (as before ABT #838), it gets no
+// temperature output, and analyze_results reports NO_THERMAL_OPERATING_POINT for it with MKF's message.
+// The other points simulate normally; any other error still refuses the whole design.
+namespace {
+    // The WebFrontend's default design (tests/fixtures/default_two_winding_pq2715.json there): PQ 27/15,
+    // 13 + 13 turns of the "Dummy" wire, +-5 A triangular at 100 kHz, 25 C. About 2 kW of copper.
+    std::pair<OpenMagnetics::Magnetic, OpenMagnetics::Inputs> load_web_default_design() {
+        auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "default_two_winding_pq2715.json");
+        auto mas = OpenMagneticsTesting::mas_loader(path);
+        auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+        auto inputs = OpenMagnetics::inputs_autocomplete(mas.get_inputs(), magnetic);
+        return {magnetic, inputs};
+    }
+
+    json read_web_default_fixture() {
+        auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "default_two_winding_pq2715.json");
+        std::ifstream file(path);
+        return json::parse(file);
+    }
+
+    // The fixture's operating point as stored, with every winding current and voltage scaled and the derived signals
+    // dropped: the Inputs constructor and inputs_autocomplete derive them again.
+    json scaled_operating_point(double factor, const std::string& name) {
+        json operatingPointJson = read_web_default_fixture()["inputs"]["operatingPoints"][0];
+        operatingPointJson["name"] = name;
+        for (auto& excitation : operatingPointJson["excitationsPerWinding"]) {
+            for (const std::string signal : {"current", "voltage"}) {
+                if (!excitation.contains(signal)) {
+                    continue;
+                }
+                for (auto& value : excitation[signal]["waveform"]["data"]) {
+                    value = factor * value.get<double>();
+                }
+                excitation[signal].erase("processed");
+                excitation[signal].erase("harmonics");
+            }
+            excitation.erase("magnetizingCurrent");
+            excitation.erase("magneticFluxDensity");
+            excitation.erase("magneticFieldStrength");
+        }
+        return operatingPointJson;
+    }
+
+    // The fixture's inputs with these operating points, processed as mas_loader processes the fixture's own
+    // (the fixture has no outputs: Inputs with the magnetizing inductance of its turns and gapping), then autocompleted.
+    OpenMagnetics::Inputs web_default_inputs_with(const json& operatingPoints, const OpenMagnetics::Magnetic& magnetic) {
+        json inputsJson = read_web_default_fixture()["inputs"];
+        inputsJson["operatingPoints"] = operatingPoints;
+        double magnetizingInductance = resolve_dimensional_values(MagnetizingInductance().calculate_inductance_from_number_turns_and_gapping(
+            magnetic.get_core(), magnetic.get_coil()).get_magnetizing_inductance());
+        return OpenMagnetics::inputs_autocomplete(OpenMagnetics::Inputs(inputsJson, true, magnetizingInductance), magnetic);
+    }
+
+    std::string describe_findings(const std::vector<ResultFinding>& findings) {
+        std::string all;
+        for (const auto& finding : findings) {
+            all += "\n[" + std::to_string(finding.operatingPointIndex) + "] " + to_string(finding.code) + ": " + finding.message;
+        }
+        return all;
+    }
+}
+
+TEST_CASE("The web's default design simulates with its losses at ambient and a NO_THERMAL_OPERATING_POINT finding",
+          "[processor][magnetic-simulator][abt-1876]") {
+    // Alf decision 2026-10-14, ABT #1876. On 98e62c64 simulate threw for the whole design: "Thermal network
+    // did not converge in 100 iterations ... Loss loop at iterate 2 (core losses at 122.5 C, winding losses at
+    // 13518.7 C)". Prod 426ec505 (losses at ambient) gave 1996.6 W of copper.
+    settings.reset();
+    auto [magnetic, inputs] = load_web_default_design();
+    REQUIRE(inputs.get_operating_points().size() == 1);
+    const double ambientTemperature = inputs.get_operating_points()[0].get_conditions().get_ambient_temperature();
+    REQUIRE(ambientTemperature == 25);
+
+    MagneticSimulator magneticSimulator;
+    OpenMagnetics::Mas simulated;
+    REQUIRE_NOTHROW(simulated = magneticSimulator.simulate(inputs, magnetic));
+    REQUIRE(simulated.get_outputs().size() == 1);
+    const auto& output = simulated.get_outputs()[0];
+    CHECK_FALSE(output.get_temperature());
+    REQUIRE(output.get_core_losses());
+    REQUIRE(output.get_winding_losses());
+    CHECK(output.get_core_losses()->get_temperature() == ambientTemperature);
+
+    // The same losses evaluated at ambient, independently of the loss loop.
+    OpenMagnetics::Magnetic woundMagnetic = magnetic;
+    if (!woundMagnetic.get_coil().get_turns_description()) {
+        woundMagnetic.get_mutable_coil().wind();
+    }
+    OperatingPoint operatingPoint = inputs.get_operating_points()[0];
+    double windingLossesAtAmbient = MagneticSimulator().calculate_winding_losses(operatingPoint, woundMagnetic, ambientTemperature).get_winding_losses();
+    MagnetizingInductance magnetizingInductanceModel(to_string(settings.get_reluctance_model()));
+    magnetizingInductanceModel.set_topology(inputs.get_design_requirements().get_topology());
+    OperatingPoint operatingPointForCore = inputs.get_operating_points()[0];
+    auto fluxDensity = magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(woundMagnetic, &operatingPointForCore).second;
+    auto excitation = operatingPointForCore.get_excitations_per_winding()[0];
+    excitation.set_magnetic_flux_density(fluxDensity);
+    double coreLossesAtAmbient = CoreLosses().calculate_core_losses(woundMagnetic.get_core(), excitation, ambientTemperature).get_core_losses();
+    INFO("winding " << output.get_winding_losses()->get_winding_losses() << " W (at ambient " << windingLossesAtAmbient
+         << " W), core " << output.get_core_losses()->get_core_losses() << " W (at ambient " << coreLossesAtAmbient << " W)");
+    CHECK_THAT(output.get_winding_losses()->get_winding_losses(), Catch::Matchers::WithinRel(windingLossesAtAmbient, 1e-12));
+    CHECK_THAT(output.get_core_losses()->get_core_losses(), Catch::Matchers::WithinRel(coreLossesAtAmbient, 1e-12));
+    // Prod 426ec505: 1996.6 W of copper.
+    CHECK_THAT(output.get_winding_losses()->get_winding_losses(), Catch::Matchers::WithinRel(1996.6, 0.01));
+
+    auto findings = ResultsAnalyzer::analyze_results(simulated);
+    INFO("findings:" << describe_findings(findings));
+    std::vector<ResultFinding> noThermal;
+    for (const auto& finding : findings) {
+        if (finding.code == ResultFindingCode::NO_THERMAL_OPERATING_POINT) {
+            noThermal.push_back(finding);
+        }
+        // No temperature output: no temperature verdicts for it.
+        CHECK(finding.code != ResultFindingCode::WINDING_TEMPERATURE_ABOVE_LIMIT);
+        CHECK(finding.code != ResultFindingCode::WINDING_TEMPERATURE_LIMIT_NOT_STATED);
+    }
+    REQUIRE(noThermal.size() == 1);
+    CHECK(noThermal[0].operatingPointIndex == 0);
+    CHECK_THAT(noThermal[0].message, Catch::Matchers::ContainsSubstring("No thermal operating point") &&
+                                     Catch::Matchers::ContainsSubstring("Thermal network did not converge") &&
+                                     Catch::Matchers::ContainsSubstring("History:") &&
+                                     Catch::Matchers::ContainsSubstring("Pcu=") &&
+                                     Catch::Matchers::ContainsSubstring("evaluated at the ambient temperature"));
+    json findingsJson;
+    to_json(findingsJson, findings);
+    bool codeInJson = false;
+    for (const auto& entry : findingsJson) {
+        codeInJson = codeInJson || entry["code"] == "NO_THERMAL_OPERATING_POINT";
+    }
+    CHECK(codeInJson);
+    settings.reset();
+}
+
+TEST_CASE("A point with no thermal operating point leaves the other points as they simulate alone",
+          "[processor][magnetic-simulator][abt-1876]") {
+    // Alf decision 2026-10-14, ABT #1876: point 0 is the web default with a hundredth of its currents (0.23 W of copper, it has a
+    // thermal operating point at about 58 C), point 1 the web default itself (it has none).
+    settings.reset();
+    auto magnetic = load_web_default_design().first;
+    json coolPoint = scaled_operating_point(0.01, "A hundredth of the current");
+    json hotPoint = scaled_operating_point(1.0, "The web default");
+    auto twoPoints = web_default_inputs_with(json::array({coolPoint, hotPoint}), magnetic);
+    auto onePoint = web_default_inputs_with(json::array({coolPoint}), magnetic);
+
+    SECTION("point 0 is bit-identical to simulating it alone; point 1 has ambient losses, no temperature and the finding") {
+        OpenMagnetics::Mas alone;
+        OpenMagnetics::Mas both;
+        REQUIRE_NOTHROW(alone = MagneticSimulator().simulate(onePoint, magnetic));
+        REQUIRE_NOTHROW(both = MagneticSimulator().simulate(twoPoints, magnetic));
+        REQUIRE(alone.get_outputs().size() == 1);
+        REQUIRE(both.get_outputs().size() == 2);
+        REQUIRE(alone.get_outputs()[0].get_temperature());
+        INFO("point 0: core " << alone.get_outputs()[0].get_core_losses()->get_core_losses() << " W, winding "
+             << alone.get_outputs()[0].get_winding_losses()->get_winding_losses() << " W, hottest "
+             << alone.get_outputs()[0].get_temperature()->get_maximum_temperature() << " C");
+        json aloneOutput, bothOutput, aloneOperatingPoint, bothOperatingPoint;
+        to_json(aloneOutput, alone.get_outputs()[0]);
+        to_json(bothOutput, both.get_outputs()[0]);
+        to_json(aloneOperatingPoint, alone.get_inputs().get_operating_points()[0]);
+        to_json(bothOperatingPoint, both.get_inputs().get_operating_points()[0]);
+        CHECK(aloneOutput.dump() == bothOutput.dump());
+        CHECK(aloneOperatingPoint.dump() == bothOperatingPoint.dump());
+
+        CHECK_FALSE(both.get_outputs()[1].get_temperature());
+        CHECK(both.get_outputs()[1].get_core_losses()->get_temperature() ==
+              both.get_inputs().get_operating_points()[1].get_conditions().get_ambient_temperature());
+
+        auto findings = ResultsAnalyzer::analyze_results(both);
+        INFO("findings:" << describe_findings(findings));
+        size_t noThermalAt1 = 0;
+        for (const auto& finding : findings) {
+            CHECK_FALSE((finding.code == ResultFindingCode::NO_THERMAL_OPERATING_POINT && finding.operatingPointIndex == 0));
+            if (finding.code == ResultFindingCode::NO_THERMAL_OPERATING_POINT && finding.operatingPointIndex == 1) {
+                ++noThermalAt1;
+                REQUIRE(finding.operatingPointName);
+                CHECK(finding.operatingPointName.value() == "The web default");
+            }
+        }
+        CHECK(noThermalAt1 == 1);
+    }
+
+    SECTION("fast mode publishes no temperature either, and analyze_results does not take it for no thermal operating point") {
+        OpenMagnetics::Mas fast;
+        REQUIRE_NOTHROW(fast = MagneticSimulator().simulate(twoPoints, magnetic, true));
+        REQUIRE(fast.get_outputs().size() == 2);
+        CHECK_FALSE(fast.get_outputs()[0].get_temperature());
+        CHECK_FALSE(fast.get_outputs()[1].get_temperature());
+        try {
+            ResultsAnalyzer::analyze_results(fast);
+            FAIL("analyze_results read a fast-mode output as one with no thermal operating point");
+        }
+        catch (const OpenMagnetics::InvalidInputException& error) {
+            CHECK_THAT(std::string(error.what()), Catch::Matchers::ContainsSubstring("fast mode") &&
+                                                  Catch::Matchers::ContainsSubstring("operating point 0"));
+        }
+    }
+    settings.reset();
+}
+
+TEST_CASE("A malformed operating point still refuses the whole design next to one with no thermal operating point",
+          "[processor][magnetic-simulator][abt-1876]") {
+    // Alf decision 2026-10-14, ABT #1876: only thermal non-convergence and the winding runaway are per point.
+    // Point 0 has no thermal operating point (the web default); point 1 has no current in its second winding.
+    // simulate must throw point 1's error, not stop at point 0's thermal one.
+    settings.reset();
+    auto magnetic = load_web_default_design().first;
+    json hotPoint = scaled_operating_point(1.0, "The web default");
+    auto twoPoints = web_default_inputs_with(json::array({hotPoint, hotPoint}), magnetic);
+    twoPoints.get_mutable_operating_points()[1].get_mutable_excitations_per_winding()[1].set_current(std::nullopt);
+
+    try {
+        MagneticSimulator().simulate(twoPoints, magnetic);
+        FAIL("simulate accepted a winding without a current");
+    }
+    catch (const OpenMagnetics::NoThermalOperatingPointException& error) {
+        FAIL("simulate stopped at point 0's thermal error instead of point 1's malformed input: " << error.what());
+    }
+    catch (const OpenMagnetics::OpenMagneticsException& error) {
+        INFO(error.what());
+        CHECK_THAT(std::string(error.what()), !Catch::Matchers::ContainsSubstring("Thermal network did not converge"));
+        CHECK_THAT(std::string(error.what()), Catch::Matchers::ContainsSubstring("urrent"));
+    }
+    settings.reset();
+}
+
+TEST_CASE("calculate_core_losses of a point with no thermal operating point returns its core losses at ambient and no temperature",
+          "[processor][magnetic-simulator][abt-1876]") {
+    // Alf decision 2026-10-14, ABT #1876: the public per-point entry point answers as simulate does per point. On 28d80298
+    // the standalone call (the WASM and PyOM calculate_core_losses bindings) still threw "[CALCULATION_INVALID_RESULT]
+    // No thermal operating point: ..." for the web's default design.
+    settings.reset();
+    auto [magnetic, inputs] = load_web_default_design();
+    const double ambientTemperature = inputs.get_operating_points()[0].get_conditions().get_ambient_temperature();
+    REQUIRE(ambientTemperature == 25);
+    OpenMagnetics::Magnetic woundMagnetic = magnetic;
+    if (!woundMagnetic.get_coil().get_turns_description()) {
+        woundMagnetic.get_mutable_coil().wind();
+    }
+
+    // The same losses evaluated at ambient, independently of the loss loop.
+    OperatingPoint operatingPointForWinding = inputs.get_operating_points()[0];
+    double windingLossesAtAmbient = MagneticSimulator().calculate_winding_losses(operatingPointForWinding, woundMagnetic, ambientTemperature).get_winding_losses();
+    MagnetizingInductance magnetizingInductanceModel(to_string(settings.get_reluctance_model()));
+    magnetizingInductanceModel.set_topology(inputs.get_design_requirements().get_topology());
+    OperatingPoint operatingPointForCore = inputs.get_operating_points()[0];
+    auto fluxDensity = magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(woundMagnetic, &operatingPointForCore).second;
+    auto excitation = operatingPointForCore.get_excitations_per_winding()[0];
+    excitation.set_magnetic_flux_density(fluxDensity);
+    double coreLossesAtAmbient = CoreLosses().calculate_core_losses(woundMagnetic.get_core(), excitation, ambientTemperature).get_core_losses();
+
+    MagneticSimulator simulator;
+    simulator.set_topology(inputs.get_design_requirements().get_topology());
+    OperatingPoint operatingPoint = inputs.get_operating_points()[0];
+
+    SECTION("the standalone call, as the bindings make it: the core losses at ambient") {
+        CoreLossesOutput coreLosses;
+        REQUIRE_NOTHROW(coreLosses = simulator.calculate_core_losses(operatingPoint, woundMagnetic));
+        INFO("core " << coreLosses.get_core_losses() << " W (at ambient " << coreLossesAtAmbient << " W) at " << coreLosses.get_temperature() << " C");
+        CHECK(coreLosses.get_temperature() == ambientTemperature);
+        CHECK_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinRel(coreLossesAtAmbient, 1e-12));
+    }
+
+    SECTION("asked for them, no temperature and the winding losses at ambient") {
+        std::optional<WindingLossesOutput> windingLossesOutput;
+        // Engaged beforehand: the call must empty it, not leave a stale temperature behind.
+        std::optional<TemperatureOutput> temperatureOutput = TemperatureOutput();
+        CoreLossesOutput coreLosses;
+        REQUIRE_NOTHROW(coreLosses = simulator.calculate_core_losses(operatingPoint, woundMagnetic, &windingLossesOutput, &temperatureOutput));
+        CHECK_FALSE(temperatureOutput);
+        CHECK(coreLosses.get_temperature() == ambientTemperature);
+        CHECK_THAT(coreLosses.get_core_losses(), Catch::Matchers::WithinRel(coreLossesAtAmbient, 1e-12));
+        REQUIRE(windingLossesOutput);
+        CHECK_THAT(windingLossesOutput->get_winding_losses(), Catch::Matchers::WithinRel(windingLossesAtAmbient, 1e-12));
+    }
+
+    SECTION("the advisers' policy still throws NoThermalOperatingPointException") {
+        CHECK_THROWS_AS(simulator.calculate_core_losses(operatingPoint, woundMagnetic, nullptr, nullptr, WindingLossesScope::FULL,
+                                                        NoThermalOperatingPointPolicy::THROW),
+                        NoThermalOperatingPointException);
+    }
+    settings.reset();
+}
+
+TEST_CASE("simulate's JSON has no temperature key, not a null, for a point with no thermal operating point",
+          "[processor][magnetic-simulator][abt-1876]") {
+    // Alf decision 2026-10-14, ABT #1876: objects are schema-valid at every stage. On 28d80298 outputs[i].temperature
+    // was written as an explicit null for the point with no thermal operating point.
+    settings.reset();
+    auto magnetic = load_web_default_design().first;
+    json coolPoint = scaled_operating_point(0.01, "A hundredth of the current");
+    json hotPoint = scaled_operating_point(1.0, "The web default");
+    auto twoPoints = web_default_inputs_with(json::array({coolPoint, hotPoint}), magnetic);
+
+    OpenMagnetics::Mas simulated;
+    REQUIRE_NOTHROW(simulated = MagneticSimulator().simulate(twoPoints, magnetic));
+    json masJson;
+    to_json(masJson, simulated);
+    REQUIRE(masJson["outputs"].size() == 2);
+    REQUIRE(masJson["outputs"][0].contains("temperature"));
+    CHECK(masJson["outputs"][0]["temperature"].is_object());
+    CHECK_FALSE(masJson["outputs"][1].contains("temperature"));
+    for (size_t index = 0; index < 2; ++index) {
+        for (const auto& [key, value] : masJson["outputs"][index].items()) {
+            INFO("outputs[" << index << "]." << key);
+            CHECK_FALSE(value.is_null());
+        }
+    }
+
+    // Read back as the web reads it: still no temperature at point 1, and analyze_results still names it.
+    OpenMagnetics::Mas reread;
+    from_json(masJson, reread);
+    REQUIRE(reread.get_outputs().size() == 2);
+    CHECK(reread.get_outputs()[0].get_temperature());
+    CHECK_FALSE(reread.get_outputs()[1].get_temperature());
+    auto findings = ResultsAnalyzer::analyze_results(reread);
+    INFO("findings:" << describe_findings(findings));
+    size_t noThermalAt1 = 0;
+    for (const auto& finding : findings) {
+        if (finding.code == ResultFindingCode::NO_THERMAL_OPERATING_POINT) {
+            CHECK(finding.operatingPointIndex == 1);
+            ++noThermalAt1;
+        }
+    }
+    CHECK(noThermalAt1 == 1);
+    settings.reset();
+}
+
+TEST_CASE("calculate_core_losses of a coil with turns and sections but no layers, as the web's builder calls it",
+          "[processor][magnetic-simulator][abt-1886]") {
+    // ABT #1886: the Magnetic Builder's call straight after Wire Advise (WebFrontend replay, models IGSE / Maniktala /
+    // Zhang): one litz winding, 10 turns, sectionsDescription and turnsDescription but no layersDescription (the builder
+    // keeps the advised coil's sections and turns, not its layers). It threw "[COIL_NOT_PROCESSED] ... Not wound by
+    // layers" from WindingLosses::combine_turn_losses, and past that "Missing layers description" from the thermal
+    // network's turn-to-turn insulation. The layers are now rebuilt from the sections before the solve.
+    // Prod 426ec505 (core-only network): 0.00657 W, 25.8 C.
+    settings.reset();
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "builder_core_losses_turns_without_layers.json");
+    std::ifstream file(path);
+    REQUIRE(file.is_open());
+    json call = json::parse(file);
+    json coreJson = call["magnetic"]["core"];
+    // As WebLibMKF's calculate_core_losses builds its inputs.
+    OpenMagnetics::Core core;
+    core.set_functional_description(MAS::CoreFunctionalDescription(coreJson["functionalDescription"]));
+    core.set_processed_description(MAS::CoreProcessedDescription(coreJson["processedDescription"]));
+    core.set_geometrical_description(std::vector<MAS::CoreGeometricalDescriptionElement>(coreJson["geometricalDescription"]));
+    OpenMagnetics::Coil coil(call["magnetic"]["coil"], false);
+    REQUIRE(coil.get_turns_description());
+    REQUIRE(coil.get_sections_description());
+    REQUIRE_FALSE(coil.get_layers_description());
+    double magnetizingInductance = MagnetizingInductance().calculate_inductance_from_number_turns_and_gapping(core, coil)
+                                       .get_magnetizing_inductance().get_nominal().value();
+    OpenMagnetics::Inputs inputs(call["inputs"], true, magnetizingInductance);
+    auto operatingPoint = inputs.get_operating_point(call["operatingPointIndex"].get<size_t>());
+    auto excitation = operatingPoint.get_excitations_per_winding()[0];
+    if (!excitation.get_current()) {
+        excitation.set_current(OpenMagnetics::Inputs::calculate_magnetizing_current(excitation, magnetizingInductance, true, 0.0));
+        operatingPoint.get_mutable_excitations_per_winding()[0] = excitation;
+    }
+    auto coreLossesModelName = OpenMagnetics::defaults.coreLossesModelDefault;
+    OpenMagnetics::from_json(call["models"]["coreLosses"], coreLossesModelName);
+    auto reluctanceModelName = OpenMagnetics::defaults.reluctanceModelDefault;
+    OpenMagnetics::from_json(call["models"]["gapReluctance"], reluctanceModelName);
+    auto coreTemperatureModelName = OpenMagnetics::defaults.coreTemperatureModelDefault;
+    OpenMagnetics::from_json(call["models"]["coreTemperature"], coreTemperatureModelName);
+    settings.set_core_temperature_model(coreTemperatureModelName);
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(coil);
+    MagneticSimulator simulator;
+    simulator.set_core_losses_model_name(coreLossesModelName);
+    simulator.set_reluctance_model_name(reluctanceModelName);
+
+    std::optional<WindingLossesOutput> windingLossesOutput;
+    std::optional<TemperatureOutput> temperatureOutput;
+    CoreLossesOutput coreLosses;
+    REQUIRE_NOTHROW(coreLosses = simulator.calculate_core_losses(operatingPoint, magnetic, &windingLossesOutput, &temperatureOutput));
+    INFO("core " << coreLosses.get_core_losses() << " W at " << coreLosses.get_temperature() << " C (prod 426ec505: 0.00657 W, 25.8 C)");
+    CHECK(std::isfinite(coreLosses.get_core_losses()));
+    CHECK(coreLosses.get_core_losses() > 0);
+    REQUIRE(windingLossesOutput);
+    if (temperatureOutput) {
+        INFO("hot spot " << temperatureOutput->get_maximum_temperature() << " C");
+        CHECK(std::isfinite(temperatureOutput->get_maximum_temperature()));
+        CHECK(temperatureOutput->get_maximum_temperature() > operatingPoint.get_conditions().get_ambient_temperature());
+    }
+    // Every breakdown, the per-layer one included: the layers the turns name were rebuilt.
+    REQUIRE(windingLossesOutput->get_winding_losses_per_turn());
+    CHECK(windingLossesOutput->get_winding_losses_per_turn()->size() == 10);
+    REQUIRE(windingLossesOutput->get_winding_losses_per_section());
+    CHECK(windingLossesOutput->get_winding_losses_per_section()->size() == 1);
+    REQUIRE(windingLossesOutput->get_winding_losses_per_layer());
+    REQUIRE(windingLossesOutput->get_winding_losses_per_layer()->size() == 2);
+    CHECK(windingLossesOutput->get_winding_losses_per_layer()->at(0).get_name() == "Primary section 0 layer 0");
+    CHECK(windingLossesOutput->get_winding_losses_per_layer()->at(1).get_name() == "Primary section 0 layer 1");
+    // The caller's magnetic is left as given.
+    CHECK_FALSE(magnetic.get_coil().get_layers_description());
+    settings.reset();
+}
+
+// ABT #1879: three web-stored designs whose winding currents are 128 points on a CLOSED uniform
+// axis ([0, T], last point = first). Their harmonics were taken as 128 OPEN samples (period one
+// step long), so a pure sine carried fake content at every harmonic, and CoilMesher's phase check
+// refused the design: "does not contain the harmonic its MAS harmonics list at 12600000 Hz" (web
+// path) or 12800000 Hz (after mas_autocomplete). Both paths must simulate.
+TEST_CASE("Web designs with 128-point closed-axis currents simulate", "[processor][magnetic-simulator][abt-1879]") {
+    settings.reset();
+    for (std::string name : {"simplest_transformer.json", "low_filling_transformer.json", "mas_autocomplete_bug.json"}) {
+        std::ifstream file(OpenMagneticsTesting::get_test_data_path(std::source_location::current(), name));
+        REQUIRE(file.good());
+        auto masJson = nlohmann::json::parse(file);
+
+        SECTION("web simulate: Inputs and Magnetic from json " + name) {
+            OpenMagnetics::Inputs inputs(masJson["inputs"]);
+            OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+            MagneticSimulator magneticSimulator;
+            OpenMagnetics::Mas simulated;
+            REQUIRE_NOTHROW(simulated = magneticSimulator.simulate(inputs, magnetic));
+            CHECK(simulated.get_outputs().size() == inputs.get_operating_points().size());
+        }
+        SECTION("mas_autocomplete then simulate " + name) {
+            OpenMagnetics::Mas mas(masJson);
+            auto autocompleted = OpenMagnetics::mas_autocomplete(mas, false);
+            nlohmann::json autocompletedJson;
+            to_json(autocompletedJson, autocompleted);
+            OpenMagnetics::Inputs inputs(autocompletedJson["inputs"]);
+            OpenMagnetics::Magnetic magnetic(autocompletedJson["magnetic"]);
+            MagneticSimulator magneticSimulator;
+            OpenMagnetics::Mas simulated;
+            REQUIRE_NOTHROW(simulated = magneticSimulator.simulate(inputs, magnetic));
+            CHECK(simulated.get_outputs().size() == inputs.get_operating_points().size());
+        }
+    }
+    settings.reset();
+}
+
+TEST_CASE("A coil with no primary winding is refused by name, not priced to NaN", "[processor][magnetic-simulator][abt-1843]") {
+    // ABT #1843: one winding on isolationSide "secondary" and no primary. The winding losses refuse it
+    // (no reference winding to refer the currents to); the core losses ahead of them used to end in
+    // iGSE NaN on a negative flyback peak-to-peak instead.
+    settings.reset();
+    std::ifstream file(OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "low_filling_inductor.json"));
+    REQUIRE(file.good());
+    auto masJson = nlohmann::json::parse(file);
+    OpenMagnetics::Inputs inputs(masJson["inputs"]);
+    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+    MagneticSimulator magneticSimulator;
+    REQUIRE_THROWS_WITH(magneticSimulator.simulate(inputs, magnetic),
+                        Catch::Matchers::ContainsSubstring("INVALID_COIL_CONFIGURATION") &&
+                        Catch::Matchers::ContainsSubstring("no winding with isolationSide \"primary\""));
+    settings.reset();
+}
+
+namespace {
+    // ABT #1840 fixture: ETD 29/16/10 N87 with residual gaps, 10:10 turns of Round 0.5, 25 C, 100 kHz sinusoidal
+    // voltage at `level` of B_sat(25 C), 1 A peak-to-peak.
+    std::pair<OpenMagnetics::Magnetic, OpenMagnetics::Inputs> abt1840_design(double level) {
+        const double frequency = 100e3;
+        json magneticJson = {
+            {"core", {{"name", "abt1840"}, {"functionalDescription", {{"type", "two-piece set"}, {"material", "N87"}, {"shape", "ETD 29/16/10"},
+                      {"gapping", json::array({{{"type", "residual"}, {"length", 1e-5}}, {{"type", "residual"}, {"length", 1e-5}}, {{"type", "residual"}, {"length", 1e-5}}})},
+                      {"numberStacks", 1}}}}},
+            {"coil", {{"bobbin", "Basic"}, {"functionalDescription", json::array({
+                      {{"name", "Primary"}, {"numberTurns", 10}, {"numberParallels", 1}, {"isolationSide", "primary"}, {"wire", "Round 0.5 - Grade 1"}},
+                      {{"name", "Secondary"}, {"numberTurns", 10}, {"numberParallels", 1}, {"isolationSide", "secondary"}, {"wire", "Round 0.5 - Grade 1"}}})}}}};
+        OpenMagnetics::Magnetic magnetic = magnetic_autocomplete(OpenMagnetics::Magnetic(magneticJson));
+        auto material = magnetic.get_core().resolve_material();
+        const double saturationFluxDensity = Core::get_magnetic_flux_density_saturation(material, 25.0, false);
+        const double effectiveArea = magnetic.get_core().get_processed_description()->get_effective_parameters().get_effective_area();
+        const double peakVoltage = 2 * M_PI * frequency * 10 * effectiveArea * level * saturationFluxDensity;
+        auto excitation = [&](const std::string& name) {
+            return json{{"name", name}, {"frequency", frequency},
+                        {"voltage", {{"processed", {{"label", "sinusoidal"}, {"peakToPeak", 2 * peakVoltage}, {"offset", 0}, {"dutyCycle", 0.5}}}}},
+                        {"current", {{"processed", {{"label", "sinusoidal"}, {"peakToPeak", 1.0}, {"offset", 0}, {"dutyCycle", 0.5}}}}}};
+        };
+        json inputsJson = {{"designRequirements", {{"magnetizingInductance", {{"nominal", 1e-3}}}, {"turnsRatios", json::array({{{"nominal", 1}}})}}},
+                           {"operatingPoints", json::array({{{"name", "op"}, {"conditions", {{"ambientTemperature", 25.0}}},
+                                                             {"excitationsPerWinding", json::array({excitation("Primary"), excitation("Secondary")})}}})}};
+        return {magnetic, OpenMagnetics::Inputs(inputsJson)};
+    }
+}
+
+TEST_CASE("Loss-temperature loop settles at the lowest stable operating point, not past the unstable one", "[processor][magnetic-simulator][abt-1840]") {
+    // ABT #1840: the fixture above at 0.44 of B_sat(25 C). Its map g(T) (the core temperature the network returns
+    // for the losses at T) has a stable fixed point near 97 C and an unstable one near 172 C; g(25 C) = 186 C. The
+    // first step from ambient overshot the unstable point and the loop climbed to the data ceiling (208 C, 13 W
+    // instead of 3 W) and held the core there with a data-limit finding. A part heated from ambient stops at the
+    // lowest stable point.
+    settings.reset();
+    auto [magnetic, inputs] = abt1840_design(0.44);
+
+    MagneticSimulator simulator;
+    OpenMagnetics::Mas simulated;
+    REQUIRE_NOTHROW(simulated = simulator.simulate(inputs, magnetic));
+    REQUIRE(simulated.get_outputs().size() == 1);
+    REQUIRE(simulated.get_outputs()[0].get_core_losses());
+    const double coreTemperature = simulated.get_outputs()[0].get_core_losses()->get_temperature();
+    INFO("core temperature " << coreTemperature << " C, core losses " << simulated.get_outputs()[0].get_core_losses()->get_core_losses() << " W");
+    CHECK_THAT(coreTemperature, Catch::Matchers::WithinAbs(97, 5));
+    // It got there through the search: the loop reached the ceiling first.
+    CHECK(simulator.get_last_lowest_fixed_point_search_evaluations() > 0);
+    for (const auto& finding : ResultsAnalyzer::analyze_results(simulated)) {
+        CHECK(finding.code != ResultFindingCode::CORE_ABOVE_MATERIAL_DATA_LIMIT);
+    }
+    settings.reset();
+}
+
+TEST_CASE("A loss-temperature loop with no fixed point below the data limit pays only the search's coarse pass", "[processor][magnetic-simulator][abt-1840]") {
+    // ABT #1840: the fixture above at 0.60 of B_sat(25 C), where h(T) = g(T) - T stays positive from
+    // ambient to the data ceiling and the core is held there. The search for the lowest stable fixed point walks the
+    // bracket from ambient to the loop's iterate next to the ceiling in ceil(sqrt(width / tolerance)) steps and evaluates the n points they reach.
+    // The tolerance-spaced scan it replaced evaluated every 2 K of the bracket (63 networks here).
+    settings.reset();
+    auto [magnetic, inputs] = abt1840_design(0.60);
+
+    MagneticSimulator simulator;
+    OpenMagnetics::Mas simulated;
+    REQUIRE_NOTHROW(simulated = simulator.simulate(inputs, magnetic));
+    REQUIRE(simulated.get_outputs().size() == 1);
+    REQUIRE(simulated.get_outputs()[0].get_core_losses());
+    const double coreTemperature = simulated.get_outputs()[0].get_core_losses()->get_temperature();
+    const double ambientTemperature = 25.0;
+    INFO("core temperature " << coreTemperature << " C, search evaluations " << simulator.get_last_lowest_fixed_point_search_evaluations());
+    // Held at the ceiling, with the finding that says so.
+    bool heldAtDataLimit = false;
+    for (const auto& finding : ResultsAnalyzer::analyze_results(simulated)) {
+        heldAtDataLimit = heldAtDataLimit || finding.code == ResultFindingCode::CORE_ABOVE_MATERIAL_DATA_LIMIT;
+    }
+    REQUIRE(heldAtDataLimit);
+    // The search walks from ambient to the loop's iterate next to the ceiling, where the core is held: at most that
+    // wide (a core held at the end of a mu_i(T) table is reported at the ceiling, past the iterate).
+    const double bracketWidth = coreTemperature - ambientTemperature;
+    const size_t coarseSteps = static_cast<size_t>(std::ceil(std::sqrt(bracketWidth / MagneticSimulator::kOperatingTemperatureTolerance)));
+    CHECK(simulator.get_last_lowest_fixed_point_search_evaluations() > 0);
+    CHECK(simulator.get_last_lowest_fixed_point_search_evaluations() <= coarseSteps);
+    settings.reset();
+}
+
+TEST_CASE("A loss-temperature loop that does not settle is that point's NO_THERMAL_OPERATING_POINT, not a refusal of the design",
+          "[processor][magnetic-simulator][abt-1960]") {
+    // ABT #1960: Fair-Rite 78 EL 25/6.3, one winding of 6 turns on the primary side, 200 kHz, 25 C, completed as the
+    // web's loader completes it (mas_autocomplete, not simulated). The core saturates and its B(T) steps down
+    // (0.637 -> 0.630 T between 135.890 and 135.895 C), so the core losses jump 4.19 -> 3.81 W and the loop's
+    // iterates close in on that step from both sides, never within the 2 K tolerance. simulate threw for the whole
+    // design ("did not settle within 100 iterations"); like a network that does not converge or a winding that runs
+    // away (ABT #1876), it is that point having no thermal operating point: losses at ambient, no temperature, and the
+    // finding from analyze_results. The step comes from the magnetizing model's DC point (ABT #1942): if a change
+    // there makes this design settle, this fixture no longer reaches the path and needs another.
+    settings.reset();
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "single_winding_78_el25_on_primary.json");
+    auto completed = OpenMagnetics::mas_autocomplete(OpenMagneticsTesting::mas_loader(path), false, json{});
+    auto magnetic = completed.get_magnetic();
+    auto inputs = completed.get_inputs();
+    REQUIRE(inputs.get_operating_points().size() == 1);
+    const double ambientTemperature = inputs.get_operating_points()[0].get_conditions().get_ambient_temperature();
+    REQUIRE(ambientTemperature == 25);
+
+    SECTION("the advisers' policy still throws, as no thermal operating point") {
+        OpenMagnetics::Magnetic woundMagnetic = magnetic;
+        REQUIRE(woundMagnetic.get_coil().get_turns_description());
+        OperatingPoint operatingPoint = inputs.get_operating_points()[0];
+        std::optional<WindingLossesOutput> windingLossesOutput;
+        std::optional<TemperatureOutput> temperatureOutput;
+        CHECK_THROWS_MATCHES(MagneticSimulator().calculate_core_losses(operatingPoint, woundMagnetic, &windingLossesOutput, &temperatureOutput,
+                                                                       WindingLossesScope::FULL, NoThermalOperatingPointPolicy::THROW),
+                             NoThermalOperatingPointException,
+                             Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("did not settle within")));
+    }
+
+    SECTION("simulate gives the point its losses at ambient, and analyze_results names it") {
+        MagneticSimulator simulator;
+        OpenMagnetics::Mas simulated;
+        REQUIRE_NOTHROW(simulated = simulator.simulate(inputs, magnetic));
+        REQUIRE(simulated.get_outputs().size() == 1);
+        const auto& output = simulated.get_outputs()[0];
+        CHECK_FALSE(output.get_temperature());
+        REQUIRE(output.get_core_losses());
+        REQUIRE(output.get_winding_losses());
+        CHECK(output.get_core_losses()->get_temperature() == ambientTemperature);
+
+        auto findings = ResultsAnalyzer::analyze_results(simulated);
+        INFO("findings:" << describe_findings(findings));
+        std::vector<ResultFinding> noThermal;
+        for (const auto& finding : findings) {
+            if (finding.code == ResultFindingCode::NO_THERMAL_OPERATING_POINT) {
+                noThermal.push_back(finding);
+            }
+        }
+        REQUIRE(noThermal.size() == 1);
+        CHECK(noThermal[0].operatingPointIndex == 0);
+        CHECK_THAT(noThermal[0].message, Catch::Matchers::ContainsSubstring("No thermal operating point") &&
+                                         Catch::Matchers::ContainsSubstring("did not settle within") &&
+                                         Catch::Matchers::ContainsSubstring("History:") &&
+                                         Catch::Matchers::ContainsSubstring("evaluated at the ambient temperature"));
+    }
+    settings.reset();
+}
+

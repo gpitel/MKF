@@ -1,11 +1,17 @@
 #include "physical_models/Temperature.h"
 #include "physical_models/ThermalResistance.h"
 #include "physical_models/WindingLosses.h"
+#include "constructive_models/Bobbin.h"
+#include "support/Settings.h"
+#include "support/Exceptions.h"
 #include "support/Painter.h"
 #include "processors/MagneticSimulator.h"
+#include "processors/ResultsAnalyzer.h"
+#include "physical_models/MagnetizingInductance.h"
 #include "Definitions.h"
 #include "TestingUtils.h"
 #include "json.hpp"
+#include <numbers>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -16,6 +22,9 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <functional>
+#include <map>
+#include <magic_enum.hpp>
 
 using namespace MAS;
 using namespace OpenMagnetics;
@@ -93,28 +102,28 @@ LossesFromSimulation getLossesFromSimulation(const OpenMagnetics::Magnetic& magn
     mas.set_magnetic(magnetic);
     mas.set_inputs(inputs);
     
-    try {
-        auto simulatedMas = magneticSimulator.simulate(inputs, magnetic);
-        
-        if (!simulatedMas.get_outputs().empty()) {
-            auto outputs = simulatedMas.get_outputs()[0];
-            
-            // Get core losses
-            if (outputs.get_core_losses()) {
-                result.coreLosses = resolve_dimensional_values(outputs.get_core_losses()->get_core_losses());
-            }
-            
-            // Get winding losses
-            if (outputs.get_winding_losses()) {
-                result.windingLosses = resolve_dimensional_values(outputs.get_winding_losses()->get_winding_losses());
-                result.windingLossesOutput = outputs.get_winding_losses();
-            }
-            
-            result.simulationSucceeded = true;
-        }
-    } catch (const std::exception& e) {
+    // No try/catch: a simulation that throws (e.g. the volt-second balance check rejecting an
+    // unbalanced fixture) must fail the test with ITS message, not surface later as a misleading
+    // "WindingLossesOutput missing" or silently switch the caller to placeholder losses.
+    auto simulatedMas = magneticSimulator.simulate(inputs, magnetic);
+    if (simulatedMas.get_outputs().empty()) {
+        throw std::runtime_error("getLossesFromSimulation: MagneticSimulator returned no outputs");
     }
-    
+    auto outputs = simulatedMas.get_outputs()[0];
+
+    // Get core losses
+    if (outputs.get_core_losses()) {
+        result.coreLosses = resolve_dimensional_values(outputs.get_core_losses()->get_core_losses());
+    }
+
+    // Get winding losses
+    if (outputs.get_winding_losses()) {
+        result.windingLosses = resolve_dimensional_values(outputs.get_winding_losses()->get_winding_losses());
+        result.windingLossesOutput = outputs.get_winding_losses();
+    }
+
+    result.simulationSucceeded = true;
+
     // Get ambient temperature from operating point
     if (!inputs.get_operating_points().empty()) {
         auto opPoint = inputs.get_operating_points()[0];
@@ -124,57 +133,46 @@ LossesFromSimulation getLossesFromSimulation(const OpenMagnetics::Magnetic& magn
     return result;
 }
 
-// Helper to create Inputs with operating points for a magnetic component
-// Uses Inputs::create_quick_operating_point_only_current with reasonable defaults
-// Properly handles multi-winding transformers by calculating turns ratios
+// The drive of these fixtures: a sinusoidal current whose peak is a stated fraction of the
+// magnetic's own saturation current at the test temperature (Magnetic::calculate_saturation_current
+// with the raw B_sat), so with that temperature's permeability the peak flux density is that
+// fraction of B_sat. The default, 0.2, is about 0.1 T in a power ferrite. The operating point
+// states the inductance MKF calculates for the magnetic, so the voltage it carries is the one
+// that current induces. Since ABT #1467 a single-winding inductor's current IS its magnetizing
+// current: an amplitude in amperes that ignores the core (these fixtures used 1 A) saturates the
+// ungapped ones (T 20/10/7 3C97 with 10 turns: 1.8 times its saturation current).
 OpenMagnetics::Inputs createInputsForMagnetic(const OpenMagnetics::Magnetic& magnetic,
                                                double frequency = 100000.0,  // 100 kHz default
                                                double temperature = 25.0,
-                                               double currentPeak = 1.0,     // 1A peak default
+                                               double saturationCurrentFraction = 0.2,
                                                WaveformLabel waveShape = WaveformLabel::SINUSOIDAL) {
-    // Estimate magnetizing inductance based on core and turns
-    double magnetizingInductance = 1e-3;  // 1mH default
-    std::vector<double> turnsRatios;
-    
-    // Try to calculate actual inductance and turns ratios if possible
-    try {
-        auto coil = magnetic.get_coil();
-        auto core = magnetic.get_core();
-        auto functionalDesc = coil.get_functional_description();
-        
-        if (!functionalDesc.empty()) {
-            // Get primary winding turns
-            auto primaryWinding = functionalDesc[0];
-            int primaryTurns = primaryWinding.get_number_turns();
-            
-            // Calculate magnetizing inductance based on primary
-            double al = 1000e-9;  // 1000 nH/turn^2 typical
-            magnetizingInductance = al * primaryTurns * primaryTurns;
-            
-            // Calculate turns ratios for additional windings (for transformers)
-            if (functionalDesc.size() > 1) {
-                for (size_t i = 1; i < functionalDesc.size(); ++i) {
-                    double ratio = static_cast<double>(functionalDesc[i].get_number_turns()) / primaryTurns;
-                    turnsRatios.push_back(ratio);
-                }
-            }
-        }
-    } catch (...) {
-        // Use defaults
+    OpenMagnetics::Magnetic sizedMagnetic = magnetic;  // the calculations below take a mutable magnetic
+    const double saturationCurrent = sizedMagnetic.calculate_saturation_current(temperature, false);
+    const double magnetizingInductance = resolve_dimensional_values(
+        OpenMagnetics::MagnetizingInductance().calculate_inductance_from_number_turns_and_gapping(
+            sizedMagnetic.get_mutable_core(), sizedMagnetic.get_mutable_coil()).get_magnetizing_inductance());
+
+    // Turns ratios of the additional windings, as these fixtures have always stated them
+    auto functionalDescription = magnetic.get_coil().get_functional_description();
+    if (functionalDescription.empty()) {
+        throw std::runtime_error("createInputsForMagnetic: the coil has no winding");
     }
-    
-    // Calculate peak-to-peak from peak for sinusoidal
-    double peakToPeak = currentPeak * 2.0;  // For sinusoidal: peak-to-peak = 2 * peak
-    
+    std::vector<double> turnsRatios;
+    const double primaryTurns = static_cast<double>(functionalDescription[0].get_number_turns());
+    for (size_t i = 1; i < functionalDescription.size(); ++i) {
+        turnsRatios.push_back(static_cast<double>(functionalDescription[i].get_number_turns()) / primaryTurns);
+    }
+
+    const double currentPeak = saturationCurrentFraction * saturationCurrent;
     return OpenMagnetics::Inputs::create_quick_operating_point_only_current(
         frequency,
         magnetizingInductance,
         temperature,
         waveShape,
-        peakToPeak,
+        2.0 * currentPeak,  // peak to peak of a sine
         0.5,    // duty cycle
         0.0,    // DC current
-        turnsRatios  // Pass turns ratios for multi-winding support
+        turnsRatios
     );
 }
 
@@ -183,9 +181,9 @@ OpenMagnetics::Inputs createInputsForMagnetic(const OpenMagnetics::Magnetic& mag
 void applySimulatedLosses(TemperatureConfig& config, 
                           const OpenMagnetics::Magnetic& magnetic,
                           double frequency = 100000.0,
-                          double currentPeak = 1.0) {
+                          double saturationCurrentFraction = 0.2) {
     // Create proper Inputs with operating points
-    auto inputs = createInputsForMagnetic(magnetic, frequency, config.ambientTemperature, currentPeak);
+    auto inputs = createInputsForMagnetic(magnetic, frequency, config.ambientTemperature, saturationCurrentFraction);
     
     // Get real losses from simulation
     auto losses = getLossesFromSimulation(magnetic, inputs);
@@ -245,7 +243,7 @@ TEST_CASE("Temperature: Toroidal Core T20 Ten Turns", "[temperature][round-windi
     config.schematicOutputPath = (getOutputDir() / "thermal_schematic_Toroid_T20_10_turns.svg").string();
     
     // Use real simulation for losses
-    // Use 0.1A current to avoid extreme core losses in small ungapped toroid
+    // A tenth of the saturation current: a small rise in this small ungapped toroid
     auto inputs = createInputsForMagnetic(magnetic, 100000.0, config.ambientTemperature, 0.1);
     auto losses = getLossesFromSimulation(magnetic, inputs);
     if (losses.simulationSucceeded) {
@@ -568,7 +566,7 @@ TEST_CASE("Temperature: E Core", "[temperature][smoke-test]") {
     config.schematicOutputPath = (getOutputDir() / "thermal_schematic_E_Core_42_21_15.svg").string();
     
     // Use real simulation for losses
-    auto inputs = createInputsForMagnetic(magnetic, 100000.0, config.ambientTemperature, 1.0);
+    auto inputs = createInputsForMagnetic(magnetic, 100000.0, config.ambientTemperature, 0.1);
     auto losses = getLossesFromSimulation(magnetic, inputs);
     
     
@@ -683,8 +681,59 @@ TEST_CASE("Temperature: Ambient Temperature Effect", "[temperature][smoke-test]"
     REQUIRE(result1.converged);
     REQUIRE(result2.converged);
     REQUIRE(result2.maximumTemperature > result1.maximumTemperature);
-    REQUIRE_THAT(result2.totalThermalResistance, 
-                 Catch::Matchers::WithinRel(result1.totalThermalResistance, 0.1));
+
+    // ABT #1735 (Alf 2026-10-11): the band is derived from how the part's own heat-transfer
+    // coefficients scale between the two ambients, not guessed. Raising the ambient from 25 to
+    // 50 C at a similar rise:
+    //   - radiation, h_rad = eps sigma (Ts^2 + Ta^2)(Ts + Ta), grows with absolute temperature
+    //     cubed: (323/298)^3 = 1.27 at a few kelvin of rise;
+    //   - natural convection on surfaces inside a correlation's range falls slightly (film
+    //     viscosity rises faster than conductivity, and the rise is smaller), while a small
+    //     surface on the Nu >= 1 floor has h = k_air(T_film)/L, which grows with k_air (~7%);
+    //   - solid conduction (ferrite, copper, enamel, tape) is ambient-independent here, and
+    //     stagnant-air films grow with k_air.
+    // So the part's total thermal resistance must FALL (radiation carries a large share of a small
+    // naturally-cooled part's heat and nothing falls by as much as it rises), and it cannot fall by
+    // more than its fastest-growing conductance rises: no part of the heat path becomes more than
+    // m_max times as conductive, so the rise per watt cannot shrink below 1/m_max of its 25 C
+    // value. m_max is read from the model's own resistors, paired between the two solves (same
+    // geometry, same network). The core/winding loss split moves between the ambients (3C97 loss
+    // falls, copper loss rises), but on this toroid both sit on one body whose hottest node is
+    // set by the surface films, so the split does not carry the rise per watt outside this range.
+    const auto& resistances25 = result1.thermalResistances;
+    const auto& resistances50 = result2.thermalResistances;
+    REQUIRE(resistances25.size() == resistances50.size());
+    REQUIRE(!resistances25.empty());
+    double maximumConductanceGrowth = 0.0;
+    double radiationConductance25 = 0.0;
+    double ambientConductance25 = 0.0;
+    const size_t ambientIdx = temp1.getNodes().size() - 1;
+    for (size_t k = 0; k < resistances25.size(); ++k) {
+        REQUIRE(resistances25[k].nodeFromId == resistances50[k].nodeFromId);
+        REQUIRE(resistances25[k].nodeToId == resistances50[k].nodeToId);
+        REQUIRE(resistances25[k].type == resistances50[k].type);
+        REQUIRE(resistances25[k].resistance > 0);
+        REQUIRE(resistances50[k].resistance > 0);
+        maximumConductanceGrowth = std::max(maximumConductanceGrowth, resistances25[k].resistance / resistances50[k].resistance);
+        if (resistances25[k].nodeToId == ambientIdx) {
+            ambientConductance25 += 1.0 / resistances25[k].resistance;
+            if (resistances25[k].type == HeatTransferType::RADIATION) {
+                radiationConductance25 += 1.0 / resistances25[k].resistance;
+            }
+        }
+    }
+    // The fastest-growing coefficient is radiation: (T50/T25)^3 within the rises seen here.
+    double hRadGrowth = ThermalResistance::calculateRadiationCoefficient(result2.maximumTemperature, 50.0, 0.9) /
+                        ThermalResistance::calculateRadiationCoefficient(result1.maximumTemperature, 25.0, 0.9);
+    double ratio = result2.totalThermalResistance / result1.totalThermalResistance;
+    INFO("R(25 C) " << result1.totalThermalResistance << " K/W, R(50 C) " << result2.totalThermalResistance
+         << " K/W, ratio " << ratio << "; largest conductance growth " << maximumConductanceGrowth
+         << ", h_rad growth at the hottest node " << hRadGrowth << "; radiation share of the 25 C surface conductance "
+         << radiationConductance25 / ambientConductance25);
+    CHECK(maximumConductanceGrowth > 1.0);
+    CHECK(maximumConductanceGrowth < hRadGrowth * 1.02);
+    CHECK(result2.totalThermalResistance < result1.totalThermalResistance);
+    CHECK(ratio > 1.0 / maximumConductanceGrowth);
 }
 
 TEST_CASE("Temperature: Loss Variation", "[temperature][smoke-test]") {
@@ -1134,8 +1183,9 @@ TEST_CASE("Temperature: Very High Losses", "[temperature][smoke-test]") {
 
     TemperatureConfig config;
     config.ambientTemperature = 25.0;
-    config.coreLosses = 10.0;
     applySimulatedLosses(config, magnetic);
+    // The stated 10 W are the test's subject; the simulation gives the per-turn winding losses.
+    config.coreLosses = 10.0;
     config.plotSchematic = false;
     
     Temperature temp(magnetic, config);
@@ -1143,6 +1193,70 @@ TEST_CASE("Temperature: Very High Losses", "[temperature][smoke-test]") {
     
     REQUIRE(result.converged);
     REQUIRE(result.maximumTemperature > 100.0);
+}
+
+// ABT #838: where a ferrite's core losses FALL with temperature (N87 below its loss minimum near
+// 100 C), the map "losses at T -> temperature those losses produce" has a negative slope, and at a
+// cold ambient the rise is large enough for that slope to pass -1 at the operating point. Plain
+// substitution then cannot converge: it swings around the fixed point forever and simulate() throws
+// "did not settle". Halving a temperature's step whenever its residual changes sign settles it.
+//
+// The fixture (found by the bounded search of 2026-10-13, 17 of 40 cold-ambient designs behave so):
+// ETD 29/16/10 N87 ungapped, 10:10 turns, -40 C ambient, 100 kHz, the flux imposed by a sinusoidal
+// winding voltage (Faraday: two windings, so the flux does not follow mu(T)) at 0.32 of B_sat(-40 C),
+// 0.188 T. The map: 13.9 W at -40 C -> 259 C; 2.93 W at 60 C -> 54.7 C; fixed point between 55 and
+// 60 C with slope -1.35. With the step halving disabled, simulate() throws after 100 iterations for
+// every level from 0.24 to 0.40 of B_sat; with it, this level settles at 58.0 C with 3.04 W.
+TEST_CASE("Temperature: simulate settles an oscillating loss-temperature loop", "[temperature][smoke-test]") {
+    const int64_t turns = 10;
+    const double ambientTemperature = -40.0;
+    const double frequency = 100000.0;
+    const double saturationFluxDensityFraction = 0.32;
+    std::vector<int64_t> numberTurns({turns, turns});
+    std::vector<int64_t> numberParallels({1, 1});
+    std::string shapeName = "ETD 29/16/10";
+    auto coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, shapeName, 1,
+                                                     WindingOrientation::CONTIGUOUS, WindingOrientation::CONTIGUOUS,
+                                                     CoilAlignment::CENTERED, CoilAlignment::CENTERED);
+    auto gapping = json::array();
+    auto core = OpenMagneticsTesting::get_quick_core(shapeName, gapping, 1, "N87");
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(coil);
+    const double magnetizingInductance = resolve_dimensional_values(
+        OpenMagnetics::MagnetizingInductance().calculate_inductance_from_number_turns_and_gapping(
+            magnetic.get_mutable_core(), magnetic.get_mutable_coil()).get_magnetizing_inductance());
+    // Faraday for a sine: V_peak = 2 pi f N A_e B_peak
+    const double fluxDensityPeak = saturationFluxDensityFraction *
+        magnetic.get_mutable_core().get_magnetic_flux_density_saturation(ambientTemperature, false);
+    const double voltagePeak = 2.0 * std::numbers::pi * frequency * static_cast<double>(turns) *
+        magnetic.get_mutable_core().get_effective_area() * fluxDensityPeak;
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point(
+        frequency, magnetizingInductance, ambientTemperature, WaveformLabel::SINUSOIDAL,
+        2.0 * voltagePeak, 0.5, 0.0, {1.0});
+
+    OpenMagnetics::MagneticSimulator simulator;
+    auto simulated = simulator.simulate(inputs, magnetic, false);
+    const auto& output = simulated.get_outputs()[0];
+    const auto& operatingPoint = simulated.get_inputs().get_operating_points()[0];
+    const double publishedCoreTemperature = output.get_core_losses()->get_temperature();
+    auto config = TemperatureConfig::fromSimulatedOutput(operatingPoint, output);
+    auto network = Temperature(magnetic, config).calculateTemperatures();
+    REQUIRE(network.maximumCoreTemperature);
+    CAPTURE(publishedCoreTemperature, network.maximumCoreTemperature.value(), output.get_core_losses()->get_core_losses());
+    // The operating point is the map's fixed point, which lies between 55 and 60 C.
+    CHECK(publishedCoreTemperature > 55.0 - OpenMagnetics::MagneticSimulator::kOperatingTemperatureTolerance);
+    CHECK(publishedCoreTemperature < 60.0 + OpenMagnetics::MagneticSimulator::kOperatingTemperatureTolerance);
+    CHECK(std::fabs(publishedCoreTemperature - network.maximumCoreTemperature.value()) <
+          OpenMagnetics::MagneticSimulator::kOperatingTemperatureTolerance);
+    auto excitation = operatingPoint.get_excitations_per_winding()[0];
+    REQUIRE(excitation.get_magnetic_flux_density());
+    REQUIRE(excitation.get_magnetic_flux_density()->get_processed());
+    // The flux is the imposed one, at the solved temperature too.
+    CHECK_THAT(excitation.get_magnetic_flux_density()->get_processed()->get_peak().value(),
+               Catch::Matchers::WithinRel(fluxDensityPeak, 0.01));
+    CHECK_THAT(output.get_core_losses()->get_core_losses(), Catch::Matchers::WithinRel(
+        OpenMagnetics::CoreLosses().calculate_core_losses(magnetic.get_core(), excitation, publishedCoreTemperature).get_core_losses(), 1e-9));
 }
 
 TEST_CASE("Temperature: Very Small Core", "[temperature][smoke-test]") {
@@ -1372,7 +1486,7 @@ TEST_CASE("Temperature: Linear Scaling Validation", "[temperature][smoke-test]")
     
     // Use different current levels to get different actual losses
     // With real simulation, losses scale with operating point, not config
-    std::vector<double> currents = {0.1, 0.2, 0.3, 0.5};
+    std::vector<double> currents = {0.05, 0.1, 0.15, 0.2};  // fractions of the saturation current
     std::vector<double> tempRises;
     std::vector<double> actualLosses;
     
@@ -1455,7 +1569,9 @@ TEST_CASE("Temperature: U Core", "[temperature][smoke-test]") {
     TemperatureConfig config;
     config.ambientTemperature = 25.0;
     config.coreLosses = 2.5;
-    applySimulatedLosses(config, magnetic);
+    // A tenth of the saturation current: at the default fifth this 297 cm3 ungapped N87 core dissipates
+    // 44 W at 100 kHz and has no operating temperature.
+    applySimulatedLosses(config, magnetic, 100000.0, 0.1);
     config.plotSchematic = false;
     
     Temperature temp(magnetic, config);
@@ -1771,7 +1887,7 @@ TEST_CASE("Temperature: Van den Bossche E42 Validation", "[temperature][smoke-te
     config.plotSchematic = false;
 
     // Test at different power levels
-    std::vector<double> currents = {0.03, 0.04, 0.05};  // Low currents for reasonable losses
+    std::vector<double> currents = {0.03, 0.04, 0.05};  // fractions of the saturation current: low losses
     
     
     // Get core geometry info
@@ -1839,7 +1955,7 @@ TEST_CASE("Temperature: Power-Temperature Linearity", "[temperature][smoke-test]
     config.plotSchematic = false;
 
     // Test linearity at different power levels using different currents
-    std::vector<double> currents = {0.1, 0.2, 0.3, 0.5};
+    std::vector<double> currents = {0.05, 0.1, 0.15, 0.2};  // fractions of the saturation current
     std::vector<double> thermalResistances;
     std::vector<double> actualLosses;
     std::vector<double> tempRises;
@@ -2696,11 +2812,29 @@ TEST_CASE("Temperature: Toroidal with Insulation Layers", "[temperature][round-w
     }
     
     // Get inputs from test file (contains operating points)
+    //
+    // Operating point: a single-winding inductor. The fixture used to drive BOTH windings (67 and
+    // 15 turns) with the same in-phase 10 A pk-pk current, so their ampere-turns added on an
+    // ungapped toroid: B_peak = 31.5 T and 2.28 MW of core loss, and the thermal network could not
+    // converge (the old helper swallowed that exception and the test ran on 0 W). Now only the
+    // 67-turn primary carries current; the 15-turn secondary stays in the coil (its section and the
+    // insulation layers around it are what this test checks) but is open: 0 A, with the induced
+    // voltage V1 * 15 / 67. That open secondary is how a single-winding inductor is expressed on
+    // this two-winding coil: MagneticSimulator rejects an operating point without exactly one
+    // excitation per winding, and removing the secondary would remove the insulation layers.
+    //   Core: Fair-Rite 98, T 28/14/15 ungapped, Ae = 105 mm^2, Bsat(100 C) = 0.405 T;
+    //   L = 44.27 mH (the fixture's stored magnetizing inductance), ambient 100 C, 100 kHz, D = 0.5.
+    //   Primary current: triangular, 30 mA pk-pk (+-15 mA), no DC.
+    //   B_peak = L * I_peak / (N * Ae) = 44.27e-3 * 0.015 / (67 * 105e-6) = 0.094 T  (23 % of Bsat).
+    //   V1 = L * dI / (D * T) = 44.27e-3 * 0.030 / 5e-6 = +-265.60 V square (volt-second balanced);
+    //   V2 = 265.60 * 15 / 67 = +-59.46 V.
     auto inputs = mas.get_inputs();
-    
+
     // Run magnetic simulation to get real losses
     auto losses = getLossesFromSimulation(magnetic, inputs);
-    
+    // The simulation must produce real losses now, not the 0 W the swallowed exception left.
+    REQUIRE(losses.coreLosses > 0);
+
     
     // Temperature config
     TemperatureConfig config;
@@ -3046,45 +3180,72 @@ TEST_CASE("Temperature: Cooling Utils Type Detection", "[temperature][cooling][s
     REQUIRE(h_mixed < 51.0);  // But natural should add a small amount
 }
 
-TEST_CASE("Temperature: 220kW Transformer", "[temperature][transformer][smoke-test]") {
+TEST_CASE("Temperature: 220kW Transformer", "[temperature][transformer][smoke-test][abt-1855][abt-1876]") {
     auto jsonPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "220kW_trafo.json");
     auto mas = OpenMagneticsTesting::mas_loader(jsonPath);
 
     auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
     auto inputs = OpenMagnetics::inputs_autocomplete(mas.get_inputs(), magnetic);
 
-    // Run magnetic simulation to get actual losses
-    auto losses = getLossesFromSimulation(magnetic, inputs);
-
-    TemperatureConfig config;
-    config.ambientTemperature = losses.ambientTemperature;
-    config.coreLosses = losses.coreLosses;
-    if (!losses.windingLossesOutput.has_value()) {
-        throw std::runtime_error("WindingLossesOutput missing from simulation results");
-    }
-    config.windingLosses = losses.windingLosses;
-    config.windingLossesOutput = losses.windingLossesOutput.value();
-    config.plotSchematic = true;
-    config.schematicOutputPath = (getOutputDir() / "thermal_schematic_220kW_transformer.svg").string();
-
-    // Add forced convection at 4 m/s
+    // Forced convection at 4 m/s is part of the OPERATING CONDITIONS (ABT #838): simulate()
+    // solves the losses at the temperature this cooling produces, so it must see the airflow,
+    // not only the thermal network built afterwards.
     MAS::Cooling forcedCooling;
-    forcedCooling.set_temperature(losses.ambientTemperature);
     forcedCooling.set_velocity(std::vector<double>{4.0, 0.0, 0.0});  // 4 m/s airflow
-    config.masCooling = forcedCooling;
+    for (auto& operatingPoint : inputs.get_mutable_operating_points()) {
+        forcedCooling.set_temperature(operatingPoint.get_conditions().get_ambient_temperature());
+        operatingPoint.get_mutable_conditions().set_cooling(forcedCooling);
+    }
 
-    Temperature temp(magnetic, config);
-    auto result = temp.calculateTemperatures();
-
-    // Export temperature field visualization
-    exportTemperatureFieldSvg("220kW_transformer", magnetic, result.nodeTemperatures, config.ambientTemperature);
-
-    // Export thermal circuit schematic
-    exportThermalCircuitSchematic("220kW_transformer", temp);
-
-    REQUIRE(result.converged);
-    REQUIRE(result.maximumTemperature > config.ambientTemperature);
-    REQUIRE(result.totalThermalResistance > 0.0);
+    // Even with the airflow this design has no operating point (ABT #838, accepted by Alf
+    // 2026-10-10): its copper alone dissipates ~1.4 kW at 60 C (360 A / 514 A rms at 20 kHz,
+    // ~42 A/mm2 in the primary litz; R_dc * I^2 checked by hand), while 4 m/s over its ~0.075 m2
+    // of surface gives ~0.4 K/W by hand (0.74 K/W in the thermal network), a 0.5-1 kK rise: core
+    // and copper heat each other past the Curie temperature.
+    // Rewritten for ABT #1855, Alf approved 2026-10-14: simulate no longer refuses a saturating core
+    // (it gives the numbers and ResultsAnalyzer names the saturation), and a core driven to its Curie
+    // temperature (DMR96A: 230 C) is held there with mu_r = 1 while the winding is iterated alone.
+    // The winding alone has no fixed point: the turn temperature the network returns grows ~1.8 K per
+    // kelvin of winding temperature its losses are evaluated at (2.8 kW at 60 C -> 1538 C turns,
+    // 16.9 kW at 1538 C -> 4262 C). The loss loop detects that from its own iterates (the winding runs away).
+    // Rewritten again, Alf decision 2026-10-14, ABT #1876: that runaway no longer refuses the design. The
+    // operating point has no thermal operating point, so simulate gives it its core and winding losses at
+    // ambient and no temperature output, and analyze_results reports NO_THERMAL_OPERATING_POINT for it with
+    // the runaway message and the loop history.
+    OpenMagnetics::MagneticSimulator magneticSimulator;
+    OpenMagnetics::Mas simulated;
+    REQUIRE_NOTHROW(simulated = magneticSimulator.simulate(inputs, magnetic));
+    REQUIRE(simulated.get_outputs().size() == inputs.get_operating_points().size());
+    for (size_t index = 0; index < simulated.get_outputs().size(); ++index) {
+        INFO("operating point " << index);
+        const auto& output = simulated.get_outputs()[index];
+        const double ambientTemperature = inputs.get_operating_points()[index].get_conditions().get_ambient_temperature();
+        CHECK_FALSE(output.get_temperature());
+        REQUIRE(output.get_core_losses());
+        REQUIRE(output.get_winding_losses());
+        CHECK(output.get_core_losses()->get_temperature() == ambientTemperature);
+        OpenMagnetics::Magnetic woundMagnetic = magnetic;
+        if (!woundMagnetic.get_coil().get_turns_description()) {
+            woundMagnetic.get_mutable_coil().wind();
+        }
+        MAS::OperatingPoint operatingPoint = inputs.get_operating_points()[index];
+        double windingLossesAtAmbient = OpenMagnetics::MagneticSimulator().calculate_winding_losses(operatingPoint, woundMagnetic, ambientTemperature).get_winding_losses();
+        INFO("winding losses " << output.get_winding_losses()->get_winding_losses() << " W, at ambient " << windingLossesAtAmbient << " W");
+        CHECK_THAT(output.get_winding_losses()->get_winding_losses(), Catch::Matchers::WithinRel(windingLossesAtAmbient, 1e-12));
+    }
+    auto findings = OpenMagnetics::ResultsAnalyzer::analyze_results(simulated);
+    size_t runawayFindings = 0;
+    for (const auto& finding : findings) {
+        INFO(OpenMagnetics::to_string(finding.code) << ": " << finding.message);
+        if (finding.code == OpenMagnetics::ResultFindingCode::NO_THERMAL_OPERATING_POINT) {
+            ++runawayFindings;
+            CHECK_THAT(finding.message, Catch::Matchers::ContainsSubstring("No thermal operating point: the winding runs away"));
+            CHECK_THAT(finding.message, Catch::Matchers::ContainsSubstring("dT_turn/dT_w"));
+            CHECK_THAT(finding.message, Catch::Matchers::ContainsSubstring("History:"));
+            CHECK_THAT(finding.message, Catch::Matchers::ContainsSubstring("Pcu="));
+        }
+    }
+    CHECK(runawayFindings == simulated.get_outputs().size());
 }
 
 TEST_CASE("Temperature: PQ Single Turn Quadrant Surface Areas", "[temperature][concentric][geometry][smoke-test]") {
@@ -3378,11 +3539,19 @@ TEST_CASE("Temperature: concentric_transformer", "[temperature][smoke-test]") {
         // Icepak core temperatures from solution overview
         // core_0: 63.50°C (from Icepak)
         // core_1: 67.88°C (from Icepak)
-        REQUIRE(tempsByType.at("core") <= 84.85); // Max Icepak: 67.88°C + 25% tolerance
-        // Min Icepak: 67.88°C - 25% tolerance = 50.91. ABT #1454/#1459 (winding->bobbin/core
-        // conduction, real core exterior) gives 48.62, 4.5 % below that band, while the other
-        // Icepak cases moved toward their references; Alf approved 48.0 (2026-09-28).
-        REQUIRE(tempsByType.at("core") >= 48.0);
+        // Re-pinned 2026-10-06 (ABT #1585), 48.63 C -> 31.70 C. The fixture's primary voltage
+        // was a -20.5/+70.5 V square (25 V mean) and its secondary 0/-100 V (-50 V mean); MKF
+        // integrated that DC into a drifting magnetizing current, 2.09 T peak on a ferrite core,
+        // 1.261 W of core loss. Inputs now rejects unbalanced volt-seconds, so the fixture carries
+        // the same squares at zero mean (+-45.5 V, +-50 V): 0.063 T, 0.133 W of core loss
+        // (winding loss unchanged, 0.201 W). The Icepak band (core_0 63.50 C, core_1 67.88 C,
+        // previously 48.0..84.85) matched only the drift artifact's loss and Icepak's loss inputs
+        // are not recorded, so it cannot be compared against a physical excitation; this pins
+        // the thermal network's result for the balanced fixture instead. The old Icepak band
+        // matched the old fixture's DC-offset flux-drift artefact (1-2 T), so this is now a
+        // REGRESSION pin, not a validation; ABT #1715 redoes the Icepak comparison with
+        // recorded loss inputs.
+        REQUIRE_THAT(tempsByType.at("core"), Catch::Matchers::WithinRel(31.70, 0.05));
     }
     
     SECTION("Bobbin temperature validation against Icepak") {
@@ -3410,12 +3579,16 @@ TEST_CASE("Temperature: concentric_transformer", "[temperature][smoke-test]") {
         // own spread, no invented tolerance. Corroboration: OMFEM's radiating 2D FEM on this
         // fixture, corrected for its documented planar area deficit, brackets the same range
         // (#461). The key REQUIREs keep the dead-lookup protection (keys must exist).
-        const double icepakColdestTurn = 38.72;
-        const double icepakHottestTurn = 60.01;
+        // Re-pinned 2026-10-06 (ABT #1585): with the volt-second balanced fixture (see the core
+        // section) the core loss falls from the drift artifact's 1.261 W to 0.133 W and the
+        // uniform winding level from 47.1..47.8 C to 32.05..32.31 C, below Icepak's exported
+        // turn span (38.72..60.01 C), which rested on that artifact's loss. Each turn is pinned
+        // to the balanced fixture's winding level, 32.2 C, at 5 % -- a REGRESSION pin, not a
+        // validation (see the core section; ABT #1715).
+        const double windingLevel = 32.2;
         auto checkTurn = [&](const std::string& key) {
             REQUIRE(tempsPerTurn.count(key) == 1);
-            REQUIRE(tempsPerTurn.at(key) >= icepakColdestTurn);
-            REQUIRE(tempsPerTurn.at(key) <= icepakHottestTurn);
+            REQUIRE_THAT(tempsPerTurn.at(key), Catch::Matchers::WithinRel(windingLevel, 0.05));
         };
         checkTurn("Secondary parallel 0 turn 4");
         checkTurn("Secondary parallel 0 turn 5");
@@ -3466,24 +3639,47 @@ TEST_CASE("Temperature: concentric_flyback_rectangular_column", "[temperature][s
     // conduction, and that path is the separate coupling problem tracked in #461.
     // The per-turn section below is currently DEAD (guarded lookups on key names
     // that never match), so it does not catch this — see ABT #454.
+    //
+    // FIXTURE (ABT #1740, Alf 2026-10-10): the fixture used to carry a second operating
+    // point, "Max. input volt.", whose 911 uVs on 24 turns of this E 25/13/7 impose a
+    // 0.73 T swing on 3C96 (B_sat ~0.5 T): the core saturates and MKF now refuses it. It
+    // was dropped; the test only ever used the first operating point's losses (outputs[0]).
+    // Its design requirements said Lm >= 510 uH and turns ratio 8.5, while the coil is
+    // 24:13 on a 0.8 mm gap (~64 uH); they now state the real coil (Lm 60-67 uH, 24/13).
+    // The remaining operating point's waveforms were simulated with Lm = 510 uH, not with
+    // this coil's ~64 uH; the Icepak references stay, as they belong to this geometry and
+    // to that operating point's losses.
     auto jsonPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "concentric_flyback_rectangular_column.json");
     auto mas = OpenMagneticsTesting::mas_loader(jsonPath);
     
     auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
     auto inputs = OpenMagnetics::inputs_autocomplete(mas.get_inputs(), magnetic);
     
-    // Run magnetic simulation to get actual losses
-    auto losses = getLossesFromSimulation(magnetic, inputs);
-    
+    // LOSSES FED TO THE NETWORK (ABT #838, Alf 2026-10-12): the losses recorded in the fixture for
+    // its SECOND operating point, "Max. input volt." (15.67 W of core loss at 484.5 C plus the
+    // per-turn winding losses), kept beside the fixture in
+    // concentric_flyback_rectangular_column_max_input_voltage_outputs.json: outputs[1] of the fixture as it was until ABT #1740
+    // dropped that operating point (git 433bfd3f). This is the INFERRED Icepak input: which losses
+    // the Icepak run was given is not recorded. Ansyas, the Icepak driver, feeds it from
+    // mas.outputs[operating_point_index] and defaults to index 0, but index 0's losses (4.02 W of
+    // core loss) put this network's core at 187-199 C, far below Icepak's 351-485 C, and only
+    // index 1 reproduces Icepak's temperatures (its recorded core-loss temperature, 484.48 C, is
+    // Icepak's core_1 of the flyback run). The test used to feed the losses MKF simulates for the
+    // first operating point, which have no relation to what Icepak solved.
+    auto recordedOutputsPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "concentric_flyback_rectangular_column_max_input_voltage_outputs.json");
+    std::ifstream recordedOutputsFile(recordedOutputsPath);
+    REQUIRE(recordedOutputsFile.good());
+    MAS::Outputs recordedOutputs(json::parse(recordedOutputsFile));
+    REQUIRE(recordedOutputs.get_core_losses());
+    REQUIRE(recordedOutputs.get_winding_losses());
+    REQUIRE(recordedOutputs.get_winding_losses()->get_winding_losses_per_turn());
+    REQUIRE(recordedOutputs.get_winding_losses()->get_winding_losses_per_turn()->size() == magnetic.get_coil().get_turns_description().value().size());
+
     TemperatureConfig config;
-    config.ambientTemperature = losses.ambientTemperature;
-    config.coreLosses = losses.coreLosses;
-    if (losses.windingLossesOutput.has_value()) {
-        config.windingLosses = losses.windingLosses;
-        config.windingLossesOutput = losses.windingLossesOutput.value();
-    } else {
-        applySimulatedLosses(config, magnetic);
-    }
+    config.ambientTemperature = inputs.get_operating_points()[0].get_conditions().get_ambient_temperature();
+    config.coreLosses = recordedOutputs.get_core_losses()->get_core_losses();
+    config.windingLosses = recordedOutputs.get_winding_losses()->get_winding_losses();
+    config.windingLossesOutput = recordedOutputs.get_winding_losses().value();
     config.plotSchematic = false;
     
     Temperature temp(magnetic, config);
@@ -3562,24 +3758,42 @@ TEST_CASE("Temperature: concentric_transformer_contiguous_rectangular_wire", "[t
     // window/room split of the turn area, and the damped solver iteration
     // (Temperature.cpp, ABT #461), the core converges at ~449°C, inside this band —
     // re-enabled.
+    //
+    // FIXTURE (ABT #1740): as in concentric_flyback_rectangular_column, the saturating
+    // "Max. input volt." operating point was dropped and the design requirements now
+    // state the real coil (Lm 60-67 uH, turns ratio 24/13). The remaining operating
+    // point's waveforms were simulated with Lm = 510 uH, not with this coil's inductance.
     auto jsonPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "concentric_transformer_contiguous_rectangular_wire.json");
     auto mas = OpenMagneticsTesting::mas_loader(jsonPath);
     
     auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
     auto inputs = OpenMagnetics::inputs_autocomplete(mas.get_inputs(), magnetic);
     
-    // Run magnetic simulation to get actual losses
-    auto losses = getLossesFromSimulation(magnetic, inputs);
-    
+    // LOSSES FED TO THE NETWORK (ABT #838, Alf 2026-10-12): the losses recorded in the fixture for
+    // its SECOND operating point, "Max. input volt." (15.67 W of core loss at 484.5 C plus the
+    // per-turn winding losses), kept beside the fixture in
+    // concentric_transformer_contiguous_rectangular_wire_max_input_voltage_outputs.json: outputs[1] of the fixture as it was until ABT #1740
+    // dropped that operating point (git 433bfd3f). This is the INFERRED Icepak input: which losses
+    // the Icepak run was given is not recorded. Ansyas, the Icepak driver, feeds it from
+    // mas.outputs[operating_point_index] and defaults to index 0, but index 0's losses (4.02 W of
+    // core loss) put this network's core at 187-199 C, far below Icepak's 351-485 C, and only
+    // index 1 reproduces Icepak's temperatures (its recorded core-loss temperature, 484.48 C, is
+    // Icepak's core_1 of the flyback run). The test used to feed the losses MKF simulates for the
+    // first operating point, which have no relation to what Icepak solved.
+    auto recordedOutputsPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "concentric_transformer_contiguous_rectangular_wire_max_input_voltage_outputs.json");
+    std::ifstream recordedOutputsFile(recordedOutputsPath);
+    REQUIRE(recordedOutputsFile.good());
+    MAS::Outputs recordedOutputs(json::parse(recordedOutputsFile));
+    REQUIRE(recordedOutputs.get_core_losses());
+    REQUIRE(recordedOutputs.get_winding_losses());
+    REQUIRE(recordedOutputs.get_winding_losses()->get_winding_losses_per_turn());
+    REQUIRE(recordedOutputs.get_winding_losses()->get_winding_losses_per_turn()->size() == magnetic.get_coil().get_turns_description().value().size());
+
     TemperatureConfig config;
-    config.ambientTemperature = losses.ambientTemperature;
-    config.coreLosses = losses.coreLosses;
-    if (losses.windingLossesOutput.has_value()) {
-        config.windingLosses = losses.windingLosses;
-        config.windingLossesOutput = losses.windingLossesOutput.value();
-    } else {
-        applySimulatedLosses(config, magnetic);
-    }
+    config.ambientTemperature = inputs.get_operating_points()[0].get_conditions().get_ambient_temperature();
+    config.coreLosses = recordedOutputs.get_core_losses()->get_core_losses();
+    config.windingLosses = recordedOutputs.get_winding_losses()->get_winding_losses();
+    config.windingLossesOutput = recordedOutputs.get_winding_losses().value();
     config.plotSchematic = true;
     
     Temperature temp(magnetic, config);
@@ -4314,57 +4528,123 @@ TEST_CASE("ABT838_Bare_Copper_Does_Not_Radiate_Like_A_Matte_Dielectric", "[tempe
     // "bare" -- how MAS writes bare metal -- so the two windings must come out with different
     // emissivities, and the value has to survive recalculateConvectionResistances, which is
     // where the single config-wide value used to be re-imposed every iteration.
+    //
+    // ABT #1540: the stored layout is litz | foil | litz, and the 0.4 x 9 mm foil touches the
+    // ten litz turns of the layer on each of its sides. The network used to measure a
+    // rectangular turn by half its SMALLER side in every direction, so only the litz turn level
+    // with the foil's centre could ever be "near" it, none was, and the foil came out with no
+    // edge to either layer and its outer face open to the room -- through a full layer of litz.
+    // That impossible surface was the bare one this test read. With the outlines measured as
+    // they are, the buried foil has no exposed face, which is asserted below; the bare surface
+    // is now read from the same design without its outer primary section (litz | foil), where
+    // the foil really is the outermost layer, and the coated one from the stored layout, whose
+    // outermost layer is litz.
     auto jsonPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(),
                                                             "concentric_litz_foil.json");
     auto mas = OpenMagneticsTesting::mas_loader(jsonPath);
-    auto magnetic = mas.get_magnetic();
-    auto operatingPoint = mas.get_inputs().get_operating_points()[0];
-    auto losses = getLossesFromSimulation(magnetic, mas.get_mutable_inputs());
 
-    TemperatureConfig config;
-    config.ambientTemperature = losses.ambientTemperature;
-    config.coreLosses = losses.coreLosses;
-    REQUIRE(losses.windingLossesOutput.has_value());
-    config.windingLosses = losses.windingLosses;
-    config.windingLossesOutput = losses.windingLossesOutput.value();
-    config.plotSchematic = false;
-
-    Temperature temperature(magnetic, config);
-    auto result = temperature.calculateTemperatures();
-    REQUIRE(result.converged);
+    auto withoutOuterPrimarySection = [](const OpenMagnetics::Magnetic& stored) {
+        json magneticJson;
+        to_json(magneticJson, stored);
+        auto& coil = magneticJson["coil"];
+        // The stored sections, from the column outwards: Primary section 0, insulation,
+        // Secondary section 0, insulation, Primary section 1, insulation.
+        REQUIRE(coil["sectionsDescription"].size() == 6);
+        REQUIRE(coil["sectionsDescription"][4]["name"] == "Primary section 1");
+        REQUIRE(coil["functionalDescription"][0]["name"] == "Primary");
+        REQUIRE(coil["functionalDescription"][0]["numberParallels"] == 2);
+        const std::set<std::string> dropped = {coil["sectionsDescription"][4]["name"].get<std::string>(),
+                                               coil["sectionsDescription"][5]["name"].get<std::string>()};
+        auto keepOutsideDropped = [&](json& description, const std::string& sectionKey) {
+            json kept = json::array();
+            for (auto& item : description) {
+                if (!dropped.count(item[sectionKey].get<std::string>())) {
+                    kept.push_back(item);
+                }
+            }
+            description = kept;
+        };
+        keepOutsideDropped(coil["sectionsDescription"], "name");
+        keepOutsideDropped(coil["layersDescription"], "section");
+        keepOutsideDropped(coil["turnsDescription"], "section");
+        // The second parallel lived entirely in the dropped section: the primary is one parallel.
+        coil["functionalDescription"][0]["numberParallels"] = 1;
+        for (const char* key : {"sectionsDescription", "layersDescription"}) {
+            for (auto& item : coil[key]) {
+                if (!item.contains("partialWindings")) continue;
+                for (auto& partialWinding : item["partialWindings"]) {
+                    if (partialWinding["winding"] != "Primary") continue;
+                    REQUIRE(partialWinding["parallelsProportion"].size() == 2);
+                    REQUIRE(partialWinding["parallelsProportion"][1] == 0);
+                    partialWinding["parallelsProportion"] = json::array({partialWinding["parallelsProportion"][0]});
+                }
+            }
+        }
+        for (auto& turn : coil["turnsDescription"]) {
+            REQUIRE(turn["parallel"] == 0);
+        }
+        return OpenMagnetics::Magnetic(magneticJson);
+    };
 
     // Read the SOLVED resistances, not just the field: a value stamped on the resistor that the
     // iteration then ignores is exactly the bug being fixed, and a test that only inspects the
     // field passes in both states. h_rad follows from R and the area, and it is proportional to
     // the emissivity, so the bare winding's radiating surfaces must come out far weaker than the
     // coated one's.
-    const auto& nodes = temperature.getNodes();
     std::vector<double> bareCoefficients;
     std::vector<double> coatedCoefficients;
-    for (const auto& resistor : temperature.getResistances()) {
-        if (resistor.type != HeatTransferType::RADIATION) {
-            continue;
+    auto readRadiatingTurnSurfaces = [&](const OpenMagnetics::Magnetic& magnetic) {
+        auto losses = getLossesFromSimulation(magnetic, mas.get_mutable_inputs());
+
+        TemperatureConfig config;
+        config.ambientTemperature = losses.ambientTemperature;
+        config.coreLosses = losses.coreLosses;
+        REQUIRE(losses.windingLossesOutput.has_value());
+        config.windingLosses = losses.windingLosses;
+        config.windingLossesOutput = losses.windingLossesOutput.value();
+        config.plotSchematic = false;
+
+        Temperature temperature(magnetic, config);
+        auto result = temperature.calculateTemperatures();
+        REQUIRE(result.converged);
+
+        const auto& nodes = temperature.getNodes();
+        for (const auto& resistor : temperature.getResistances()) {
+            if (resistor.type != HeatTransferType::RADIATION) {
+                continue;
+            }
+            if (resistor.nodeFromId >= nodes.size() || resistor.area <= 0 || resistor.resistance <= 0) {
+                continue;
+            }
+            const auto& node = nodes[resistor.nodeFromId];
+            if (node.part != ThermalNodePartType::TURN || !node.windingIndex) {
+                continue;
+            }
+            const double impliedCoefficient = 1.0 / (resistor.resistance * resistor.area);
+            // Winding 0 is the served litz, winding 1 the bare foil.
+            if (node.windingIndex.value() == 1) {
+                bareCoefficients.push_back(impliedCoefficient);
+                CHECK_THAT(resistor.emissivity,
+                           Catch::Matchers::WithinRel(OpenMagnetics::ThermalDefaults::kRadiation_BareCopperEmissivity, 1e-12));
+            }
+            else {
+                coatedCoefficients.push_back(impliedCoefficient);
+                CHECK_THAT(resistor.emissivity,
+                           Catch::Matchers::WithinRel(OpenMagnetics::ThermalDefaults::kConvection_DefaultEmissivity, 1e-12));
+            }
         }
-        if (resistor.nodeFromId >= nodes.size() || resistor.area <= 0 || resistor.resistance <= 0) {
-            continue;
-        }
-        const auto& node = nodes[resistor.nodeFromId];
-        if (node.part != ThermalNodePartType::TURN || !node.windingIndex) {
-            continue;
-        }
-        const double impliedCoefficient = 1.0 / (resistor.resistance * resistor.area);
-        // Winding 0 is the served litz, winding 1 the bare foil.
-        if (node.windingIndex.value() == 1) {
-            bareCoefficients.push_back(impliedCoefficient);
-            CHECK_THAT(resistor.emissivity,
-                       Catch::Matchers::WithinRel(OpenMagnetics::ThermalDefaults::kRadiation_BareCopperEmissivity, 1e-12));
-        }
-        else {
-            coatedCoefficients.push_back(impliedCoefficient);
-            CHECK_THAT(resistor.emissivity,
-                       Catch::Matchers::WithinRel(OpenMagnetics::ThermalDefaults::kConvection_DefaultEmissivity, 1e-12));
-        }
-    }
+    };
+
+    // Stored layout, litz | foil | litz: the outer litz layer radiates, the buried foil does not.
+    readRadiatingTurnSurfaces(mas.get_magnetic());
+    CHECK(bareCoefficients.empty());
+    REQUIRE(!coatedCoefficients.empty());
+    const size_t coatedSurfacesOfStoredLayout = coatedCoefficients.size();
+
+    // litz | foil: the foil is the outermost layer and covers the litz, so it alone radiates.
+    readRadiatingTurnSurfaces(withoutOuterPrimarySection(mas.get_magnetic()));
+    CHECK(coatedCoefficients.size() == coatedSurfacesOfStoredLayout);
+
     // Both kinds must actually be present, or the test is asserting nothing.
     REQUIRE(!bareCoefficients.empty());
     REQUIRE(!coatedCoefficients.empty());
@@ -4397,6 +4677,301 @@ TEST_CASE("Temperature: an insulation material is found under its MAS name", "[t
     // A name that only the generic list knows still resolves there.
     REQUIRE_THAT(ThermalResistance::getMaterialThermalConductivity("mylar"),
                  Catch::Matchers::WithinAbs(0.15, 1e-12));
+}
+
+// ============================================================================
+// ABT #1753: a core material's heat conductivity — the MAS value, or a flagged estimate (class,
+// family, all sourced materials); absence never throws, malformed data does
+// ============================================================================
+// The network used the configured coreThermalConductivity (4.0) or a per-composition constant
+// table whenever MAS had no heatConductivity: numbers no datasheet backs, applied silently. Now
+// one resolver returns the MAS value, or estimates it from the SOURCED materials of the nearest
+// pool that has any and says so (Alf, 2026-10-11: "always keep an approved fallback").
+namespace {
+CoreMaterial core_material_without_heat_conductivity(MaterialType type, std::optional<MaterialComposition> composition) {
+    auto material = find_core_material_by_name("N87");
+    material.set_name("N87 without heat conductivity");
+    material.set_heat_conductivity(std::nullopt);
+    material.set_provenance(std::nullopt);
+    material.set_material(type);
+    material.set_material_composition(composition);
+    return material;
+}
+
+// Resolves a renamed copy (the WARNING is logged once per material) and returns the warnings.
+std::vector<std::string> estimate_warnings(CoreMaterial material, const std::string& probeName) {
+    material.set_name(probeName);
+    Logger::getInstance().disableCollector();
+    Logger::getInstance().enableCollector(LogLevel::WARNING);
+    resolve_core_material_heat_conductivity(material);
+    auto collected = Logger::getInstance().drainCollected();
+    Logger::getInstance().disableCollector();
+    std::vector<std::string> messages;
+    for (const auto& record : collected) {
+        if (record.level == LogLevel::WARNING && record.message.find(probeName) != std::string::npos) {
+            messages.push_back(record.message);
+        }
+    }
+    return messages;
+}
+
+// The span of the pooled members' values; every member must be sourced and satisfy `inPool`.
+std::pair<double, double> sourced_pool_span(const CoreHeatConductivityEstimate& estimate,
+                                            const std::function<bool(const CoreMaterial&)>& inPool) {
+    double low = std::numeric_limits<double>::max();
+    double high = std::numeric_limits<double>::lowest();
+    for (const auto& name : estimate.sourceMaterials) {
+        auto member = find_core_material_by_name(name);
+        REQUIRE(member.get_heat_conductivity());
+        REQUIRE(member.get_provenance());
+        REQUIRE(inPool(member));
+        double value = resolve_dimensional_values(member.get_heat_conductivity().value());
+        low = std::min(low, value);
+        high = std::max(high, value);
+    }
+    return {low, high};
+}
+
+bool has_sourced_heat_conductivity(const CoreMaterial& material) {
+    if (!material.get_heat_conductivity() || !material.get_provenance()) {
+        return false;
+    }
+    const auto provenance = material.get_provenance().value();  // bound: never range-for over a temporary's value()
+    for (const auto& entry : provenance) {
+        if (entry.get_retracted() && entry.get_retracted().value()) {
+            continue;
+        }
+        if (entry.get_fields()) {
+            auto fields = entry.get_fields().value();
+            if (std::find(fields.begin(), fields.end(), "heatConductivity") != fields.end() &&
+                (entry.get_source_url() || entry.get_source_name())) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+}
+
+TEST_CASE("Core heat conductivity: a material with MAS data uses it exactly", "[temperature][thermal][smoke-test]") {
+    SECTION("Sourced value") {
+        auto material = find_core_material_by_name("N87");
+        REQUIRE(material.get_heat_conductivity());
+        auto resolved = resolve_core_material_heat_conductivity(material);
+        CHECK_FALSE(resolved.is_estimated());
+        CHECK(resolved.tier == CoreHeatConductivityTier::MATERIAL);
+        CHECK(resolved.source);
+        CHECK_FALSE(resolved.is_unsourced());
+        CHECK(resolved.value == resolve_dimensional_values(material.get_heat_conductivity().value()));
+        CHECK(ThermalResistance::getCoreMaterialThermalConductivity(material) == resolved.value);
+        CHECK(ThermalResistance::getMaterialThermalConductivity("N87") == resolved.value);
+    }
+    SECTION("Unsourced value: still the material's own, flagged unsourced") {
+        auto material = find_core_material_by_name("MPP 14");
+        REQUIRE(material.get_heat_conductivity());
+        REQUIRE_FALSE(has_sourced_heat_conductivity(material));
+        auto resolved = resolve_core_material_heat_conductivity(material);
+        CHECK_FALSE(resolved.is_estimated());
+        CHECK(resolved.tier == CoreHeatConductivityTier::MATERIAL);
+        CHECK(resolved.is_unsourced());
+        CHECK(resolved.value == resolve_dimensional_values(material.get_heat_conductivity().value()));
+        auto warnings = estimate_warnings(material, "MPP 14 (unsourced warning probe)");
+        REQUIRE(warnings.size() == 1);
+        CHECK(warnings[0].find("UNSOURCED") != std::string::npos);
+    }
+}
+
+TEST_CASE("Core heat conductivity: a material without data gets its class estimate, flagged", "[temperature][thermal][smoke-test]") {
+    SECTION("MnZn ferrite: family values only, so the class median") {
+        auto material = core_material_without_heat_conductivity(MaterialType::FERRITE, MaterialComposition::MN_ZN);
+        auto resolved = resolve_core_material_heat_conductivity(material);
+        REQUIRE(resolved.is_estimated());
+        CHECK(resolved.tier == CoreHeatConductivityTier::CLASS);
+        const auto& estimate = resolved.estimate.value();
+        CHECK(estimate.tier == CoreHeatConductivityTier::CLASS);
+        CHECK(estimate.pool == "class FERRITE MN_ZN");
+        REQUIRE(estimate.sourceMaterials.size() > 1);
+        CHECK(estimate.numberDataPoints < estimate.sourceMaterials.size());  // family values counted once
+        CHECK(estimate.numberDocuments > 1);
+        CHECK_FALSE(estimate.predictor);
+        auto [low, high] = sourced_pool_span(estimate, [](const CoreMaterial& m) {
+            return m.get_material() == MaterialType::FERRITE && m.get_material_composition() == MaterialComposition::MN_ZN;
+        });
+        CHECK(resolved.value >= low);
+        CHECK(resolved.value <= high);
+    }
+    SECTION("Carbonyl iron powder: per-grade data with a density trend") {
+        auto mix1 = find_core_material_by_name("Mix 1");
+        REQUIRE_FALSE(mix1.get_heat_conductivity());
+        auto resolved = resolve_core_material_heat_conductivity(mix1);
+        REQUIRE(resolved.is_estimated());
+        CHECK(resolved.tier == CoreHeatConductivityTier::CLASS);
+        const auto& estimate = resolved.estimate.value();
+        REQUIRE(estimate.predictor);
+        CHECK(estimate.predictor.value() == "density");
+        CHECK(estimate.predictorValue.value() == mix1.get_density().value());
+        CHECK(estimate.predictorValue.value() >= estimate.predictorMinimum.value());
+        CHECK(estimate.predictorValue.value() <= estimate.predictorMaximum.value());
+        CHECK_FALSE(estimate.trendNotFollowedReason);
+        auto [low, high] = sourced_pool_span(estimate, [](const CoreMaterial& m) {
+            return m.get_material() == MaterialType::POWDER && m.get_material_composition() == MaterialComposition::CARBONYL_IRON;
+        });
+        CHECK(resolved.value > low);
+        CHECK(resolved.value < high);
+        auto warnings = estimate_warnings(mix1, "Mix 1 (estimate warning probe)");
+        REQUIRE(warnings.size() == 1);
+        CHECK(warnings[0].find("ESTIMATED") != std::string::npos);
+        CHECK(warnings[0].find("tier CLASS") != std::string::npos);
+        CHECK(warnings[0].find("class POWDER CARBONYL_IRON") != std::string::npos);
+        CHECK(warnings[0].find("least-squares trend on density") != std::string::npos);
+    }
+    SECTION("Carbonyl iron powder outside the sourced density span: the class median, never extrapolated") {
+        auto mix1 = resolve_core_material_heat_conductivity(find_core_material_by_name("Mix 1")).estimate.value();
+        auto mix17 = find_core_material_by_name("Mix 17");
+        REQUIRE_FALSE(mix17.get_heat_conductivity());
+        REQUIRE(mix17.get_density().value() < mix1.predictorMinimum.value());
+        auto resolved = resolve_core_material_heat_conductivity(mix17);
+        REQUIRE(resolved.is_estimated());
+        const auto& estimate = resolved.estimate.value();
+        CHECK_FALSE(estimate.predictor);
+        REQUIRE(estimate.trendNotFollowedReason);
+        // The median of the class's per-grade sourced values.
+        std::vector<double> values;
+        for (const auto& name : estimate.sourceMaterials) {
+            values.push_back(resolve_dimensional_values(find_core_material_by_name(name).get_heat_conductivity().value()));
+        }
+        std::sort(values.begin(), values.end());
+        REQUIRE(values.size() % 2 == 1);
+        CHECK(resolved.value == values[values.size() / 2]);
+        auto warnings = estimate_warnings(mix17, "Mix 17 (estimate warning probe)");
+        REQUIRE(warnings.size() == 1);
+        CHECK(warnings[0].find("ESTIMATED") != std::string::npos);
+        CHECK(warnings[0].find("median") != std::string::npos);
+        CHECK(warnings[0].find("trend is not followed") != std::string::npos);
+    }
+}
+
+TEST_CASE("Core heat conductivity: a class with no sourced member gets its family estimate, flagged", "[temperature][thermal][smoke-test]") {
+    // No FeSiCr powder in MAS carries a sourced value: the metal powder and alloy family answers.
+    auto material = core_material_without_heat_conductivity(MaterialType::POWDER, MaterialComposition::FE_SI_CR);
+    auto resolved = resolve_core_material_heat_conductivity(material);
+    REQUIRE(resolved.is_estimated());
+    CHECK(resolved.tier == CoreHeatConductivityTier::FAMILY);
+    const auto& estimate = resolved.estimate.value();
+    CHECK(estimate.pool.find("metal powder and alloy family") != std::string::npos);
+    CHECK(estimate.method.find("class POWDER FE_SI_CR has no sourced member") != std::string::npos);
+    CHECK(estimate.numberDocuments >= 1);
+    CHECK_FALSE(estimate.predictor);
+    auto [low, high] = sourced_pool_span(estimate, [](const CoreMaterial& m) { return m.get_material() != MaterialType::FERRITE; });
+    CHECK(resolved.value >= low);
+    CHECK(resolved.value <= high);
+    // Every sourced non-ferrite material is in the pool.
+    size_t sourcedMetals = 0;
+    for (const auto& name : get_core_material_names()) {
+        auto member = find_core_material_by_name(name);
+        if (member.get_material() != MaterialType::FERRITE && has_sourced_heat_conductivity(member)) {
+            ++sourcedMetals;
+        }
+    }
+    CHECK(estimate.sourceMaterials.size() == sourcedMetals);
+    auto warnings = estimate_warnings(material, "FeSiCr powder (family warning probe)");
+    REQUIRE(warnings.size() == 1);
+    CHECK(warnings[0].find("tier FAMILY") != std::string::npos);
+}
+
+TEST_CASE("Core heat conductivity: a proprietary or missing composition falls to its material type, then to all sourced materials", "[temperature][thermal][smoke-test]") {
+    size_t sourcedAll = 0;
+    std::map<MaterialType, size_t> sourcedByType;
+    for (const auto& name : get_core_material_names()) {
+        auto member = find_core_material_by_name(name);
+        if (has_sourced_heat_conductivity(member)) {
+            ++sourcedAll;
+            ++sourcedByType[member.get_material()];
+        }
+    }
+    REQUIRE(sourcedAll > 0);
+    size_t lastResortCases = 0;
+    for (auto type : magic_enum::enum_values<MaterialType>()) {
+        for (std::optional<MaterialComposition> composition : {std::optional<MaterialComposition>(MaterialComposition::PROPRIETARY),
+                                                                std::optional<MaterialComposition>()}) {
+            CAPTURE(magic_enum::enum_name(type), composition.has_value());
+            auto resolved = resolve_core_material_heat_conductivity(core_material_without_heat_conductivity(type, composition));
+            REQUIRE(resolved.is_estimated());
+            const auto& estimate = resolved.estimate.value();
+            if (sourcedByType[type] > 0) {
+                CHECK(resolved.tier == CoreHeatConductivityTier::FAMILY);
+                CHECK(estimate.pool == "material type " + std::string(magic_enum::enum_name(type)));
+                CHECK(estimate.sourceMaterials.size() == sourcedByType[type]);
+                sourced_pool_span(estimate, [type](const CoreMaterial& m) { return m.get_material() == type; });
+            }
+            else {
+                ++lastResortCases;
+                CHECK(resolved.tier == CoreHeatConductivityTier::ALL_SOURCED);
+                CHECK(estimate.pool == "all sourced core materials");
+                CHECK(estimate.sourceMaterials.size() == sourcedAll);
+                auto [low, high] = sourced_pool_span(estimate, [](const CoreMaterial&) { return true; });
+                CHECK(resolved.value >= low);
+                CHECK(resolved.value <= high);
+            }
+        }
+    }
+    // MAS today has no sourced electrical-steel or nanocrystalline value, so the last resort is
+    // exercised; if sourcing ever covers every material type, this count drops to 0 by design.
+    INFO("material types answered by the last resort: " << lastResortCases / 2);
+    CHECK(lastResortCases > 0);
+}
+
+TEST_CASE("Core heat conductivity: a malformed value throws", "[temperature][thermal][smoke-test]") {
+    for (double bad : {-1.0, 0.0}) {
+        auto material = find_core_material_by_name("N87");
+        DimensionWithTolerance malformed;
+        malformed.set_nominal(bad);
+        material.set_heat_conductivity(malformed);
+        CHECK_THROWS_AS(resolve_core_material_heat_conductivity(material), MaterialException);
+    }
+}
+
+TEST_CASE("Temperature: the network takes the core conductivity from the resolver and never from a configured default", "[temperature][thermal][smoke-test]") {
+    std::vector<int64_t> numberTurns({10});
+    std::vector<int64_t> numberParallels({1});
+    std::string shapeName = "ETD 29/16/10";
+    auto coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, shapeName, 1,
+        WindingOrientation::OVERLAPPING, WindingOrientation::OVERLAPPING,
+        CoilAlignment::CENTERED, CoilAlignment::CENTERED);
+    auto core = OpenMagneticsTesting::get_quick_core(shapeName, json::array(), 1, "N87");
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_coil(coil);
+
+    TemperatureConfig config;
+    config.ambientTemperature = 25.0;
+    config.plotSchematic = false;
+    // Losses from the N87 design, then held FIXED: only the thermal model is under test.
+    magnetic.set_core(core);
+    applySimulatedLosses(config, magnetic);
+
+    auto solve = [&](const CoreMaterial& material) {
+        core.get_mutable_functional_description().set_material(material);
+        magnetic.set_core(core);
+        auto result = Temperature(magnetic, config).calculateTemperatures();
+        REQUIRE(result.converged);
+        return result.maximumTemperature;
+    };
+    auto with_conductivity = [](CoreMaterial material, double k) {
+        DimensionWithTolerance value;
+        value.set_nominal(k);
+        material.set_heat_conductivity(value);
+        return material;
+    };
+
+    // A material whose class has no sourced conductivity: the solve runs on the flagged family
+    // estimate (it used to run on the configured 4.0, and before this ticket's first draft, threw).
+    auto noData = core_material_without_heat_conductivity(MaterialType::POWDER, MaterialComposition::FE_SI_CR);
+    const double resolvedK = resolve_core_material_heat_conductivity(noData).value;
+    // The guard only discriminates if the estimate is not the old default.
+    REQUIRE(std::abs(resolvedK - 4.0) > 0.5);
+    const double estimated = solve(noData);
+    CHECK_THAT(estimated, Catch::Matchers::WithinAbs(solve(with_conductivity(noData, resolvedK)), 1e-9));
+    CHECK(std::abs(estimated - solve(with_conductivity(noData, 4.0))) > 1e-3);
 }
 
 // ============================================================================
@@ -4557,4 +5132,532 @@ TEST_CASE("Temperature: ABT 1454 an unserved litz rests on its enclosure through
     // than that: it has the thicker film between copper and enclosure.
     CHECK(std::abs(tUnserved - tServed) < 3.0);
     CHECK(tUnserved <= tServed + 0.5);
+}
+
+// ABT #1735: the full network put the core of a WOUND toroid 3-12x hotter than the same core bare
+// (T 36/23/15 N87 20:10: 97 K/W full vs 33 K/W core-only at 1 W, and the "core-only" value itself
+// wrapped the core in the coil's invisible turns). Three faults in the toroidal builder, all
+// topology/area, none a correlation: (1) the outermost insulation wrap convected a section-plane
+// quadrant -- half the core height at the mean radius, no annular faces -- a third of its real
+// skin; (2) turn-to-wrap conduction ran over the chord between the turn's angle and the wrap
+// segment's mid-angle (millimetres of tape) instead of the radial contact; (3) a toroid with no
+// wrap blocked a core face outright under any turn and never counted the bare ferrite between
+// sparse turns. A winding with no copper loss only ADDS surface to the core it is wound on, so the
+// wound core must not be hotter than the bare one at the same core loss.
+namespace {
+OpenMagnetics::Magnetic abt1735WoundToroid(std::vector<int64_t> turns, const std::string& shape, const std::string& material) {
+    std::vector<int64_t> parallels(turns.size(), 1);
+    auto coil = OpenMagneticsTesting::get_quick_coil(turns, parallels, shape, 1, WindingOrientation::OVERLAPPING,
+                                                     WindingOrientation::OVERLAPPING, CoilAlignment::SPREAD,
+                                                     CoilAlignment::SPREAD);
+    auto core = OpenMagneticsTesting::get_quick_core(shape, json::array(), 1, material);
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(coil);
+    magnetic.get_mutable_coil().wind();
+    return magnetic;
+}
+
+double abt1735CoreRise(const OpenMagnetics::Magnetic& magnetic, bool coreOnly, double coreLosses) {
+    TemperatureConfig config;
+    config.ambientTemperature = 25.0;
+    config.coreLosses = coreLosses;
+    config.windingLosses = 0.0;  // P_cu = 0: the winding is a passive fin and wrap
+    config.coreOnly = coreOnly;
+    config.plotSchematic = false;
+    Temperature temperature(magnetic, config);
+    auto result = temperature.calculateTemperatures();
+    REQUIRE(result.converged);
+    double hottestCore = -std::numeric_limits<double>::max();
+    for (const auto& node : temperature.getNodes()) {
+        if (node.part == ThermalNodePartType::CORE_TOROIDAL_SEGMENT) hottestCore = std::max(hottestCore, node.temperature);
+    }
+    REQUIRE(hottestCore > config.ambientTemperature);
+    return hottestCore - config.ambientTemperature;
+}
+
+// h*A hand estimate for an isothermal ring body at rise dT, by surface (ABT #1735, Alf
+// 2026-10-11): the rim and bore cylinders are VERTICAL with L = the body height, the two annular
+// faces HORIZONTAL_TOP / HORIZONTAL_BOTTOM with L = area/perimeter = (R_out - R_in)/2; each adds
+// grey-body radiation at the default emissivity -- the bore wall only over the share of its view
+// that leaves through the bore's two openings (abt1735BoreViewFactor). The correlation is shared
+// with the network on purpose: what this checks is the AREA, the orientation and the length of
+// each surface.
+// View factor from the inner wall of an open cylinder (radius r, height H) to its two end
+// openings, written out here independently of ThermalResistance: coaxial equal disks at
+// separation H see each other with F_dd = (X - sqrt(X^2 - 4))/2, X = 2 + (H/r)^2; each opening
+// sees the wall with 1 - F_dd; reciprocity 2 pi r H F = 2 pi r^2 (1 - F_dd).
+double abt1735BoreViewFactor(double r, double H) {
+    double X = 2.0 + (H / r) * (H / r);
+    double diskToDisk = (X - std::sqrt(X * X - 4.0)) / 2.0;
+    return (r / H) * (1.0 - diskToDisk);
+}
+
+double abt1735RingResistance(double rimR, double boreR, double height, double rise) {
+    double ambient = 25.0;
+    double surface = ambient + rise;
+    double hRad = ThermalResistance::calculateRadiationCoefficient(surface, ambient, ThermalDefaults::kConvection_DefaultEmissivity);
+    double faceLength = (rimR - boreR) / 2.0;
+    double faceArea = std::numbers::pi * (rimR * rimR - boreR * boreR);
+    double rimArea = 2.0 * std::numbers::pi * rimR * height;
+    double boreArea = 2.0 * std::numbers::pi * boreR * height;
+    double hVertical = ThermalResistance::calculateNaturalConvectionCoefficient(surface, ambient, height, SurfaceOrientation::VERTICAL);
+    double conductance =
+        (hVertical + hRad) * rimArea +
+        (hVertical + hRad * abt1735BoreViewFactor(boreR, height)) * boreArea +
+        (ThermalResistance::calculateNaturalConvectionCoefficient(surface, ambient, faceLength, SurfaceOrientation::HORIZONTAL_TOP) + hRad) * faceArea +
+        (ThermalResistance::calculateNaturalConvectionCoefficient(surface, ambient, faceLength, SurfaceOrientation::HORIZONTAL_BOTTOM) + hRad) * faceArea;
+    return 1.0 / conductance;
+}
+}  // namespace
+
+TEST_CASE("Temperature: ABT 1735 a wound toroid with no copper loss is no hotter than its bare core",
+          "[temperature][toroidal][abt-1735][smoke-test]") {
+    struct Case { std::vector<int64_t> turns; std::string shape; std::string material; };
+    // Two-winding quick coils carry a full-circle insulation wrap (faults 1 and 2); the single
+    // sparse winding has none (fault 3); the 60-turn one is a fully covered single winding.
+    std::vector<Case> cases = {
+        {{20, 10}, "T 36/23/15", "N87"},
+        {{5, 5}, "T 20/10/7", "N87"},
+        {{24, 12, 8, 6}, "T 36/23/15", "3C97"},
+        {{10}, "T 36/23/15", "N87"},
+        {{60}, "T 20/10/7", "N87"},
+    };
+    for (const auto& c : cases) {
+        CAPTURE(c.shape, c.material, c.turns.size(), c.turns[0]);
+        auto magnetic = abt1735WoundToroid(c.turns, c.shape, c.material);
+        double bareRise = abt1735CoreRise(magnetic, true, 1.0);
+        double woundRise = abt1735CoreRise(magnetic, false, 1.0);
+        CAPTURE(bareRise, woundRise);
+        // The wrap and the turns' contact strips add a little series resistance (enamel, tape,
+        // the air a turn holds open under the tape next to it) to a surface they enlarge by
+        // 25-40%; at no copper loss the wound core may land a few per cent above the bare one,
+        // never several times. Between sparse turns the tape lies on the ferrite: a 0.5 mm air
+        // film under the whole wrap of the 5:5 T 20/10/7 alone is ~17 K/W, 1.2x its bare core.
+        CHECK(woundRise < bareRise * 1.15);
+    }
+}
+
+TEST_CASE("Temperature: ABT 1735 toroid surface resistance matches the h*A of its own surface",
+          "[temperature][toroidal][abt-1735][smoke-test]") {
+    // Bare core: its whole surface -- both cylinders AND both annular faces -- by arithmetic.
+    {
+        auto magnetic = abt1735WoundToroid({20, 10}, "T 36/23/15", "N87");
+        auto dimensions = magnetic.get_core().resolve_shape().get_dimensions().value();
+        double A = resolve_dimensional_values(dimensions["A"]);
+        double B = resolve_dimensional_values(dimensions["B"]);
+        double C = resolve_dimensional_values(dimensions["C"]);
+        double rise = abt1735CoreRise(magnetic, true, 1.0);
+        double handEstimate = abt1735RingResistance(A / 2.0, B / 2.0, C, rise);
+        CAPTURE(rise, handEstimate);
+        // Isothermal ring, same correlations: the network must reproduce h*A to a few per cent.
+        CHECK(rise > handEstimate * 0.95);
+        CHECK(rise < handEstimate * 1.05);
+    }
+    // Wound and wrapped: the outermost wrap's skin, by arithmetic from the MAS layer record
+    // (radial offset of the layer centre from the core surface, and its thickness).
+    {
+        auto magnetic = abt1735WoundToroid({20, 10}, "T 36/23/15", "N87");
+        auto dimensions = magnetic.get_core().resolve_shape().get_dimensions().value();
+        double A = resolve_dimensional_values(dimensions["A"]);
+        double B = resolve_dimensional_values(dimensions["B"]);
+        double C = resolve_dimensional_values(dimensions["C"]);
+        auto layers = magnetic.get_coil().get_layers_description_insulation();
+        REQUIRE(!layers.empty());
+        double skinOffset = 0;
+        for (const auto& layer : layers) {
+            if (layer.get_dimensions().size() < 2 || layer.get_coordinates().size() < 2) continue;
+            skinOffset = std::max(skinOffset, layer.get_coordinates()[0] + layer.get_dimensions()[0] / 2.0);
+        }
+        REQUIRE(skinOffset > 0);
+        double rimR = A / 2.0 + skinOffset;
+        double boreR = B / 2.0 - skinOffset;
+        double height = C + 2.0 * skinOffset;
+        double rise = abt1735CoreRise(magnetic, false, 1.0);
+        double handEstimate = abt1735RingResistance(rimR, boreR, height, rise);
+        CAPTURE(rise, handEstimate);
+        // Hand estimate of the internal path, core to wrap, at 1 W: ~20 turns x 2 contact strips
+        // of ~0.5 mm x ~35 mm through ~30 um enamel at ~0.2 W/mK is ~0.4 K/W, plus half a tape
+        // thickness: well under 10% of the ~15 K/W surface term. Before the fix: 97 K/W, 6x.
+        CHECK(rise > handEstimate * 0.95);
+        CHECK(rise < handEstimate * 1.15);
+    }
+}
+
+TEST_CASE("Temperature: ABT 1735 a toroid's bore radiates to the room only through its openings",
+          "[temperature][toroidal][abt-1735][smoke-test]") {
+    // Closed form against hand values: r = H gives X = 3, F_dd = (3 - sqrt 5)/2 and
+    // F = (sqrt 5 - 1)/2 = 0.618034; H = 2r gives X = 6, F_dd = 3 - 2 sqrt 2 and F = sqrt 2 - 1.
+    CHECK_THAT(ThermalResistance::calculateCylinderWallToOpeningsViewFactor(1e-3, 1e-3),
+               Catch::Matchers::WithinAbs((std::sqrt(5.0) - 1.0) / 2.0, 1e-12));
+    CHECK_THAT(ThermalResistance::calculateCylinderWallToOpeningsViewFactor(2e-3, 4e-3),
+               Catch::Matchers::WithinAbs(std::sqrt(2.0) - 1.0, 1e-12));
+    CHECK_THROWS(ThermalResistance::calculateCylinderWallToOpeningsViewFactor(0.0, 1e-3));
+
+    // Bare T 36/23/15: every exterior surface radiates to the room at full view except the bore
+    // wall, which sees the room through its two openings (r = B/2, H = C) and otherwise itself.
+    // It used to radiate its whole area to the room at view factor 1, against the builder's own
+    // statement that the bore is a cavity with ~zero net exchange.
+    auto magnetic = abt1735WoundToroid({20, 10}, "T 36/23/15", "N87");
+    auto dimensions = magnetic.get_core().resolve_shape().get_dimensions().value();
+    double A = resolve_dimensional_values(dimensions["A"]);
+    double B = resolve_dimensional_values(dimensions["B"]);
+    double C = resolve_dimensional_values(dimensions["C"]);
+    TemperatureConfig config;
+    config.ambientTemperature = 25.0;
+    config.coreLosses = 1.0;
+    config.windingLosses = 0.0;
+    config.coreOnly = true;
+    config.plotSchematic = false;
+    Temperature temperature(magnetic, config);
+    auto result = temperature.calculateTemperatures();
+    REQUIRE(result.converged);
+    const size_t ambientIdx = temperature.getNodes().size() - 1;
+    REQUIRE(temperature.getNodes()[ambientIdx].part == ThermalNodePartType::AMBIENT);
+    double radiatingArea = 0.0;
+    double convectingArea = 0.0;
+    for (const auto& r : temperature.getResistances()) {
+        if (r.nodeToId != ambientIdx) continue;
+        if (r.type == HeatTransferType::RADIATION) radiatingArea += r.area;
+        if (r.type == HeatTransferType::NATURAL_CONVECTION) convectingArea += r.area;
+    }
+    double rimArea = std::numbers::pi * A * C;
+    double boreArea = std::numbers::pi * B * C;
+    double facesArea = 2.0 * std::numbers::pi * (A * A - B * B) / 4.0;
+    double boreViewFactor = abt1735BoreViewFactor(B / 2.0, C);
+    CAPTURE(rimArea, boreArea, facesArea, boreViewFactor, convectingArea, radiatingArea);
+    // T 36/23/15: r = 11.5 mm, H = 15 mm, F = 0.553.
+    CHECK(boreViewFactor > 0.5);
+    CHECK(boreViewFactor < 0.6);
+    // Convection takes the whole surface; radiation the same surface less the bore's self-view.
+    CHECK_THAT(convectingArea, Catch::Matchers::WithinRel(rimArea + boreArea + facesArea, 1e-6));
+    CHECK_THAT(radiatingArea, Catch::Matchers::WithinRel(rimArea + boreViewFactor * boreArea + facesArea, 1e-6));
+}
+
+TEST_CASE("Temperature: ABT 1735 a foil-wound E core with no copper loss is no hotter than its bare core",
+          "[temperature][abt-1735][smoke-test]") {
+    // Test_Simulator_Web_1's E 40/11 MPP 40, two 6-turn foil windings. FOIL used to classify the
+    // winding as PCB-planar, and the planar path convected the core from its quarter-model section
+    // quadrants: 6.6 cm2 of core exterior (vs 32 cm2 from the real geometry) and 83 K/W at 1 W
+    // against 27.6 K/W core-only. A foil winding is wound around the column like any other.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "test_simulator_web_1_1095.json");
+    OpenMagnetics::Magnetic magnetic(json::parse(std::ifstream(path)));
+    REQUIRE(magnetic.get_coil().get_turns_description());
+    for (const auto& winding : magnetic.get_coil().get_functional_description()) {
+        REQUIRE(std::get<OpenMagnetics::Wire>(winding.get_wire()).get_type() == WireType::FOIL);
+    }
+    auto hottestCoreRise = [&](bool coreOnly) {
+        TemperatureConfig config;
+        config.ambientTemperature = 25.0;
+        config.coreLosses = 1.0;
+        config.windingLosses = 0.0;
+        config.coreOnly = coreOnly;
+        config.plotSchematic = false;
+        Temperature temperature(magnetic, config);
+        auto result = temperature.calculateTemperatures();
+        REQUIRE(result.converged);
+        double hottest = -std::numeric_limits<double>::max();
+        for (const auto& node : temperature.getNodes()) {
+            if (node.part == ThermalNodePartType::CORE_CENTRAL_COLUMN || node.part == ThermalNodePartType::CORE_LATERAL_COLUMN ||
+                node.part == ThermalNodePartType::CORE_TOP_YOKE || node.part == ThermalNodePartType::CORE_BOTTOM_YOKE) {
+                hottest = std::max(hottest, node.temperature);
+            }
+        }
+        REQUIRE(hottest > config.ambientTemperature);
+        return hottest - config.ambientTemperature;
+    };
+    double bareRise = hottestCoreRise(true);
+    double woundRise = hottestCoreRise(false);
+    CAPTURE(bareRise, woundRise);
+    CHECK(woundRise < bareRise * 1.15);
+}
+
+namespace {
+// E 42/21/20 with per-column windows: windings[i] is placed in bobbin winding window windows[i]
+// (0: main column; on this shell 1 and 2 are the outer legs' windows).
+OpenMagnetics::Magnetic abt1735MultiColumnMagnetic(const std::vector<int64_t>& turns, const std::vector<int64_t>& windows) {
+    auto core = OpenMagneticsTesting::get_quick_core("E 42/21/20", json::parse("[]"), 1, "3C97");
+    auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.001, 0.001);
+    json bobbinJson;
+    to_json(bobbinJson, bobbin);
+    json coilJson;
+    coilJson["bobbin"] = bobbinJson;
+    coilJson["functionalDescription"] = json::array();
+    const std::vector<std::string> names = {"Primary", "Secondary", "Tertiary"};
+    for (size_t i = 0; i < turns.size(); ++i) {
+        coilJson["functionalDescription"].push_back(json{{"name", names[i]}, {"numberTurns", turns[i]}, {"numberParallels", 1},
+                                                         {"isolationSide", i == 0 ? "primary" : (i == 1 ? "secondary" : "tertiary")},
+                                                         {"wire", "Round 0.475 - Grade 1"}});
+    }
+    OpenMagnetics::Coil coil(coilJson, false);
+    for (size_t i = 0; i < windows.size(); ++i) {
+        if (windows[i] != 0) coil.get_mutable_functional_description()[i].set_winding_window(windows[i]);
+    }
+    coil.set_core_columns(core.get_processed_description()->get_columns());
+    REQUIRE(coil.wind());
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(coil);
+    return magnetic;
+}
+
+struct Abt1735Solved {
+    std::map<std::string, double> legTemperature;   // "Core_Column_<i>" -> C
+    double hottestTurnOnLeg[3] = {-1e9, -1e9, -1e9};  // per wound column index
+    double coldestTurn = 1e9;
+    double heatToAmbient = 0, injected = 0;
+    size_t lateralNodes = 0;
+    bool anyWoundColumnTag = false;
+};
+
+Abt1735Solved abt1735Solve(OpenMagnetics::Magnetic magnetic, double coreLoss, double lossPerTurn) {
+    TemperatureConfig config;
+    config.ambientTemperature = 25.0;
+    config.coreLosses = coreLoss;
+    config.plotSchematic = false;
+    size_t numberTurns = magnetic.get_coil().get_turns_description()->size();
+    config.windingLosses = lossPerTurn * numberTurns;
+    if (lossPerTurn > 0) {
+        WindingLossesOutput lossesOutput;
+        std::vector<WindingLossesPerElement> perTurn;
+        for (size_t t = 0; t < numberTurns; ++t) {
+            WindingLossesPerElement element;
+            OhmicLosses ohmic;
+            ohmic.set_losses(lossPerTurn);
+            ohmic.set_method_used("test");
+            ohmic.set_origin(ResultOrigin::SIMULATION);
+            element.set_name(magnetic.get_coil().get_turns_description()->at(t).get_name());
+            element.set_ohmic_losses(ohmic);
+            perTurn.push_back(element);
+        }
+        lossesOutput.set_winding_losses_per_turn(perTurn);
+        lossesOutput.set_winding_losses(config.windingLosses);
+        lossesOutput.set_origin(ResultOrigin::SIMULATION);
+        lossesOutput.set_method_used("test");
+        config.windingLossesOutput = lossesOutput;
+    }
+    Temperature temperature(magnetic, config);
+    auto result = temperature.calculateTemperatures();
+    REQUIRE(result.converged);
+    Abt1735Solved solved;
+    const auto& nodes = temperature.getNodes();
+    size_t ambientIdx = nodes.size();
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        const auto& node = nodes[i];
+        if (node.part == ThermalNodePartType::AMBIENT) ambientIdx = i;
+        if (node.part == ThermalNodePartType::CORE_LATERAL_COLUMN) {
+            solved.lateralNodes++;
+            solved.legTemperature[node.name] = node.temperature;
+        }
+        if (node.woundColumnIndex) solved.anyWoundColumnTag = true;
+        if (node.part == ThermalNodePartType::TURN) {
+            solved.coldestTurn = std::min(solved.coldestTurn, node.temperature);
+            if (node.woundColumnIndex) {
+                auto& hottest = solved.hottestTurnOnLeg[node.woundColumnIndex.value()];
+                hottest = std::max(hottest, node.temperature);
+            }
+        }
+        solved.injected += node.powerDissipation;
+    }
+    REQUIRE(ambientIdx < nodes.size());
+    for (const auto& r : temperature.getResistances()) {
+        size_t other = nodes.size();
+        if (r.nodeToId == ambientIdx) other = r.nodeFromId;
+        else if (r.nodeFromId == ambientIdx) other = r.nodeToId;
+        if (other < nodes.size() && r.resistance > 0.0) {
+            solved.heatToAmbient += (nodes[other].temperature - nodes[ambientIdx].temperature) / r.resistance;
+        }
+    }
+    return solved;
+}
+}  // namespace
+
+TEST_CASE("Temperature: ABT 1735 a winding on an outer leg is modelled in its own window",
+          "[temperature][abt-1735][multi-column][smoke-test]") {
+    // The concentric network used to build the main column's window only; a winding on an outer
+    // leg was refused (first as a 21 mm "overlap", then as unmodelled). Alf 2026-10-11: model it.
+    // Each wound leg becomes its own node, its winding rests on that leg's bobbin column, faces the
+    // main winding's crossing across the shared window, and convects from its room-facing wrap.
+    auto& settings = Settings::GetInstance();
+    settings.reset();
+    settings.set_core_per_column_winding_windows(true);
+    struct Case { std::string label; std::vector<int64_t> turns; std::vector<int64_t> windows; };
+    std::vector<Case> cases = {
+        {"secondary on the -x leg", {20, 10}, {0, 2}},
+        {"secondary on the +x leg", {20, 10}, {0, 1}},
+        {"secondary and tertiary on both legs", {20, 10, 10}, {0, 1, 2}},
+    };
+    for (const auto& c : cases) {
+        CAPTURE(c.label);
+        auto magnetic = abt1735MultiColumnMagnetic(c.turns, c.windows);
+        auto columns = magnetic.get_core().get_processed_description()->get_columns();
+        size_t mainColumn = magnetic.get_core().get_main_column_index();
+        std::set<size_t> woundLegs;
+        for (size_t w = 1; w < c.windows.size(); ++w) {
+            woundLegs.insert(magnetic.get_core().get_winding_window_column_index(static_cast<size_t>(c.windows[w])));
+        }
+        // Copper loss only: the leg windings heat their own legs.
+        auto solved = abt1735Solve(magnetic, 0.2, 0.02);
+        CAPTURE(solved.heatToAmbient, solved.injected);
+        CHECK(solved.lateralNodes == 2);
+        CHECK_THAT(solved.heatToAmbient, Catch::Matchers::WithinRel(solved.injected, 0.02));
+        for (size_t leg = 0; leg < columns.size(); ++leg) {
+            if (leg == mainColumn) continue;
+            std::string name = "Core_Column_" + std::to_string(leg);
+            REQUIRE(solved.legTemperature.count(name));
+            CAPTURE(leg, solved.legTemperature[name], solved.hottestTurnOnLeg[leg]);
+            if (woundLegs.count(leg)) {
+                CHECK(solved.hottestTurnOnLeg[leg] > 25.0);
+                CHECK(solved.hottestTurnOnLeg[leg] > solved.legTemperature[name]);
+                for (size_t other = 0; other < columns.size(); ++other) {
+                    if (other == mainColumn || woundLegs.count(other)) continue;
+                    CHECK(solved.legTemperature[name] > solved.legTemperature["Core_Column_" + std::to_string(other)]);
+                }
+            }
+        }
+        CHECK(solved.coldestTurn > 25.0);
+    }
+    // Mirror images: the +x and -x placements are the same component turned around.
+    {
+        auto minus = abt1735Solve(abt1735MultiColumnMagnetic({20, 10}, {0, 2}), 0.2, 0.02);
+        auto plus = abt1735Solve(abt1735MultiColumnMagnetic({20, 10}, {0, 1}), 0.2, 0.02);
+        CHECK_THAT(minus.hottestTurnOnLeg[2], Catch::Matchers::WithinRel(plus.hottestTurnOnLeg[1], 1e-6));
+        CHECK_THAT(minus.legTemperature["Core_Column_2"], Catch::Matchers::WithinRel(plus.legTemperature["Core_Column_1"], 1e-6));
+        CHECK_THAT(minus.legTemperature["Core_Column_1"], Catch::Matchers::WithinRel(plus.legTemperature["Core_Column_2"], 1e-6));
+    }
+    // Core-only needs no window and still answers.
+    {
+        auto magnetic = abt1735MultiColumnMagnetic({20, 10}, {0, 2});
+        TemperatureConfig config;
+        config.coreLosses = 1.0;
+        config.coreOnly = true;
+        config.plotSchematic = false;
+        CHECK(Temperature(magnetic, config).calculateTemperatures().converged);
+    }
+    settings.reset();
+}
+
+TEST_CASE("Temperature: ABT 1735 without an outer-leg winding the network keeps one two-leg node",
+          "[temperature][abt-1735][multi-column][smoke-test]") {
+    // Per-column windows on, every winding on the main column: nothing is placed on a leg, so the
+    // network is the unsplit main-window network (one lateral node standing for both legs, no
+    // node tagged with a wound column) and the outer-leg code never runs.
+    auto& settings = Settings::GetInstance();
+    settings.reset();
+    settings.set_core_per_column_winding_windows(true);
+    auto solved = abt1735Solve(abt1735MultiColumnMagnetic({20, 10}, {0, 0}), 0.2, 0.02);
+    CHECK(solved.lateralNodes == 1);
+    CHECK(solved.legTemperature.count("Core_Column_1") == 1);
+    CHECK(!solved.anyWoundColumnTag);
+    CHECK_THAT(solved.heatToAmbient, Catch::Matchers::WithinRel(solved.injected, 0.02));
+    settings.reset();
+}
+
+// ============================================================================
+// ABT #1643 (bobbin half, Alf 2026-10-18): a bobbin material's conductivity is its MAS value or a
+// WARNING-flagged estimate from its polymer class; never a built-in constant. Material names MAS
+// has no record of throw.
+// ============================================================================
+TEST_CASE("Bobbin thermal conductivity: the MAS value, or a flagged estimate from the polymer class", "[temperature][thermal][bobbin][abt-1643]") {
+    clear_databases();
+    // Sourced values win (MAS 33f771a: Toray Torelina A504X90; BASF Ultramid A3X2G5).
+    auto pps = resolve_bobbin_material_thermal_conductivity(find_insulation_material_by_name("PPS"));
+    CHECK(pps.tier == BobbinThermalConductivityTier::MATERIAL);
+    CHECK(pps.source.has_value());
+    CHECK_FALSE(pps.is_estimated());
+    CHECK_THAT(pps.value, Catch::Matchers::WithinAbs(0.3, 1e-12));
+    // A value MAS carries without a source is the material's own, flagged unsourced.
+    auto pet = resolve_bobbin_material_thermal_conductivity(find_insulation_material_by_name("PET"));
+    CHECK(pet.is_unsourced());
+    CHECK_FALSE(pet.is_estimated());
+
+    // PA66 = Durethan AKV30H2.0 (PA66-GF30), no published conductivity: the median of the three BASF
+    // PA66-GF points in MAS c1b29c0 (A3X2G5 0.33 -- one document for its two records --, A3X2G10 0.35
+    // and the GFN (Natural) representative grade A3EG7 0.35).
+    auto pa66 = resolve_bobbin_material_thermal_conductivity(find_insulation_material_by_name("PA66"));
+    REQUIRE(pa66.is_estimated());
+    CHECK(pa66.tier == BobbinThermalConductivityTier::CLASS);
+    CHECK(pa66.estimate->polymerClass == "PA66, glass-fibre reinforced");
+    CHECK(pa66.estimate->datasheetGrades.empty());
+    CHECK(pa66.estimate->numberDataPoints == 3);
+    CHECK_THAT(pa66.value, Catch::Matchers::WithinAbs(0.35, 1e-12));
+
+    // SKYT.5220FR = Skytra 5220FR (PET-GF30 FR): the sourced polyesters in MAS (Pocan B4225 0.23,
+    // Valox 420SE0 0.25) and the cited DuPont Crastin/Rynite glass-fibre grades, median 0.29.
+    auto skytra = resolve_bobbin_material_thermal_conductivity(find_insulation_material_by_name("SKYT.5220FR"));
+    REQUIRE(skytra.is_estimated());
+    CHECK(skytra.estimate->polymerClass == "PET/PBT, glass-fibre reinforced");
+    CHECK(skytra.estimate->datasheetGrades.size() == 7);
+    CHECK_THAT(skytra.value, Catch::Matchers::WithinAbs(0.29, 1e-12));
+
+    // Zen.6130L = Zenite 6130L (LCP-GF30): the cited Celanese VECTRA E130i point.
+    auto zenite = resolve_bobbin_material_thermal_conductivity(find_insulation_material_by_name("Zen.6130L"));
+    REQUIRE(zenite.is_estimated());
+    CHECK(zenite.estimate->polymerClass == "LCP, glass-fibre reinforced");
+    CHECK_THAT(zenite.value, Catch::Matchers::WithinAbs(0.348, 1e-12));
+
+    // No class, no estimate: a material without composition, or of a polymer no class covers.
+    auto anonymous = find_insulation_material_by_name("PA66");
+    anonymous.set_composition(std::nullopt);
+    CHECK_THROWS_AS(resolve_bobbin_material_thermal_conductivity(anonymous), MaterialException);
+    auto polyurethane = find_insulation_material_by_name("Polyurethane 155");
+    REQUIRE_FALSE(polyurethane.get_thermal_conductivity());
+    CHECK_THROWS_AS(resolve_bobbin_material_thermal_conductivity(polyurethane), MaterialException);
+    // A class with no sourced data point (unreinforced PA66) throws instead of borrowing the filled one.
+    auto unfilled = find_insulation_material_by_name("PA66");
+    unfilled.set_composition("Polyamide 6.6");
+    CHECK_THROWS_AS(resolve_bobbin_material_thermal_conductivity(unfilled), MaterialException);
+}
+
+TEST_CASE("Temperature: the bobbin conductivity is the resolver's, and a material MAS lacks throws", "[temperature][thermal][bobbin][abt-1643]") {
+    clear_databases();
+    std::string shapeName = "ETD 29/16/10";
+    auto coil = OpenMagneticsTesting::get_quick_coil({10}, {1}, shapeName, 1,
+        WindingOrientation::OVERLAPPING, WindingOrientation::OVERLAPPING,
+        CoilAlignment::CENTERED, CoilAlignment::CENTERED);
+    auto core = OpenMagneticsTesting::get_quick_core(shapeName, json::array(), 1, "N87");
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_coil(coil);
+    magnetic.set_core(core);
+    TemperatureConfig config;
+    config.ambientTemperature = 25.0;
+    config.plotSchematic = false;
+    applySimulatedLosses(config, magnetic);
+
+    auto solve = [&](MAS::InsulationMaterialDataOrNameUnion material) {
+        auto bobbin = magnetic.get_mutable_coil().resolve_bobbin();
+        MAS::BobbinFunctionalDescription functionalDescription;
+        functionalDescription.set_family(MAS::BobbinFamily::ETD);
+        functionalDescription.set_shape(shapeName);
+        functionalDescription.set_type(MAS::FunctionalDescriptionType::CUSTOM);
+        functionalDescription.set_dimensions({});
+        functionalDescription.set_material(material);
+        bobbin.set_functional_description(functionalDescription);
+        magnetic.get_mutable_coil().set_bobbin(bobbin);
+        auto result = Temperature(magnetic, config).calculateTemperatures();
+        REQUIRE(result.converged);
+        return result.maximumTemperature;
+    };
+    auto with_conductivity = [](std::string name, double k) {
+        MAS::InsulationMaterial material = find_insulation_material_by_name(name);
+        material.set_thermal_conductivity(k);
+        return MAS::InsulationMaterialDataOrNameUnion(material);
+    };
+
+    // SKYT.5220FR has no conductivity in MAS: the network runs on the class estimate, 0.29, not
+    // on the old built-in 0.2.
+    const double estimated = solve(std::string("SKYT.5220FR"));
+    CHECK_THAT(estimated, Catch::Matchers::WithinAbs(solve(with_conductivity("SKYT.5220FR", 0.29)), 1e-9));
+    CHECK(std::abs(estimated - solve(with_conductivity("SKYT.5220FR", 0.2))) > 1e-4);
+
+    // 'Valox 420-SE0' is not a MAS record name (MAS calls it 'PBT GF30 FR (Valox 420SE0)'): a
+    // material name MAS has no record of is a named error, not an estimate.
+    try {
+        solve(std::string("Valox 420-SE0"));
+        FAIL("a bobbin material MAS has no record of must throw");
+    }
+    catch (const MaterialException& e) {
+        CHECK(e.code() == ErrorCode::MATERIAL_NOT_FOUND);
+        CHECK(std::string(e.what()).find("Valox 420-SE0") != std::string::npos);
+    }
 }

@@ -33,6 +33,7 @@
 #include <iostream>
 #include <list>
 #include <map>
+#include <numbers>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -42,7 +43,7 @@
 
 namespace OpenMagnetics {
 
-void correct_windings(std::vector<std::pair<Magnetic, double>> *magneticsWithScoring, const Inputs& inputs) {
+void correct_windings(std::vector<std::pair<Magnetic, double>> *magneticsWithScoring, const Inputs& inputs, bool sizeParallelsToCurrent) {
     MagnetizingInductance magnetizingInductance;
 
     // If the wizard supplied per-winding excitation names (e.g. LLC center-tap
@@ -152,11 +153,13 @@ void correct_windings(std::vector<std::pair<Magnetic, double>> *magneticsWithSco
 
             // Size this secondary's parallels to its own RMS current (both the DC
             // ~7 A/mm2 and effective ~12 A/mm2 limits), like get_dummy_coil does
-            // for the primary. ABT #126: not for common-mode chokes — see
+            // for the primary. ABT #126: not for interference suppression — see
             // get_dummy_coil; current-sized parallels made every CMC candidate
             // unwindable and the suppression adviser returned zero results.
-            if (!inputs.get_operating_points().empty() &&
-                !Inputs::can_be_common_mode_choke(inputs.get_operating_points()[0])) {
+            // ABT #1822: the caller says so (sizeParallelsToCurrent, as for
+            // get_dummy_coil); the excitation's shape does not, a 1:1 transformer
+            // with equal currents being CMC-shaped too.
+            if (sizeParallelsToCurrent && !inputs.get_operating_points().empty()) {
                 const auto& secExcitations = inputs.get_operating_points()[0].get_excitations_per_winding();
                 if (windingIndex < secExcitations.size() && secExcitations[windingIndex].get_current()) {
                     auto secCurrent = secExcitations[windingIndex].get_current().value();
@@ -223,10 +226,81 @@ std::vector<std::pair<Magnetic, double>> cull_to_unique_core_shapes(std::vector<
     return magneticsWithScoring;
 }
 
+// The core stage's stand-in coil (get_dummy_coil + correct_windings) gives every winding the same
+// round strand, two skin depths thick. That is a sensible AC conductor, but nothing ties it to the
+// window: at line frequency two skin depths are centimetres (Test_CoreAdviser_Web_8, 50 Hz: an
+// 18.6 mm strand, turns laid out 38 mm past an E core's window), and with a high turn count even a
+// 0.42 mm strand overflows a small window (10 mH at 100 kHz: 206 turns in a PQ 20/20's 3.2 mm).
+// The loss <-> temperature solve heats the wound stand-in on the full thermal network, which
+// refuses copper outside the window (ABT #838), so those candidates were all dropped. A stand-in
+// is not a design: the coil stage picks the real wire. So when the stand-in's turns do not fit,
+// thin its strand (every winding's, parallels kept) to the thickest one whose fast_wind layout
+// keeps every turn inside the winding window. That is the most copper the window can hold in this
+// layout, so the stand-in's copper losses stay a lower bound of what the coil stage can reach.
+// Works on a coil that fast_wind() has just wound; rewinds it.
+static void fit_stand_in_strand_to_window(Coil& coil) {
+    if (!coil.get_turns_description() || coil.are_turns_inside_winding_window()) {
+        return;
+    }
+    auto wires = coil.get_wires();
+    if (wires.empty() || !wires[0].get_conducting_diameter()) {
+        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+            "fit_stand_in_strand_to_window: the stand-in coil's first winding has no round conducting diameter.");
+    }
+    const double standInDiameter = resolve_dimensional_values(wires[0].get_conducting_diameter().value());
+    for (size_t windingIndex = 1; windingIndex < wires.size(); ++windingIndex) {
+        if (!wires[windingIndex].get_conducting_diameter() ||
+            resolve_dimensional_values(wires[windingIndex].get_conducting_diameter().value()) != standInDiameter) {
+            throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+                "fit_stand_in_strand_to_window: winding " + std::to_string(windingIndex) +
+                " does not carry the stand-in strand of the first winding; this is not a core-stage stand-in coil.");
+        }
+    }
+    auto windWith = [&coil, &wires](double conductingDiameter) {
+        Wire strand = Wire::get_wire_for_conducting_area(std::numbers::pi * conductingDiameter * conductingDiameter / 4,
+                                                         Defaults().ambientTemperature, true);
+        std::vector<Wire> strands(wires.size(), strand);
+        coil.set_wires(strands);
+        coil.unwind();
+        SettingsGuard<bool> coilDelimitGuard(settings, &Settings::get_coil_delimit_and_compact, &Settings::set_coil_delimit_and_compact, false);
+        return coil.fast_wind() && coil.are_turns_inside_winding_window();
+    };
+
+    // Bracket: halve until the layout fits (a thinner strand never needs more room in a layer or
+    // more layers), then bisect between the last overflowing and the first fitting diameter.
+    double overflowing = standInDiameter;
+    double fitting = standInDiameter / 2;
+    const size_t maximumHalvings = 30;  // 2^-30 of the skin-depth strand: far below any wire
+    size_t halvings = 1;
+    while (!windWith(fitting)) {
+        if (++halvings > maximumHalvings) {
+            throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+                "fit_stand_in_strand_to_window: no round strand down to " + std::to_string(fitting * 1e6) +
+                " um lays every turn of the stand-in coil inside the winding window.");
+        }
+        overflowing = fitting;
+        fitting /= 2;
+    }
+    const double relativeResolution = 1e-3;
+    while (overflowing - fitting > relativeResolution * fitting) {
+        double middle = (overflowing + fitting) / 2;
+        if (windWith(middle)) {
+            fitting = middle;
+        }
+        else {
+            overflowing = middle;
+        }
+    }
+    if (!windWith(fitting)) {
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+            "fit_stand_in_strand_to_window: the " + std::to_string(fitting * 1e3) +
+            " mm strand that fitted the window no longer does when rewound.");
+    }
+}
+
 Mas CoreAdviser::post_process_core(Magnetic magnetic, Inputs inputs) {
     MagneticEnergy magneticEnergy;
     Mas mas;
-    double temperature = inputs.get_maximum_temperature();
 
     magnetic.get_reference();
     if (magnetic.get_manufacturer_info()) {
@@ -239,8 +313,19 @@ Mas CoreAdviser::post_process_core(Magnetic magnetic, Inputs inputs) {
         // RAII (ABT #113 sweep): exception-safe replacement for the manual
         // save/set/restore — fast_wind can throw.
         SettingsGuard<bool> coilDelimitGuard(settings, &Settings::get_coil_delimit_and_compact, &Settings::set_coil_delimit_and_compact, false);
-        magnetic.get_mutable_coil().fast_wind();
+        // ABT #838: the stand-in is wound with the layout the coil stage will use (toroids CONTIGUOUS
+        // sectors, not the quick bobbin's OVERLAPPING rings, which stacked a CMC's two windings radially
+        // and left no room for them), and a coil that layout cannot wind is not a candidate: say why.
+        CoilAdviser::apply_coil_stage_winding_layout(magnetic.get_mutable_coil(), magnetic.get_core().get_functional_description().get_type(),
+                                                     bool(inputs.get_design_requirements().get_minimum_impedance()));
+        if (!magnetic.get_mutable_coil().fast_wind()) {
+            auto coreName = magnetic.get_core().get_name();
+            throw CoilException(ErrorCode::COIL_WINDING_ERROR,
+                "post_process_core: the stand-in coil" + (coreName ? " of '" + coreName.value() + "'" : std::string()) +
+                " cannot be wound: " + magnetic.get_coil().get_last_fit_failure());
+        }
     }
+    fit_stand_in_strand_to_window(magnetic.get_mutable_coil());
 
     // Store the magnetic AFTER fast_wind so the returned Mas carries the wound
     // coil (sections/layers/turns). Previously set_magnetic ran before
@@ -254,6 +339,7 @@ Mas CoreAdviser::post_process_core(Magnetic magnetic, Inputs inputs) {
         Outputs outputs;
         auto operatingPoint = inputs.get_operating_point(operatingPointIndex);
 
+        _magneticSimulator.set_topology(inputs.get_design_requirements().get_topology());
         MagnetizingInductanceOutput magnetizingInductanceOutput = _magneticSimulator.calculate_magnetizing_inductance(operatingPoint, magnetic);
         // calculate_magnetizing_inductance() re-evaluated the magnetizing current — the flux /
         // saturation driver, which scales with 1/Lm — at THIS core's achieved inductance (Np^2 /
@@ -272,15 +358,24 @@ Mas CoreAdviser::post_process_core(Magnetic magnetic, Inputs inputs) {
         magnetizingInductanceOutput.set_origin(ResultOrigin::SIMULATION);
 
 
-        WindingLossesOutput windingLossesOutput = _windingOhmicLosses.calculate_ohmic_losses(magnetic.get_coil(), operatingPoint, temperature);
-
-        CoreLossesOutput coreLossesOutput = _magneticSimulator.calculate_core_losses(operatingPoint, magnetic);
+        // ABT #838: DC winding losses and core losses from ONE loss <-> temperature solve, each at
+        // the temperature their combined heat produces (previously the DC losses were computed
+        // here at the inputs' maximum temperature, beside core losses solved with their own copy
+        // of the winding losses).
+        // ABT #1802: the hot spot that solve found is published with the losses, and it is what the
+        // temperature gate judges the returned part on (post_process_and_cut).
+        std::optional<WindingLossesOutput> solvedWindingLosses;
+        std::optional<TemperatureOutput> solvedTemperature;
+        CoreLossesOutput coreLossesOutput = _magneticSimulator.calculate_core_losses(operatingPoint, magnetic, &solvedWindingLosses, &solvedTemperature,
+                                                                                     WindingLossesScope::OHMIC, NoThermalOperatingPointPolicy::THROW);
+        WindingLossesOutput windingLossesOutput = solvedWindingLosses.value();
 
         InductanceOutput inductanceOutput;
         inductanceOutput.set_magnetizing_inductance(magnetizingInductanceOutput);
         outputs.set_inductance(inductanceOutput);
         outputs.set_winding_losses(windingLossesOutput);
         outputs.set_core_losses(coreLossesOutput);
+        outputs.set_temperature(solvedTemperature.value());
 
         mas.get_mutable_outputs().push_back(outputs);
     }
@@ -305,8 +400,15 @@ Inputs pre_process_inputs(Inputs inputs) {
                 Inputs::set_current_as_magnetizing_current(&inputs.get_mutable_operating_points()[operatingPointIndex]);
                 continue;
             }
-            auto magnetizingCurrent = Inputs::calculate_magnetizing_current(excitation, magnetizingInductance, false);
-            inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[0].set_magnetizing_current(magnetizingCurrent);
+            // The decision Inputs::process_operating_point makes for the primary (ABT #1467): Faraday
+            // on its voltage, DC from the currents where they give it.
+            auto& operatingPoint = inputs.get_mutable_operating_points()[operatingPointIndex];
+            std::vector<double> turnsRatios;
+            for (auto& turnsRatio : inputs.get_design_requirements().get_turns_ratios()) {
+                turnsRatios.push_back(resolve_dimensional_values(turnsRatio));
+            }
+            auto magnetizingCurrent = Inputs::calculate_magnetizing_current(operatingPoint, 0, magnetizingInductance, turnsRatios, false);
+            operatingPoint.get_mutable_excitations_per_winding()[0].set_magnetizing_current(magnetizingCurrent);
         }
     }
     return inputs;
@@ -316,18 +418,52 @@ Inputs pre_process_inputs(Inputs inputs) {
 std::vector<std::pair<Mas, double>> CoreAdviser::post_process_and_cut(std::vector<std::pair<Magnetic, double>>& magneticsWithScoring,
                                                                       Inputs& inputs,
                                                                       size_t maximumNumberResults,
-                                                                      bool withAlternativeMaterials) {
+                                                                      bool withAlternativeMaterials,
+                                                                      std::optional<double> maximumTemperature) {
+    std::vector<std::pair<Mas, double>> masWithScoring;
+    post_process_and_append(magneticsWithScoring, inputs, maximumNumberResults, withAlternativeMaterials, maximumTemperature, masWithScoring);
+    return masWithScoring;
+}
+
+void CoreAdviser::post_process_and_append(std::vector<std::pair<Magnetic, double>>& magneticsWithScoring,
+                                          Inputs& inputs,
+                                          size_t maximumNumberResults,
+                                          bool withAlternativeMaterials,
+                                          std::optional<double> maximumTemperature,
+                                          std::vector<std::pair<Mas, double>>& masWithScoring) {
     // See the declaration comment (ABT #126): walk in score order, keep the first
     // maximumNumberResults candidates that SURVIVE post-processing. Windings are
     // corrected (and alternative materials looked up) per candidate, so tail
     // candidates that are never reached cost nothing.
-    std::vector<std::pair<Mas, double>> masWithScoring;
     std::vector<std::string> usedShapes;
     const bool uniqueShapes = get_unique_core_shapes();
+    if (uniqueShapes) {
+        for (const auto& [keptMas, keptScoring] : masWithScoring) {
+            usedShapes.push_back(keptMas.get_magnetic().get_core().get_shape_name());
+        }
+    }
     log_probe("entering post_process_and_cut", magneticsWithScoring.size());
     size_t candidatesExamined = 0;
     size_t candidatesDropped = 0;
     std::map<std::string, std::vector<std::string>> alternativeMaterialsCache;
+    // A core the coil stage cannot give every winding a wire within its limits would only come
+    // back as INVALID coils; drop it here and let the next-scored core backfill. Wound windings
+    // only: a printed winding's copper is the board's, and suppression chokes are sized by the
+    // wire adviser downstream (ABT #126).
+    std::optional<MagneticFilterWireWithinLimits> wireWithinLimits;
+    if (MagneticFilterWindowCopperCapacity::applies_to(inputs) &&
+        get_application() != MAS::MagneticApplication::INTERFERENCE_SUPPRESSION) {
+        wireWithinLimits.emplace(defaults.maximumEffectiveCurrentDensity, defaults.maximumNumberParallels);
+    }
+    // ABT #1802: the temperature gate's verdict on a returned part is read from the loss-temperature
+    // solve that post_process_core publishes. The gate's filter stage ranks and culls the pool on a
+    // single pass (losses at ambient, the network solved once); a part whose losses rise with
+    // temperature passed it at 124 C and was returned with its core solved at 218 C under a 130 C limit.
+    std::optional<MagneticFilterTemperature> temperatureGate;
+    if (maximumTemperature) {
+        temperatureGate.emplace(inputs, maximumTemperature.value());
+        temperatureGate->set_application(get_application());
+    }
     for (auto& magneticWithScoring : magneticsWithScoring) {
         if (masWithScoring.size() >= maximumNumberResults) {
             break;
@@ -341,12 +477,31 @@ std::vector<std::pair<Mas, double>> CoreAdviser::post_process_and_cut(std::vecto
             }
         }
         std::vector<std::pair<Magnetic, double>> candidate{magneticWithScoring};
-        correct_windings(&candidate, inputs);
+        correct_windings(&candidate, inputs, get_application() != MAS::MagneticApplication::INTERFERENCE_SUPPRESSION);
         if (withAlternativeMaterials) {
             add_alternative_materials(&candidate, inputs, &alternativeMaterialsCache);
         }
         try {
             auto mas = post_process_core(candidate[0].first, inputs);
+            if (wireWithinLimits) {
+                auto magnetic = mas.get_magnetic();
+                if (!wireWithinLimits->evaluate_magnetic(&magnetic, &inputs).first) {
+                    ++candidatesDropped;
+                    logEntry("CoreAdviser: dropping core without a wire within the coil stage's limits (backfilling): " +
+                                 wireWithinLimits->get_last_reason(), "CoreAdviser", 2);
+                    continue;
+                }
+            }
+            if (temperatureGate) {
+                auto [withinLimit, solvedMaximumTemperature] = temperatureGate->evaluate_solved_outputs(mas.get_outputs());
+                if (!withinLimit) {
+                    ++candidatesDropped;
+                    logEntry("CoreAdviser: dropping core whose loss-temperature solve reaches " + std::to_string(solvedMaximumTemperature) +
+                                 " C, above " + std::to_string(maximumTemperature.value()) + " C (backfilling): " +
+                                 mas.get_magnetic().get_core().get_name().value_or("unnamed"), "CoreAdviser", 2);
+                    continue;
+                }
+            }
             masWithScoring.push_back({mas, candidate[0].second});
             if (uniqueShapes) {
                 usedShapes.push_back(shapeName);
@@ -365,7 +520,6 @@ std::vector<std::pair<Mas, double>> CoreAdviser::post_process_and_cut(std::vecto
                   ", dropped " + std::to_string(candidatesDropped) + ")",
                   magneticsWithScoring.size());
     }
-    return masWithScoring;
 }
 
 std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_application(std::vector<std::pair<Magnetic, double>>* magnetics, Inputs inputs, std::map<CoreAdviserFilters, double> weights, size_t maximumMagneticsAfterFiltering, size_t maximumNumberResults){
@@ -374,7 +528,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
     MagneticCoreFilterAreaProduct filterAreaProduct(inputs);
     MagneticCoreFilterEnergyStored filterEnergyStored(inputs, _models);
     MagneticCoreFilterCost filterCost(inputs);
-    MagneticCoreFilterLosses filterLosses(inputs, _models);
+    MagneticCoreFilterLosses filterLosses(inputs, _models, get_application());
     MagneticCoreFilterDimensions filterDimensions;
     MagneticCoreFilterMagneticInductance filterMagneticInductance;
 
@@ -394,19 +548,24 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
     // verdict from an earlier seeding would judge a different turn count.
     filterMagneticInductance.set_cache_usage(false);
 
-    std::vector<std::pair<Magnetic, double>> magneticsWithScoring = *magnetics;
-    magneticsWithScoring = filterAreaProduct.filter_magnetics(&magneticsWithScoring, inputs, 1.0, true);  // Fixed weight: pre-filtering criterion, not efficiency scoring
-    log_stage("Area Product filter", magneticsWithScoring.size());
-
-    if (settings.get_core_adviser_enable_intermediate_pruning() && magneticsWithScoring.size() > maximumMagneticsAfterFiltering) {
-        magneticsWithScoring.resize(maximumMagneticsAfterFiltering); // F10 FIX: resize instead of copy-construct
-        log_stage("first-filter score-cull", magneticsWithScoring.size());
+    // ABT #1785: filtered straight out of the dataset, which the retries below and the caller's
+    // stacked second search start from again. Copying the whole dataset first and filtering the
+    // copy held it twice (60 000+ candidates, each with its inline core material, in the stacked search).
+    // The first-filter score-cull is applied inside the filter: only the best
+    // maximumMagneticsAfterFiltering survivors are copied out of the dataset, the same pool as
+    // copying every survivor and then resize() (F10), without holding the ones the cull drops.
+    std::optional<size_t> firstFilterCull;
+    if (settings.get_core_adviser_enable_intermediate_pruning()) {
+        firstFilterCull = maximumMagneticsAfterFiltering;
     }
+    std::vector<std::pair<Magnetic, double>> magneticsWithScoring = filterAreaProduct.filter_magnetics_from(*magnetics, inputs, 1.0, firstFilterCull);  // Fixed weight: pre-filtering criterion, not efficiency scoring
+    log_stage("Area Product filter (+ first-filter score-cull)", magneticsWithScoring.size());
 
     magneticsWithScoring = filterEnergyStored.filter_magnetics(&magneticsWithScoring, inputs, 1.0, true);  // Fixed weight: pre-filtering criterion, not efficiency scoring
     log_stage("Energy Stored filter", magneticsWithScoring.size());
 
     add_initial_turns_by_inductance(&magneticsWithScoring, inputs);
+    filter_by_window_copper_capacity(&magneticsWithScoring, inputs, "");
 
     // ABT #1411: this path had no inductance gate, so a stock core whose seeded turns
     // miss the required band (powder toroids at 4.6-10.4 uH for a 28.5-38.5 uH spec)
@@ -455,7 +614,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
 
     if (settings.get_core_adviser_enable_temperature_filter()) {
         MagneticCoreFilterTemperature filterTemperature(
-            inputs, _models, settings.get_core_adviser_maximum_temperature());
+            inputs, _models, resolve_maximum_design_temperature(inputs), get_application());
         filterTemperature.set_scorings(&_scorings);
         filterTemperature.set_filter_configuration(&_filterConfiguration);
         magneticsWithScoring = filterTemperature.filter_magnetics(
@@ -474,8 +633,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
         logEntry("No cores found with standard filters. Retrying without intermediate pruning (keeping larger cores), saturation still enforced...", "CoreAdviser");
 
         // Stage 1: full candidate set, saturation enforced
-        magneticsWithScoring = *magnetics;
-        magneticsWithScoring = filterAreaProduct.filter_magnetics(&magneticsWithScoring, inputs, 1.0, true);
+        magneticsWithScoring = filterAreaProduct.filter_magnetics_from(*magnetics, inputs, 1.0);  // ABT #1785: no whole-dataset copy
         magneticsWithScoring = filterEnergyStored.filter_magnetics(&magneticsWithScoring, inputs, 1.0, true);
 
         // ABT #926: bound the retry BY SIZE, which is the thing it is actually looking for.
@@ -519,6 +677,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
         keepLargestCores(magneticsWithScoring);
 
         add_initial_turns_by_inductance(&magneticsWithScoring, inputs);
+        filter_by_window_copper_capacity(&magneticsWithScoring, inputs, " (retry)");
         magneticsWithScoring = filterMagneticInductance.filter_magnetics(&magneticsWithScoring, inputs, 0, true);
         magneticsWithScoring = filterSaturationAvailable.filter_magnetics(&magneticsWithScoring, inputs, 1, true);
         log_stage("retry Saturation (size-bounded)", magneticsWithScoring.size());
@@ -534,13 +693,13 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
                 // RAII (ABT #113 sweep): the retry filters below can throw; a
                 // manual restore would leak the relaxed 1.0 margin.
                 SettingsGuard<double> saturationMarginGuard(settings, &Settings::get_core_adviser_saturation_margin, &Settings::set_core_adviser_saturation_margin, 1.0);
-                magneticsWithScoring = *magnetics;
-                magneticsWithScoring = filterAreaProduct.filter_magnetics(&magneticsWithScoring, inputs, 1.0, true);
+                magneticsWithScoring = filterAreaProduct.filter_magnetics_from(*magnetics, inputs, 1.0);  // ABT #1785: no whole-dataset copy
                 magneticsWithScoring = filterEnergyStored.filter_magnetics(&magneticsWithScoring, inputs, 1.0, true);
                 // Same size bound as stage 1: this stage had none, so a design that failed
                 // stage 1 sized and saturation-checked the entire pool a second time.
                 keepLargestCores(magneticsWithScoring);
                 add_initial_turns_by_inductance(&magneticsWithScoring, inputs);
+                filter_by_window_copper_capacity(&magneticsWithScoring, inputs, " (retry, margin 1.0)");
                 magneticsWithScoring = filterMagneticInductance.filter_magnetics(&magneticsWithScoring, inputs, 0, true);
                 magneticsWithScoring = filterSaturationAvailable.filter_magnetics(&magneticsWithScoring, inputs, 1, true);
             }
@@ -559,7 +718,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
 
         if (settings.get_core_adviser_enable_temperature_filter()) {
             MagneticCoreFilterTemperature filterTemperature(
-                inputs, _models, settings.get_core_adviser_maximum_temperature());
+                inputs, _models, resolve_maximum_design_temperature(inputs), get_application());
             filterTemperature.set_scorings(&_scorings);
             filterTemperature.set_filter_configuration(&_filterConfiguration);
             magneticsWithScoring = filterTemperature.filter_magnetics(
@@ -590,7 +749,13 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_power_ap
     // own core-adviser regression still lands ~4.3 W (was ~3.2 W) and the
     // magnetic-adviser default inductor ~3.2 W, both with the re-rank removed.
     // ABT #126: post-process before cutting (backfill; see post_process_and_cut)
-    return post_process_and_cut(magneticsWithScoring, inputs, maximumNumberResults);
+    // ABT #1802: where the temperature gate ran (enabled, and not skipped at zero EFFICIENCY weight),
+    // the returned parts are held to its limit on the temperature their loss solve found.
+    std::optional<double> solvedTemperatureLimit;
+    if (settings.get_core_adviser_enable_temperature_filter() && weights[CoreAdviserFilters::EFFICIENCY] > 0) {
+        solvedTemperatureLimit = resolve_maximum_design_temperature(inputs);
+    }
+    return post_process_and_cut(magneticsWithScoring, inputs, maximumNumberResults, /*withAlternativeMaterials=*/false, solvedTemperatureLimit);
 }
 
 std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_suppression_application(std::vector<std::pair<Magnetic, double>>* magnetics, Inputs inputs, std::map<CoreAdviserFilters, double> weights, size_t maximumMagneticsAfterFiltering, size_t maximumNumberResults){
@@ -599,7 +764,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_available_cores_suppress
     log_probe("pre_process_inputs (suppression)", magnetics->size());
 
     MagneticCoreFilterCost filterCost(inputs);
-    MagneticCoreFilterLosses filterLosses(inputs, _models);
+    MagneticCoreFilterLosses filterLosses(inputs, _models, get_application());
     MagneticCoreFilterDimensions filterDimensions;
     MagneticCoreFilterMagneticInductance filterMagneticInductance;
     MagneticCoreFilterMinimumImpedance filterMinimumImpedance;
@@ -761,7 +926,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_standard_cores_power_app
     MagneticCoreFilterAreaProduct filterAreaProduct(inputs);
     MagneticCoreFilterEnergyStored filterEnergyStored(inputs, _models);
     MagneticCoreFilterCost filterCost(inputs);
-    MagneticCoreFilterLosses filterLosses(inputs, _models);
+    MagneticCoreFilterLosses filterLosses(inputs, _models, get_application());
     MagneticCoreFilterDimensions filterDimensions;
     MagneticCoreFilterMagneticInductance filterMagneticInductance;
     MagneticCoreFilterFringingFactor filterFringingFactor(inputs, _models);
@@ -792,8 +957,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_standard_cores_power_app
     filterSaturation.set_filter_configuration(&_filterConfiguration);
     filterSaturation.set_cache_usage(false);
 
-    std::vector<std::pair<Magnetic, double>> magneticsWithScoring = *magnetics;
-    log_stage("Starting", magneticsWithScoring.size());
+    log_stage("Starting", magnetics->size());
 
     bool usingPowderCores = should_include_powder(inputs);
 
@@ -808,7 +972,8 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_standard_cores_power_app
     // ========================================================================
     // STEP 1: Area Product filter on all cores
     // ========================================================================
-    magneticsWithScoring = filterAreaProduct.filter_magnetics(&magneticsWithScoring, inputs, 1, true);
+    // ABT #1785: filtered straight out of the dataset; copying it whole first held it twice.
+    std::vector<std::pair<Magnetic, double>> magneticsWithScoring = filterAreaProduct.filter_magnetics_from(*magnetics, inputs, 1);
     log_stage("AreaProduct", magneticsWithScoring.size());
 
     // ========================================================================
@@ -834,48 +999,61 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_standard_cores_power_app
     // ========================================================================
     // STEP 3: Process FERRITE cores (gapped)
     // ========================================================================
-    if (!ferriteCores.empty()) {
+    // The temperature gate is skipped at zero EFFICIENCY weight (see
+    // MagneticCoreFilterTemperature::filter_magnetics), so the walk below only
+    // makes sense when the gate actually runs.
+    const bool temperatureGateActive = settings.get_core_adviser_enable_temperature_filter() &&
+                                       userWeight(CoreAdviserFilters::EFFICIENCY) > 0;
+    // Largest core volume that reached the temperature gate. Every core up to it
+    // was either pruned for ranking poorly or tried and found too hot.
+    double largestVolumeAtTemperatureGate = 0;
+
+    auto processFerriteCores = [&](std::vector<std::pair<Magnetic, double>> cores, bool pruneBeforeLosses, const std::string& stage) {
+        if (cores.empty()) {
+            return cores;
+        }
         // Add gaps to ferrite cores
-        add_gapping_standard_cores(&ferriteCores, inputs);
-        log_stage("gapping ferrite", ferriteCores.size());
+        add_gapping_standard_cores(&cores, inputs);
+        log_stage("gapping ferrite" + stage, cores.size());
 
         // Filter by fringing factor
-        ferriteCores = filterFringingFactor.filter_magnetics(&ferriteCores, inputs, 1 * userWeight(CoreAdviserFilters::EFFICIENCY), true);
-        log_stage("FringingFactor", ferriteCores.size());
+        cores = filterFringingFactor.filter_magnetics(&cores, inputs, 1 * userWeight(CoreAdviserFilters::EFFICIENCY), true);
+        log_stage("FringingFactor" + stage, cores.size());
 
         // Filter by dimensions
-        ferriteCores = filterDimensions.filter_magnetics(&ferriteCores, inputs, 1 * userWeight(CoreAdviserFilters::DIMENSIONS), true);
-        log_stage("Dimensions (ferrite)", ferriteCores.size());
+        cores = filterDimensions.filter_magnetics(&cores, inputs, 1 * userWeight(CoreAdviserFilters::DIMENSIONS), true);
+        log_stage("Dimensions (ferrite)" + stage, cores.size());
 
         // Assign concrete ferrite materials
-        ferriteCores = add_ferrite_materials_by_losses(&ferriteCores, inputs);
-        log_stage("materials (ferrite)", ferriteCores.size());
+        cores = add_ferrite_materials_by_losses(&cores, inputs);
+        log_stage("materials (ferrite)" + stage, cores.size());
 
         // Calculate turns
-        add_initial_turns_by_inductance(&ferriteCores, inputs);
+        add_initial_turns_by_inductance(&cores, inputs);
+        filter_by_window_copper_capacity(&cores, inputs, " (ferrite)" + stage);
 
         // Re-check fringing on the FINALIZED gap: add_initial_turns_by_inductance
         // can grow the gap (raising N + re-solving for L) to clear saturation, so
         // the gap the early fringing pass saw is stale. Reject winding-killers here.
-        reject_winding_killing_gaps(&ferriteCores, inputs);
-        log_stage("FringingFactor (post-gap, ferrite)", ferriteCores.size());
+        reject_winding_killing_gaps(&cores, inputs);
+        log_stage("FringingFactor (post-gap, ferrite)" + stage, cores.size());
 
         // Filter by inductance
-        ferriteCores = filterMagneticInductance.filter_magnetics(&ferriteCores, inputs, 0.1 * userWeight(CoreAdviserFilters::EFFICIENCY), true);
-        log_stage("Inductance (ferrite)", ferriteCores.size());
+        cores = filterMagneticInductance.filter_magnetics(&cores, inputs, 0.1 * userWeight(CoreAdviserFilters::EFFICIENCY), true);
+        log_stage("Inductance (ferrite)" + stage, cores.size());
 
         // Filter by saturation
-        ferriteCores = filterSaturation.filter_magnetics(&ferriteCores, inputs, 1, true);
-        log_stage("Saturation (ferrite)", ferriteCores.size());
+        cores = filterSaturation.filter_magnetics(&cores, inputs, 1, true);
+        log_stage("Saturation (ferrite)" + stage, cores.size());
 
         // Prune to top candidates by accumulated score before the expensive Loss filter
         // (which sweeps N per core). Cores already losing on cost+dimensions+inductance
         // are not going to be promoted by losses alone.
-        {
+        if (pruneBeforeLosses) {
             const size_t preLossCap = std::max<size_t>(maximumNumberResults * 5, 50);
-            if (settings.get_core_adviser_enable_intermediate_pruning() && ferriteCores.size() > preLossCap) {
-                ferriteCores.resize(preLossCap);
-                log_pruned("Losses (ferrite)", ferriteCores.size());
+            if (settings.get_core_adviser_enable_intermediate_pruning() && cores.size() > preLossCap) {
+                cores.resize(preLossCap);
+                log_pruned("Losses (ferrite)" + stage, cores.size());
             }
         }
 
@@ -886,22 +1064,85 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_standard_cores_power_app
         // Standard cores only. Available-cores mode (filter_available_cores_power_application)
         // is excluded on purpose: a stock core's gap is part of the catalogue part, so its
         // (N, gap) is not the adviser's to re-solve (Alf's decision).
-        select_inductor_turns_and_gap_by_losses(&ferriteCores, inputs);
-        log_stage("Loss-optimal turns (ferrite)", ferriteCores.size());
+        select_inductor_turns_and_gap_by_losses(&cores, inputs);
+        log_stage("Loss-optimal turns (ferrite)" + stage, cores.size());
 
         // Filter by losses
-        ferriteCores = filterLosses.filter_magnetics(&ferriteCores, inputs, 1 * userWeight(CoreAdviserFilters::EFFICIENCY), true);
-        log_stage("Losses (ferrite)", ferriteCores.size());
+        cores = filterLosses.filter_magnetics(&cores, inputs, 1 * userWeight(CoreAdviserFilters::EFFICIENCY), true);
+        log_stage("Losses (ferrite)" + stage, cores.size());
 
-        if (settings.get_core_adviser_enable_temperature_filter()) {
+        if (temperatureGateActive) {
+            for (const auto& [magnetic, scoring] : cores) {
+                largestVolumeAtTemperatureGate = std::max(largestVolumeAtTemperatureGate, magnetic.get_core().get_effective_volume());
+            }
             MagneticCoreFilterTemperature filterTemperature(
-                inputs, _models, settings.get_core_adviser_maximum_temperature());
+                inputs, _models, resolve_maximum_design_temperature(inputs), get_application());
             filterTemperature.set_scorings(&_scorings);
             filterTemperature.set_filter_configuration(&_filterConfiguration);
             filterTemperature.set_cache_usage(false);
-            ferriteCores = filterTemperature.filter_magnetics(&ferriteCores, inputs, 1 * userWeight(CoreAdviserFilters::EFFICIENCY), true);
-            log_stage("Temperature (ferrite)", ferriteCores.size());
+            cores = filterTemperature.filter_magnetics(&cores, inputs, 1 * userWeight(CoreAdviserFilters::EFFICIENCY), true);
+            log_stage("Temperature (ferrite)" + stage, cores.size());
         }
+        return cores;
+    };
+
+    ferriteCores = processFerriteCores(ferriteCores, true, "");
+
+    // ABT #126: post-process before cutting (backfill; see post_process_and_cut)
+    // ABT #1802: where the temperature gate ran, the returned parts are held to its limit on the
+    // temperature their loss solve found.
+    std::optional<double> solvedTemperatureLimit;
+    if (temperatureGateActive) {
+        solvedTemperatureLimit = resolve_maximum_design_temperature(inputs);
+    }
+    // ABT #1875: the ferrite parts are post-processed here, before the walk below, because the
+    // walk's "enough" is the number of parts post_process_and_cut's gates (the wire within limits and
+    // the #1802 solved temperature) let through: those are the verdicts a returned part is held to.
+    // Counting the single-pass temperature filter's passes instead stopped the walk on a batch the
+    // solved gate then rejected almost whole (46 counted, 43 rejected; 28 counted, 30 of 30 rejected),
+    // and the adviser returned 3 or 0 parts where larger cores would have passed. Ferrite parts are
+    // kept first and powder parts appended after them, the order the single post-processing of the
+    // ferrite-then-powder list had.
+    std::vector<std::pair<Mas, double>> results;
+    post_process_and_append(ferriteCores, inputs, maximumNumberResults, /*withAlternativeMaterials=*/true, solvedTemperatureLimit, results);
+    const size_t ferriteFirstPass = ferriteCores.size();
+
+    // ABT #1412: when losses, not saturation, size the core (a resonant inductor with no
+    // DC bias swings the full flux every cycle), the ranking above favours small, cheap
+    // cores and the temperature gate can reject all of them. The answer is the next larger
+    // core (the classic area-product iteration, McLyman), which the ranking-based pruning
+    // never let through. Walk up the area-product survivors by volume, above the largest
+    // core the gate has already seen, a batch at a time, until enough pass. The walk is
+    // bounded by the same maximumMagneticsAfterFiltering budget the first pass uses.
+    if (temperatureGateActive && largestVolumeAtTemperatureGate > 0 && results.size() < maximumNumberResults) {
+        std::vector<std::pair<Magnetic, double>> largerCores;
+        for (const auto& [magnetic, scoring] : magneticsWithScoring) {
+            if (magnetic.get_core().get_functional_description().get_type() != CoreType::TOROIDAL &&
+                magnetic.get_core().get_effective_volume() > largestVolumeAtTemperatureGate) {
+                largerCores.push_back({magnetic, scoring});
+            }
+        }
+        std::stable_sort(largerCores.begin(), largerCores.end(),
+                         [](const std::pair<Magnetic, double>& left, const std::pair<Magnetic, double>& right) {
+                             return left.first.get_core().get_effective_volume() < right.first.get_core().get_effective_volume();
+                         });
+        const size_t budget = std::min(largerCores.size(), maximumMagneticsAfterFiltering);
+        const size_t batchSize = std::max<size_t>(maximumNumberResults * 5, 50);
+        size_t examined = 0;
+        while (examined < budget && results.size() < maximumNumberResults) {
+            size_t end = std::min(examined + batchSize, budget);
+            std::vector<std::pair<Magnetic, double>> batch(largerCores.begin() + examined, largerCores.begin() + end);
+            examined = end;
+            auto passed = processFerriteCores(batch, false, " (larger cores)");
+            ferriteCores.insert(ferriteCores.end(), passed.begin(), passed.end());
+            post_process_and_append(passed, inputs, maximumNumberResults, /*withAlternativeMaterials=*/true, solvedTemperatureLimit, results);
+        }
+        logEntry("Temperature walk to larger ferrite cores examined " + std::to_string(examined) + " of " +
+                 std::to_string(largerCores.size()) + " larger cores (budget " + std::to_string(budget) + "); " +
+                 std::to_string(ferriteCores.size()) + " ferrite cores pass the filters (" + std::to_string(ferriteFirstPass) +
+                 " before the walk) and " + std::to_string(results.size()) + " pass post-processing" +
+                 (results.size() < maximumNumberResults ? " - fewer than requested, budget or catalogue exhausted." : "."),
+                 "CoreAdviser");
     }
 
     // ========================================================================
@@ -954,6 +1195,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_standard_cores_power_app
 
             // Calculate turns
             add_initial_turns_by_inductance(&powderCores, inputs);
+            filter_by_window_copper_capacity(&powderCores, inputs, " (powder)");
 
             // Filter by inductance
             powderCores = filterMagneticInductance.filter_magnetics(&powderCores, inputs, 0.1 * userWeight(CoreAdviserFilters::EFFICIENCY), true);
@@ -978,7 +1220,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_standard_cores_power_app
 
             if (settings.get_core_adviser_enable_temperature_filter()) {
                 MagneticCoreFilterTemperature filterTemperature(
-                    inputs, _models, settings.get_core_adviser_maximum_temperature());
+                    inputs, _models, resolve_maximum_design_temperature(inputs), get_application());
                 filterTemperature.set_scorings(&_scorings);
                 filterTemperature.set_filter_configuration(&_filterConfiguration);
                 filterTemperature.set_cache_usage(false);
@@ -991,41 +1233,24 @@ std::vector<std::pair<Mas, double>> CoreAdviser::filter_standard_cores_power_app
     // ========================================================================
     // STEP 5: Combine ferrite and powder results
     // ========================================================================
-    magneticsWithScoring.clear();
-    
-    // Add ferrite cores first (they typically perform better for gapped applications)
-    for (const auto& core : ferriteCores) {
-        magneticsWithScoring.push_back(core);
-    }
-    
-    // Add powder cores
-    for (const auto& core : powderCores) {
-        magneticsWithScoring.push_back(core);
-    }
-    
-    logEntry("Combined results: " + std::to_string(magneticsWithScoring.size()) + 
-             " (ferrite: " + std::to_string(ferriteCores.size()) + 
-             ", powder: " + std::to_string(powderCores.size()) + ")", "CoreAdviser");
-
-    if (magneticsWithScoring.size() == 0) {
-        return {};
-    }
-
-    // ========================================================================
-    // STEP 6: Final processing
-    // ========================================================================
+    // Ferrite parts first (they typically perform better for gapped applications), already
+    // post-processed above; the powder parts backfill what the ferrite ones left.
     // ABT #4's proximity-aware re-rank was removed here in ABT #14; the post-gap
     // fringing ceiling (1.3) now prunes the catastrophic gap-fringing cores up
     // front, making the per-advise re-rank winding cost redundant. See the
     // matching note in the standard-cores pipeline above.
-    // ABT #126: post-process before cutting (backfill; see post_process_and_cut)
-    return post_process_and_cut(magneticsWithScoring, inputs, maximumNumberResults, /*withAlternativeMaterials=*/true);
+    const size_t ferriteResults = results.size();
+    post_process_and_append(powderCores, inputs, maximumNumberResults, /*withAlternativeMaterials=*/true, solvedTemperatureLimit, results);
+    logEntry("Combined results: " + std::to_string(results.size()) +
+             " (ferrite: " + std::to_string(ferriteResults) + " of " + std::to_string(ferriteCores.size()) +
+             ", powder: " + std::to_string(results.size() - ferriteResults) + " of " + std::to_string(powderCores.size()) + ")", "CoreAdviser");
+    return results;
 }
 
 std::vector<std::pair<Mas, double>> CoreAdviser::filter_standard_cores_interference_suppression_application(std::vector<std::pair<Magnetic, double>>* magnetics, Inputs inputs, std::map<CoreAdviserFilters, double> weights, size_t maximumMagneticsAfterFiltering, size_t maximumNumberResults){
     inputs = pre_process_inputs(inputs);
 
-    MagneticCoreFilterLosses filterLosses(inputs, _models);
+    MagneticCoreFilterLosses filterLosses(inputs, _models, get_application());
     MagneticCoreFilterDimensions filterDimensions;
     MagneticCoreFilterMinimumImpedance filterMinimumImpedance;
     MagneticCoreFilterMagneticInductance filterMagneticInductance;

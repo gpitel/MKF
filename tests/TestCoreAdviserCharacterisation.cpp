@@ -30,6 +30,7 @@
 //   Baselines recorded at the bottom of the file.
 // =============================================================================
 
+#include <numbers>
 #include <source_location>
 #include <cmath>
 #include <fstream>
@@ -61,6 +62,11 @@ constexpr bool kRegenerateBaselines = false;
 // sits 3x above that floor and 100x below the ~1e-2 shift a real physics change
 // produces, so identity flips and real drift still fail loudly.
 constexpr double kRelTol = 1e-4;
+// AVAILABLE_CORES x POWER only: 5e-3 (0.5 %) on the SCORE, approved by Alf on 2026-10-12 ("just repin
+// it by adding some margin"). Stacked model changes keep moving this score by about 0.1 % with the
+// same core (ABT #1766 -0.22 %, ABT #1467 -0.098 %), each one failing the 1e-4 pin without any change
+// of ranking. The core NAMES are still compared exactly, so an identity flip fails as before.
+constexpr double kRelTolAvailablePower = 5e-3;
 
 // --- Fixture loader ---------------------------------------------------------
 std::vector<Core> load_test_cores_fixture() {
@@ -97,10 +103,15 @@ OpenMagnetics::Inputs make_power_inputs() {
 }
 
 OpenMagnetics::Inputs make_interference_suppression_inputs() {
-    // Mirrors TestCoreAdviser.cpp:Test_CoreAdviserAvailableCores_Toroidal_Cores_With_Impedance.
+    // Mirrors TestCoreAdviser.cpp:Test_CoreAdviserAvailableCores_Toroidal_Cores_With_Impedance, except for
+    // the inductance. ABT #838: the 60 Vpp drive's current is derived from the specified inductance, and
+    // 1 uH made it 48 A peak, imposed as magnetising current on toroids whose inductance is thousands of
+    // times higher. 1.6 mH is the inductance the 1 kOhm at 100 kHz impedance requirement itself asks
+    // for (1000 / (2 pi 100 kHz)); the drive becomes 30 mA peak.
+    const double magnetizingInductance = 1000 / (2 * std::numbers::pi * 100000);
     auto inputs = OpenMagnetics::Inputs::create_quick_operating_point(
         /*frequency*/ 100000,
-        /*magnetizingInductance*/ 1e-6,
+        /*magnetizingInductance*/ magnetizingInductance,
         /*temperature*/ 25,
         /*label*/ WaveformLabel::SINUSOIDAL,
         /*peakToPeak*/ 60,
@@ -115,7 +126,7 @@ OpenMagnetics::Inputs make_interference_suppression_inputs() {
     iaf.set_impedance(ip);
     minimumImpedance.push_back(iaf);
     inputs.get_mutable_design_requirements().set_minimum_impedance(minimumImpedance);
-    inputs.get_mutable_design_requirements().get_mutable_magnetizing_inductance().set_minimum(1e-6);
+    inputs.get_mutable_design_requirements().get_mutable_magnetizing_inductance().set_minimum(magnetizingInductance);
     inputs.get_mutable_design_requirements().get_mutable_magnetizing_inductance().set_nominal(std::nullopt);
     inputs.get_mutable_design_requirements().get_mutable_magnetizing_inductance().set_maximum(std::nullopt);
     return inputs;
@@ -129,7 +140,8 @@ struct TopEntry {
 
 void check_top_n(const std::string& label,
                  const std::vector<std::pair<OpenMagnetics::Mas, double>>& got,
-                 const std::vector<TopEntry>& expectedTop) {
+                 const std::vector<TopEntry>& expectedTop,
+                 double relTol = kRelTol) {
     // Print baseline lines whenever regenerating OR when no snapshot has
     // been recorded yet (expectedTop empty). Empty-snapshot still enforces
     // the monotonic-ordering structural contract.
@@ -164,7 +176,7 @@ void check_top_n(const std::string& label,
         INFO("top[" << i << "] expected=\"" << expectedTop[i].name << "\" got=\"" << name
                     << "\" score=" << std::setprecision(17) << got[i].second);
         REQUIRE(name == expectedTop[i].name);
-        REQUIRE_THAT(got[i].second, WithinRel(expectedTop[i].score, kRelTol));
+        REQUIRE_THAT(got[i].second, WithinRel(expectedTop[i].score, relTol));
     }
 }
 
@@ -219,12 +231,28 @@ void check_top_n(const std::string& label,
 // #756/#764 shape corrections) moved the min-max normalization pool (ABT #398). Same
 // slot-0 core; EP 20/PQ 20/20 3C96 climb past the EFD 3C95, and a second EP 20 gap
 // variant (0.598 mm) displaces the PQ 20/20 3C94 from the tail. Scores -2.4%.
+// Refreshed 2026-10-01 (ABT #1551, user-approved). NOT an MKF change: bisected (first-parent,
+// 8f07c293..fd4751f1) to 535103cb, the MAS bump to 2acaf9b, and within it to MAS 2acaf9b
+// "Norwe column openings re-read from drawings" (ABT #1244). 535103cb's code with MAS b7cf597
+// reproduces the old pin bit-for-bit; with 2acaf9b it gives these values. Every top-5
+// candidate keeps its N, gap, quick bobbin and core/winding losses; what moves is
+// Bobbin::get_filling_factor (EP 20 0.670 -> 0.613), a spline fitted through the whole bobbin
+// catalogue, and with it the pool-relative area-product and loss normalisation. Same slot-0
+// core; EP 20 0.598 climbs past PQ 20/20 and EFD 3C95. Scores -3.7%.
+// Re-pinned 2026-10-04 (temperature gate, ABT #1412): the core-stage temperature gate
+// (130 C) now scores the copper as the coil stage would wind it. At 600 Vpp / 100 kHz on
+// 100 uH (3.4 A rms) the former top-5 run hot: EFD 25/13/9 - 3C96 - Gapped 0.43 mm 249.2 C,
+// EP 20 - 3C96 - Gapped 0.375 mm 134.9 C, PQ 20/20 - 3C96 - Gapped 0.469 mm 193.1 C,
+// EFD 25/13/9 - 3C95 - Gapped 0.44 mm 196.1 C (no EP 20 - 3C96 - Gapped 0.598 mm reaches the gate).
+// One core of the fixture catalogue stays under the limit (129.6 C), and it is the only result.
+// Re-pinned 2026-10-12 (ABT #1766, user-approved): rectangular-limb cores (E, planar E, U, UI, EI)
+// now carry the field-exact right-angle bends in le/Ve (Ae unchanged), i.e. a lower core reluctance.
+// Same single core; score 4.7327978556817465 -> 4.7223288293487959 (-0.22 %).
+// Re-pinned 2026-10-12 (ABT #1467, approved by Alf): the magnetizing current is Faraday on the winding
+// voltage and the sampler closes the period. Same single core; score 4.7223288293487959 ->
+// 4.7177218949119135 (-0.098 %). Compared with kRelTolAvailablePower (0.5 %), names exactly.
 const std::vector<TopEntry> kTopAvailablePower = {
-    {"EFD 25/13/9 - 3C96 - Gapped 0.43 mm",        3.8502080757738115},
-    {"EP 20 - 3C96 - Gapped 0.375 mm",             3.7771608347344783},
-    {"PQ 20/20 - 3C96 - Gapped 0.46900000000000003 mm", 3.7642990791044353},
-    {"EFD 25/13/9 - 3C95 - Gapped 0.44 mm",        3.7354355592417958},
-    {"EP 20 - 3C96 - Gapped 0.598 mm",             3.7094997930199556},
+    {"PQ 20/20 - 3C97 - Gapped 0.477 mm",          4.7177218949119135},
 };
 
 // STANDARD_CORES x POWER: top-5 unique standard-shape ferrite candidates.
@@ -314,10 +342,26 @@ const std::vector<TopEntry> kTopStandardPower = {
 // same kind of unarbitrated near-tie as the 2026-08-23 third-place swap: no measurement decides
 // between them, and the pin records the engine, not a new truth. Scores are pool-relative
 // min-max, so they are not comparable across pins in absolute terms.
+// Re-pinned 2026-10-11 (ABT #1467, magnetizing-current inputs commits incl. ee4955b3): same
+// three cores in the same order, scores -0.05 % / -0.10 % / -0.34 %. The magnetizing current is
+// Faraday on the winding voltage with the DC the currents fix: the zero-DC excitation's spurious
+// -0.377 A magnetizing offset is gone (-0.0014 A; peak 48.10 -> 47.73 A), the top core's flux peak
+// 0.2919 -> 0.2897 T and its core loss -3 %.
+// Re-pinned 2026-10-13 (ABT #838, approved by Alf 2026-10-13) to the three N30 toroids. The
+// fixture's drive changed, not the ranking engine: make_interference_suppression_inputs asks for
+// the 1.6 mH the 1 kOhm at 100 kHz requirement implies instead of 1 uH, so the 60 Vpp excitation
+// drives 30 mA peak instead of 48 A. At 30 mA the T 16/9.6/6.3 in N30 meets the requirement with
+// 24 turns (H = 18.8 A/m, |Z| = 1003 Ohm at 100 kHz, B_peak 0.10 T), while the T 134/77/155 in
+// XFlux 26 needs 60 turns on a 134 mm powder toroid for the same 1 kOhm, so the small ferrite
+// toroids lead on turn count and losses. At 48 A they could not be in the list at all: 48.1 A
+// peak on a single turn is H = 1249 A/m on a 38.5 mm path, far into saturation (N30's B_sat is
+// 0.23 T at 100 C), the impedance collapses to milliohms and the impedance filter rejects them;
+// only the big low-permeability powder toroids survived that drive, which is what the former
+// pin recorded.
 const std::vector<TopEntry> kTopAvailableInterference = {
-    {"T 134/77/155 - XFlux 26 - Ungapped",         1.96010195480288},
-    {"T 134/77/78 - XFlux 26 - Ungapped",          1.8544802939152827},
-    {"T 134/77/27 - Edge 26 - Ungapped",           1.5364767289418393},
+    {"T 16/9.6/6.3 - N30 - Ungapped",              1.9957918197708548},
+    {"T 14/9/5 - N30 - Ungapped",                  1.7852313889986431},
+    {"T 12.5/7.5/5 - N30 - Ungapped",              1.6854890970047767},
 };
 
 } // namespace
@@ -344,7 +388,7 @@ TEST_CASE("CoreAdviser AVAILABLE_CORES x POWER top-5 snapshot",
     adviser.set_mode(CoreAdviser::CoreAdviserModes::AVAILABLE_CORES);
     auto results = adviser.get_advised_core(inputs, weights, &cores, 5);
 
-    check_top_n("AVAILABLE_CORES_POWER", results, kTopAvailablePower);
+    check_top_n("AVAILABLE_CORES_POWER", results, kTopAvailablePower, kRelTolAvailablePower);
 }
 
 TEST_CASE("CoreAdviser STANDARD_CORES x POWER top-5 snapshot",

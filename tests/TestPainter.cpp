@@ -6,11 +6,18 @@
 #include "Fixtures.h"
 #include "physical_models/WindingLosses.h"
 #include "physical_models/StrayCapacitance.h"
+#include "physical_models/LeakageInductance.h"
+#include "physical_models/MagneticField.h"
+#include "constructive_models/Bobbin.h"
+#include "support/CoilMesher.h"
 #include <source_location>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <fstream>
+#include <limits>
+#include <numbers>
+#include <regex>
 #include <string>
 #include <cstdint>
 #include <filesystem>
@@ -1203,6 +1210,186 @@ namespace {
         painter.export_svg();
         OpenMagneticsTesting::check_svg(outFile);
 
+        settings.reset();
+    }
+
+    // ABT #1759 (Alf 2026-10-11): with the default winding-loss model set per core type, leakage and the Painter's field
+    // plot MUST work for every core type. One transformer per family, single parallel and (single-window families)
+    // paralleled windings: leakage gives a positive value and the field paints. Counter-check: give the Painter the global
+    // field/fringing pair with MMF_BOUNDARY as default and the toroid / multi-window rows throw; give leakage the global
+    // fringing model and it throws once that model is MMF_BOUNDARY.
+    namespace {
+        struct DesignUnderTest {
+            std::string name;
+            OpenMagnetics::Magnetic magnetic;
+            OperatingPoint operatingPoint;
+        };
+
+        OperatingPoint transformer_operating_point() {
+            auto inputs = OpenMagnetics::Inputs::create_quick_operating_point(100000, 0.001, 25, WaveformLabel::TRIANGULAR, 100, 0.5, 0, {2.0});
+            return inputs.get_operating_point(0);
+        }
+
+        DesignUnderTest quick_transformer(std::string shapeName, json gapping, std::vector<int64_t> numberParallels) {
+            auto coil = OpenMagneticsTesting::get_quick_coil({20, 10}, numberParallels, shapeName, 1, WindingOrientation::OVERLAPPING,
+                                                             WindingOrientation::OVERLAPPING, CoilAlignment::CENTERED, CoilAlignment::INNER_OR_TOP);
+            auto core = OpenMagneticsTesting::get_quick_core(shapeName, gapping, 1, "3C97");
+            OpenMagnetics::Magnetic magnetic;
+            magnetic.set_core(core);
+            magnetic.set_coil(coil);
+            return {shapeName + " x" + std::to_string(numberParallels[0]) + "/" + std::to_string(numberParallels[1]), magnetic, transformer_operating_point()};
+        }
+
+        // E 42/21/20 with one winding window per column: primary on the central column, secondary on a lateral one
+        // (MultiColumnWinding_ECore_PrimaryCentral_SecondaryLateral). The central turns carry additionalCoordinates.
+        DesignUnderTest multi_window_transformer(std::vector<int64_t> numberParallels) {
+            settings.set_core_per_column_winding_windows(true);
+            auto core = OpenMagneticsTesting::get_quick_core("E 42/21/20", OpenMagneticsTesting::get_ground_gap(0.0005), 1, "3C97");
+            auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.001, 0.001);
+            json coilJson;
+            json bobbinJson;
+            to_json(bobbinJson, bobbin);
+            coilJson["bobbin"] = bobbinJson;
+            coilJson["functionalDescription"] = json::array();
+            coilJson["functionalDescription"].push_back(json{{"name", "Primary"}, {"numberTurns", 20}, {"numberParallels", numberParallels[0]},
+                                                             {"isolationSide", "primary"}, {"wire", "Round 0.475 - Grade 1"}});
+            coilJson["functionalDescription"].push_back(json{{"name", "Secondary"}, {"numberTurns", 10}, {"numberParallels", numberParallels[1]},
+                                                             {"isolationSide", "secondary"}, {"wire", "Round 0.475 - Grade 1"}});
+            OpenMagnetics::Coil coil(coilJson, false);
+            coil.get_mutable_functional_description()[1].set_winding_window(2);
+            coil.set_core_columns(core.get_processed_description()->get_columns());
+            REQUIRE(coil.wind());
+            OpenMagnetics::Magnetic magnetic;
+            magnetic.set_core(core);
+            magnetic.set_coil(coil);
+            return {"E 42/21/20 multi-window x" + std::to_string(numberParallels[0]) + "/" + std::to_string(numberParallels[1]), magnetic,
+                    transformer_operating_point()};
+        }
+
+        void check_leakage_and_field_paint(DesignUnderTest& design) {
+            INFO(design.name);
+            double leakage = 0;
+            REQUIRE_NOTHROW(leakage = LeakageInductance().calculate_leakage_inductance(design.magnetic, 100000).get_leakage_inductance_per_winding()[0].get_nominal().value());
+            CHECK(leakage > 0);
+            double windingLosses = 0;
+            REQUIRE_NOTHROW(windingLosses = WindingLosses().calculate_losses(design.magnetic, design.operatingPoint, 25).get_winding_losses());
+            CHECK(windingLosses > 0);
+            auto outFile = outputFilePath;
+            outFile.append("Test_Painter_Leakage_And_Field_Work_For_Every_Core_Type.svg");
+            std::filesystem::remove(outFile);
+            Painter painter(outFile);
+            settings.set_painter_number_points_x(20);
+            settings.set_painter_number_points_y(20);
+            REQUIRE_NOTHROW(painter.paint_magnetic_field(design.operatingPoint, design.magnetic));
+            painter.paint_core(design.magnetic);
+            painter.export_svg();
+            REQUIRE(std::filesystem::exists(outFile));
+        }
+    }
+
+    TEST_CASE("Test_Painter_Leakage_And_Field_Work_For_Every_Core_Type", "[support][painter][magnetic-field-painter][leakage-inductance][model-sets]") {
+        auto gap = OpenMagneticsTesting::get_ground_gap(0.0005);
+        std::vector<std::pair<std::string, json>> singleWindowFamilies = {
+            {"E 42/21/20", gap}, {"ETD 34/17/11", gap}, {"PQ 26/25", gap}, {"RM 10", gap}, {"EP 17", gap}};
+        for (auto& [shapeName, gapping] : singleWindowFamilies) {
+            for (auto parallels : std::vector<std::vector<int64_t>>{{1, 1}, {2, 2}}) {
+                settings.reset();
+                clear_databases();
+                auto design = quick_transformer(shapeName, gapping, parallels);
+                check_leakage_and_field_paint(design);
+            }
+        }
+        // ABT #1759: toroids and multi-window cores split their parallels by the explicit RESISTIVE model (no neutral
+        // window frame); with parallels on either winding, winding losses, leakage and the field paint must all work.
+        for (auto parallels : std::vector<std::vector<int64_t>>{{1, 1}, {2, 1}, {1, 2}, {2, 2}}) {
+            settings.reset();
+            clear_databases();
+            auto toroid = quick_transformer("T 40/24/16", json::array(), parallels);
+            check_leakage_and_field_paint(toroid);
+            settings.reset();
+            clear_databases();
+            auto multiWindow = multi_window_transformer(parallels);
+            check_leakage_and_field_paint(multiWindow);
+        }
+        {
+            settings.reset();
+            clear_databases();
+            auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "leakage_inductance_planar.json");
+            OpenMagnetics::Mas mas;
+            OpenMagnetics::from_file(path, mas);
+            auto planarInputs = mas.get_inputs();
+            DesignUnderTest design{"planar (leakage_inductance_planar.json)", mas.get_magnetic(), planarInputs.get_operating_point(0)};
+            check_leakage_and_field_paint(design);
+        }
+        settings.reset();
+    }
+
+    // ABT #1759 probe (hidden): which consumers throw NotImplemented for paralleled windings where the parallel current
+    // split has no frame (855cd23e): toroid and multi-window, through winding losses, leakage and the field paint.
+    TEST_CASE("Debug_Abt1759_Parallel_Split_Throw_Probe", "[.][abt1759-probe]") {
+        auto probe = [](DesignUnderTest design) {
+            auto run = [&](const std::string& consumer, auto&& call) {
+                try {
+                    call();
+                    std::cout << "PROBE " << design.name << " " << consumer << " OK" << std::endl;
+                }
+                catch (const std::exception& e) {
+                    std::cout << "PROBE " << design.name << " " << consumer << " THROWS " << e.what() << std::endl;
+                }
+            };
+            run("winding-losses", [&]() { WindingLosses().calculate_losses(design.magnetic, design.operatingPoint, 25); });
+            run("leakage", [&]() { LeakageInductance().calculate_leakage_inductance(design.magnetic, 100000); });
+            run("field-paint", [&]() {
+                auto outFile = outputFilePath;
+                outFile.append("Debug_Abt1759_Parallel_Split_Throw_Probe.svg");
+                Painter painter(outFile);
+                settings.set_painter_number_points_x(20);
+                settings.set_painter_number_points_y(20);
+                painter.paint_magnetic_field(design.operatingPoint, design.magnetic);
+            });
+        };
+        for (auto parallels : std::vector<std::vector<int64_t>>{{1, 1}, {2, 1}, {1, 2}}) {
+            settings.reset();
+            clear_databases();
+            probe(quick_transformer("T 40/24/16", json::array(), parallels));
+            settings.reset();
+            clear_databases();
+            probe(multi_window_transformer(parallels));
+        }
+        settings.reset();
+    }
+
+    // ABT #1759: the Painter plots the winding-loss model's own H. On a single-window core with nothing configured that
+    // is the default set's pair, BINNS_LAWRENSON + MMF_BOUNDARY, point for point. Counter-check: build the Painter's
+    // MagneticField from the global settings again (Painter.cpp) and this fails.
+    TEST_CASE("Test_Painter_Field_Is_The_Default_Winding_Loss_Field", "[support][painter][magnetic-field-painter][model-sets]") {
+        struct FieldProbe : public Painter {
+            using Painter::Painter;
+            ComplexField field(OperatingPoint operatingPoint, OpenMagnetics::Magnetic magnetic) { return calculate_magnetic_field(operatingPoint, magnetic, 1); }
+        };
+        settings.reset();
+        clear_databases();
+        auto design = quick_transformer("E 42/21/20", OpenMagneticsTesting::get_ground_gap(0.0005), {1, 1});
+        settings.set_painter_number_points_x(20);
+        settings.set_painter_number_points_y(20);
+        settings.set_painter_include_fringing(true);
+        auto outFile = outputFilePath;
+        outFile.append("Test_Painter_Field_Is_The_Default_Winding_Loss_Field.svg");
+        FieldProbe probe(outFile);
+        auto painted = probe.field(design.operatingPoint, design.magnetic);
+
+        auto frequency = design.operatingPoint.get_excitations_per_winding()[0].get_current()->get_harmonics()->get_frequencies()[1];
+        Field inducedField = CoilMesher::generate_mesh_induced_grid(design.magnetic, frequency, 20, 20, true, true, true).first;
+        settings.set_magnetic_field_include_fringing(true);
+        settings.set_magnetic_field_mirroring_dimension(settings.get_painter_mirroring_dimension());
+        MagneticField magneticField(MagneticFieldStrengthModels::BINNS_LAWRENSON, MagneticFieldStrengthFringingEffectModels::MMF_BOUNDARY);
+        auto expected = magneticField.calculate_magnetic_field_strength_field(design.operatingPoint, design.magnetic, inducedField).get_field_per_frequency()[0];
+        REQUIRE(painted.get_data().size() == expected.get_data().size());
+        REQUIRE(painted.get_data().size() > 0);
+        for (size_t index = 0; index < painted.get_data().size(); ++index) {
+            CHECK(painted.get_data()[index].get_real() == expected.get_data()[index].get_real());
+            CHECK(painted.get_data()[index].get_imaginary() == expected.get_data()[index].get_imaginary());
+        }
         settings.reset();
     }
 
@@ -4988,8 +5175,9 @@ namespace {
     }
     // TEMPORARY (ABT #685): repaint Alf's buck-inductor toroid with the new outer-crossing
     // placement so the anchored crossings can be looked at. Writes straight to the path he asked
-    // for. Remove once reviewed.
-    TEST_CASE("Test_Tmp_Buck_Toroid_Repaint", "[tmp-buck]") {
+    // for. Remove once reviewed. Hidden ([.]): it reads and writes MVB++ paths on the developer's
+    // machine (ABT #1596), so it is a manual diagnostic, not part of any suite.
+    TEST_CASE("Test_Tmp_Buck_Toroid_Repaint", "[.][tmp-buck]") {
         clear_databases();
         std::ifstream json_file("/home/alf/OpenMagnetics/MVB++/tests/mas_complete_fixtures/"
                                 "buck_inductor_complete.json");
@@ -5024,6 +5212,490 @@ namespace {
         painter.paint_magnetic(magnetic, PainterProjection::XY);
         painter.export_svg();
         REQUIRE(std::filesystem::exists(outFile));
+        settings.reset();
+    }
+}  // namespace
+
+namespace {
+    // Painter::get_color is the only way a field value becomes an SVG colour. The settings store colours as
+    // "0xrrggbb", which is not an SVG colour; every result must be "#rrggbb" whatever form the end colours take.
+    bool is_svg_hex_colour(const std::string& colour) {
+        return colour.size() == 7 && colour[0] == '#' && colour.find_first_not_of("0123456789abcdef", 1) == std::string::npos;
+    }
+
+    TEST_CASE("Painter colour scale returns #rrggbb and rejects NaN and invalid limits", "[support][painter][painter-colour]") {
+        Painter painter;
+        // End colours come out exactly, in "#rrggbb", from either input form.
+        CHECK(painter.get_color(0, 1, "0x2b35f5", "#ff0000", 0) == "#2b35f5");
+        CHECK(painter.get_color(0, 1, "0x2b35f5", "#ff0000", 1) == "#ff0000");
+        CHECK(painter.get_color(0, 1, "#f00", "0x0000ff", 0) == "#ff0000");
+        // Linear interpolation per channel, truncated: 0x00 + 0.5 * 0xff = 127.5 -> 0x7f.
+        CHECK(painter.get_color(0, 1, "#000000", "#ffffff", 0.5) == "#7f7f7f");
+        // Beyond the scale, including the -inf of log10(0) and +inf, the end colour.
+        CHECK(painter.get_color(0, 1, "0x2b35f5", "#ff0000", -std::numeric_limits<double>::infinity()) == "#2b35f5");
+        CHECK(painter.get_color(0, 1, "0x2b35f5", "#ff0000", std::numeric_limits<double>::infinity()) == "#ff0000");
+        CHECK(painter.get_color(0, 1, "0x2b35f5", "#ff0000", -3) == "#2b35f5");
+        for (double value : {-1.0, 0.0, 0.13, 0.5, 0.77, 1.0, 2.0}) {
+            CHECK(is_svg_hex_colour(painter.get_color(0, 1, settings.get_painter_color_magnetic_field_minimum(), settings.get_painter_color_magnetic_field_maximum(), value)));
+        }
+        double nan = std::numeric_limits<double>::quiet_NaN();
+        double inf = std::numeric_limits<double>::infinity();
+        CHECK_THROWS(painter.get_color(0, 1, "#000000", "#ffffff", nan));
+        CHECK_THROWS(painter.get_color(nan, 1, "#000000", "#ffffff", 0.5));
+        CHECK_THROWS(painter.get_color(0, inf, "#000000", "#ffffff", 0.5));
+        CHECK_THROWS(painter.get_color(1, 1, "#000000", "#ffffff", 0.5));
+        CHECK_THROWS(painter.get_color(1, 0, "#000000", "#ffffff", 0.5));
+        CHECK_THROWS(painter.get_color(0, 1, "red", "#ffffff", 0.5));
+        CHECK_THROWS(painter.get_color(0, 1, "#00000", "#ffffff", 0.5));
+        CHECK_THROWS(painter.get_color(0, 1, "#000000", "#gg0000", 0.5));
+    }
+}  // namespace
+
+namespace {
+    // The toroid's painted H is the ring-plane field of the toroidal leakage model (LeakageInductance.h,
+    // "Toroidal cores"), the field whose energy is the model's L_DM. Until 2026-10 the Painter imaged every
+    // crossing in both walls, which cancelled the bore field, and painted nothing outside the core.
+    struct ExposedFieldPainter : Painter { using PainterInterface::calculate_magnetic_field; };
+
+    OperatingPoint toroid_sine_operating_point(const std::vector<double>& peakCurrents, double frequency) {
+        // A negative peak is a phase of pi.
+        OperatingPoint operatingPoint;
+        std::vector<OperatingPointExcitation> excitations;
+        for (double peak : peakCurrents) {
+            SignalDescriptor current;
+            current.set_waveform(OpenMagnetics::Inputs::create_waveform(WaveformLabel::SINUSOIDAL, 2 * std::fabs(peak), frequency, 0.5, 0, 0, 0, peak < 0 ? std::numbers::pi : 0));
+            OperatingPointExcitation excitation;
+            excitation.set_frequency(frequency);
+            excitation.set_current(current);
+            excitations.push_back(excitation);
+        }
+        operatingPoint.set_excitations_per_winding(excitations);
+        OperatingConditions conditions;
+        conditions.set_ambient_temperature(25);
+        operatingPoint.set_conditions(conditions);
+        return operatingPoint;
+    }
+
+    // ∮ H·dl around the circle of the given radius centred on the core axis, by the midpoint rule.
+    double ring_plane_circulation(const LeakageInductance::ToroidalRingPlaneConductors& conductors, double radius, size_t numberSegments) {
+        double circulation = 0;
+        double dphi = 2 * std::numbers::pi / numberSegments;
+        for (size_t segment = 0; segment < numberSegments; ++segment) {
+            double phi = (segment + 0.5) * dphi;
+            auto h = LeakageInductance::calculate_toroidal_ring_plane_field(conductors, radius * std::cos(phi), radius * std::sin(phi));
+            circulation += (-h[0] * std::sin(phi) + h[1] * std::cos(phi)) * radius * dphi;
+        }
+        return circulation;
+    }
+
+    TEST_CASE("Painter toroid H is the ring-plane field of the toroidal leakage model, inside and outside the core", "[support][painter][magnetic-field-painter][toroidal][painter-toroid-field]") {
+        // WE 744822222 (T 14/8/9, 2 x 18 turns), 1 A peak at 100 kHz in differential and common mode.
+        settings.reset();
+        clear_databases();
+        auto testDataPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "cmc_we_744822222_functional.json");
+        std::ifstream file(testDataPath);
+        REQUIRE(file.good());
+        OpenMagnetics::Magnetic magnetic(json::parse(file));
+        magnetic = magnetic_autocomplete(magnetic);
+        settings.set_painter_number_points_x(40);
+        settings.set_painter_number_points_y(40);
+        settings.set_painter_logarithmic_scale(false);
+        settings.set_painter_maximum_value_colorbar(std::nullopt);
+        settings.set_painter_minimum_value_colorbar(std::nullopt);
+
+        double frequency = 100e3;
+        // The Painter drives winding w with its current times the MAS direction of w; DM is opposite effective
+        // bore currents, CM equal ones.
+        auto directions = CoilMesher::calculate_current_direction_per_winding(magnetic.get_coil());
+        std::vector<std::pair<std::string, std::vector<double>>> modes = {
+            {"DM", {1.0 * directions[0], -1.0 * directions[1]}},
+            {"CM", {1.0 * directions[0], 1.0 * directions[1]}},
+        };
+        for (const auto& [mode, peakCurrents] : modes) {
+            INFO(mode);
+            auto operatingPoint = toroid_sine_operating_point(peakCurrents, frequency);
+            // In-phase effective currents: the MKF harmonic amplitude of each winding's sampled sine, signed by its
+            // phase (0 or pi) relative to the reference winding's and by its MAS direction.
+            auto referenceWinding = CoilMesher::get_reference_winding_index(magnetic.get_coil());
+            std::vector<double> effectiveCurrents;
+            for (size_t winding = 0; winding < 2; ++winding) {
+                auto waveform = operatingPoint.get_excitations_per_winding()[winding].get_current()->get_waveform().value();
+                auto sampled = OpenMagnetics::Inputs::calculate_sampled_waveform(waveform, frequency);
+                double amplitude = OpenMagnetics::Inputs::calculate_harmonics_data(waveform, sampled, frequency).get_amplitudes()[1];
+                CHECK_THAT(amplitude, Catch::Matchers::WithinRel(1.0, 0.01));
+                double relativeSign = (peakCurrents[winding] < 0) == (peakCurrents[referenceWinding] < 0) ? 1.0 : -1.0;
+                effectiveCurrents.push_back(amplitude * relativeSign * directions[winding]);
+            }
+            auto conductors = LeakageInductance::calculate_toroidal_ring_plane_conductors(magnetic, effectiveCurrents);
+            REQUIRE(!conductors.bore.empty());
+
+            // 1. The field the Painter paints is calculate_toroidal_ring_plane_field at its grid points. The
+            //    phasor of a sampled sine is exact to the waveform's sampling, hence the relative 1e-9.
+            ExposedFieldPainter painter;
+            auto field = painter.calculate_magnetic_field(operatingPoint, magnetic, 1);
+            REQUIRE(field.get_data().size() > 100);
+            size_t outsidePoints = 0;
+            size_t outsideNonZero = 0;
+            size_t borePoints = 0;
+            size_t ferritePoints = 0;
+            for (const auto& datum : field.get_data()) {
+                auto point = datum.get_point();
+                auto expected = LeakageInductance::calculate_toroidal_ring_plane_field(conductors, point[0], point[1]);
+                double expectedModule = std::hypot(expected[0], expected[1]);
+                double tolerance = 1e-9 * expectedModule + 1e-12;
+                CHECK(std::fabs(datum.get_real() - expected[0]) <= tolerance);
+                CHECK(std::fabs(datum.get_imaginary() - expected[1]) <= tolerance);
+                double radius = std::hypot(point[0], point[1]);
+                if (radius > conductors.outerWallRadius) {
+                    ++outsidePoints;
+                    if (std::hypot(datum.get_real(), datum.get_imaginary()) > 0) {
+                        ++outsideNonZero;
+                    }
+                }
+                else if (radius < conductors.innerWallRadius) {
+                    ++borePoints;
+                }
+                else {
+                    ++ferritePoints;
+                }
+            }
+            // The grid covers the bore, the ferrite and the outside, and the field outside the core is not zero.
+            CHECK(borePoints > 0);
+            CHECK(ferritePoints > 0);
+            REQUIRE(outsidePoints > 0);
+            CHECK(outsideNonZero == outsidePoints);
+
+            // 2. The painted SVG carries each point's |H| in its title, to two significant figures, in field order.
+            auto outFile = outputFilePath;
+            outFile.append("Test_Painter_Toroid_Ring_Plane_Field_" + mode + ".svg");
+            std::filesystem::remove(outFile);
+            Painter svgPainter(outFile);
+            svgPainter.paint_magnetic_field(operatingPoint, magnetic);
+            auto svg = svgPainter.export_svg();
+            std::regex titleRegex("<title>([-+0-9.e]+) A/m</title>");
+            std::vector<double> labels;
+            for (auto it = std::sregex_iterator(svg.begin(), svg.end(), titleRegex); it != std::sregex_iterator(); ++it) {
+                labels.push_back(std::stod((*it)[1].str()));
+            }
+            REQUIRE(labels.size() == field.get_data().size());
+            for (size_t index = 0; index < labels.size(); ++index) {
+                auto point = field.get_data()[index].get_point();
+                auto expected = LeakageInductance::calculate_toroidal_ring_plane_field(conductors, point[0], point[1]);
+                double expectedModule = std::hypot(expected[0], expected[1]);
+                // "%.1e": half a unit of the second significant figure.
+                double rounding = expectedModule > 0 ? 0.5 * std::pow(10.0, std::floor(std::log10(expectedModule)) - 1) : 0;
+                CHECK(std::fabs(labels[index] - expectedModule) <= rounding * (1 + 1e-9));
+            }
+            CHECK(svg.find("0x") == std::string::npos);
+
+            // 3. Ampère: the circulation is 0 on a circle around the bore centre inside every crossing, Σ I_bore in
+            //    the ferrite, and 0 outside every crossing. The integrand is smooth on each circle, so the midpoint
+            //    rule converges geometrically; 1e-6 of the turn current is far below any modelling term.
+            double boreNetCurrent = 0;
+            double smallestBoreRadius = std::numeric_limits<double>::max();
+            double largestOuterRadius = 0;
+            for (const auto& conductor : conductors.bore) {
+                boreNetCurrent += conductor.current;
+                smallestBoreRadius = std::min(smallestBoreRadius, std::hypot(conductor.x, conductor.y) - conductor.geometricMeanRadius * std::exp(0.25));
+            }
+            for (const auto& conductor : conductors.outer) {
+                largestOuterRadius = std::max(largestOuterRadius, std::hypot(conductor.x, conductor.y) + conductor.geometricMeanRadius * std::exp(0.25));
+            }
+            double ferriteRadius = (conductors.innerWallRadius + conductors.outerWallRadius) / 2;
+            CHECK_THAT(ring_plane_circulation(conductors, 0.5 * smallestBoreRadius, 4096), Catch::Matchers::WithinAbs(0, 1e-6));
+            CHECK_THAT(ring_plane_circulation(conductors, ferriteRadius, 4096), Catch::Matchers::WithinAbs(boreNetCurrent, 1e-6));
+            CHECK_THAT(ring_plane_circulation(conductors, 1.5 * largestOuterRadius, 4096), Catch::Matchers::WithinAbs(0, 1e-6));
+            if (mode == "CM") {
+                CHECK_THAT(std::fabs(boreNetCurrent), Catch::Matchers::WithinRel(36.0 * std::fabs(effectiveCurrents[0]), 1e-12));
+            }
+            else {
+                CHECK_THAT(boreNetCurrent, Catch::Matchers::WithinAbs(0.0, 1e-12));
+            }
+
+            // 4. A given field is painted as given on a toroid.
+            auto inputFile = outputFilePath;
+            inputFile.append("Test_Painter_Toroid_Input_Field_" + mode + ".svg");
+            std::filesystem::remove(inputFile);
+            Painter inputPainter(inputFile);
+            inputPainter.paint_magnetic_field(operatingPoint, magnetic, 1, field);
+            auto inputSvg = inputPainter.export_svg();
+            size_t inputLabels = std::distance(std::sregex_iterator(inputSvg.begin(), inputSvg.end(), titleRegex), std::sregex_iterator());
+            CHECK(inputLabels == field.get_data().size());
+            CHECK(std::filesystem::exists(inputFile));
+        }
+        settings.reset();
+    }
+
+    // ---- Painter fix 3: the electric energy of the stray-capacitance model, element by element ----
+
+    // Sums every element's sampled energy and checks it is conserved: the samples plus what the sampler returns
+    // as unplaced carry exactly the energy handed to it.
+    void check_sampling_conserves(const StrayCapacitance::ElectricEnergyElement& element, double spacing) {
+        // Millions of samples: summed with Kahan's compensation, so the check measures the sampler, not the sum.
+        double sampled = 0;
+        double compensation = 0;
+        size_t negativeSamples = 0;
+        double unplaced = StrayCapacitance::sample_electric_energy_element(element, 1.0, spacing, [&](double, double, double energy) {
+            negativeSamples += energy < 0;
+            double corrected = energy - compensation;
+            double next = sampled + corrected;
+            compensation = (next - sampled) - corrected;
+            sampled = next;
+        });
+        CHECK(negativeSamples == 0);
+        CHECK_THAT(sampled + unplaced, Catch::Matchers::WithinRel(1.0, 1e-12));
+    }
+
+    TEST_CASE("Electric energy painting of a bobbin inductor is the stray-capacitance model's energy, element by element", "[support][painter][painter-electric-energy]") {
+        settings.reset();
+        settings.set_stray_capacitance_model(StrayCapacitanceModels::ALBACH);
+        OpenMagneticsTesting::PainterTestConfig config;
+        auto [magnetic, inputs] = OpenMagneticsTesting::prepare_painter_test(config);
+        settings.set_painter_number_points_x(60);
+        settings.set_painter_number_points_y(120);
+        auto operatingPoint = inputs.get_operating_point(0);
+        auto painting = PainterInterface::calculate_electric_energy_painting(operatingPoint, magnetic, 1);
+
+        size_t roundPairs = 0;
+        size_t coreFaces = 0;
+        for (const auto& element : painting.elements) {
+            roundPairs += element.kind == StrayCapacitance::ElectricEnergyElement::Kind::ROUND_PAIR;
+            coreFaces += element.kind == StrayCapacitance::ElectricEnergyElement::Kind::CORE_FACE;
+        }
+        REQUIRE(roundPairs > 0);
+        REQUIRE(coreFaces > 0);
+        REQUIRE(painting.totalEnergyPerLengthInPlane > 0);
+
+        // 1. Conservation: every in-plane J/m is either in a cell, outside the window, or has no place.
+        CHECK_THAT(painting.placedEnergyPerLength + painting.unplacedEnergyPerLength + painting.outsideGridEnergyPerLength,
+                   Catch::Matchers::WithinRel(painting.totalEnergyPerLengthInPlane, 1e-9));
+        // A bobbin inductor's turns and faces are all in the painted window, and a rectangular face has a place.
+        CHECK(painting.unplacedEnergyPerLength == 0);
+        // Outside the window: only the turn-to-core faces' far field can go there (each face is the model's
+        // conductor over an unbounded plane, which runs past the window's corners); a turn pair's tubes run
+        // between its two turns, inside the window.
+        {
+            const double originX = magnetic.get_mutable_core().get_columns()[0].get_width() / 2;
+            const double originY = -0.5 * settings.get_painter_number_points_y() * painting.cellHeight;
+            const double endX = originX + settings.get_painter_number_points_x() * painting.cellWidth;
+            const double endY = -originY;
+            std::map<std::string, double> outsidePerKind;
+            for (size_t elementIndex = 0; elementIndex < painting.elements.size(); ++elementIndex) {
+                const auto& element = painting.elements[elementIndex];
+                std::string key = element.kind == StrayCapacitance::ElectricEnergyElement::Kind::CORE_FACE ? "face" + std::to_string(static_cast<int>(element.surface))
+                                                                                                         : "pair" + std::to_string(static_cast<int>(element.kind));
+                StrayCapacitance::sample_electric_energy_element(element, painting.energyPerLength[elementIndex], std::min(painting.cellWidth, painting.cellHeight),
+                    [&](double x, double y, double energy) {
+                        if (x < originX || x >= endX || y < originY || y >= endY) {
+                            outsidePerKind[key + (x < originX ? " beside the column" : x >= endX ? " beyond the window" : y < originY ? " below" : " above")] += energy;
+                        }
+                    });
+            }
+            double outsideSum = 0;
+            for (const auto& [key, energy] : outsidePerKind) {
+                std::cout << "outside the window, " << key << ": " << energy / painting.totalEnergyPerLengthInPlane << " of the in-plane energy" << std::endl;
+                CHECK(key.rfind("face", 0) == 0);
+                outsideSum += energy;
+            }
+            CHECK_THAT(outsideSum, Catch::Matchers::WithinRel(painting.outsideGridEnergyPerLength, 1e-9));
+        }
+        // 2. The painted cells integrate (u dA) to the placed energy, and the grid is the painter's exact tiling.
+        const size_t numberPointsX = settings.get_painter_number_points_x();
+        const size_t numberPointsY = settings.get_painter_number_points_y();
+        REQUIRE(painting.field.get_data().size() == numberPointsX * numberPointsY);
+        double cellArea = painting.cellWidth * painting.cellHeight;
+        double painted = 0;
+        double nextToColumn = 0;
+        double columnFace = magnetic.get_mutable_core().get_columns()[0].get_width() / 2;
+        for (const auto& datum : painting.field.get_data()) {
+            REQUIRE(std::isfinite(datum.get_value()));
+            REQUIRE(datum.get_value() >= 0);
+            painted += datum.get_value() * cellArea;
+            if (datum.get_point()[0] < columnFace + painting.cellWidth) {
+                nextToColumn += datum.get_value();
+            }
+        }
+        CHECK_THAT(painted, Catch::Matchers::WithinRel(painting.placedEnergyPerLength, 1e-9));
+        // 3. The turn-to-core energy reaches the cells against the column (the old painter had no core).
+        CHECK(nextToColumn > 0);
+
+        // 4. Each element: sampling conserves, and a round pair's flux tubes integrate to its closed form.
+        //    Albach's closed form is the integral of these same tubes, so the difference is the quadrature only.
+        double spacing = std::min(painting.cellWidth, painting.cellHeight);
+        double worstRoundPair = 0;
+        size_t contactCellsChecked = 0;
+        for (size_t elementIndex = 0; elementIndex < painting.elements.size(); ++elementIndex) {
+            const auto& element = painting.elements[elementIndex];
+            check_sampling_conserves(element, spacing);
+            if (element.kind != StrayCapacitance::ElectricEnergyElement::Kind::ROUND_PAIR) {
+                continue;
+            }
+            double closedForm = element.capacitance / (2 * element.length);
+            double tubes = StrayCapacitance::integrate_electric_energy_element(element, spacing);
+            worstRoundPair = std::max(worstRoundPair, std::fabs(tubes - closedForm) / closedForm);
+            // 5. Two touching turns store energy at their contact: the cell holding the contact point is lit.
+            if (element.gap < 0.1 * spacing && painting.energyPerLength[elementIndex] > 0) {
+                double x = (element.firstCentre[0] + element.secondCentre[0]) / 2;
+                double y = (element.firstCentre[1] + element.secondCentre[1]) / 2;
+                size_t column = static_cast<size_t>(std::floor((x - columnFace) / painting.cellWidth));
+                size_t row = static_cast<size_t>(std::floor((y + 0.5 * numberPointsY * painting.cellHeight) / painting.cellHeight));
+                REQUIRE(column < numberPointsX);
+                REQUIRE(row < numberPointsY);
+                CHECK(painting.field.get_data()[row * numberPointsX + column].get_value() > 0);
+                ++contactCellsChecked;
+            }
+        }
+        std::cout << "bobbin inductor: worst round-pair tube integral vs closed form " << worstRoundPair << ", contact cells " << contactCellsChecked << std::endl;
+        CHECK(worstRoundPair < 1e-3);
+        CHECK(contactCellsChecked > 0);
+        settings.reset();
+    }
+
+    TEST_CASE("Electric energy of a turn over the core is the field of a conductor over a plane", "[support][painter][painter-electric-energy]") {
+        settings.reset();
+        const double vacuumPermittivity = Constants().vacuumPermittivity;
+        StrayCapacitance::ElectricEnergyElement element;
+        element.kind = StrayCapacitance::ElectricEnergyElement::Kind::CORE_FACE;
+        element.surface = StrayCapacitance::ElectricEnergyElement::Surface::COLUMN;
+        element.firstCentre = {3e-3, 1e-3};
+        element.length = 1;
+        element.conductingRadius = 0.25e-3;
+        element.airEquivalentGap = 0.1e-3;
+        element.realDistance = 0.4e-3;
+        element.capacitance = 1e-12;
+        const double height = element.conductingRadius + element.airEquivalentGap;
+        const double spacing = 0.02e-3;
+
+        // 1. Isolated: the bipolar integrand is the constant 1/tau0^2, so the integral is Smythe's 2 pi eps0 / acosh(H/r)
+        //    halved (energy per V^2), exactly.
+        double isolated = StrayCapacitance::integrate_electric_energy_element(element, spacing);
+        CHECK_THAT(isolated, Catch::Matchers::WithinRel(std::numbers::pi * vacuumPermittivity / std::acosh(height / element.conductingRadius), 1e-9));
+        check_sampling_conserves(element, spacing);
+        // Every sample lies on the conductor's side of the core surface (column face at x = centre - realDistance).
+        StrayCapacitance::sample_electric_energy_element(element, 1.0, spacing, [&](double x, double, double) {
+            CHECK(x >= element.firstCentre[0] - element.realDistance - 1e-12);
+        });
+
+        // 2. In a row: the charge-simulation field, cell by cell, integrates to the row capacitance it solves.
+        for (double pitch : {0.55e-3, 0.8e-3, 2e-3}) {
+            INFO(pitch);
+            element.positivePitch = pitch;
+            element.negativePitch = pitch;
+            double row = StrayCapacitance::integrate_electric_energy_element(element, spacing);
+            double closedForm = StrayCapacitance::calculate_conductor_row_over_plane_capacitance_per_length(element.conductingRadius, height, pitch) / 2;
+            std::cout << "row pitch " << pitch << ": integral / closed form - 1 = " << row / closedForm - 1 << std::endl;
+            CHECK_THAT(row, Catch::Matchers::WithinRel(closedForm, 1e-3));
+            check_sampling_conserves(element, spacing);
+        }
+        settings.reset();
+    }
+
+    TEST_CASE("Electric energy painting of WE 744822222 in differential mode is the energy of its DM capacitance", "[support][painter][painter-electric-energy][toroidal]") {
+        settings.reset();
+        clear_databases();
+        auto testDataPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "cmc_we_744822222_functional.json");
+        std::ifstream file(testDataPath);
+        REQUIRE(file.good());
+        OpenMagnetics::Magnetic magnetic(json::parse(file));
+        magnetic = magnetic_autocomplete(magnetic);
+        settings.set_painter_number_points_x(100);
+        settings.set_painter_number_points_y(100);
+        settings.set_painter_logarithmic_scale(true);
+        settings.set_painter_maximum_value_colorbar(std::nullopt);
+        settings.set_painter_minimum_value_colorbar(std::nullopt);
+
+        // DM: the same 1 V peak sine on both windings, the second in antiphase.
+        const double frequency = 100e3;
+        const double peak = 1.0;
+        OperatingPoint operatingPoint;
+        std::vector<OperatingPointExcitation> excitations;
+        for (double phase : {0.0, std::numbers::pi}) {
+            SignalDescriptor voltage;
+            voltage.set_waveform(OpenMagnetics::Inputs::create_waveform(WaveformLabel::SINUSOIDAL, 2 * peak, frequency, 0.5, 0, 0, 0, phase));
+            OperatingPointExcitation excitation;
+            excitation.set_frequency(frequency);
+            excitation.set_voltage(voltage);
+            excitations.push_back(excitation);
+        }
+        operatingPoint.set_excitations_per_winding(excitations);
+        OperatingConditions conditions;
+        conditions.set_ambient_temperature(25);
+        operatingPoint.set_conditions(conditions);
+
+        auto painting = PainterInterface::calculate_electric_energy_painting(operatingPoint, magnetic, 1);
+        REQUIRE(!painting.elements.empty());
+
+        // 1. The elements' energies add up to the DM capacitance's: 1/2 C_DM |V_port|^2, with V_port the rms of the
+        //    two windings' start terminals in antiphase (the sampled sine's harmonic, not the nominal peak).
+        auto waveform = operatingPoint.get_excitations_per_winding()[0].get_voltage()->get_waveform().value();
+        double rms = std::abs(CoilMesher::calculate_harmonic_phasor(waveform, frequency, frequency)) / std::sqrt(2.0);
+        StrayCapacitance strayCapacitance(settings.get_stray_capacitance_model());
+        double differentialModeCapacitance = strayCapacitance.calculate_differential_mode_capacitance(magnetic.get_coil(), magnetic.get_core(), frequency,
+                                                                                                      magnetic.get_core_electrical_reference());
+        double portVoltage = 2 * rms;
+        std::cout << "744822222 DM: C_DM " << differentialModeCapacitance * 1e12 << " pF, painted elements " << painting.elements.size()
+                  << ", total " << painting.totalEnergy << " J, in-plane " << painting.totalEnergyPerLengthInPlane << " J/m, out of plane "
+                  << painting.outOfPlaneEnergyPerLength << " J/m, unplaced " << painting.unplacedEnergyPerLength << " J/m, outside grid "
+                  << painting.outsideGridEnergyPerLength << " J/m" << std::endl;
+        CHECK_THAT(painting.totalEnergy, Catch::Matchers::WithinRel(0.5 * differentialModeCapacitance * portVoltage * portVoltage, 1e-9));
+
+        // 2. Conservation of the in-plane energy, and the painted cells integrate to what was placed.
+        CHECK_THAT(painting.placedEnergyPerLength + painting.unplacedEnergyPerLength + painting.outsideGridEnergyPerLength,
+                   Catch::Matchers::WithinRel(painting.totalEnergyPerLengthInPlane, 1e-9));
+        double cellArea = painting.cellWidth * painting.cellHeight;
+        double painted = 0;
+        for (const auto& datum : painting.field.get_data()) {
+            REQUIRE(std::isfinite(datum.get_value()));
+            REQUIRE(datum.get_value() >= 0);
+            painted += datum.get_value() * cellArea;
+        }
+        CHECK_THAT(painted, Catch::Matchers::WithinRel(painting.placedEnergyPerLength, 1e-9));
+        // A toroid's top and bottom runs are out of the ring plane, and they carry energy.
+        CHECK(painting.outOfPlaneEnergyPerLength > 0);
+
+        // 3. Energy in the cells between the turns and the core: the bore and outer wall faces are lit.
+        auto core = magnetic.get_core();
+        auto processed = core.get_processed_description().value();
+        double outerRadius = processed.get_width() / 2;
+        double innerRadius = outerRadius - core.get_columns()[0].get_width();
+        double coreFacing = 0;
+        for (const auto& datum : painting.field.get_data()) {
+            double radius = std::hypot(datum.get_point()[0], datum.get_point()[1]);
+            if ((radius < innerRadius && radius > innerRadius - 2 * painting.cellWidth) || (radius > outerRadius && radius < outerRadius + 2 * painting.cellWidth)) {
+                coreFacing += datum.get_value();
+            }
+        }
+        CHECK(coreFacing > 0);
+
+        // 4. What the painter paints for SDF_PHYSICS is this painting, cell for cell.
+        {
+            struct ExposedElectricPainter : Painter { using PainterInterface::calculate_electric_field; };
+            ExposedElectricPainter exposedPainter;
+            auto painted = exposedPainter.calculate_electric_field(operatingPoint, magnetic, 1, ElectricFieldVisualizationModel::SDF_PHYSICS);
+            REQUIRE(painted.get_data().size() == painting.field.get_data().size());
+            size_t differentCells = 0;
+            for (size_t index = 0; index < painted.get_data().size(); ++index) {
+                const auto& expected = painting.field.get_data()[index];
+                const auto& actual = painted.get_data()[index];
+                differentCells += actual.get_point() != expected.get_point() || std::fabs(actual.get_value() - expected.get_value()) > 1e-12 * std::fabs(expected.get_value());
+            }
+            CHECK(differentCells == 0);
+        }
+
+        // 5. The painter draws it (SDF_PHYSICS) with real colours.
+        auto outFile = outputFilePath;
+        outFile.append("Test_Electric_Energy_Painting_744822222_DM.svg");
+        std::filesystem::remove(outFile);
+        Painter painter(outFile);
+        painter.paint_electric_field(operatingPoint, magnetic, 1, std::nullopt, ElectricFieldVisualizationModel::SDF_PHYSICS, ColorPalette::PLASMA);
+        painter.paint_core(magnetic);
+        painter.paint_coil_turns(magnetic);
+        painter.export_svg();
+        REQUIRE(std::filesystem::exists(outFile));
+        std::ifstream svgFile(outFile);
+        std::string svg((std::istreambuf_iterator<char>(svgFile)), std::istreambuf_iterator<char>());
+        CHECK(std::regex_search(svg, std::regex("fill: ?#[0-9a-fA-F]{6}")));
+        CHECK(svg.find("nan") == std::string::npos);
         settings.reset();
     }
 }  // namespace

@@ -9,6 +9,9 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include <algorithm>
+#include <cmath>
+#include <numbers>
 
 using namespace MAS;
 using namespace OpenMagnetics;
@@ -339,6 +342,11 @@ OpenMagnetics::Inputs get_quick_insulation_inputs(DimensionWithTolerance altitud
     excitation.set_frequency(frequency);
     excitation.set_voltage(voltage);
     operatingPoint.get_mutable_excitations_per_winding().push_back(excitation);
+    // ABT #1299: conditions.ambientTemperature is required by MAS; left unset, the generated
+    // struct carries an uninitialised double that lead-sleeve selection read as 5.4e150 C.
+    OperatingConditions conditions;
+    conditions.set_ambient_temperature(25);
+    operatingPoint.set_conditions(conditions);
     inputs.get_mutable_operating_points().push_back(operatingPoint);
     insulationRequirements.set_altitude(altitude);
     insulationRequirements.set_cti(cti);
@@ -664,10 +672,112 @@ bool check_turns_description(OpenMagnetics::Coil coil) {
     bool collides = check_collisions(dimensionsByName, coordinatesByName, bobbinWindingWindowShape == WindingWindowShape::ROUND);
     CHECK(!collides);
     if (additionalCoordinatesByName.size() > 0) {
-        collides |= check_collisions(dimensionsByName, additionalCoordinatesByName, bobbinWindingWindowShape == WindingWindowShape::ROUND);
+        // Only the turns that HAVE an outer crossing take part: under real winding the last
+        // station of each conductor has none (ABT #685), and check_collisions looks every
+        // dimensioned name up in the coordinates map -- a missing one read an empty vector
+        // (segfault on the first real-winding toroid checked here, ABT #1734).
+        std::map<std::string, std::vector<double>> additionalDimensionsByName;
+        for (const auto& [name, dimensions] : dimensionsByName) {
+            if (additionalCoordinatesByName.count(name)) {
+                additionalDimensionsByName[name] = dimensions;
+            }
+        }
+        collides |= check_collisions(additionalDimensionsByName, additionalCoordinatesByName, bobbinWindingWindowShape == WindingWindowShape::ROUND);
     }
     CHECK(!collides);
     return !collides && equalToOne;
+}
+
+bool check_toroidal_sections_keep_their_sectors(OpenMagnetics::Coil coil) {
+    REQUIRE(coil.get_turns_description());
+    coil.convert_turns_to_cartesian_coordinates();
+    const auto turns = coil.get_turns_description().value();
+    auto azimuthOf = [](const Turn& turn) {
+        double a = std::atan2(turn.get_coordinates()[1], turn.get_coordinates()[0]) * 180.0 / std::numbers::pi;
+        return a < 0 ? a + 360.0 : a;
+    };
+    // Keyed by SECTION: an interleaved winding owns one sector per section.
+    std::map<std::string, std::vector<double>> azimuthsPerSection;
+    for (const auto& turn : turns) {
+        REQUIRE(turn.get_section());
+        azimuthsPerSection[turn.get_section().value()].push_back(azimuthOf(turn));
+    }
+    REQUIRE(azimuthsPerSection.size() >= 2);
+    bool allKept = true;
+    for (auto& [sectionName, azimuths] : azimuthsPerSection) {
+        std::sort(azimuths.begin(), azimuths.end());
+        double largestGap = 360.0 - (azimuths.back() - azimuths.front());
+        double arcStart = azimuths.front();
+        for (size_t i = 1; i < azimuths.size(); ++i) {
+            if (azimuths[i] - azimuths[i - 1] > largestGap) {
+                largestGap = azimuths[i] - azimuths[i - 1];
+                arcStart = azimuths[i];
+            }
+        }
+        const double arcSpan = 360.0 - largestGap;
+        size_t foreignInside = 0;
+        for (const auto& turn : turns) {
+            if (turn.get_section().value() == sectionName) {
+                continue;
+            }
+            double fromStart = std::fmod(azimuthOf(turn) - arcStart + 360.0, 360.0);
+            if (fromStart > 1e-6 && fromStart < arcSpan - 1e-6) {
+                if (foreignInside < 5) {
+                    INFO("turn '" << turn.get_name() << "' at " << azimuthOf(turn) << " deg lies inside section '"
+                         << sectionName << "' arc " << arcStart << " deg + " << arcSpan << " deg");
+                    CHECK(false);
+                }
+                ++foreignInside;
+            }
+        }
+        INFO("section '" << sectionName << "' occupies " << arcStart << " deg + " << arcSpan << " deg; "
+             << foreignInside << " foreign turn(s) inside it");
+        CHECK(foreignInside == 0);
+        allKept = allKept && foreignInside == 0;
+    }
+    return allKept;
+}
+
+void check_turns_clear_toroidal_bars(OpenMagnetics::Coil coil) {
+    REQUIRE(coil.get_turns_description());
+    coil.convert_turns_to_cartesian_coordinates();
+    auto sections = coil.get_sections_description().value();
+    std::vector<std::pair<double, double>> planes;
+    for (const auto& section : sections) {
+        if (section.get_type() != ElectricalType::CONDUCTION) {
+            continue;
+        }
+        auto barAngles = coil.toroidal_section_margin_angles(section);
+        double start = section.get_coordinates()[1] - section.get_dimensions()[1] / 2 - barAngles.first;
+        double end = section.get_coordinates()[1] + section.get_dimensions()[1] / 2 + barAngles.second;
+        planes.push_back({start, end});
+        auto margins = OpenMagnetics::Coil::resolve_margin(section);
+        auto windingIndex = coil.get_winding_index_by_name(section.get_partial_windings()[0].get_winding());
+        double wireRadius = coil.resolve_wire(windingIndex).get_maximum_outer_width() / 2;
+        for (const auto& turn : coil.get_turns_by_section(section.get_name())) {
+            double x = turn.get_coordinates()[0];
+            double y = turn.get_coordinates()[1];
+            for (size_t side = 0; side < 2; ++side) {
+                if (margins[side] == 0) {
+                    continue;
+                }
+                double plane = (side == 0 ? start : end) * std::numbers::pi / 180;
+                // Distance to the half-line from the axis at angle `plane`, on the section's side.
+                double distance = side == 0 ? -x * sin(plane) + y * cos(plane) : x * sin(plane) - y * cos(plane);
+                INFO(turn.get_name() << " side " << side << ": " << distance * 1e3 << " mm from the bar plane, needs "
+                     << (margins[side] + wireRadius) * 1e3 << " mm");
+                CHECK(distance >= margins[side] + wireRadius - 1e-9);
+            }
+        }
+    }
+    REQUIRE(planes.size() >= 2);
+    std::sort(planes.begin(), planes.end());
+    for (size_t index = 0; index < planes.size(); ++index) {
+        const auto& current = planes[index];
+        const auto& next = planes[(index + 1) % planes.size()];
+        INFO("bar after the section ending at " << current.second << " deg, next section starting at " << next.first << " deg");
+        CHECK(std::remainder(next.first - current.second, 360.0) >= -1e-6);
+    }
 }
 
 bool check_wire_standards(OpenMagnetics::Coil coil) {

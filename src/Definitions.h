@@ -2,6 +2,9 @@
 #include <MAS.hpp>
 #include "json.hpp"
 #include "Models.h"
+#include <limits>
+#include <optional>
+#include <magic_enum.hpp>
 
 using json = nlohmann::json;
 
@@ -237,6 +240,37 @@ inline void from_json(const json & j, MagneticFieldStrengthModels & x) {
     else { throw std::runtime_error("Input JSON does not conform to MagneticFieldStrengthModels schema: " + to_string(j)); }
 }
 
+void from_json(const json & j, WindingLossesModelSets & x);
+void to_json(json & j, const WindingLossesModelSets & x);
+
+inline void to_json(json & j, const WindingLossesModelSets & x) {
+    switch (x) {
+        case WindingLossesModelSets::CUSTOM: j = "Custom"; break;
+        case WindingLossesModelSets::LEGACY_DEFAULT: j = "LegacyDefault"; break;
+        case WindingLossesModelSets::NEUTRAL_WINDOW: j = "NeutralWindow"; break;
+        case WindingLossesModelSets::NEUTRAL_WINDOW_WANG: j = "NeutralWindowWang"; break;
+        case WindingLossesModelSets::WANG_PLANAR: j = "WangPlanar"; break;
+        case WindingLossesModelSets::SULLIVAN_GAP: j = "SullivanGap"; break;
+        case WindingLossesModelSets::AXISYMMETRIC: j = "Axisymmetric"; break;
+        case WindingLossesModelSets::TOROID: j = "Toroid"; break;
+        case WindingLossesModelSets::MULTI_WINDOW: j = "MultiWindow"; break;
+        case WindingLossesModelSets::DOWELL_1D: j = "Dowell1D"; break;
+        case WindingLossesModelSets::EWALD_BENCHMARK: j = "EwaldBenchmark"; break;
+        default: throw std::runtime_error("Unexpected value in enumeration \"WindingLossesModelSets\": " + std::to_string(static_cast<int>(x)));
+    }
+}
+
+inline void from_json(const json & j, WindingLossesModelSets & x) {
+    for (auto value : magic_enum::enum_values<WindingLossesModelSets>()) {
+        json name = value;
+        if (j == name || j == std::string(magic_enum::enum_name(value))) {
+            x = value;
+            return;
+        }
+    }
+    throw std::runtime_error("Input JSON does not conform to WindingLossesModelSets schema: " + to_string(j));
+}
+
 void from_json(const json & j, MagneticFieldStrengthFringingEffectModels & x);
 void to_json(json & j, const MagneticFieldStrengthFringingEffectModels & x);
 
@@ -245,6 +279,7 @@ inline void to_json(json & j, const MagneticFieldStrengthFringingEffectModels & 
         case MagneticFieldStrengthFringingEffectModels::ROSHEN: j = "Roshen"; break;
         case MagneticFieldStrengthFringingEffectModels::ALBACH: j = "Albach"; break;
         case MagneticFieldStrengthFringingEffectModels::SULLIVAN: j = "Sullivan"; break;
+        case MagneticFieldStrengthFringingEffectModels::MMF_BOUNDARY: j = "MmfBoundary"; break;
         default: throw std::runtime_error("Unexpected value in enumeration \"MagneticFieldStrengthFringingEffectModels\": " + std::to_string(static_cast<int>(x)));
     }
 }
@@ -253,6 +288,7 @@ inline void from_json(const json & j, MagneticFieldStrengthFringingEffectModels 
     if (j == "Roshen" || j == "roshen" || j == "ROSHEN") x = MagneticFieldStrengthFringingEffectModels::ROSHEN;
     else if (j == "Albach" || j == "albach" || j == "ALBACH") x = MagneticFieldStrengthFringingEffectModels::ALBACH;
     else if (j == "Sullivan" || j == "sullivan" || j == "SULLIVAN") x = MagneticFieldStrengthFringingEffectModels::SULLIVAN;
+    else if (j == "MmfBoundary" || j == "mmfBoundary" || j == "MMF_BOUNDARY") x = MagneticFieldStrengthFringingEffectModels::MMF_BOUNDARY;
     else { throw std::runtime_error("Input JSON does not conform to MagneticFieldStrengthFringingEffectModels schema: " + to_string(j)); }
 }
 
@@ -463,11 +499,90 @@ inline void from_json(const json & j, StrayCapacitanceModels & x) {
 }
 
 
+// A stretch of a curve's x axis whose points are estimated rather than computed from data (ABT #1861:
+// the impedance sweeps, where the core's complex permeability lies outside its tabulated range).
+// from/to are the first and last swept x of the stretch; parts names what is estimated in it
+// ("real" = mu', "imaginary" = mu''); source says how; material and tabulatedMinimum/Maximum name
+// the material and the range (Hz) over which both its parts are tabulated.
+struct Curve2DRange {
+    double from;
+    double to;
+    std::vector<std::string> parts;
+    std::string source;
+    std::string material;
+    double tabulatedMinimum;
+    double tabulatedMaximum;
+};
+
+inline void to_json(json & j, const Curve2DRange & x) {
+    j = json::object();
+    j["from"] = x.from;
+    j["to"] = x.to;
+    j["parts"] = x.parts;
+    j["source"] = x.source;
+    j["material"] = x.material;
+    j["tabulatedMinimum"] = x.tabulatedMinimum;
+    j["tabulatedMaximum"] = x.tabulatedMaximum;
+}
+
+inline void from_json(const json & j, Curve2DRange & x) {
+    x.from = j.at("from").get<double>();
+    x.to = j.at("to").get<double>();
+    x.parts = j.at("parts").get<std::vector<std::string>>();
+    x.source = j.at("source").get<std::string>();
+    x.material = j.at("material").get<std::string>();
+    x.tabulatedMinimum = j.at("tabulatedMinimum").get<double>();
+    x.tabulatedMaximum = j.at("tabulatedMaximum").get<double>();
+}
+
+// A stretch of a curve's x axis where no point could be computed (ABT #1861: an impedance sweep
+// past where the core's complex permeability can be estimated, e.g. A072's mu' above 97.2 MHz). The
+// curve stops there: its points in the stretch are left out. from/to are the first and last swept x
+// left out; reason is the specific "cannot be estimated" error (it names the material and the gap).
+struct Curve2DUnavailableRange {
+    double from;
+    double to;
+    std::string material;
+    std::string reason;
+};
+
+inline void to_json(json & j, const Curve2DUnavailableRange & x) {
+    j = json::object();
+    j["from"] = x.from;
+    j["to"] = x.to;
+    j["material"] = x.material;
+    j["reason"] = x.reason;
+}
+
+inline void from_json(const json & j, Curve2DUnavailableRange & x) {
+    x.from = j.at("from").get<double>();
+    x.to = j.at("to").get<double>();
+    x.material = j.at("material").get<std::string>();
+    x.reason = j.at("reason").get<std::string>();
+}
+
 class Curve2D {
 
     std::vector<double> xPoints;
     std::vector<double> yPoints;
     std::string title;
+    // One flag per point, set only by the sweeps that have a saturated-state model (Sweeper's DC-bias
+    // inductance and core-loss sweeps, ABT #1790): true where the core saturates at that point. What
+    // the y value of such a point is depends on the sweep and is stated in its title: the inductance
+    // sweep carries the air-core inductance (mu_r = 1) there, and the core-loss sweep carries no value
+    // (NaN, a JSON null), since no core loss is computed for a saturated core. Unset for every curve
+    // without that model, where a saturating point still throws.
+    std::optional<std::vector<bool>> saturatedPoints;
+    // One flag per point, set only by the impedance sweeps (Sweeper: impedance, common-mode
+    // impedance, Q factor; ABT #1861): true where the core's complex permeability is ESTIMATED
+    // (ComplexPermeabilityEstimator) because the frequency lies outside the material's tabulated
+    // range. extrapolatedRanges groups the flagged points into labelled stretches. Unset for every
+    // other curve.
+    std::optional<std::vector<bool>> extrapolatedPoints;
+    std::optional<std::vector<Curve2DRange>> extrapolatedRanges;
+    // Set only by the impedance sweeps: the stretches of the swept range left out because the core's
+    // complex permeability cannot be estimated there (empty when none is).
+    std::optional<std::vector<Curve2DUnavailableRange>> unavailableRanges;
 
     public: 
         Curve2D() = default;
@@ -485,6 +600,18 @@ class Curve2D {
         const std::string & get_title() const { return title; }
         std::string & get_mutable_title() { return title; }
         void set_title(const std::string & value) { this->title = value; }
+
+        const std::optional<std::vector<bool>> & get_saturated_points() const { return saturatedPoints; }
+        void set_saturated_points(const std::optional<std::vector<bool>> & value) { this->saturatedPoints = value; }
+
+        const std::optional<std::vector<bool>> & get_extrapolated_points() const { return extrapolatedPoints; }
+        void set_extrapolated_points(const std::optional<std::vector<bool>> & value) { this->extrapolatedPoints = value; }
+
+        const std::optional<std::vector<Curve2DRange>> & get_extrapolated_ranges() const { return extrapolatedRanges; }
+        void set_extrapolated_ranges(const std::optional<std::vector<Curve2DRange>> & value) { this->extrapolatedRanges = value; }
+
+        const std::optional<std::vector<Curve2DUnavailableRange>> & get_unavailable_ranges() const { return unavailableRanges; }
+        void set_unavailable_ranges(const std::optional<std::vector<Curve2DUnavailableRange>> & value) { this->unavailableRanges = value; }
 };
                 
 void from_json(const json & j, Curve2D & x);
@@ -492,8 +619,25 @@ void to_json(json & j, const Curve2D & x);
 
 inline void from_json(const json & j, Curve2D& x) {
     x.set_x_points(j.at("xPoints").get<std::vector<double>>());
-    x.set_y_points(j.at("yPoints").get<std::vector<double>>());
+    // A point without a value (NaN) is written by to_json as a JSON null; read it back as NaN.
+    std::vector<double> yPoints;
+    for (const auto& yPoint : j.at("yPoints")) {
+        yPoints.push_back(yPoint.is_null() ? std::numeric_limits<double>::quiet_NaN() : yPoint.get<double>());
+    }
+    x.set_y_points(yPoints);
     x.set_title(j.at("title").get<std::string>());
+    if (j.contains("saturatedPoints")) {
+        x.set_saturated_points(j.at("saturatedPoints").get<std::vector<bool>>());
+    }
+    if (j.contains("extrapolatedPoints")) {
+        x.set_extrapolated_points(j.at("extrapolatedPoints").get<std::vector<bool>>());
+    }
+    if (j.contains("extrapolatedRanges")) {
+        x.set_extrapolated_ranges(j.at("extrapolatedRanges").get<std::vector<Curve2DRange>>());
+    }
+    if (j.contains("unavailableRanges")) {
+        x.set_unavailable_ranges(j.at("unavailableRanges").get<std::vector<Curve2DUnavailableRange>>());
+    }
 }
 
 inline void to_json(json & j, const Curve2D & x) {
@@ -501,6 +645,18 @@ inline void to_json(json & j, const Curve2D & x) {
     j["xPoints"] = x.get_x_points();
     j["yPoints"] = x.get_y_points();
     j["title"] = x.get_title();
+    if (x.get_saturated_points()) {
+        j["saturatedPoints"] = x.get_saturated_points().value();
+    }
+    if (x.get_extrapolated_points()) {
+        j["extrapolatedPoints"] = x.get_extrapolated_points().value();
+    }
+    if (x.get_extrapolated_ranges()) {
+        j["extrapolatedRanges"] = x.get_extrapolated_ranges().value();
+    }
+    if (x.get_unavailable_ranges()) {
+        j["unavailableRanges"] = x.get_unavailable_ranges().value();
+    }
 }
 
 enum class MagneticFilters : int {
@@ -549,7 +705,9 @@ enum class MagneticFilters : int {
 
 class MagneticFilterOperation {
     public:
-    MagneticFilterOperation(MagneticFilters filter, bool invert, bool log, double weight) : filter(filter), invert(invert), log(log), weight(weight) {};
+    // Every construction states whether the filter rejects a part (strictlyRequired) or only ranks it
+    // (ABT #1231): a second constructor without the flag, one bool apart, made dropping it compile and
+    // silently turned seven of the catalogue adviser's eight default gates into rankings.
     MagneticFilterOperation(MagneticFilters filter, bool invert, bool log, bool strictlyRequired, double weight) : filter(filter), invert(invert), log(log), strictlyRequired(strictlyRequired), weight(weight) {};
     MagneticFilterOperation() {};
     virtual ~MagneticFilterOperation() = default;

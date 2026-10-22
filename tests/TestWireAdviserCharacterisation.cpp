@@ -68,6 +68,9 @@ Section make_section(double width, double height) {
     Section s;
     s.set_dimensions({width, height});
     s.set_coordinate_system(CoordinateSystem::CARTESIAN);
+    // layersOrientation is required by MAS; left unset it is an uninitialised enum, which the
+    // area filter's whole-turn layer packing (ABT #1446) reads. Concentric layers, as wound.
+    s.set_layers_orientation(WindingOrientation::OVERLAPPING);
     return s;
 }
 
@@ -144,24 +147,30 @@ void check_top_n(const std::string& label,
 // WireAdviser now breaks score ties by ascending outer diameter, which
 // promotes the thinner-insulation variant. Same fix promoted Round 17.0
 // Single Build over Heavy Build in slot 4.
+// ABT #1446 (2026-10-04): the area filter now also requires whole turns per layer to fit the
+// section depth. Round 16.0 (1.35 mm over the insulation) packs 11 turns per 15 mm layer, so 42
+// turns need 4 layers = 5.4 mm in this 5 mm section: it never fitted, the bulk-area test let it
+// through. Round 17.0 takes 4 x 1.21 = 4.84 mm. Re-pinned with Alf's approval.
 const std::vector<TopEntry> kTopAllTypes = {
-    {"Round 16.0 - Single Build", 3.9999898124395115},
-    {"Round 1.25 - Grade 1",      3.9983446101392519},
-    {"Round 16.5 - Single Build", 3.9969312641903958},
-    {"Round 16.5 - Heavy Build",  3.9969312641903958},
-    {"Round 17.0 - Single Build", 3.9933077449224341},
+    {"Round 17.0 - Single Build", 3.9999867967525091},
+    {"Round 17.0 - Heavy Build",  3.9999867967525091},
+    {"Round 1.12 - Grade 1",      3.9980298419951352},
+    {"Round 1.12 - Grade 2",      3.9980298419951352},
+    {"Round 1.12 - Grade 3",      3.9980298419951352},
 };
 
 // Phase 1 fix landed: previously top-2 tied at 3.9996749837491876 with
 // Single-Served before Unserved with no deterministic tie-break. The
 // outer-diameter tie-break now promotes Unserved (no serving = smaller
 // outer diameter).
+// ABT #1446 (2026-10-04): the same whole-turn packing check now rejects the former first choice,
+// Litz 10x0.3, in this 5 mm deep section. Re-pinned with Alf's approval.
 const std::vector<TopEntry> kTopLitzHighFreq = {
-    {"Litz 10x0.3 - Grade 1 - Unserved",      3.9996749837491876},
-    {"Litz 10x0.3 - Grade 1 - Single Served", 3.9996749837491876},
-    {"Litz 6x0.4 - Grade 1 - Unserved",       3.9993320286548131},
-    {"Litz 45x0.14 - Grade 1 - Unserved",     3.9953893064831778},
-    {"Litz 4x0.5 - Grade 1 - Unserved",       3.995096563768834},
+    {"Litz 20x0.2 - Grade 1 - Unserved",       3.9985155090241427},
+    {"Litz 30x0.16 - Grade 1 - Unserved",      3.9946058368921773},
+    {"Litz 6x0.355 - Grade 1 - Unserved",      3.9939837949108128},
+    {"Litz 6x0.355 - Grade 1 - Single Served", 3.9939837949108128},
+    {"Litz 6x0.355 - Grade 2 - Unserved",      3.9939837949108128},
 };
 
 // Phase 1 fix landed: the planar dataset generator (create_planar_dataset)
@@ -169,12 +178,17 @@ const std::vector<TopEntry> kTopLitzHighFreq = {
 // SAME display name (e.g. two "Planar 243.59 µm" rows with different
 // scores at ranks 0 and 3). The parallels count is now encoded in the
 // display name so users can disambiguate.
+// 2026-10-04 re-pin: the planar copper-thickness penalty is gone from the wire adviser
+// (coil adviser commit "try lower current densities and keep the lowest-loss wound coils";
+// the coil adviser now ranks wound coils by their losses). Without it the thicker copper,
+// which carries 5 A at 200 kHz with lower losses, ranks first: was 243.59 µm x2 (1.3197),
+// 278.38 x2, 208.79 x2, 243.59 x3, 313.18 x2.
 const std::vector<TopEntry> kTopPlanar = {
-    {"Planar 243.59 µm x2 parallels", 1.3196636443022853},
-    {"Planar 278.38 µm x2 parallels", 1.2926461763463761},
-    {"Planar 208.79 µm x2 parallels", 1.2613406508784197},
-    {"Planar 243.59 µm x3 parallels", 1.1647936870013549},
-    {"Planar 313.18 µm x2 parallels", 1.1599709209384959},
+    {"Planar 313.18 µm x2 parallels", 1.9315554209384957},
+    {"Planar 347.98 µm x2 parallels", 1.9292044850553256},
+    {"Planar 278.38 µm x2 parallels", 1.9119274110402538},
+    {"Planar 243.59 µm x2 parallels", 1.8484465039961628},
+    {"Planar 208.79 µm x2 parallels", 1.7578835080212769},
 };
 
 } // namespace

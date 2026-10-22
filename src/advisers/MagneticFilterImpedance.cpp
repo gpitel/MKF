@@ -1,13 +1,17 @@
 #include "advisers/MagneticFilter.h"
 #include "advisers/MagneticFilterInternal.h"
 #include "constructive_models/NumberTurns.h"
+#include "physical_models/ComplexPermeability.h"
+#include "physical_models/InitialPermeability.h"
 #include "physical_models/Impedance.h"
 #include "physical_models/WindingLosses.h"
 #include "physical_models/WindingSkinEffectLosses.h"
+#include "processors/ResultsAnalyzer.h"
 #include "support/Exceptions.h"
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <numbers>
 
@@ -21,6 +25,26 @@ namespace OpenMagnetics {
 //   - MagneticFilterImpedance (post-cap evaluator)
 // Shared helpers (prepare_bobbin_for_non_pqi etc.) live in
 // advisers/MagneticFilterInternal.h.
+
+// ABT #1794 (Alf, 2026-10-12): a candidate whose core saturates at the bias it would carry is not a
+// choke for this requirement; the filter rejects it, as the saturation filter does, so the adviser goes
+// on with the others. Until ABT #1855 the impedance model refused that bias (CALCULATION_CORE_SATURATES)
+// and the filter caught it; the model now gives its numbers for a saturated core (mu_r = 1), and the
+// verdict is the saturation check analyze_results makes (ResultsAnalyzer::check_saturation), on the DC
+// flux density the material's magnetisation curve gives at the bias H_dc, asked before the impedance.
+// The bias's permeability is the one the impedance model reads at that frequency: the check's second
+// criterion (the bias collapsed it to mu_r = 1, Alf 2026-10-14) asks the material's model there.
+static bool core_saturates_at_bias(const Core& core, double magneticFieldDcBias, double temperature, double frequency) {
+    auto coreMaterial = core.resolve_material();
+    double biasFluxDensity = InitialPermeability::get_flux_density_for_magnetic_field_dc_bias(coreMaterial, magneticFieldDcBias, temperature);
+    auto saturation = ResultsAnalyzer::check_saturation(coreMaterial, biasFluxDensity, temperature, 1.0,
+                                                        DcBiasPoint{magneticFieldDcBias, temperature, frequency});
+    if (saturation.saturates) {
+        logEntry(std::string("Core minimum impedance filter: rejecting candidate ") + core.get_name().value_or("(unnamed core)") +
+                 " at H_dc = " + std::to_string(magneticFieldDcBias) + " A/m: " + saturation.message, "MagneticFilter", 2);
+    }
+    return saturation.saturates;
+}
 
 std::pair<bool, double> MagneticFilterCoreMinimumImpedance::evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs) {
     const auto& core = magnetic->get_core();
@@ -110,6 +134,11 @@ std::pair<bool, double> MagneticFilterCoreMinimumImpedance::evaluate_magnetic(Ma
                 double zUnit;
                 if (magnetizingCurrentPeak > 0 && effectiveLength > 0) {
                     double H_dc_unit = 1.0 * magnetizingCurrentPeak / effectiveLength;
+                    if (core_saturates_at_bias(core, H_dc_unit, ambientTemperature, frequency)) {
+                        // Saturated with a single turn at this current: more turns only raise the bias.
+                        magnetic->set_coil(std::move(coil));
+                        return {false, 0};
+                    }
                     zUnit = abs(_impedanceModel.calculate_impedance(core, unitCoil, frequency, H_dc_unit, ambientTemperature));
                 } else {
                     zUnit = abs(_impedanceModel.calculate_impedance(core, unitCoil, frequency));
@@ -160,6 +189,11 @@ std::pair<bool, double> MagneticFilterCoreMinimumImpedance::evaluate_magnetic(Ma
                         double impedance;
                         if (magnetizingCurrentPeak > 0 && effectiveLength > 0) {
                             double H_dc = static_cast<double>(requiredN) * magnetizingCurrentPeak / effectiveLength;
+                            if (core_saturates_at_bias(core, H_dc, ambientTemperature, frequency)) {
+                                // Saturated at the turns the requirement needs.
+                                magnetic->set_coil(std::move(coil));
+                                return {false, 0};
+                            }
                             impedance = abs(_impedanceModel.calculate_impedance(core, coil, frequency, H_dc, ambientTemperature));
                         } else {
                             impedance = abs(_impedanceModel.calculate_impedance(core, coil, frequency));
@@ -240,6 +274,11 @@ std::pair<bool, double> MagneticFilterCoreMinimumImpedance::evaluate_magnetic(Ma
                 double impedance;
                 if (magnetizingCurrentPeak > 0 && effectiveLength > 0) {
                     double H_dc = numberTurnsCombination[0] * magnetizingCurrentPeak / effectiveLength;
+                    if (core_saturates_at_bias(core, H_dc, defaults.ambientTemperature, frequency)) {
+                        // Saturated at this turn count; the search only goes up in turns, so in bias.
+                        magnetic->set_coil(std::move(coil));
+                        return {false, 0};
+                    }
                     impedance = abs(_impedanceModel.calculate_impedance(core, coil, frequency, H_dc, defaults.ambientTemperature));
                 } else {
                     impedance = abs(_impedanceModel.calculate_impedance(core, coil, frequency));
@@ -354,6 +393,147 @@ std::pair<bool, double> MagneticFilterProximityFactor::evaluate_magnetic(Winding
     return {valid, proximityFactor};
 }
 
+std::optional<MagneticFilterImpedance::MeasuredImpedanceCurve> MagneticFilterImpedance::get_measured_impedance_curve(const Magnetic& magnetic) {
+    auto manufacturerInfo = magnetic.get_manufacturer_info();
+    if (!manufacturerInfo || !manufacturerInfo->get_datasheet_info() || !manufacturerInfo->get_datasheet_info()->get_electrical()) {
+        return std::nullopt;
+    }
+    std::string reference = manufacturerInfo->get_reference() ? manufacturerInfo->get_reference().value() : magnetic.get_reference();
+    std::optional<MeasuredImpedanceCurve> curve;
+    // Named copies throughout: these getters return optionals by value, and ranging over a
+    // temporary's value() would iterate a destroyed object.
+    const auto electricalEntries = manufacturerInfo->get_datasheet_info()->get_electrical().value();
+    for (const auto& electrical : electricalEntries) {
+        if (electrical.get_subtype() != ElectricalSubtype::COMMON_MODE_CHOKE || !electrical.get_impedance_points()) {
+            continue;
+        }
+        MeasuredImpedanceCurve entryCurve;
+        std::optional<std::optional<std::string>> curveWinding;
+        const auto impedancePoints = electrical.get_impedance_points().value();
+        for (const auto& point : impedancePoints) {
+            if (point.get_current()) {
+                double current = point.get_current().value();
+                if (!std::isfinite(current)) {
+                    throw InvalidDatasheetImpedanceException(reference, "a point at " + std::to_string(point.get_frequency()) +
+                                                             " Hz has a non-finite DC-bias current");
+                }
+                if (current != 0) {
+                    continue;  // a DC-biased measurement: not the zero-bias curve
+                }
+            }
+            double frequency = point.get_frequency();
+            double magnitude = point.get_impedance().get_magnitude();
+            if (!std::isfinite(frequency) || frequency <= 0) {
+                throw InvalidDatasheetImpedanceException(reference, "a point has frequency " + std::to_string(frequency) +
+                                                         " Hz; a measured frequency must be finite and positive");
+            }
+            if (!std::isfinite(magnitude) || magnitude <= 0) {
+                throw InvalidDatasheetImpedanceException(reference, "the point at " + std::to_string(frequency) + " Hz has |Z| " +
+                                                         std::to_string(magnitude) + " Ohm; a measured magnitude must be finite and positive");
+            }
+            if (!curveWinding) {
+                curveWinding = point.get_winding();
+            }
+            else if (curveWinding.value() != point.get_winding()) {
+                throw InvalidDatasheetImpedanceException(reference, "the zero-bias points belong to more than one winding, so there is more than one curve to choose from");
+            }
+            entryCurve.push_back({frequency, magnitude});
+        }
+        if (entryCurve.empty()) {
+            continue;
+        }
+        if (curve) {
+            throw InvalidDatasheetImpedanceException(reference, "more than one commonModeChoke entry carries a zero-bias impedance curve");
+        }
+        std::sort(entryCurve.begin(), entryCurve.end());
+        for (size_t index = 1; index < entryCurve.size(); ++index) {
+            if (entryCurve[index].first == entryCurve[index - 1].first) {
+                throw InvalidDatasheetImpedanceException(reference, "two zero-bias points are measured at " + std::to_string(entryCurve[index].first) + " Hz");
+            }
+        }
+        curve = std::move(entryCurve);
+    }
+    return curve;
+}
+
+double MagneticFilterImpedance::interpolate_measured_impedance(const MeasuredImpedanceCurve& curve, double frequency) {
+    if (curve.empty() || !(frequency >= curve.front().first && frequency <= curve.back().first)) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Measured impedance asked at " + std::to_string(frequency) +
+                                    " Hz, outside the measured range" +
+                                    (curve.empty() ? std::string(" (no points)") : " " + std::to_string(curve.front().first) + "-" +
+                                                                                    std::to_string(curve.back().first) + " Hz") +
+                                    "; the measurement is never extrapolated");
+    }
+    auto upper = std::lower_bound(curve.begin(), curve.end(), frequency,
+                                  [](const std::pair<double, double>& point, double value) { return point.first < value; });
+    if (upper->first == frequency) {
+        return upper->second;
+    }
+    auto lower = std::prev(upper);
+    double fraction = (std::log(frequency) - std::log(lower->first)) / (std::log(upper->first) - std::log(lower->first));
+    return std::exp(std::log(lower->second) + fraction * (std::log(upper->second) - std::log(lower->second)));
+}
+
+MagneticFilterImpedance::RequirementCoverage MagneticFilterImpedance::classify_requirement(Magnetic* magnetic, Inputs* inputs) {
+    RequirementCoverage coverage;
+    auto [minimumMaterialFrequency, maximumMaterialFrequency] = ComplexPermeability().get_frequency_range(magnetic->get_core().resolve_material());
+    coverage.minimumMaterialFrequency = minimumMaterialFrequency;
+    coverage.maximumMaterialFrequency = maximumMaterialFrequency;
+    // A named copy: get_minimum_impedance() returns the optional by value, so ranging over its
+    // value() directly would iterate a destroyed temporary.
+    const auto requirement = inputs->get_design_requirements().get_minimum_impedance().value();
+    bool measuredCurveRead = false;
+    for (const auto& impedanceAtFrequency : requirement) {
+        double frequency = impedanceAtFrequency.get_frequency();
+        if (frequency >= minimumMaterialFrequency && frequency <= maximumMaterialFrequency) {
+            coverage.sources.push_back(ImpedanceSource::MODEL);
+            continue;
+        }
+        // Outside the material's data: the part's own measurement, read only when a point needs it.
+        if (!measuredCurveRead) {
+            coverage.measuredCurve = get_measured_impedance_curve(*magnetic);
+            measuredCurveRead = true;
+        }
+        if (coverage.measuredCurve && frequency >= coverage.measuredCurve->front().first && frequency <= coverage.measuredCurve->back().first) {
+            coverage.sources.push_back(ImpedanceSource::MEASURED);
+        }
+        else {
+            coverage.sources.push_back(ImpedanceSource::NOT_JUDGED);
+        }
+    }
+    return coverage;
+}
+
+std::optional<std::vector<double>> MagneticFilterImpedance::get_judged_frequencies(Magnetic* magnetic, Inputs* inputs) const {
+    if (!inputs->get_design_requirements().get_minimum_impedance()) {
+        return std::nullopt;
+    }
+    auto coverage = classify_requirement(magnetic, inputs);
+    const auto requirement = inputs->get_design_requirements().get_minimum_impedance().value();
+    std::vector<double> judgedFrequencies;
+    for (size_t index = 0; index < requirement.size(); ++index) {
+        if (coverage.sources[index] != ImpedanceSource::NOT_JUDGED) {
+            judgedFrequencies.push_back(requirement[index].get_frequency());
+        }
+    }
+    return judgedFrequencies;
+}
+
+std::optional<std::vector<double>> MagneticFilterImpedance::get_measured_frequencies(Magnetic* magnetic, Inputs* inputs) const {
+    if (!inputs->get_design_requirements().get_minimum_impedance()) {
+        return std::nullopt;
+    }
+    auto coverage = classify_requirement(magnetic, inputs);
+    const auto requirement = inputs->get_design_requirements().get_minimum_impedance().value();
+    std::vector<double> measuredFrequencies;
+    for (size_t index = 0; index < requirement.size(); ++index) {
+        if (coverage.sources[index] == ImpedanceSource::MEASURED) {
+            measuredFrequencies.push_back(requirement[index].get_frequency());
+        }
+    }
+    return measuredFrequencies;
+}
+
 std::pair<bool, double> MagneticFilterImpedance::evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs) {
     bool valid = true;
     double scoring = 0;
@@ -361,12 +541,12 @@ std::pair<bool, double> MagneticFilterImpedance::evaluate_magnetic(Magnetic* mag
     // Impedance scoring: dimensionless log-ratio.
     //
     // For a "minimum impedance" requirement the part is invalid if Zact < Zreq at any
-    // frequency. Among valid parts we want to reward parts close to the requirement
+    // judged frequency. Among valid parts we want to reward parts close to the requirement
     // (smallest over-dimensioning) and penalize gross over-dimensioning (cost/size).
     //
     // Per-frequency:
     //     dev_i = log10(max(Zact_i / Zreq_i, 1))   // 0 when at-spec (under-spec → invalid)
-    // Filter score = mean over frequency points (then min-max normalized + inverted
+    // Filter score = mean over the judged frequency points (then min-max normalized + inverted
     // downstream so smallest dev becomes the top score).
     //
     // No dead band on the raw score: normalize_scoring rescales to [0,1] so any
@@ -375,6 +555,25 @@ std::pair<bool, double> MagneticFilterImpedance::evaluate_magnetic(Magnetic* mag
     // normalize_scoring and returns 1.0 for every part (the "all show 100" bug).
     // Keeping the raw monotonic dev preserves ranking spread when this is the only
     // active filter.
+    //
+    // Judged frequencies: only the requirement points inside the core material's tabulated
+    // complex-permeability range (get_judged_frequencies). Outside it the material has no mu(f),
+    // so |Z| there is unknown: such a point is not judged at all -- neither a pass nor a fail,
+    // and nothing is invented for it. A CISPR-band request reaches 30 MHz while many CMC ferrites
+    // are tabulated only to 1-16 MHz; judging those parts on the band their data covers keeps
+    // them in the ranking (El Choker: 142 of 299 chokes were excluded), and the mean over the
+    // judged points keeps their score on the same per-point scale as a fully covered part's. The
+    // adviser reports the judged frequencies per candidate. A part with no judged point at all
+    // cannot be judged on the requirement and throws RequirementOutsideMaterialDataException.
+    //
+    // Measured band: a requirement point outside the material's mu(f) range is judged on the part's
+    // own measured common-mode |Z| when its datasheet carries one (get_measured_impedance_curve:
+    // the zero-bias commonModeChoke impedancePoints), interpolated log|Z| against log f between the
+    // two bracketing measured points and never extrapolated past them. It is compared to the
+    // requirement exactly as the model |Z| is (same validity, same per-point score). ACME's A07/A05
+    // mu(f) ends at 12.5-14 MHz (their plot stops at mu = 10) while the WE CMCs on them are measured
+    // to 1 GHz, so a 30 MHz CISPR point is judged on the measurement rather than left out. The
+    // adviser reports these points as the candidate's measured frequencies.
 
     // Candidate SCORING runs the fast (OneLayer) capacitance path, explicitly. MKF d424c32e made
     // the full energy-based capacitance model Impedance's default -- right for analysing ONE
@@ -388,10 +587,31 @@ std::pair<bool, double> MagneticFilterImpedance::evaluate_magnetic(Magnetic* mag
 
     if (inputs->get_design_requirements().get_minimum_impedance()) {
         auto impedanceRequirement = inputs->get_design_requirements().get_minimum_impedance().value();
-        for (auto impedanceAtFrequency : impedanceRequirement) {
-            auto impedance = OpenMagnetics::Impedance(kFastCapacitanceForScoring).calculate_impedance(*magnetic, impedanceAtFrequency.get_frequency());
+        auto coverage = classify_requirement(magnetic, inputs);
+        size_t numberJudged = std::count_if(coverage.sources.begin(), coverage.sources.end(),
+                                            [](ImpedanceSource source) { return source != ImpedanceSource::NOT_JUDGED; });
+        if (numberJudged == 0) {
+            auto material = magnetic->get_core().resolve_material();
+            auto [lowest, highest] = std::minmax_element(impedanceRequirement.begin(), impedanceRequirement.end(),
+                [](const ImpedanceAtFrequency& a, const ImpedanceAtFrequency& b) { return a.get_frequency() < b.get_frequency(); });
+            std::optional<std::pair<double, double>> measuredRange;
+            if (coverage.measuredCurve) {
+                measuredRange = std::make_pair(coverage.measuredCurve->front().first, coverage.measuredCurve->back().first);
+            }
+            throw RequirementOutsideMaterialDataException(material.get_name(), "minimumImpedance",
+                                                          lowest->get_frequency(), highest->get_frequency(),
+                                                          coverage.minimumMaterialFrequency, coverage.maximumMaterialFrequency,
+                                                          measuredRange);
+        }
+        for (size_t index = 0; index < impedanceRequirement.size(); ++index) {
+            const auto& impedanceAtFrequency = impedanceRequirement[index];
+            if (coverage.sources[index] == ImpedanceSource::NOT_JUDGED) {
+                continue;  // outside the material's mu(f) data and the measured curve: not judged
+            }
+            double zAct = coverage.sources[index] == ImpedanceSource::MODEL
+                ? abs(OpenMagnetics::Impedance(kFastCapacitanceForScoring).calculate_impedance(*magnetic, impedanceAtFrequency.get_frequency()))
+                : interpolate_measured_impedance(coverage.measuredCurve.value(), impedanceAtFrequency.get_frequency());
             double zReq = impedanceAtFrequency.get_impedance().get_magnitude();
-            double zAct = abs(impedance);
 
             if (zReq > zAct) {
                 valid = false;
@@ -403,25 +623,40 @@ std::pair<bool, double> MagneticFilterImpedance::evaluate_magnetic(Magnetic* mag
             double dev = std::log10(ratio);
             scoring += dev;
         }
-        scoring /= impedanceRequirement.size();
+        scoring /= numberJudged;
     }
 
-    // Always emit the impedance output for any operating points so downstream UI
-    // has the simulated |Z|. We deliberately do NOT add this into `scoring`: there
-    // is no requirement here, and mixing 1/|Z| in arbitrary units corrupts the
-    // min-max normalization (kills monotonicity and frequency-fairness).
+    // Emit the impedance output at the operating points so downstream UI has the simulated |Z|.
+    // We deliberately do NOT add this into `scoring`: there is no requirement here, and mixing
+    // 1/|Z| in arbitrary units corrupts the min-max normalization (kills monotonicity and
+    // frequency-fairness).
+    //
+    // This |Z| is display only, so it is written only at operating points whose frequency lies
+    // inside the core material's tabulated complex-permeability span. Outside it there is no
+    // mu(f) to evaluate (get_complex_permeability throws), and the output is left ABSENT at that
+    // operating point rather than invented. A common-mode choke's inputs carry the 50 Hz mains
+    // point (line current, thermal) next to the noise point, and every CMC ferrite is tabulated
+    // from above 50 Hz: the throw here made the adviser drop the part over a number it only
+    // shows (El Choker: 4 of 299 chokes left). The minimumImpedance requirement above is judged
+    // inside the span only, and throws when no requirement point lies inside it.
     if (inputs->get_operating_points().size() > 0 && outputs != nullptr) {
+        auto [minimumMaterialFrequency, maximumMaterialFrequency] = ComplexPermeability().get_frequency_range(magnetic->get_core().resolve_material());
         for (size_t operatingPointIndex = 0; operatingPointIndex < inputs->get_operating_points().size(); ++operatingPointIndex) {
-            auto operatingPoint = inputs->get_operating_points()[operatingPointIndex];
-            auto impedance = OpenMagnetics::Impedance(kFastCapacitanceForScoring).calculate_impedance(*magnetic, operatingPoint.get_excitations_per_winding()[0].get_frequency());
-            std::string name = magnetic->get_coil().get_functional_description()[0].get_name();
+            const auto& operatingPoint = inputs->get_operating_points()[operatingPointIndex];
+            double frequency = operatingPoint.get_excitations_per_winding()[0].get_frequency();
 
             while (outputs->size() < operatingPointIndex + 1) {
                 outputs->push_back(Outputs());
             }
+            if (!(frequency >= minimumMaterialFrequency && frequency <= maximumMaterialFrequency)) {
+                continue;
+            }
+
+            auto impedance = OpenMagnetics::Impedance(kFastCapacitanceForScoring).calculate_impedance(*magnetic, frequency);
+            std::string name = magnetic->get_coil().get_functional_description()[0].get_name();
             ImpedanceOutput impedanceOutput;
             ComplexMatrixAtFrequency complexMatrixAtFrequency;
-            complexMatrixAtFrequency.set_frequency(operatingPoint.get_excitations_per_winding()[0].get_frequency());
+            complexMatrixAtFrequency.set_frequency(frequency);
             complexMatrixAtFrequency.get_mutable_magnitude()[name][name].set_nominal(abs(impedance));
             std::vector<ComplexMatrixAtFrequency> impedanceMatrixPerFrequency;
             impedanceMatrixPerFrequency.push_back(complexMatrixAtFrequency);

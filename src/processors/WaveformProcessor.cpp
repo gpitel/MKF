@@ -7,8 +7,11 @@
 #include <complex>
 #include <cstdio>
 #include <cstdint>
+#include <iomanip>
+#include <limits>
 #include <numeric>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -124,7 +127,96 @@ bool is_close_enough(double x, double y, double error){
     return fabs(x - y) <= error;
 }
 
+// The vertices create_waveform gives each label that calculate_offset and
+// try_guess_duty_cycle read at FIXED vertex indices: a bipolar rectangle's duty is
+// (time[3] - time[2]) / T, a rectangle's time[2] / T, and so on. Those reads only
+// mean anything on a waveform that has at least that many vertices; one with fewer
+// cannot be the shape its label names. Labels whose values are measured from the
+// samples, not read at fixed indices (sinusoidal, custom, the dead-time variants),
+// are not listed.
+std::optional<size_t> label_vertex_count(WaveformLabel label) {
+    switch (label) {
+        case WaveformLabel::TRIANGULAR: return 3;
+        case WaveformLabel::UNIPOLAR_TRIANGULAR: return 4;
+        case WaveformLabel::RECTANGULAR: return 5;
+        case WaveformLabel::UNIPOLAR_RECTANGULAR: return 5;
+        case WaveformLabel::BIPOLAR_RECTANGULAR: return 10;
+        case WaveformLabel::BIPOLAR_TRIANGULAR: return 6;
+        case WaveformLabel::FLYBACK_PRIMARY: return 4;
+        case WaveformLabel::FLYBACK_SECONDARY: return 4;
+        default: return std::nullopt;
+    }
+}
+
+// Throw when a waveform cannot be the shape its label names, instead of reading the
+// label's vertex indices past the end of its vectors. That read is what returned a
+// processed dutyCycle of -1 (and 6.4e11) for a 3-vertex triangle labelled
+// bipolarRectangular, with offset 0 for a 20 A dc current (ABT #1878). The label got
+// there from a stored "ancillaryLabel": "Triangular", the pre-1.0 spelling: MAS.hpp's
+// generated from_json(WaveformLabel) ignores a string that is not in the enum and
+// leaves its first value, bipolarRectangular.
+void throw_if_waveform_cannot_be_its_label(const Waveform& waveform, WaveformLabel label) {
+    const auto vertexCount = label_vertex_count(label);
+    if (!vertexCount) {
+        return;
+    }
+    const size_t numberPoints = waveform.get_data().size();
+    const auto time = waveform.get_time();
+    if (time && time->size() == numberPoints && numberPoints >= vertexCount.value()) {
+        return;
+    }
+    json labelJson;
+    to_json(labelJson, label);
+    std::string reason = !time ? "has no time axis"
+                       : time->size() != numberPoints ? "has " + std::to_string(time->size()) + " times for " + std::to_string(numberPoints) + " values"
+                       : "has " + std::to_string(numberPoints) + " vertices, and a " + labelJson.get<std::string>() + " has at least " + std::to_string(vertexCount.value());
+    throw std::invalid_argument("Waveform labelled " + labelJson.get<std::string>() + " " + reason +
+                                ": its label does not describe its data, so no offset or duty cycle can be read from it. "
+                                "A label spelled the pre-1.0 way (e.g. \"Triangular\") is not a MAS waveformLabel and must be migrated before the waveform is parsed.");
+}
+
+// The vertices calculate_offset and try_guess_duty_cycle actually index for each label:
+// the highest index read, plus one. A sampled or compressed copy of a labelled waveform is
+// not held to the label's layout (a 0.5-duty bipolar rectangle with no dead time compresses
+// from 10 vertices to 6 and is still a bipolar rectangle), but what is read off it must
+// exist. A triangle's duty is measured from its samples when it has neither 3 nor 4
+// vertices, so it only needs a time axis.
+std::optional<size_t> label_vertices_read(WaveformLabel label) {
+    switch (label) {
+        case WaveformLabel::TRIANGULAR: return 1;
+        case WaveformLabel::UNIPOLAR_TRIANGULAR: return 2;
+        case WaveformLabel::RECTANGULAR: return 3;
+        case WaveformLabel::UNIPOLAR_RECTANGULAR: return 3;
+        case WaveformLabel::BIPOLAR_RECTANGULAR: return 4;
+        case WaveformLabel::BIPOLAR_TRIANGULAR: return 3;
+        case WaveformLabel::FLYBACK_PRIMARY: return 2;
+        case WaveformLabel::FLYBACK_SECONDARY: return 4;
+        default: return std::nullopt;
+    }
+}
+
+// Throw rather than read a label's vertex past the end of a waveform's vectors (ABT #1878).
+void throw_if_label_reads_past_the_end(const Waveform& waveform, WaveformLabel label) {
+    const auto verticesRead = label_vertices_read(label);
+    if (!verticesRead) {
+        return;
+    }
+    const size_t numberPoints = waveform.get_data().size();
+    const auto time = waveform.get_time();
+    if (time && time->size() == numberPoints && numberPoints >= verticesRead.value()) {
+        return;
+    }
+    json labelJson;
+    to_json(labelJson, label);
+    std::string reason = !time ? "has no time axis"
+                       : time->size() != numberPoints ? "has " + std::to_string(time->size()) + " times for " + std::to_string(numberPoints) + " values"
+                       : "has " + std::to_string(numberPoints) + " vertices, and the offset and duty cycle of a " + labelJson.get<std::string>() + " are read from vertex " + std::to_string(verticesRead.value() - 1);
+    throw std::invalid_argument("Waveform labelled " + labelJson.get<std::string>() + " " + reason +
+                                ": its label does not describe its data, so no offset or duty cycle can be read from it.");
+}
+
 double calculate_offset(Waveform waveform, WaveformLabel label) {
+    throw_if_label_reads_past_the_end(waveform, label);
     switch (label) {
         case WaveformLabel::TRIANGULAR:
             // The midpoint between the two extremes. This used to read
@@ -215,18 +307,37 @@ double WaveformProcessor::calculate_waveform_average(Waveform waveform) {
     return integration / period;
 }
 
-Waveform WaveformProcessor::compress_waveform(const Waveform& waveform) {
+Waveform WaveformProcessor::compress_waveform(const Waveform& waveform, std::optional<double> frequency) {
     Waveform compressedWaveform;
     auto data = waveform.get_data();
     if (data.size() < 2) {
         return waveform;
     }
-    data.push_back(data[0]);
     auto time = waveform.get_time().value();
     if (time.size() < 2) {
         return waveform;
     }
-    time.push_back(time[time.size() - 1] + (time[time.size() - 1] - time[time.size() - 2]));
+    // An open axis is closed periodically with the first sample one step after the last. A closed
+    // axis already reaches t0 + T: closing it again made the result span T + dt (ABT #1467).
+    // Only an axis recognised as closed (it spans the period within the sampler's 0.1 %, and is
+    // nearer to it than its one-step extension) loses the closing point. An axis that spans
+    // something else is not judged here: compressing is not where a record is validated.
+    bool openAxis = true;
+    if (frequency) {
+        if (!std::isfinite(frequency.value()) || frequency.value() <= 0) {
+            throw std::invalid_argument("compress_waveform needs a positive excitation frequency to tell a closed time axis from an open one, got " + std::to_string(frequency.value()));
+        }
+        const double expectedPeriod = 1.0 / frequency.value();
+        const double span = time.back() - time.front();
+        const double lastStep = time[time.size() - 1] - time[time.size() - 2];
+        const double closedError = std::fabs(span - expectedPeriod);
+        const double openError = std::fabs(span + lastStep - expectedPeriod);
+        openAxis = !(closedError <= 1e-3 * expectedPeriod && closedError <= openError);
+    }
+    if (openAxis) {
+        data.push_back(data[0]);
+        time.push_back(time[time.size() - 1] + (time[time.size() - 1] - time[time.size() - 2]));
+    }
     std::vector<double> compressedData;
     std::vector<double> compressedTime;
     double previousSlope = DBL_MAX;
@@ -289,7 +400,15 @@ static double triangle_duty_from_samples(const Waveform& waveform) {
     const auto timeOptional = waveform.get_time();
     if (timeOptional && timeOptional->size() == numberPoints && numberPoints > 1) {
         const auto& time = *timeOptional;
-        double period = (time.back() - time.front()) * numberPoints / (numberPoints - 1.0);
+        // Raw uniform samples stop one step short of the period, so their span is
+        // T - dt and is extended by the mean step. A COMPRESSED waveform already
+        // spans the whole T: it ends on the wrapped copy of its first point.
+        // Extending that again stretched the period by n/(n-1): the 5-vertex
+        // magnetizing current of a 0.3-duty rectangle read 0.2969 / 1.25 = 0.2375
+        // (ABT #1878). Same tell as the reference sine in the label guess.
+        const double span = time.back() - time.front();
+        const bool spansWholePeriod = data.back() == data.front();
+        double period = spansWholePeriod ? span : span * numberPoints / (numberPoints - 1.0);
         if (period > 0) {
             double rise = time[peakIndex] - time[troughIndex];
             if (rise < 0) {
@@ -357,6 +476,10 @@ static double measure_duty_cycle_from_samples(const Waveform& waveform) {
 }
 
 double WaveformProcessor::try_guess_duty_cycle(Waveform waveform, WaveformLabel label, double frequency, size_t numberPointsSampledWaveforms) {
+    // This reads vertex indices off whatever it is handed, which may be a compressed copy of a
+    // labelled waveform: those indices must exist. Whether the shape as given is the label's
+    // is checked where the given waveform is known (calculate_basic_processed_data).
+    throw_if_label_reads_past_the_end(waveform, label);
     if (label != WaveformLabel::CUSTOM) {
         switch(label) {
             case WaveformLabel::TRIANGULAR: {
@@ -655,6 +778,41 @@ WaveformLabel WaveformProcessor::try_guess_waveform_label(Waveform waveform, siz
         period = compressedWaveform.get_time()->back() - compressedWaveform.get_time()->front();
     }
 
+    // Volt-second balance of a 5-point rectangle (RECTANGULAR vs UNIPOLAR_RECTANGULAR).
+    // The vertex tests accept an edge anywhere within edgeTimeTolerance of where it
+    // should be, so a balanced rectangle can carry a volt-second error of up to its
+    // peak-to-peak times that time: it is the tolerance for the balance, in V*s. (The
+    // test used to take `period` itself, in seconds, as the tolerance: a sampled
+    // -250/+750 V rectangle, whose high plateau the sampler shortens by one sample, was
+    // 7.8e-5 V*s "out" of balance against 1e-5 and labelled unipolar, while a genuinely
+    // unipolar 0/1 V one at 100 kHz, 2.5e-6 V*s, passed as balanced.)
+    const double edgeTimeTolerance = 1.5 * period / numberPointsSampledWaveforms;
+    double voltSecondTolerance = 0;
+    // UNIPOLAR means one polarity: a rectangle whose levels lie on both sides of zero is
+    // bipolar whatever its volt-second balance, so it is RECTANGULAR (with an offset when
+    // unbalanced, e.g. +-1 V at duty 0.2), never UNIPOLAR_RECTANGULAR. The balance alone
+    // cannot tell them apart: the unipolar 0/1 V rectangle at duty 0.25 is 0.25 p2p*T
+    // out of balance, a +-1 V one at duty 0.2 0.3 p2p*T. A level within the same fraction
+    // of the peak-to-peak as the edge-time tolerance of the period counts as zero.
+    bool levelsOnBothSidesOfZero = false;
+    if (!compressedWaveform.get_data().empty()) {
+        auto [minimumIt, maximumIt] = std::minmax_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end());
+        voltSecondTolerance = (*maximumIt - *minimumIt) * edgeTimeTolerance;
+        const double levelTolerance = (*maximumIt - *minimumIt) * 1.5 / numberPointsSampledWaveforms;
+        levelsOnBothSidesOfZero = *minimumIt < -levelTolerance && *maximumIt > levelTolerance;
+    }
+    // Each level held from one edge to the next, every interval of the period counted.
+    auto rectangleVoltSecondsEdgesAtSecondAndFourthPoints = [&compressedWaveform]() {
+        const auto time = compressedWaveform.get_time().value();
+        const auto& data = compressedWaveform.get_data();
+        return (time[2] - time[0]) * data[2] + (time[4] - time[2]) * data[4];
+    };
+    auto rectangleVoltSecondsEdgesAtFirstAndThirdPoints = [&compressedWaveform]() {
+        const auto time = compressedWaveform.get_time().value();
+        const auto& data = compressedWaveform.get_data();
+        return (time[1] - time[0]) * data[1] + (time[3] - time[1]) * data[3] + (time[4] - time[3]) * data[4];
+    };
+
     if (compressedWaveform.get_data().size() == 3 &&
         compressedWaveform.get_data()[0] == compressedWaveform.get_data()[2]) {
             return WaveformLabel::TRIANGULAR;
@@ -682,7 +840,8 @@ WaveformLabel WaveformProcessor::try_guess_waveform_label(Waveform waveform, siz
                 return WaveformLabel::TRIANGULAR;
         }
         else if (compressedWaveform.get_data().size() == 5 &&
-            !is_close_enough((compressedWaveform.get_time().value()[2] - compressedWaveform.get_time().value()[0]) * compressedWaveform.get_data()[2] + (compressedWaveform.get_time().value()[4] - compressedWaveform.get_time().value()[2]) * compressedWaveform.get_data()[4], 0 , period) &&
+            !levelsOnBothSidesOfZero &&
+            !is_close_enough(rectangleVoltSecondsEdgesAtSecondAndFourthPoints(), 0, voltSecondTolerance) &&
             is_close_enough(compressedWaveform.get_time().value()[0], compressedWaveform.get_time().value()[1], 1.5 * period / numberPointsSampledWaveforms) &&
             compressedWaveform.get_data()[1] == compressedWaveform.get_data()[2] &&
             is_close_enough(compressedWaveform.get_time().value()[2], compressedWaveform.get_time().value()[3], 1.5 * period / numberPointsSampledWaveforms) &&
@@ -691,16 +850,7 @@ WaveformLabel WaveformProcessor::try_guess_waveform_label(Waveform waveform, siz
                 return WaveformLabel::UNIPOLAR_RECTANGULAR;
         }
         else if (compressedWaveform.get_data().size() == 5 &&
-            !is_close_enough((compressedWaveform.get_time().value()[2] - compressedWaveform.get_time().value()[0]) * compressedWaveform.get_data()[2] + (compressedWaveform.get_time().value()[4] - compressedWaveform.get_time().value()[2]) * compressedWaveform.get_data()[4], 0 , period) &&
-            is_close_enough(compressedWaveform.get_time().value()[0], compressedWaveform.get_time().value()[1], 1.5 * period / numberPointsSampledWaveforms) &&
-            compressedWaveform.get_data()[1] == compressedWaveform.get_data()[2] &&
-            is_close_enough(compressedWaveform.get_time().value()[2], compressedWaveform.get_time().value()[3], 1.5 * period / numberPointsSampledWaveforms) &&
-            compressedWaveform.get_data()[3] == compressedWaveform.get_data()[4] &&
-            compressedWaveform.get_data()[0] == compressedWaveform.get_data()[4]) {
-                return WaveformLabel::UNIPOLAR_RECTANGULAR;
-        }
-        else if (compressedWaveform.get_data().size() == 5 &&
-            is_close_enough((compressedWaveform.get_time().value()[2] - compressedWaveform.get_time().value()[0]) * compressedWaveform.get_data()[2] + (compressedWaveform.get_time().value()[4] - compressedWaveform.get_time().value()[2]) * compressedWaveform.get_data()[4], 0 , period) &&
+            (levelsOnBothSidesOfZero || is_close_enough(rectangleVoltSecondsEdgesAtSecondAndFourthPoints(), 0, voltSecondTolerance)) &&
             is_close_enough(compressedWaveform.get_time().value()[0], compressedWaveform.get_time().value()[1], 1.5 * period / numberPointsSampledWaveforms) &&
             compressedWaveform.get_data()[1] == compressedWaveform.get_data()[2] &&
             is_close_enough(compressedWaveform.get_time().value()[2], compressedWaveform.get_time().value()[3], 1.5 * period / numberPointsSampledWaveforms) &&
@@ -709,7 +859,7 @@ WaveformLabel WaveformProcessor::try_guess_waveform_label(Waveform waveform, siz
                 return WaveformLabel::RECTANGULAR;
         }
         else if (compressedWaveform.get_data().size() == 5 &&
-            is_close_enough((compressedWaveform.get_time().value()[1] - compressedWaveform.get_time().value()[0]) * compressedWaveform.get_data()[1] + (compressedWaveform.get_time().value()[3] - compressedWaveform.get_time().value()[2]) * compressedWaveform.get_data()[3], 0 , period) &&
+            (levelsOnBothSidesOfZero || is_close_enough(rectangleVoltSecondsEdgesAtFirstAndThirdPoints(), 0, voltSecondTolerance)) &&
             is_close_enough(compressedWaveform.get_time().value()[1], compressedWaveform.get_time().value()[2], 1.5 * period / numberPointsSampledWaveforms) &&
             compressedWaveform.get_data()[0] == compressedWaveform.get_data()[1] &&
             is_close_enough(compressedWaveform.get_time().value()[3], compressedWaveform.get_time().value()[4], 1.5 * period / numberPointsSampledWaveforms) &&
@@ -944,9 +1094,43 @@ Waveform WaveformProcessor::create_waveform(WaveformLabel label, double peakToPe
     return waveform;
 }
 
+bool WaveformProcessor::check_time_axis_spans_one_period(const std::vector<double>& time, double frequency) {
+    // The time axis must span the excitation's period, closed ([t0, t0 + T]) or, on a uniform
+    // axis, open by one step ([t0, t0 + T - dt], the sampled convention). An axis that covers
+    // only part of the period (e.g. a flyback primary given over its on-time alone) or several
+    // periods would be stretched or squeezed onto one period, silently changing every harmonic
+    // and the duty cycle, so it is rejected. A frequency is required: the axis is checked against
+    // it, never taken as the period on its own; 0, NaN, inf and negative throw (ABT #1467).
+    if (!std::isfinite(frequency) || frequency <= 0) {
+        throw std::invalid_argument("A waveform with a time axis needs the excitation frequency to check that the axis spans one period, got frequency " + std::to_string(frequency));
+    }
+    if (time.size() < 2) {
+        throw std::invalid_argument("A time axis needs at least 2 points, got " + std::to_string(time.size()));
+    }
+    const double period = time.back() - time.front();
+    const double expectedPeriod = 1.0 / frequency;
+    const double lastStep = time[time.size() - 1] - time[time.size() - 2];
+    bool uniformAxis = lastStep > 0;
+    for (size_t index = 1; uniformAxis && index < time.size(); ++index) {
+        uniformAxis = std::fabs((time[index] - time[index - 1]) - lastStep) <= 1e-6 * lastStep;
+    }
+    const double tolerance = 1e-3 * expectedPeriod;
+    const double closedError = std::fabs(period - expectedPeriod);
+    const double openError = uniformAxis? std::fabs(period + lastStep - expectedPeriod) : std::numeric_limits<double>::infinity();
+    if (closedError > tolerance && openError > tolerance) {
+        std::ostringstream message;
+        message << std::setprecision(10) << "Waveform time axis spans " << period << " s (" << time.size() << " points from " << time.front()
+                << " s to " << time.back() << " s, last step " << lastStep << " s" << (uniformAxis? ", uniform" : "") << ") but the excitation period is "
+                << expectedPeriod << " s (" << frequency << " Hz): a waveform must be given over exactly one period, including the intervals where it is zero";
+        throw std::invalid_argument(message.str());
+    }
+    return openError < closedError;
+}
+
 Waveform WaveformProcessor::calculate_sampled_waveform(Waveform waveform, double frequency, std::optional<size_t> numberPoints, size_t numberPointsSampledWaveforms, std::optional<size_t> maximumNumberPoints) {
     std::vector<double> time;
     auto data = waveform.get_data();
+    std::optional<double> openAxisPeriodClosure;
 
     // Validate input data
     if (data.size() < 2) {
@@ -967,15 +1151,23 @@ Waveform WaveformProcessor::calculate_sampled_waveform(Waveform waveform, double
     }
     else {
         time = waveform.get_time().value();
+        if (time.size() != data.size()) {
+            throw std::invalid_argument("Waveform has " + std::to_string(data.size()) + " data points but " + std::to_string(time.size()) + " time points");
+        }
         // The waveform time data defines the actual period to sample over
-        // Always use the frequency derived from the waveform time data for sampling
         // This ensures the sampled time points fall within the waveform's time range
         double period = (time.back() - time.front());
         if (period <= 0) {
             throw std::invalid_argument("Invalid waveform period: " + std::to_string(period));
         }
-        // Use frequency from waveform time data for sampling purposes
-        // The passed frequency parameter is only used as fallback when time data is missing
+        if (check_time_axis_spans_one_period(time, frequency)) {
+            // Open axis: the last sample holds until t0 + T, where the next period starts with
+            // the first sample. Sampling over the axis alone squeezed the period by one step,
+            // (N - 1) / N, on every resampling of an already sampled waveform.
+            const double lastStep = time[time.size() - 1] - time[time.size() - 2];
+            openAxisPeriodClosure = time.back() + lastStep;
+            period += lastStep;
+        }
         frequency = 1.0 / period;
         // Validate frequency after inference
         if (!std::isfinite(frequency) || frequency <= 0) {
@@ -1006,6 +1198,11 @@ Waveform WaveformProcessor::calculate_sampled_waveform(Waveform waveform, double
     }
 
     auto sampledTime = linear_spaced_array(0, 1. / roundFloat(frequency, 9), numberPointsForSampling + 1);
+    if (openAxisPeriodClosure) {
+        // Periodic: the interval after the last sample ends at the first sample of the next period.
+        data.push_back(data.front());
+        time.push_back(openAxisPeriodClosure.value());
+    }
 
     // The sampled instants increase, and on a time axis that never goes back the segment that
     // holds instant i+1 is never before the one that held instant i: every earlier segment ended
@@ -1211,10 +1408,8 @@ std::vector<std::complex<double>> uniform_samples_exact_coefficients(const Wavef
 }
 } // namespace
 
-Harmonics WaveformProcessor::calculate_harmonics_data(Waveform waveform, double frequency, bool trimHarmonics, double harmonicAmplitudeThreshold, size_t numberPointsSampledWaveforms) {
-    bool isWaveformImported = is_waveform_imported(waveform, numberPointsSampledWaveforms);
-    Harmonics harmonics;
-
+WaveformProcessor::FourierSeries WaveformProcessor::calculate_fourier_series(const Waveform& waveform, double frequency, size_t numberPointsSampledWaveforms) {
+    FourierSeries series;
     if (!waveform.get_time()) {
         // Data only: samples with no knots to be exact about, so this keeps the plain DFT of the
         // samples, harmonics 0..N/2-1. Every MKF path that has knots or a time axis goes through
@@ -1228,33 +1423,132 @@ Harmonics WaveformProcessor::calculate_harmonics_data(Waveform waveform, double 
             throw std::invalid_argument("Data vector size is not a power of 2: " + std::to_string(data.size()));
         }
         fft(data);
-
-        harmonics.get_mutable_amplitudes().push_back(abs(data[0] / static_cast<double>(data.size())));
-        for (size_t i = 1; i < data.size() / 2; ++i) {
-            harmonics.get_mutable_amplitudes().push_back(abs(2. * data[i] / static_cast<double>(data.size())));
-        }
+        // N is a power of 2, so dividing by it is exact: 2 * (X/N) is bit-identical to (2 X) / N.
         for (size_t i = 0; i < data.size() / 2; ++i) {
-            harmonics.get_mutable_frequencies().push_back(frequency * i);
+            series.coefficients.push_back(data[i] / static_cast<double>(data.size()));
         }
+        // Sample 0 sits at t = 0: no rotation is ever applied, the period is only informative.
+        series.timeOrigin = 0;
+        series.period = 1.0 / frequency;
+        return series;
     }
-    else {
-        std::vector<std::complex<double>> coefficients;
+
+    std::vector<std::complex<double>>& coefficients = series.coefficients;
+    {
         // N points count as samples only on a uniform axis. The simulator's 128 samples, resampled
         // over their own span and compressed, come back as 128 uneven knots (autocomplete's
         // magnetizing current): those are knots, and their exact series is below.
-        if (is_waveform_sampled(waveform, numberPointsSampledWaveforms) && has_uniform_time_step(waveform.get_time().value())) {
+        // A uniform axis is read as samples only when it is OPEN ([t0, t0 + N dt), the sampled
+        // convention). The same N points on a CLOSED axis ([t0, t0 + T], step T / (N - 1), as
+        // stored designs carry them) are N knots: read as samples, their period came out one step
+        // long, N T / (N - 1), and a pure sine leaked into every harmonic up to N/2 (ABT #1879).
+        // check_time_axis_spans_one_period tells the two apart against the excitation period, and
+        // throws for an axis that spans neither.
+        const auto time = waveform.get_time().value();
+        if (is_waveform_sampled(waveform, numberPointsSampledWaveforms) && has_uniform_time_step(time) &&
+            check_time_axis_spans_one_period(time, frequency)) {
             coefficients = uniform_samples_exact_coefficients(waveform);
+            // N open samples: the period is N steps, one more than the axis spans.
+            series.timeOrigin = time.front();
+            series.period = (time.back() - time.front()) * static_cast<double>(time.size()) / static_cast<double>(time.size() - 1);
         }
         else if (waveform.get_data().size() > numberPointsSampledWaveforms) {
             // Denser than the sampling grid (imports, 2N+1-sample converter models): the closed
             // form would cost O(knots x harmonics) with thousands of both, so these are sampled
             // at their own power-of-2 resolution and the samples' interpolant is used. It
             // differs from the knots only where a knot falls between two samples.
-            coefficients = uniform_samples_exact_coefficients(calculate_sampled_waveform(waveform, frequency, std::nullopt, numberPointsSampledWaveforms));
+            auto sampledWaveform = calculate_sampled_waveform(waveform, frequency, std::nullopt, numberPointsSampledWaveforms);
+            coefficients = uniform_samples_exact_coefficients(sampledWaveform);
+            const auto sampledTime = sampledWaveform.get_time().value();
+            series.timeOrigin = sampledTime.front();
+            series.period = (sampledTime.back() - sampledTime.front()) * static_cast<double>(sampledTime.size()) / static_cast<double>(sampledTime.size() - 1);
         }
         else {
-            coefficients = calculate_exact_fourier_coefficients(waveform.get_time().value(), waveform.get_data(), numberPointsSampledWaveforms / 2);
+            coefficients = calculate_exact_fourier_coefficients(time, waveform.get_data(), numberPointsSampledWaveforms / 2);
+            // Knots: the period is their span (calculate_exact_fourier_coefficients' rule).
+            series.timeOrigin = time.front();
+            series.period = time.back() - time.front();
         }
+    }
+    return series;
+}
+
+std::complex<double> WaveformProcessor::calculate_harmonic_phasor(const FourierSeries& series, double frequency, double harmonicFrequency) {
+    if (!std::isfinite(frequency) || frequency <= 0) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Harmonic phasor: the excitation frequency must be positive and finite, got " + std::to_string(frequency));
+    }
+    if (!std::isfinite(harmonicFrequency) || harmonicFrequency < 0) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Harmonic phasor: the harmonic frequency must be non-negative and finite, got " + std::to_string(harmonicFrequency));
+    }
+    // By index, as calculate_harmonics_data labels harmonic k with k * frequency.
+    const double order = harmonicFrequency / frequency;
+    const double roundedOrder = std::round(order);
+    if (std::fabs(order - roundedOrder) > 1e-6) {
+        std::ostringstream message;
+        message << std::setprecision(12) << "Harmonic phasor: " << harmonicFrequency << " Hz is not a harmonic of the excitation frequency "
+                << frequency << " Hz (order " << order << "), so it has no Fourier coefficient";
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, message.str());
+    }
+    const size_t index = static_cast<size_t>(roundedOrder);
+    if (index >= series.coefficients.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Harmonic phasor: harmonic " + std::to_string(index) + " (" + std::to_string(harmonicFrequency) +
+                                    " Hz) is beyond the waveform's Fourier series, which ends at harmonic " + std::to_string(series.coefficients.size() - 1));
+    }
+    std::complex<double> phasor = index == 0 ? series.coefficients[0] : 2.0 * series.coefficients[index];
+    if (index > 0 && series.timeOrigin != 0) {
+        if (!(series.period > 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "Harmonic phasor: the Fourier series has no positive period");
+        }
+        // c_k is referred to t0: c_k exp(+j k w (t - t0)) = (c_k exp(-j k w t0)) exp(+j k w t).
+        phasor *= std::polar(1.0, -2 * kWaveformPi * static_cast<double>(index) * series.timeOrigin / series.period);
+    }
+    return phasor;
+}
+
+WaveformProcessor::FourierSeries WaveformProcessor::calculate_waveform_fourier_series(const Waveform& waveform, double frequency, size_t numberPointsSampledWaveforms) {
+    if (!waveform.get_time()) {
+        // MKF lists the harmonics of a waveform without a time axis from its sampled version
+        // (Inputs::calculate_harmonics_data(waveform, sampledWaveform, f)): the same here.
+        auto sampledWaveform = calculate_sampled_waveform(waveform, frequency, std::nullopt, numberPointsSampledWaveforms);
+        return calculate_fourier_series(sampledWaveform, frequency, numberPointsSampledWaveforms);
+    }
+    return calculate_fourier_series(waveform, frequency, numberPointsSampledWaveforms);
+}
+
+std::complex<double> WaveformProcessor::calculate_harmonic_phasor(const Waveform& waveform, double frequency, double harmonicFrequency, size_t numberPointsSampledWaveforms) {
+    return calculate_harmonic_phasor(calculate_waveform_fourier_series(waveform, frequency, numberPointsSampledWaveforms), frequency, harmonicFrequency);
+}
+
+double WaveformProcessor::calculate_largest_harmonic_amplitude(const FourierSeries& series) {
+    double largest = 0;
+    for (size_t index = 0; index < series.coefficients.size(); ++index) {
+        largest = std::max(largest, (index == 0 ? 1.0 : 2.0) * std::abs(series.coefficients[index]));
+    }
+    return largest;
+}
+
+bool WaveformProcessor::is_zero_harmonic(const FourierSeries& series, double listedAmplitude, std::complex<double> phasor) {
+    const double zeroScale = harmonicConsistencyTolerance * calculate_largest_harmonic_amplitude(series);
+    return std::fabs(listedAmplitude) < zeroScale && std::abs(phasor) < zeroScale;
+}
+
+Harmonics WaveformProcessor::calculate_harmonics_data(Waveform waveform, double frequency, bool trimHarmonics, double harmonicAmplitudeThreshold, size_t numberPointsSampledWaveforms) {
+    bool isWaveformImported = is_waveform_imported(waveform, numberPointsSampledWaveforms);
+    Harmonics harmonics;
+
+    const auto series = calculate_fourier_series(waveform, frequency, numberPointsSampledWaveforms);
+    const auto& coefficients = series.coefficients;
+    if (!waveform.get_time()) {
+        // The plain DFT of the samples, harmonics 0..N/2-1 (amplitude expressions unchanged).
+        harmonics.get_mutable_amplitudes().push_back(std::abs(coefficients[0]));
+        for (size_t i = 1; i < coefficients.size(); ++i) {
+            harmonics.get_mutable_amplitudes().push_back(std::abs(2. * coefficients[i]));
+        }
+        for (size_t i = 0; i < coefficients.size(); ++i) {
+            harmonics.get_mutable_frequencies().push_back(frequency * i);
+        }
+    }
+    else {
         harmonics.get_mutable_amplitudes().push_back(std::abs(coefficients[0]));
         harmonics.get_mutable_frequencies().push_back(0);
         for (size_t k = 1; k < coefficients.size(); ++k) {
@@ -1291,10 +1585,13 @@ ProcessedWaveform WaveformProcessor::calculate_processed_data(SignalDescriptor e
                                             size_t numberPointsSampledWaveforms) {
 
     auto harmonics = excitation.get_harmonics().value();
-    return calculate_processed_data(harmonics, sampledWaveform, includeAdvancedData, processed, numberPointsSampledWaveforms);
+    // The label is checked on, and read off, the excitation's waveform as given, not on the
+    // sample of it this was handed (ABT #1878).
+    return calculate_processed_data(harmonics, sampledWaveform, includeAdvancedData, processed, numberPointsSampledWaveforms,
+                                    excitation.get_waveform());
 }
 
-ProcessedWaveform WaveformProcessor::calculate_basic_processed_data(Waveform waveform, size_t numberPointsSampledWaveforms) {
+ProcessedWaveform WaveformProcessor::calculate_basic_processed_data(Waveform waveform, size_t numberPointsSampledWaveforms, std::optional<Waveform> givenWaveform) {
     ProcessedWaveform processed;
     std::vector<double> dataToProcess;
     auto sampledWaveform = waveform;
@@ -1335,7 +1632,20 @@ ProcessedWaveform WaveformProcessor::calculate_basic_processed_data(Waveform wav
         // processed.set_average(average);
     }
 
-    double offset = calculate_offset(compressedWaveform, label);
+    // ABT #1878 (Alf, 2026-10-16: check before sampling). The label names the shape of the
+    // waveform as its producer gave it, so that is the one held to the label's vertex layout,
+    // and the label's offset and duty are read off its vertices. A sampled or compressed copy
+    // is never held to the layout: a 0.5-duty bipolar rectangle with no dead time compresses
+    // from 10 vertices to 6 and is still one. When the given waveform is itself a sample, the
+    // label's reads come off its compressed copy, which only has to have the vertices read.
+    const Waveform given = givenWaveform ? givenWaveform.value() : waveform;
+    const bool readGivenVertices = given.get_ancillary_label() && given.get_ancillary_label().value() == label &&
+                                   !is_waveform_sampled(given, numberPointsSampledWaveforms);
+    if (readGivenVertices) {
+        throw_if_waveform_cannot_be_its_label(given, label);
+    }
+    const Waveform& labelVertices = readGivenVertices ? given : compressedWaveform;
+    double offset = calculate_offset(labelVertices, label);
     processed.set_offset(offset);
 
     processed.set_peak_to_peak(*max_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end()) -
@@ -1343,10 +1653,12 @@ ProcessedWaveform WaveformProcessor::calculate_basic_processed_data(Waveform wav
 
     if (label == WaveformLabel::FLYBACK_PRIMARY ||
         label == WaveformLabel::FLYBACK_SECONDARY) {
-        // Flyback waveforms include a 0-level floor, so max - min overstates the
-        // ramp peak-to-peak by the offset. UNIPOLAR_* waveforms never touch 0
-        // (their minimum IS the offset), so max - min is already correct for them.
-        processed.set_peak_to_peak(processed.get_peak_to_peak().value() - offset);
+        // A flyback waveform's peak-to-peak is its ramp: from the offset (the ramp's start, read off its
+        // vertices) to its maximum, as the synthesis above builds it (max = peakToPeak + offset). Its floor
+        // between ramps is not part of it. This was max - min - offset, which is the ramp only on a floor
+        // at 0: a flux density whose DC point lifted it onto a 0.27 T floor came out at -0.21 T, and iGSE
+        // raised that to a fractional power (ABT #1843).
+        processed.set_peak_to_peak(*max_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end()) - offset);
     }
 
     double positivePeak = *max_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end());
@@ -1360,28 +1672,23 @@ ProcessedWaveform WaveformProcessor::calculate_basic_processed_data(Waveform wav
     // compression would thin out.
     processed.set_duty_cycle(label == WaveformLabel::CUSTOM
         ? try_guess_duty_cycle(waveform, label, 0, numberPointsSampledWaveforms)
-        : try_guess_duty_cycle(compressedWaveform, label, 0, numberPointsSampledWaveforms));
+        : try_guess_duty_cycle(labelVertices, label, 0, numberPointsSampledWaveforms));
 
     return processed;
 }
 
 ProcessedWaveform WaveformProcessor::calculate_processed_data(Waveform waveform,
-                                            std::optional<double> frequency,
+                                            double frequency,
                                             bool includeAdvancedData,
                                             std::optional<ProcessedWaveform> processed,
                                             bool trimHarmonics,
                                             double harmonicAmplitudeThreshold,
                                             size_t numberPointsSampledWaveforms) {
-    double frequencyValue;
-    if (frequency) {
-        frequencyValue = frequency.value();
+    // A frequency is required, never derived from the time axis (ABT #1467).
+    if (!std::isfinite(frequency) || frequency <= 0) {
+        throw std::invalid_argument("calculate_processed_data needs the excitation frequency, got " + std::to_string(frequency));
     }
-    else {
-        if (!waveform.get_time()) {
-            throw std::invalid_argument("Either frequency or time must be provided");
-        }
-        frequencyValue = 1.0 / (waveform.get_time()->back() - waveform.get_time()->front());
-    }
+    const double frequencyValue = frequency;
     auto sampledWaveform = waveform;
     if (!is_size_power_of_2(waveform.get_data())) {
         sampledWaveform = calculate_sampled_waveform(waveform, frequencyValue, std::nullopt, numberPointsSampledWaveforms);
@@ -1395,7 +1702,8 @@ ProcessedWaveform WaveformProcessor::calculate_processed_data(Harmonics harmonic
                                             Waveform waveform,
                                             bool includeAdvancedData,
                                             std::optional<ProcessedWaveform> processed,
-                                            size_t numberPointsSampledWaveforms) {
+                                            size_t numberPointsSampledWaveforms,
+                                            std::optional<Waveform> givenWaveform) {
     auto sampledDataToProcess = waveform;
 
     if (waveform.get_time() && waveform.get_data().size() < numberPointsSampledWaveforms) {
@@ -1408,7 +1716,7 @@ ProcessedWaveform WaveformProcessor::calculate_processed_data(Harmonics harmonic
         processedResult = processed.value();
     }
     else {
-        processedResult = calculate_basic_processed_data(sampledDataToProcess, numberPointsSampledWaveforms);
+        processedResult = calculate_basic_processed_data(sampledDataToProcess, numberPointsSampledWaveforms, givenWaveform ? givenWaveform.value() : waveform);
     }
 
     {

@@ -1,6 +1,8 @@
 #include "physical_models/MagneticField.h"
 #include <numbers>
 #include "physical_models/StrayCapacitance.h"
+#include "physical_models/LeakageInductance.h"
+#include "physical_models/WindingLossesModelSets.h"
 #include "support/Painter.h"
 #include "support/CoilMesher.h"
 #include "constructive_models/Coil.h"
@@ -45,6 +47,9 @@ static void resolve_harmonic_index_for_painting(const Harmonics& harmonics, size
 }
 
 ComplexField PainterInterface::calculate_magnetic_field(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex) {
+    if (magnetic.get_core().get_shape_family() == MAS::CoreShapeFamily::T) {
+        return calculate_toroidal_magnetic_field(operatingPoint, magnetic, harmonicIndex);
+    }
     if (!operatingPoint.get_excitations_per_winding()[0].get_current()) {
         throw InvalidInputException(ErrorCode::MISSING_DATA, "Current is missing in excitation");
     }
@@ -83,11 +88,30 @@ ComplexField PainterInterface::calculate_magnetic_field(OperatingPoint operating
     Field inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, true, true, true).first;
 
     auto modelOverride = settings.get_painter_magnetic_field_strength_model();
-    // Use painter override if set, otherwise use the simulation magnetic field strength model
-    auto magneticFieldModel = modelOverride.value_or(settings.get_magnetic_field_strength_model());
-    // Use the configured fringing effect model from settings
-    auto fringingEffectModel = settings.get_magnetic_field_strength_fringing_effect_model();
+    // ABT #1759: the plotted field is the winding-loss model's own H. Without a painter override, the field and fringing
+    // models are the pair of the set WindingLosses solves this magnetic with (resolve_winding_losses_model_set_from_settings,
+    // the default set when nothing is configured); with CUSTOM, the individually configured models as before.
+    const WindingLossesModelSets modelSetId = modelOverride ? WindingLossesModelSets::CUSTOM :
+                                              resolve_winding_losses_model_set_from_settings(magnetic, includeFringing);
+    MagneticFieldStrengthModels magneticFieldModel;
+    MagneticFieldStrengthFringingEffectModels fringingEffectModel;
+    if (modelSetId != WindingLossesModelSets::CUSTOM) {
+        const auto& modelSet = get_winding_losses_model_set(modelSetId);
+        check_winding_losses_model_set_applies(modelSet, magnetic);
+        magneticFieldModel = resolve_winding_losses_field_model(modelSet, magnetic);
+        fringingEffectModel = modelSet.fringingModel;
+    }
+    else {
+        magneticFieldModel = modelOverride.value_or(settings.get_magnetic_field_strength_model());
+        fringingEffectModel = settings.get_magnetic_field_strength_fringing_effect_model();
+    }
     MagneticField magneticField(magneticFieldModel, fringingEffectModel);
+    // ABT #1759 (Alf 2026-10-13): the currents the parallels carry are the winding-loss model's, solved on the model's own
+    // image lattice (the magnetic-field mirroring, exactly as WindingLosses solves them) BEFORE the painter's display
+    // settings are applied below. The painter mirroring only decides which images of those currents the plot draws: it
+    // used to reach the split too, which a display mirroring of 0 made throw (no lattice to solve the strands on).
+    const auto parallelCurrentSplit = MagneticField::calculate_parallel_current_split(magnetic, operatingPoint,
+                                                                                      operatingPoint.get_conditions().get_ambient_temperature());
     // RAII: restore the global magnetic-field settings on scope exit. They used to be
     // overwritten permanently, leaking the painter's fringing/mirroring choice into
     // every later physics computation in the process.
@@ -95,7 +119,7 @@ ComplexField PainterInterface::calculate_magnetic_field(OperatingPoint operating
     SettingsGuard<int> mirroringGuard(settings, &Settings::get_magnetic_field_mirroring_dimension, &Settings::set_magnetic_field_mirroring_dimension, mirroringDimension);
     ComplexField field;
     {
-        auto windingWindowMagneticStrengthFieldOutput = magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic, inducedField);
+        auto windingWindowMagneticStrengthFieldOutput = magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic, inducedField, std::nullopt, std::nullopt, parallelCurrentSplit);
         field = windingWindowMagneticStrengthFieldOutput.get_field_per_frequency()[0];
 
     }
@@ -108,7 +132,7 @@ ComplexField PainterInterface::calculate_magnetic_field(OperatingPoint operating
             }
         }
         magnetic.get_mutable_coil().set_turns_description(turns);
-        auto windingWindowMagneticStrengthFieldOutput = magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic, inducedField);
+        auto windingWindowMagneticStrengthFieldOutput = magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic, inducedField, std::nullopt, std::nullopt, parallelCurrentSplit);
         auto additionalField = windingWindowMagneticStrengthFieldOutput.get_field_per_frequency()[0];
         for (size_t pointIndex = 0; pointIndex < field.get_data().size(); ++pointIndex) {
             field.get_mutable_data()[pointIndex].set_real(field.get_mutable_data()[pointIndex].get_real() + additionalField.get_mutable_data()[pointIndex].get_real());
@@ -120,584 +144,251 @@ ComplexField PainterInterface::calculate_magnetic_field(OperatingPoint operating
     return field;
 }
 
-ComplexField PainterInterface::calculate_magnetic_field_internal_only(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex) {
-    // Calculate field using only internal turns (original coordinates)
-    if (!operatingPoint.get_excitations_per_winding()[0].get_current()) {
-        throw InvalidInputException(ErrorCode::MISSING_DATA, "Current is missing in excitation");
+ComplexField PainterInterface::calculate_toroidal_magnetic_field(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex) {
+    // The ring-plane field of the toroidal leakage model (LeakageInductance.h, "Toroidal cores"; white
+    // paper section 9.3): per-region Kelvin images with the net-current term, built and evaluated by the
+    // same code that gives the leakage energy, so that the picture is the field whose energy is the
+    // model's L_DM. Each winding is driven by its current phasor at the painted harmonic, signed by the
+    // MAS direction convention (CoilMesher::calculate_current_direction_per_winding). Like the other cores'
+    // painter field (MagneticField's in-phase output), each point holds the in-phase field, i.e. the field of
+    // the peak currents' components in phase with the gauge winding (CoilMesher::calculate_current_phase_per_winding),
+    // as real = Hx and imaginary = Hy.
+    if (magnetic.get_core().get_shape_family() != MAS::CoreShapeFamily::T) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "calculate_toroidal_magnetic_field needs a toroidal core");
     }
-    for (size_t windingIndex = 0; windingIndex < magnetic.get_coil().get_functional_description().size(); ++windingIndex) {
-        if (!operatingPoint.get_excitations_per_winding()[windingIndex].get_current()->get_harmonics()) {
-            auto current = operatingPoint.get_excitations_per_winding()[windingIndex].get_current().value();
-            if (!current.get_waveform()) {
-                throw InvalidInputException(ErrorCode::MISSING_DATA, "Waveform is missing from current");
-            }
-            auto sampledWaveform = Inputs::calculate_sampled_waveform(current.get_waveform().value(), operatingPoint.get_excitations_per_winding()[windingIndex].get_frequency());
-            auto harmonics = Inputs::calculate_harmonics_data(current.get_waveform().value(), sampledWaveform, operatingPoint.get_excitations_per_winding()[windingIndex].get_frequency());
-            current.set_harmonics(harmonics);
-            if (!current.get_processed()) {
-                auto processed = Inputs::calculate_processed_data(harmonics, sampledWaveform, true);
-                current.set_processed(processed);
-            }
-            operatingPoint.get_mutable_excitations_per_winding()[windingIndex].set_current(current);
+    auto coil = magnetic.get_coil();
+    size_t numberWindings = coil.get_functional_description().size();
+    if (operatingPoint.get_excitations_per_winding().size() != numberWindings) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Toroidal field: " + std::to_string(operatingPoint.get_excitations_per_winding().size()) +
+                                    " excitations for " + std::to_string(numberWindings) + " windings");
+    }
+    auto excitationFrequency = operatingPoint.get_excitations_per_winding()[0].get_frequency();
+    for (const auto& excitation : operatingPoint.get_excitations_per_winding()) {
+        if (!excitation.get_current() || !excitation.get_current()->get_waveform()) {
+            throw InvalidInputException(ErrorCode::MISSING_DATA, "Toroidal field: every winding needs a current waveform");
+        }
+        if (excitation.get_frequency() != excitationFrequency) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "Toroidal field: the windings are excited at different frequencies");
         }
     }
-
-    auto harmonics = operatingPoint.get_excitations_per_winding()[0].get_current()->get_harmonics().value();
+    // Every winding's harmonics, from its waveform when MAS does not list them, so that the phases come from
+    // the same gauge as every other core's painted field (CoilMesher::calculate_current_phase_per_winding).
+    auto excitations = operatingPoint.get_excitations_per_winding();
+    for (auto& excitation : excitations) {
+        auto current = excitation.get_current().value();
+        if (!current.get_harmonics()) {
+            auto sampledWaveform = Inputs::calculate_sampled_waveform(current.get_waveform().value(), excitationFrequency);
+            current.set_harmonics(Inputs::calculate_harmonics_data(current.get_waveform().value(), sampledWaveform, excitationFrequency));
+            excitation.set_current(current);
+        }
+    }
+    operatingPoint.set_excitations_per_winding(excitations);
+    Harmonics harmonics = excitations[0].get_current()->get_harmonics().value();
     resolve_harmonic_index_for_painting(harmonics, harmonicIndex);
-    auto frequency = harmonics.get_frequencies()[harmonicIndex];
+    if (harmonicIndex >= harmonics.get_frequencies().size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Toroidal field: harmonic " + std::to_string(harmonicIndex) + " is not in the current");
+    }
+    double frequency = harmonics.get_frequencies()[harmonicIndex];
 
-    bool includeFringing = settings.get_painter_include_fringing();
-    int mirroringDimension = settings.get_painter_mirroring_dimension();  // int (0/1/2/3 mirroring planes), was truncated through bool
+    // In-phase current of winding w: A_w cos(phi_w - phi_gauge), signed by its MAS direction.
+    auto directions = CoilMesher::calculate_current_direction_per_winding(coil);
+    // A winding without this harmonic, or with it zero both in its list and its waveform, carries none of it (ABT #1880).
+    std::vector<std::vector<double>> currentAmplitudes;
+    auto phases = CoilMesher::calculate_current_phase_per_winding(coil, operatingPoint, {harmonicIndex}, nullptr, &currentAmplitudes)[0];
+    std::vector<double> realCurrents(numberWindings);
+    for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
+        realCurrents[windingIndex] = currentAmplitudes[0][windingIndex] * std::cos(phases[windingIndex]) * static_cast<double>(directions[windingIndex]);
+    }
+    auto conductors = LeakageInductance::calculate_toroidal_ring_plane_conductors(magnetic, realCurrents);
 
     size_t numberPointsX = settings.get_painter_number_points_x();
     size_t numberPointsY = settings.get_painter_number_points_y();
-    Field inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, true, true, true).first;
-
-    auto modelOverride = settings.get_painter_magnetic_field_strength_model();
-    auto magneticFieldModel = modelOverride.value_or(settings.get_magnetic_field_strength_model());
-    auto fringingEffectModel = settings.get_magnetic_field_strength_fringing_effect_model();
-    MagneticField magneticField(magneticFieldModel, fringingEffectModel);
-    // RAII: restore the global magnetic-field settings on scope exit. They used to be
-    // overwritten permanently, leaking the painter's fringing/mirroring choice into
-    // every later physics computation in the process.
-    SettingsGuard<bool> fringingGuard(settings, &Settings::get_magnetic_field_include_fringing, &Settings::set_magnetic_field_include_fringing, includeFringing);
-    SettingsGuard<int> mirroringGuard(settings, &Settings::get_magnetic_field_mirroring_dimension, &Settings::set_magnetic_field_mirroring_dimension, mirroringDimension);
-    
-    auto windingWindowMagneticStrengthFieldOutput = magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic, inducedField);
-    return windingWindowMagneticStrengthFieldOutput.get_field_per_frequency()[0];
+    Field grid = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, true, true, true).first;
+    ComplexField field;
+    field.set_frequency(frequency);
+    std::vector<ComplexFieldPoint> data;
+    data.reserve(grid.get_data().size());
+    for (const auto& gridPoint : grid.get_data()) {
+        const auto& point = gridPoint.get_point();
+        auto h = LeakageInductance::calculate_toroidal_ring_plane_field(conductors, point[0], point[1]);
+        ComplexFieldPoint datum;
+        datum.set_point(point);
+        datum.set_real(h[0]);
+        datum.set_imaginary(h[1]);
+        data.push_back(datum);
+    }
+    field.set_data(data);
+    return field;
 }
 
-ComplexField PainterInterface::calculate_magnetic_field_external_only(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex) {
-    // Calculate field using only external turns (additional coordinates)
-    if (!operatingPoint.get_excitations_per_winding()[0].get_current()) {
-        throw InvalidInputException(ErrorCode::MISSING_DATA, "Current is missing in excitation");
-    }
-    for (size_t windingIndex = 0; windingIndex < magnetic.get_coil().get_functional_description().size(); ++windingIndex) {
-        if (!operatingPoint.get_excitations_per_winding()[windingIndex].get_current()->get_harmonics()) {
-            auto current = operatingPoint.get_excitations_per_winding()[windingIndex].get_current().value();
-            if (!current.get_waveform()) {
-                throw InvalidInputException(ErrorCode::MISSING_DATA, "Waveform is missing from current");
-            }
-            auto sampledWaveform = Inputs::calculate_sampled_waveform(current.get_waveform().value(), operatingPoint.get_excitations_per_winding()[windingIndex].get_frequency());
-            auto harmonics = Inputs::calculate_harmonics_data(current.get_waveform().value(), sampledWaveform, operatingPoint.get_excitations_per_winding()[windingIndex].get_frequency());
-            current.set_harmonics(harmonics);
-            if (!current.get_processed()) {
-                auto processed = Inputs::calculate_processed_data(harmonics, sampledWaveform, true);
-                current.set_processed(processed);
-            }
-            operatingPoint.get_mutable_excitations_per_winding()[windingIndex].set_current(current);
-        }
-    }
+// ==================== Electric energy painting ====================
 
-    auto harmonics = operatingPoint.get_excitations_per_winding()[0].get_current()->get_harmonics().value();
-    resolve_harmonic_index_for_painting(harmonics, harmonicIndex);
-    auto frequency = harmonics.get_frequencies()[harmonicIndex];
-
-    bool includeFringing = settings.get_painter_include_fringing();
-    int mirroringDimension = settings.get_painter_mirroring_dimension();  // int (0/1/2/3 mirroring planes), was truncated through bool
-
-    size_t numberPointsX = settings.get_painter_number_points_x();
-    size_t numberPointsY = settings.get_painter_number_points_y();
-    Field inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, true, true, true).first;
-
-    auto modelOverride = settings.get_painter_magnetic_field_strength_model();
-    auto magneticFieldModel = modelOverride.value_or(settings.get_magnetic_field_strength_model());
-    auto fringingEffectModel = settings.get_magnetic_field_strength_fringing_effect_model();
-    MagneticField magneticField(magneticFieldModel, fringingEffectModel);
-    // RAII: restore the global magnetic-field settings on scope exit. They used to be
-    // overwritten permanently, leaking the painter's fringing/mirroring choice into
-    // every later physics computation in the process.
-    SettingsGuard<bool> fringingGuard(settings, &Settings::get_magnetic_field_include_fringing, &Settings::set_magnetic_field_include_fringing, includeFringing);
-    SettingsGuard<int> mirroringGuard(settings, &Settings::get_magnetic_field_mirroring_dimension, &Settings::set_magnetic_field_mirroring_dimension, mirroringDimension);
-    
-    // Swap to external coordinates
-    auto turns = magnetic.get_coil().get_turns_description().value();
-    bool hasAdditional = false;
-    for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
-        if (turns[turnIndex].get_additional_coordinates()) {
-            turns[turnIndex].set_coordinates(turns[turnIndex].get_additional_coordinates().value()[0]);
-            hasAdditional = true;
-        }
-    }
-    
-    if (!hasAdditional) {
-        // No external turns, return empty field
-        ComplexField emptyField;
-        emptyField.set_frequency(frequency);
-        return emptyField;
-    }
-    
-    magnetic.get_mutable_coil().set_turns_description(turns);
-    auto windingWindowMagneticStrengthFieldOutput = magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic, inducedField);
-    return windingWindowMagneticStrengthFieldOutput.get_field_per_frequency()[0];
-}
-
-
-// ==================== SDF Primitives ====================
-
-double PainterInterface::sdf_circle(double px, double py, double cx, double cy, double radius) {
-    return hypot(px - cx, py - cy) - radius;
-}
-
-double PainterInterface::sdf_box(double px, double py, double cx, double cy, double halfW, double halfH) {
-    double dx = fabs(px - cx) - halfW;
-    double dy = fabs(py - cy) - halfH;
-    return hypot(std::max(dx, 0.0), std::max(dy, 0.0)) + std::min(std::max(dx, dy), 0.0);
-}
-
-double PainterInterface::sdf_oriented_box(double px, double py, double cx, double cy,
-                                           double halfW, double halfH, double angle) {
-    double cosA = cos(angle), sinA = sin(angle);
-    double lx =  cosA * (px - cx) + sinA * (py - cy);
-    double ly = -sinA * (px - cx) + cosA * (py - cy);
-    double dx = fabs(lx) - halfW;
-    double dy = fabs(ly) - halfH;
-    return hypot(std::max(dx, 0.0), std::max(dy, 0.0)) + std::min(std::max(dx, dy), 0.0);
-}
-
-double PainterInterface::sdf_turn(double px, double py, const Turn& turn) {
-    if (!turn.get_cross_sectional_shape() || !turn.get_dimensions()) {
-        return std::numeric_limits<double>::max();
-    }
-    auto shape = turn.get_cross_sectional_shape().value();
-    auto& coords = turn.get_coordinates();
-    auto dims = turn.get_dimensions().value();
-
-    if (coords.size() < 2 || dims.empty()) {
-        return std::numeric_limits<double>::max();
-    }
-
-    // Calculate SDF for main coordinates
-    double mainSdf;
-    if (shape == TurnCrossSectionalShape::ROUND) {
-        mainSdf = sdf_circle(px, py, coords[0], coords[1], dims[0] / 2.0);
-    } else {
-        double angle = 0.0;
-        if (turn.get_rotation()) {
-            angle = turn.get_rotation().value() * std::numbers::pi / 180.0;
-        }
-        double halfWidth = dims[0] / 2.0;
-        double halfHeight = dims.size() > 1 ? dims[1] / 2.0 : halfWidth;
-        mainSdf = sdf_oriented_box(px, py, coords[0], coords[1],
-                                halfWidth, halfHeight, angle);
-    }
-
-    // For toroidal turns, also check additional coordinates (outer half) and return minimum
-    if (turn.get_additional_coordinates()) {
-        auto additionalCoords = turn.get_additional_coordinates().value();
-        for (const auto& addCoord : additionalCoords) {
-            if (addCoord.size() < 2) continue;
-            
-            double addSdf;
-            if (shape == TurnCrossSectionalShape::ROUND) {
-                addSdf = sdf_circle(px, py, addCoord[0], addCoord[1], dims[0] / 2.0);
-            } else {
-                double angle = 0.0;
-                if (turn.get_rotation()) {
-                    angle = turn.get_rotation().value() * std::numbers::pi / 180.0;
-                }
-                double halfWidth = dims[0] / 2.0;
-                double halfHeight = dims.size() > 1 ? dims[1] / 2.0 : halfWidth;
-                addSdf = sdf_oriented_box(px, py, addCoord[0], addCoord[1],
-                                        halfWidth, halfHeight, angle);
-            }
-            mainSdf = std::min(mainSdf, addSdf);
-        }
-    }
-
-    return mainSdf;
-}
-
-// ==================== Energy Density Models ====================
-
-double PainterInterface::energy_density_bipolar(double px, double py,
-                                                 const Turn& t1, const Turn& t2,
-                                                 double voltageDrop, double epsilonEff) {
-    // For toroidal turns with additional coordinates (outer half), we need to use the appropriate
-    // coordinate set based on which part of the turn the pixel is closest to.
-    // This ensures energy density is correctly calculated for both inner and outer turn regions.
-
-    auto get_effective_coords = [](const Turn& t, double px, double py) -> std::vector<double> {
-        auto& mainCoords = t.get_coordinates();
-        if (mainCoords.size() < 2) return mainCoords;
-
-        // Check if there's an additional coordinate (outer half for toroidal turns)
-        if (t.get_additional_coordinates()) {
-            auto additionalCoords = t.get_additional_coordinates().value();
-            for (const auto& addCoord : additionalCoords) {
-                if (addCoord.size() >= 2) {
-                    double distMain = hypot(mainCoords[0] - px, mainCoords[1] - py);
-                    double distAdd = hypot(addCoord[0] - px, addCoord[1] - py);
-                    // If closer to additional coordinate, use it as the effective center
-                    if (distAdd < distMain) {
-                        return addCoord;
-                    }
-                }
-            }
-        }
-        return mainCoords;
-    };
-
-    // Get effective coordinates for both turns based on pixel position
-    auto effCoords1 = get_effective_coords(t1, px, py);
-    auto effCoords2 = get_effective_coords(t2, px, py);
-
-    // Create temporary turns with effective coordinates for bipolar parameter calculation
-    Turn effTurn1 = t1;
-    Turn effTurn2 = t2;
-    effTurn1.set_coordinates(effCoords1);
-    effTurn2.set_coordinates(effCoords2);
-
-    auto params = StrayCapacitance::compute_bipolar_params(effTurn1, effTurn2);
-    double energy = StrayCapacitance::bipolar_energy_density_at_point(px, py, params, voltageDrop, epsilonEff);
-    // Prevent infinity/NaN
-    if (!std::isfinite(energy) || energy < 0) return 0;
-    if (energy > 1e300) return 1e300;
-    return energy;
-}
-
-double PainterInterface::energy_density_parallel_plate(double px, double py,
-                                                         const Turn& t1, const Turn& t2,
-                                                         double voltageDrop, double epsilonEff) {
-    // For toroidal turns, use effective coordinates based on pixel position
-    auto get_effective_coords = [](const Turn& t, double px, double py) -> std::vector<double> {
-        auto& mainCoords = t.get_coordinates();
-        if (mainCoords.size() < 2) return mainCoords;
-
-        if (t.get_additional_coordinates()) {
-            auto additionalCoords = t.get_additional_coordinates().value();
-            for (const auto& addCoord : additionalCoords) {
-                if (addCoord.size() >= 2) {
-                    double distMain = hypot(mainCoords[0] - px, mainCoords[1] - py);
-                    double distAdd = hypot(addCoord[0] - px, addCoord[1] - py);
-                    if (distAdd < distMain) {
-                        return addCoord;
-                    }
-                }
-            }
-        }
-        return mainCoords;
-    };
-
-    auto effCoords1 = get_effective_coords(t1, px, py);
-    auto effCoords2 = get_effective_coords(t2, px, py);
-
-    if (effCoords1.size() < 2 || effCoords2.size() < 2) return 0;
-
-    double cx1 = effCoords1[0], cy1 = effCoords1[1];
-    double cx2 = effCoords2[0], cy2 = effCoords2[1];
-    double centerDist = hypot(cx2 - cx1, cy2 - cy1);
-    if (centerDist < 1e-15) return 0;
-
-    double axisAngle = atan2(cy2 - cy1, cx2 - cx1);
-
-    auto getHalfExtent = [](const Turn& t, double ax_angle) -> double {
-        if (!t.get_dimensions()) return 0;
-        auto d = t.get_dimensions().value();
-        if (d.empty()) return 0;
-
-        double turnAngle = 0.0;
-        if (t.get_rotation()) {
-            turnAngle = t.get_rotation().value() * std::numbers::pi / 180.0;
-        }
-        double relAngle = ax_angle - turnAngle;
-        double hw = d[0] / 2.0;
-        double hh = d.size() > 1 ? d[1] / 2.0 : hw;
-        return fabs(hw * cos(relAngle)) + fabs(hh * sin(relAngle));
-    };
-
-    double halfExt1 = getHalfExtent(t1, axisAngle);
-    double halfExt2 = getHalfExtent(t2, axisAngle);
-    double gap = centerDist - halfExt1 - halfExt2;
-    if (gap < 1e-15) gap = 1e-15;
-
-    double E = voltageDrop / gap;
-    double energy = 0.5 * epsilonEff * E * E;
-    // Prevent infinity/NaN
-    if (!std::isfinite(energy) || energy < 0) return 0;
-    if (energy > 1e300) return 1e300;
-    return energy;
-}
-
-double PainterInterface::energy_density_angled_plates(double px, double py,
-                                                       const Turn& t1, const Turn& t2,
-                                                       double voltageDrop, double epsilonEff) {
-    // Local gap model: use SDF from each turn surface, sum as local gap
-    double d1 = sdf_turn(px, py, t1);
-    double d2 = sdf_turn(px, py, t2);
-    double localGap = d1 + d2;
-    if (localGap < 1e-15) localGap = 1e-15;
-
-    double E = voltageDrop / localGap;
-    double energy = 0.5 * epsilonEff * E * E;
-    // Prevent infinity/NaN
-    if (!std::isfinite(energy) || energy < 0) return 0;
-    if (energy > 1e300) return 1e300;
-    return energy;
-}
-
-double PainterInterface::energy_density_round_rect(double px, double py,
-                                                     const Turn& roundTurn, const Turn& rectTurn,
-                                                     double voltageDrop, double epsilonEff) {
-    double dRound = sdf_turn(px, py, roundTurn);
-    double dRect  = sdf_turn(px, py, rectTurn);
-    double localGap = dRound + dRect;
-    if (localGap < 1e-15) localGap = 1e-15;
-
-    double totalDist = dRound + dRect;
-    double blendRect = (totalDist > 1e-15) ? dRound / totalDist : 0.5;
-
-    double E_plate = voltageDrop / localGap;
-    double u_plate = 0.5 * epsilonEff * E_plate * E_plate;
-
-    // Bipolar correction near the round conductor
-    double bipolarBoost = 1.0;
-    if (roundTurn.get_dimensions() && !roundTurn.get_dimensions().value().empty()) {
-        double r = roundTurn.get_dimensions().value()[0] / 2.0;
-        if (r > 1e-15 && dRound < r && dRound > 0) {
-            bipolarBoost = localGap / std::max(1e-15, localGap - 0.3 * dRound * dRound / r);
-            bipolarBoost = std::max(1.0, std::min(bipolarBoost, 3.0));
-        }
-    }
-
-    double energy = u_plate * (blendRect + (1.0 - blendRect) * bipolarBoost);
-    // Prevent infinity/NaN
-    if (!std::isfinite(energy) || energy < 0) return 0;
-    if (energy > 1e300) return 1e300;
-    return energy;
-}
-
-double PainterInterface::compute_energy_density_at_pixel(double px, double py,
-                                                          const Turn& t1, const Turn& t2,
-                                                          double voltageDrop, double epsilonEff) {
-    if (!t1.get_cross_sectional_shape() || !t2.get_cross_sectional_shape()) {
-        return 0.0;
-    }
-    auto shape1 = t1.get_cross_sectional_shape().value();
-    auto shape2 = t2.get_cross_sectional_shape().value();
-    bool round1 = (shape1 == TurnCrossSectionalShape::ROUND);
-    bool round2 = (shape2 == TurnCrossSectionalShape::ROUND);
-
-    if (round1 && round2) {
-        return energy_density_bipolar(px, py, t1, t2, voltageDrop, epsilonEff);
-    }
-    else if (!round1 && !round2) {
-        double angle1 = 0.0, angle2 = 0.0;
-        if (t1.get_rotation()) {
-            angle1 = t1.get_rotation().value();
-        }
-        if (t2.get_rotation()) {
-            angle2 = t2.get_rotation().value();
-        }
-        double angleDiff = fabs(angle1 - angle2);
-        while (angleDiff >= 180.0) angleDiff -= 180.0;
-
-        if (angleDiff < 1.0) {
-            return energy_density_parallel_plate(px, py, t1, t2, voltageDrop, epsilonEff);
-        } else {
-            return energy_density_angled_plates(px, py, t1, t2, voltageDrop, epsilonEff);
-        }
-    }
-    else {
-        const Turn& rTurn = round1 ? t1 : t2;
-        const Turn& xTurn = round1 ? t2 : t1;
-        return energy_density_round_rect(px, py, rTurn, xTurn, voltageDrop, epsilonEff);
-    }
-}
-
-
-// ==================== SDF-based Electric Field Calculation ====================
-
-Field PainterInterface::calculate_electric_field_sdf(OperatingPoint operatingPoint,
-                                                      Magnetic magnetic,
-                                                      size_t harmonicIndex) {
-    // Ensure core is processed
+PainterInterface::ElectricEnergyPainting PainterInterface::calculate_electric_energy_painting(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex) {
     if (!magnetic.get_core().get_processed_description()) {
         magnetic.get_mutable_core().process_data();
     }
-
-    // --- Voltage preprocessing (same as legacy) ---
-    if (!operatingPoint.get_excitations_per_winding()[0].get_voltage()) {
-        throw InvalidInputException(ErrorCode::MISSING_DATA, "voltage is missing in excitation");
-    }
-    for (size_t windingIndex = 0; windingIndex < magnetic.get_coil().get_functional_description().size(); ++windingIndex) {
-        if (!operatingPoint.get_excitations_per_winding()[windingIndex].get_voltage()->get_harmonics()) {
-            auto voltage = operatingPoint.get_excitations_per_winding()[windingIndex].get_voltage().value();
-            if (!voltage.get_waveform()) {
-                throw InvalidInputException(ErrorCode::MISSING_DATA, "Waveform is missing from voltage");
-            }
-            auto sampledWaveform = Inputs::calculate_sampled_waveform(voltage.get_waveform().value(),
-                operatingPoint.get_excitations_per_winding()[windingIndex].get_frequency());
-            auto harmonics_data = Inputs::calculate_harmonics_data(voltage.get_waveform().value(), sampledWaveform,
-                operatingPoint.get_excitations_per_winding()[windingIndex].get_frequency());
-            voltage.set_harmonics(harmonics_data);
-            if (!voltage.get_processed()) {
-                auto processed = Inputs::calculate_processed_data(harmonics_data, sampledWaveform, true);
-                voltage.set_processed(processed);
-            } else if (!voltage.get_processed()->get_rms()) {
-                auto processed = Inputs::calculate_processed_data(harmonics_data, sampledWaveform, true);
-                voltage.set_processed(processed);
-            }
-            operatingPoint.get_mutable_excitations_per_winding()[windingIndex].set_voltage(voltage);
-        }
-    }
-
-    bool includeFringing = settings.get_painter_include_fringing();
-    int mirroringDimension = settings.get_painter_mirroring_dimension();
-
-    // Use same factor as LEGACY method for consistent mesh generation.
-    // RAII (ABT #113 sweep): previously saved/restored by hand at three of the
-    // four exits — the `!coil.get_turns_description()` early return leaked the
-    // 1.2 factor, and any exception leaked it too.
-    SettingsGuard<double> mesherFactorGuard(settings, &Settings::get_coil_mesher_inside_turns_factor, &Settings::set_coil_mesher_inside_turns_factor, 1.2);
-    // RAII: restore the global magnetic-field settings on scope exit. They used to be
-    // overwritten permanently, leaking the painter's fringing/mirroring choice into
-    // every later physics computation in the process.
-    SettingsGuard<bool> fringingGuard(settings, &Settings::get_magnetic_field_include_fringing, &Settings::set_magnetic_field_include_fringing, includeFringing);
-    SettingsGuard<int> mirroringGuard(settings, &Settings::get_magnetic_field_mirroring_dimension, &Settings::set_magnetic_field_mirroring_dimension, mirroringDimension);
-
-    auto strayCapacitanceModel = settings.get_stray_capacitance_model();
-    StrayCapacitance strayCapacitance(strayCapacitanceModel);
-
     auto coil = magnetic.get_coil();
-    auto wirePerWinding = coil.get_wires();
-
-    // Create the mesh field (same as legacy: reuse CoilMesher for grid points)
-    auto harmonics = operatingPoint.get_excitations_per_winding()[0].get_voltage()->get_harmonics().value();
-    auto frequency = harmonics.get_frequencies()[harmonicIndex];
-    size_t numberPointsX = settings.get_painter_number_points_x();
-    size_t numberPointsY = settings.get_painter_number_points_y();
-    Field inducedField = CoilMesher::generate_mesh_induced_grid(magnetic, frequency, numberPointsX, numberPointsY, false, false, true).first;
-
-    auto capacitanceOutput = strayCapacitance.calculate_capacitance(coil, operatingPoint);
-    auto voltageDropAmongTurnsOpt = capacitanceOutput.get_voltage_drop_among_turns();
-    if (!voltageDropAmongTurnsOpt) {
-        // Return the mesh field even without voltage data
-        return inducedField;
-    }
-    auto voltageDropAmongTurns = voltageDropAmongTurnsOpt.value();
-
     if (!coil.get_turns_description()) {
-        return inducedField;
+        throw CoilNotProcessedException("Electric energy painting: the coil has no turns description");
     }
     auto turns = coil.get_turns_description().value();
-
-    // Clear values to zero - we just want the mesh grid positions
-    for (size_t i = 0; i < inducedField.get_data().size(); ++i) {
-        inducedField.get_mutable_data()[i].set_value(0);
+    auto windings = coil.get_functional_description();
+    auto excitations = operatingPoint.get_excitations_per_winding();
+    if (excitations.size() < windings.size()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Electric energy painting: the operating point has " + std::to_string(excitations.size()) +
+                                    " excitations for a coil with " + std::to_string(windings.size()) + " windings");
     }
 
-    // --- Pre-compute turn pair data ---
-    struct TurnPairInfo {
-        size_t idx1, idx2;
-        double voltageDrop;
-    };
-    std::vector<TurnPairInfo> pairInfos;
-    std::set<std::pair<std::string, std::string>> processedPairs;
+    // The harmonic, from the first winding's voltage.
+    if (!excitations[0].get_voltage()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Electric energy painting: the first winding's excitation has no voltage");
+    }
+    auto firstVoltage = excitations[0].get_voltage().value();
+    Harmonics firstHarmonics;
+    if (firstVoltage.get_harmonics()) {
+        firstHarmonics = firstVoltage.get_harmonics().value();
+    }
+    else if (firstVoltage.get_waveform()) {
+        auto sampledWaveform = Inputs::calculate_sampled_waveform(firstVoltage.get_waveform().value(), excitations[0].get_frequency());
+        firstHarmonics = Inputs::calculate_harmonics_data(firstVoltage.get_waveform().value(), sampledWaveform, excitations[0].get_frequency());
+    }
+    else {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Electric energy painting: the first winding's voltage has neither waveform nor harmonics");
+    }
+    if (harmonicIndex >= firstHarmonics.get_frequencies().size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Electric energy painting: harmonic " + std::to_string(harmonicIndex) +
+                                    " requested, the voltage has " + std::to_string(firstHarmonics.get_frequencies().size()));
+    }
+    const double harmonicFrequency = firstHarmonics.get_frequencies()[harmonicIndex];
 
-    for (auto& [firstName, aux] : voltageDropAmongTurns) {
-        for (auto& [secondName, vDrop] : aux) {
-            auto key = std::make_pair(firstName, secondName);
-            auto revKey = std::make_pair(secondName, firstName);
-            if (processedPairs.contains(key) || processedPairs.contains(revKey)) continue;
-            processedPairs.insert(key);
-
-            size_t idx1 = SIZE_MAX, idx2 = SIZE_MAX;
-            for (size_t t = 0; t < turns.size(); ++t) {
-                if (turns[t].get_name() == firstName) idx1 = t;
-                if (turns[t].get_name() == secondName) idx2 = t;
-            }
-            if (idx1 == SIZE_MAX || idx2 == SIZE_MAX) continue;
-            pairInfos.push_back({idx1, idx2, fabs(vDrop)});
+    // Rms phasor of every winding's voltage at that harmonic.
+    std::vector<std::complex<double>> phasorPerWinding;
+    for (size_t windingIndex = 0; windingIndex < windings.size(); ++windingIndex) {
+        if (!excitations[windingIndex].get_voltage()) {
+            throw InvalidInputException(ErrorCode::MISSING_DATA, "Electric energy painting: winding " + windings[windingIndex].get_name() + " has no voltage");
+        }
+        auto voltage = excitations[windingIndex].get_voltage().value();
+        if (voltage.get_waveform()) {
+            phasorPerWinding.push_back(CoilMesher::calculate_harmonic_phasor(voltage.get_waveform().value(), excitations[windingIndex].get_frequency(), harmonicFrequency) / std::sqrt(2.0));
+        }
+        else if (windings.size() == 1 && voltage.get_harmonics()) {
+            // One winding: its phase is the reference, the amplitude is all that matters.
+            phasorPerWinding.push_back(std::complex<double>(firstHarmonics.get_amplitudes()[harmonicIndex] / std::sqrt(2.0), 0.0));
+        }
+        else {
+            throw InvalidInputException(ErrorCode::MISSING_DATA, "Electric energy painting: winding " + windings[windingIndex].get_name() +
+                                        " has no voltage waveform, and with more than one winding the relative phases are needed");
         }
     }
 
-    // Pre-compute bipolar params for round-round pairs (cache for performance)
-    std::map<std::pair<size_t, size_t>, StrayCapacitance::BipolarParams> bipolarCache;
-    for (auto& pInfo : pairInfos) {
-        auto shape1 = turns[pInfo.idx1].get_cross_sectional_shape();
-        auto shape2 = turns[pInfo.idx2].get_cross_sectional_shape();
-        if (shape1 && shape2 &&
-            shape1.value() == TurnCrossSectionalShape::ROUND &&
-            shape2.value() == TurnCrossSectionalShape::ROUND) {
-            bipolarCache[{pInfo.idx1, pInfo.idx2}] =
-                StrayCapacitance::compute_bipolar_params(turns[pInfo.idx1], turns[pInfo.idx2]);
+    // Each winding's linear divider: 1 at its start terminal, 0 at its end.
+    std::map<std::string, double> unitVoltagePerWinding;
+    for (auto& winding : windings) {
+        unitVoltagePerWinding[winding.get_name()] = 1.0;
+    }
+    auto dividerOutput = StrayCapacitance::calculate_voltages_per_turn(coil, unitVoltagePerWinding);
+    if (!dividerOutput.get_voltage_per_turn()) {
+        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Electric energy painting: no voltage per turn");
+    }
+    auto dividerPerTurn = dividerOutput.get_voltage_per_turn().value();
+    if (dividerPerTurn.size() != turns.size()) {
+        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Electric energy painting: voltage divider and turns differ in size");
+    }
+    std::vector<std::complex<double>> turnPotentials(turns.size());
+    for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
+        turnPotentials[turnIndex] = phasorPerWinding[coil.get_winding_index_by_name(turns[turnIndex].get_winding())] * dividerPerTurn[turnIndex];
+    }
+
+    // The core node: held by its electrical reference, or floating.
+    std::optional<std::complex<double>> fixedCorePotential;
+    auto coreElectricalReference = magnetic.get_core_electrical_reference();
+    auto unitCorePotential = StrayCapacitance::resolve_core_reference_potential(coil, coreElectricalReference, dividerOutput, unitVoltagePerWinding);
+    if (unitCorePotential) {
+        if (coreElectricalReference->get_type() == CoreElectricalReferenceType::TIED_TO_WINDING) {
+            fixedCorePotential = phasorPerWinding[coil.get_winding_index_by_name(coreElectricalReference->get_winding().value())] * unitCorePotential.value();
+        }
+        else {
+            fixedCorePotential = std::complex<double>(unitCorePotential.value(), 0.0);
         }
     }
 
-    // Vacuum permittivity as default effective permittivity
-    double epsilonEff = 8.854187817e-12;
+    StrayCapacitance strayCapacitance(settings.get_stray_capacitance_model());
+    ElectricEnergyPainting painting;
+    auto core = magnetic.get_core();
+    painting.elements = strayCapacitance.calculate_electric_energy_elements(coil, core, harmonicFrequency);
+    auto distribution = StrayCapacitance::calculate_electric_energy_per_element(painting.elements, coil, core, turnPotentials, fixedCorePotential);
+    painting.gapEnergy = distribution.gapEnergy;
+    painting.totalEnergy = distribution.gapEnergy;
 
-    // If no pairs found, return the empty field
-    if (pairInfos.empty()) {
-        return inducedField;
+    // The painter's pixel tiling, exactly: the cells paint_electric_field draws.
+    auto [cellWidth, cellHeight] = Painter::get_pixel_dimensions(magnetic);
+    if (!(cellWidth > 0) || !(cellHeight > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Electric energy painting: the core gives no pixel dimensions");
     }
+    painting.cellWidth = cellWidth;
+    painting.cellHeight = cellHeight;
+    const size_t numberPointsX = settings.get_painter_number_points_x();
+    const size_t numberPointsY = settings.get_painter_number_points_y();
+    double originX;
+    const double originY = -0.5 * numberPointsY * cellHeight;
+    if (magnetic.get_core().get_shape_family() == CoreShapeFamily::T) {
+        originX = -0.5 * numberPointsX * cellWidth;
+    }
+    else {
+        originX = magnetic.get_mutable_core().get_columns()[0].get_width() / 2;
+    }
+    std::vector<double> energyPerLengthPerCell(numberPointsX * numberPointsY, 0.0);
+    const double samplingSpacing = std::min(cellWidth, cellHeight);
 
-    // --- Per-pixel: SDF Voronoi assignment + physics-based energy density ---
-    for (size_t pointIndex = 0; pointIndex < inducedField.get_data().size(); ++pointIndex) {
-        auto& datum = inducedField.get_data()[pointIndex];
-        auto& point = datum.get_point();
-        if (point.size() < 2) {
-            inducedField.get_mutable_data()[pointIndex].set_value(0);
+    for (size_t elementIndex = 0; elementIndex < painting.elements.size(); ++elementIndex) {
+        const auto& element = painting.elements[elementIndex];
+        if (!(element.length > 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "Electric energy painting: element " + std::to_string(elementIndex) + " has no length");
+        }
+        double energy = distribution.energyPerElement[elementIndex];
+        painting.totalEnergy += energy;
+        double energyPerLength = energy / element.length;
+        painting.energyPerLength.push_back(energyPerLength);
+        if (!element.inPlane) {
+            painting.outOfPlaneEnergyPerLength += energyPerLength;
             continue;
         }
-        double px = point[0];
-        double py = point[1];
-
-        // Find 2 nearest turns by SDF
-        double dBest = DBL_MAX, dSecond = DBL_MAX;
-        size_t iBest = 0, iSecond = 0;
-
-        for (size_t t = 0; t < turns.size(); ++t) {
-            double d = sdf_turn(px, py, turns[t]);
-            if (d < dBest) {
-                dSecond = dBest;  iSecond = iBest;
-                dBest = d;        iBest = t;
-            } else if (d < dSecond) {
-                dSecond = d;  iSecond = t;
-            }
-        }
-
-        // Only compute for pixels outside all turns
-        if (dBest <= 0 || turns.size() < 2) {
-            inducedField.get_mutable_data()[pointIndex].set_value(0);
+        painting.totalEnergyPerLengthInPlane += energyPerLength;
+        if (energyPerLength == 0) {
             continue;
         }
-
-        // Find the voltage drop for this (iBest, iSecond) pair
-        double voltageDrop = 0;
-        bool found = false;
-        for (auto& pInfo : pairInfos) {
-            if ((pInfo.idx1 == iBest && pInfo.idx2 == iSecond) ||
-                (pInfo.idx1 == iSecond && pInfo.idx2 == iBest)) {
-                voltageDrop = pInfo.voltageDrop;
-                found = true;
-                break;
-            }
-        }
-
-        if (!found || voltageDrop < 1e-15) {
-            inducedField.get_mutable_data()[pointIndex].set_value(0);
-            continue;
-        }
-
-        // Compute physics-accurate energy density based on shape combination
-        double u = compute_energy_density_at_pixel(px, py,
-            turns[iBest], turns[iSecond], voltageDrop, epsilonEff);
-
-        // Ensure value is valid before setting
-        if (!std::isfinite(u) || u < 0) u = 0;
-        if (u > 1e300) u = 1e300;
-
-        inducedField.get_mutable_data()[pointIndex].set_value(u);
+        painting.unplacedEnergyPerLength += StrayCapacitance::sample_electric_energy_element(element, energyPerLength, samplingSpacing,
+            [&](double x, double y, double sampleEnergyPerLength) {
+                double column = std::floor((x - originX) / cellWidth);
+                double row = std::floor((y - originY) / cellHeight);
+                if (column < 0 || row < 0 || column >= static_cast<double>(numberPointsX) || row >= static_cast<double>(numberPointsY)) {
+                    painting.outsideGridEnergyPerLength += sampleEnergyPerLength;
+                    return;
+                }
+                energyPerLengthPerCell[static_cast<size_t>(row) * numberPointsX + static_cast<size_t>(column)] += sampleEnergyPerLength;
+                painting.placedEnergyPerLength += sampleEnergyPerLength;
+            });
     }
 
-    return inducedField;
+    std::vector<FieldPoint> data;
+    data.reserve(energyPerLengthPerCell.size());
+    const double cellArea = cellWidth * cellHeight;
+    for (size_t row = 0; row < numberPointsY; ++row) {
+        for (size_t column = 0; column < numberPointsX; ++column) {
+            FieldPoint fieldPoint;
+            fieldPoint.set_point({originX + (column + 0.5) * cellWidth, originY + (row + 0.5) * cellHeight});
+            fieldPoint.set_value(energyPerLengthPerCell[row * numberPointsX + column] / cellArea);
+            data.push_back(fieldPoint);
+        }
+    }
+    painting.field.set_data(data);
+    painting.field.set_frequency(harmonicFrequency);
+    return painting;
 }
 
 Field PainterInterface::calculate_electric_field(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex, ElectricFieldVisualizationModel model) {
     if (model == ElectricFieldVisualizationModel::SDF_PHYSICS) {
-        return calculate_electric_field_sdf(operatingPoint, magnetic, harmonicIndex);
+        return calculate_electric_energy_painting(operatingPoint, magnetic, harmonicIndex).field;
     }
     // === LEGACY implementation below ===
     if (!operatingPoint.get_excitations_per_winding()[0].get_voltage()) {

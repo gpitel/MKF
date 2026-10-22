@@ -9,6 +9,7 @@
 
 #include "processors/WaveformProcessor.h"
 #include "processors/Inputs.h"
+#include "physical_models/MagneticField.h"
 #include "json.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -383,14 +384,140 @@ TEST_CASE("Test_Sample_And_Compress_Sinusoidal", "[processor][waveform-processor
 
     REQUIRE(!WaveformProcessor::is_waveform_sampled(waveform));
 
-    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform);
+    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform, 1.0 / (2 * M_PI));  // open axis of 69 samples over a 2 pi s period
     REQUIRE(WaveformProcessor::is_waveform_sampled(sampledWaveform));
     REQUIRE(128UL == sampledWaveform.get_data().size());
 
     auto compressedWaveform = WaveformProcessor::compress_waveform(sampledWaveform);
-    REQUIRE(115UL == compressedWaveform.get_data().size());
+    // ABT #1467: 115 -> 110. The open 69-sample axis is now closed periodically and the sine sampled
+    // over the full 2 pi period, instead of being resampled onto (127/128) of it; the exact periodic
+    // sine compresses to 110 points.
+    REQUIRE(110UL == compressedWaveform.get_data().size());
     auto guessedLabel = WaveformProcessor::try_guess_waveform_label(compressedWaveform);
     REQUIRE(magic_enum::enum_name(WaveformLabel::SINUSOIDAL) == magic_enum::enum_name(guessedLabel));
+}
+
+TEST_CASE("Test_Compress_A_Closed_Axis_Of_128_Points_Spans_One_Period", "[processor][waveform-processor][abt-1467]") {
+    // ABT #1467: a waveform given on 128 points over a CLOSED axis ([0, T], step T / 127) has the
+    // size of a sampled one, so is_waveform_sampled says yes and the flux path compressed it.
+    // compress_waveform assumed the sampled OPEN axis and appended the first point at t_127 + dt:
+    // the flux then spanned 128 T / 127 and the core-loss split refused it ("time axis spans T + dt").
+    // With the excitation frequency the closed axis is told apart and not closed twice.
+    const double frequency = 100000;
+    const double period = 1 / frequency;
+    const size_t numberPoints = 128;
+    auto sineOn = [&](double step) {
+        std::vector<double> time, data;
+        for (size_t i = 0; i < numberPoints; ++i) {
+            time.push_back(i * step);
+            data.push_back(sin(2 * std::numbers::pi * i * step / period));
+        }
+        Waveform waveform;
+        waveform.set_time(time);
+        waveform.set_data(data);
+        return waveform;
+    };
+    auto closed = sineOn(period / (numberPoints - 1));
+    auto open = sineOn(period / numberPoints);
+    REQUIRE(WaveformProcessor::is_waveform_sampled(closed));
+    REQUIRE(WaveformProcessor::is_waveform_sampled(open));
+
+    for (const auto& [name, waveform] : {std::pair{"closed", closed}, std::pair{"open", open}}) {
+        INFO(name << " axis");
+        auto compressed = WaveformProcessor::compress_waveform(waveform, frequency);
+        const auto time = compressed.get_time().value();
+        CHECK(time.front() == 0);
+        CHECK_THAT(time.back(), Catch::Matchers::WithinRel(period, 1e-12));
+        CHECK_THAT(compressed.get_data().back(), Catch::Matchers::WithinAbs(compressed.get_data().front(), 1e-12));
+
+        // The flux of a magnetizing current on that axis spans the same period.
+        SignalDescriptor magnetizingCurrent;
+        magnetizingCurrent.set_waveform(waveform);
+        auto flux = MagneticField::calculate_magnetic_flux(magnetizingCurrent, 1e6, 10, frequency);
+        const auto fluxTime = flux.get_waveform()->get_time().value();
+        CHECK_THAT(fluxTime.back() - fluxTime.front(), Catch::Matchers::WithinRel(period, 1e-12));
+        CHECK_NOTHROW(WaveformProcessor::check_time_axis_spans_one_period(fluxTime, frequency));
+    }
+}
+
+namespace {
+// 128 points of amplitude * sin(2 pi t / period) on a uniform axis of step period / stepsPerPeriod.
+Waveform sine_on_128_points(double period, double amplitude, double stepsPerPeriod) {
+    std::vector<double> time, data;
+    for (size_t i = 0; i < 128; ++i) {
+        const double t = period * static_cast<double>(i) / stepsPerPeriod;
+        time.push_back(t);
+        data.push_back(amplitude * sin(2 * std::numbers::pi * t / period));
+    }
+    Waveform waveform;
+    waveform.set_time(time);
+    waveform.set_data(data);
+    return waveform;
+}
+} // namespace
+
+TEST_CASE("Test_Harmonics_Of_A_Closed_128_Point_Axis_Are_Its_Knots_Series", "[processor][waveform-processor][abt-1879]") {
+    // ABT #1879: 128 points on a CLOSED uniform axis ([0, T], step T / 127, last point = first),
+    // as web-stored designs carry them, have the size of a sampled waveform. calculate_harmonics_data
+    // read them as 128 OPEN samples, period 128 T / 127, so a pure sine leaked into every harmonic
+    // (a1 0.4 % low, a2 about 1 %, a tail down to a64) and CoilMesher refused the design: the
+    // waveform has no content, so no phase, at harmonics its MAS list claimed. A closed axis is a
+    // knot list: its harmonics are the exact series of the 127-segment linear interpolant, whose
+    // only content up to N/2 is the fundamental, amplitude * sinc^2(pi / 127).
+    const double frequency = 200000;
+    const double period = 1 / frequency;
+    const double amplitude = 0.2256;
+    auto waveform = sine_on_128_points(period, amplitude, 127);
+    REQUIRE(WaveformProcessor::is_waveform_sampled(waveform));
+    REQUIRE_FALSE(WaveformProcessor::check_time_axis_spans_one_period(waveform.get_time().value(), frequency));
+
+    auto harmonics = WaveformProcessor::calculate_harmonics_data(waveform, frequency, false);
+    const auto& amplitudes = harmonics.get_amplitudes();
+    REQUIRE(amplitudes.size() == 65);
+    for (size_t k = 0; k < amplitudes.size(); ++k) {
+        CHECK(harmonics.get_frequencies()[k] == frequency * static_cast<double>(k));
+    }
+    const double x = std::numbers::pi / 127;
+    const double interpolantFundamental = amplitude * (sin(x) / x) * (sin(x) / x);
+    CHECK_THAT(amplitudes[1], Catch::Matchers::WithinRel(interpolantFundamental, 1e-9));
+    // The interpolant's fundamental is the sine's to sinc^2(pi / 127) = 1 - 2.0e-4.
+    CHECK_THAT(amplitudes[1], Catch::Matchers::WithinRel(amplitude, 2.1e-4));
+    CHECK(amplitudes[0] < 1e-12 * amplitude);
+    for (size_t k = 2; k < amplitudes.size(); ++k) {
+        INFO("harmonic " << k);
+        CHECK(amplitudes[k] < 1e-12 * amplitude);
+    }
+}
+
+TEST_CASE("Test_Harmonics_Of_An_Open_128_Point_Axis_Are_Its_Samples_Series", "[processor][waveform-processor][abt-1879]") {
+    // ABT #1879: the open axis ([0, T), step T / 128, MKF's own sampled convention) stays 128
+    // samples. Their interpolant's series is the DFT times sinc^2(pi k / 128): a pure sine gives
+    // amplitude * sinc^2(pi / 128) at the fundamental and nothing else up to N/2. Read as knots
+    // (period = span = 127 T / 128), the same points would leak into every harmonic.
+    const double frequency = 200000;
+    const double period = 1 / frequency;
+    const double amplitude = 0.2256;
+    auto waveform = sine_on_128_points(period, amplitude, 128);
+    REQUIRE(WaveformProcessor::is_waveform_sampled(waveform));
+    REQUIRE(WaveformProcessor::check_time_axis_spans_one_period(waveform.get_time().value(), frequency));
+
+    auto harmonics = WaveformProcessor::calculate_harmonics_data(waveform, frequency, false);
+    const auto& amplitudes = harmonics.get_amplitudes();
+    REQUIRE(amplitudes.size() == 65);
+    const double x = std::numbers::pi / 128;
+    CHECK_THAT(amplitudes[1], Catch::Matchers::WithinRel(amplitude * (sin(x) / x) * (sin(x) / x), 1e-12));
+    for (size_t k = 2; k < amplitudes.size(); ++k) {
+        INFO("harmonic " << k);
+        CHECK(amplitudes[k] < 1e-12 * amplitude);
+    }
+}
+
+TEST_CASE("Test_Harmonics_Of_A_128_Point_Uniform_Axis_Spanning_No_Period_Throw", "[processor][waveform-processor][abt-1879]") {
+    // ABT #1879: open and closed are told apart against the excitation period; 128 uniform points
+    // spanning neither T - dt nor T (here half the period) are refused, not read as either.
+    const double frequency = 200000;
+    auto waveform = sine_on_128_points(0.5 / frequency, 1, 127);
+    CHECK_THROWS(WaveformProcessor::calculate_harmonics_data(waveform, frequency, false));
 }
 
 TEST_CASE("Test_Sample_And_Compress_Rectangular", "[processor][waveform-processor][smoke-test]") {
@@ -400,7 +527,7 @@ TEST_CASE("Test_Sample_And_Compress_Rectangular", "[processor][waveform-processo
 
     REQUIRE(!WaveformProcessor::is_waveform_sampled(waveform));
 
-    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform);
+    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform, 100000);
     REQUIRE(WaveformProcessor::is_waveform_sampled(sampledWaveform));
     REQUIRE(128UL == sampledWaveform.get_data().size());
 
@@ -417,7 +544,7 @@ TEST_CASE("Test_Sample_And_Compress_Triangular", "[processor][waveform-processor
 
     REQUIRE(!WaveformProcessor::is_waveform_sampled(waveform));
 
-    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform);
+    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform, 100000);
     REQUIRE(WaveformProcessor::is_waveform_sampled(sampledWaveform));
     REQUIRE(128UL == sampledWaveform.get_data().size());
 
@@ -434,7 +561,7 @@ TEST_CASE("Test_Sample_And_Compress_Unipolar_Triangular", "[processor][waveform-
 
     REQUIRE(!WaveformProcessor::is_waveform_sampled(waveform));
 
-    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform);
+    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform, 100000);
     REQUIRE(WaveformProcessor::is_waveform_sampled(sampledWaveform));
     REQUIRE(128UL == sampledWaveform.get_data().size());
 
@@ -451,7 +578,7 @@ TEST_CASE("Test_Sample_And_Compress_Unipolar_Rectangular", "[processor][waveform
 
     REQUIRE(!WaveformProcessor::is_waveform_sampled(waveform));
 
-    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform);
+    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform, 100000);
     REQUIRE(WaveformProcessor::is_waveform_sampled(sampledWaveform));
     REQUIRE(128UL == sampledWaveform.get_data().size());
 
@@ -468,7 +595,7 @@ TEST_CASE("Test_Sample_And_Compress_Bipolar_Rectangular", "[processor][waveform-
 
     REQUIRE(!WaveformProcessor::is_waveform_sampled(waveform));
 
-    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform);
+    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform, 100000);
     REQUIRE(WaveformProcessor::is_waveform_sampled(sampledWaveform));
     REQUIRE(128UL == sampledWaveform.get_data().size());
 
@@ -485,7 +612,7 @@ TEST_CASE("Test_Sample_And_Compress_Flyback_Primary", "[processor][waveform-proc
 
     REQUIRE(!WaveformProcessor::is_waveform_sampled(waveform));
 
-    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform);
+    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform, 100000);
     REQUIRE(WaveformProcessor::is_waveform_sampled(sampledWaveform));
     REQUIRE(128UL == sampledWaveform.get_data().size());
 
@@ -502,7 +629,7 @@ TEST_CASE("Test_Sample_And_Compress_Flyback_Secondary", "[processor][waveform-pr
 
     REQUIRE(!WaveformProcessor::is_waveform_sampled(waveform));
 
-    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform);
+    auto sampledWaveform = WaveformProcessor::calculate_sampled_waveform(waveform, 100000);
     REQUIRE(WaveformProcessor::is_waveform_sampled(sampledWaveform));
     REQUIRE(128UL == sampledWaveform.get_data().size());
 
@@ -1121,5 +1248,220 @@ TEST_CASE("Test_Exact_Harmonics_Knot_Invariance_And_Errors", "[processor][wavefo
         for (size_t k = 1; k <= 64; ++k) {
             CHECK(harmonics.get_amplitudes()[k] == 2 * std::abs(exact[k]));
         }
+    }
+}
+
+TEST_CASE("Test_Rectangle_Label_Volt_Second_Balance_Is_Relative_To_Amplitude", "[processor][waveform-processor][smoke-test]") {
+    // ABT #1641: the RECTANGULAR vs UNIPOLAR_RECTANGULAR decision compared a volt-second sum
+    // (V*s) against an absolute tolerance equal to the period (s). Sampled at 128 points, a
+    // balanced rectangle loses one sample of its high plateau (the sampler takes the pre-edge
+    // value at t = 0), an imbalance of peak-to-peak * period / 128: at -250/+750 V and
+    // 100 kHz that is 7.8e-5 V*s against a "tolerance" of 1e-5, and it was labelled
+    // UNIPOLAR_RECTANGULAR with its minimum (-250 V) as offset. A genuinely unipolar 0/1 V
+    // one, 2.5e-6 V*s, passed as balanced.
+    const double frequency = 100000;
+    const double period = 1 / frequency;
+    const double dutyCycle = 0.25;
+    for (double amplitude : {1e-3, 1.0, 1000.0, 1e6}) {
+        INFO("peak-to-peak " << amplitude);
+        Waveform balanced;
+        balanced.set_data({-0.25 * amplitude, 0.75 * amplitude, 0.75 * amplitude, -0.25 * amplitude, -0.25 * amplitude});
+        balanced.set_time(std::vector<double>{0, 0, dutyCycle * period, dutyCycle * period, period});
+        auto sampledBalanced = WaveformProcessor::calculate_sampled_waveform(balanced, frequency);
+        REQUIRE(WaveformProcessor::is_waveform_sampled(sampledBalanced));
+        CHECK(WaveformProcessor::try_guess_waveform_label(balanced) == WaveformLabel::RECTANGULAR);
+        CHECK(WaveformProcessor::try_guess_waveform_label(sampledBalanced) == WaveformLabel::RECTANGULAR);
+        auto processedBalanced = WaveformProcessor::calculate_processed_data(sampledBalanced, frequency);
+        CHECK(processedBalanced.get_label() == WaveformLabel::RECTANGULAR);
+        CHECK(processedBalanced.get_offset() == 0);
+
+        Waveform unipolar;
+        unipolar.set_data({0, amplitude, amplitude, 0, 0});
+        unipolar.set_time(std::vector<double>{0, 0, dutyCycle * period, dutyCycle * period, period});
+        auto sampledUnipolar = WaveformProcessor::calculate_sampled_waveform(unipolar, frequency);
+        CHECK(WaveformProcessor::try_guess_waveform_label(unipolar) == WaveformLabel::UNIPOLAR_RECTANGULAR);
+        CHECK(WaveformProcessor::try_guess_waveform_label(sampledUnipolar) == WaveformLabel::UNIPOLAR_RECTANGULAR);
+    }
+}
+
+
+// ABT #1878. A stored design's waveform carried "ancillaryLabel": "Triangular", the
+// pre-1.0 spelling. MAS.hpp's generated from_json(WaveformLabel) ignores a string that is
+// not in the enum and leaves its first value, bipolarRectangular, so a 3-vertex triangle
+// reached calculate_processed_data labelled as a 10-vertex bipolar rectangle. Its duty was
+// read as (time[3] - time[2]) / T, past the end of the vector: -1 (or 6.4e11), which the
+// schema refuses, with offset 0 for a 20 A dc current. A waveform that cannot be the shape
+// its label names must throw, not be read. These are the web's reported shapes, rebuilt
+// synthetically.
+namespace {
+Waveform abt1878_waveform(std::vector<double> data, std::vector<double> time, std::optional<WaveformLabel> label) {
+    Waveform waveform;
+    waveform.set_data(data);
+    waveform.set_time(time);
+    if (label) {
+        waveform.set_ancillary_label(label.value());
+    }
+    return waveform;
+}
+
+struct Abt1878Case {
+    std::string name;
+    Waveform waveform;  // unlabelled
+    double frequency;
+    double offset;      // the dc level the processed data must carry once the label is right
+    double dutyCycle;   // trough-to-peak fraction of the period, MKF's triangle duty
+};
+
+std::vector<Abt1878Case> abt1878_cases() {
+    std::vector<Abt1878Case> cases;
+    // Inductor current, 20 A dc / 40 A peak, 50 kHz, as three vertices.
+    cases.push_back({"dc-biased triangle 0/40/0 A", abt1878_waveform({0, 40, 0}, {0, 1e-5, 2e-5}, std::nullopt), 50000, 20, 0.5});
+    // Bipolar dc-biased triangle -3/27/-3 A at 40 kHz.
+    cases.push_back({"dc-biased triangle -3/27/-3 A", abt1878_waveform({-3, 27, -3}, {0, 1.25e-5, 2.5e-5}, std::nullopt), 40000, 12, 0.5});
+    // Flyback magnetizing current, 0 to 0.92 A at 100 kHz, stored as 128 samples. Duty 0.3,
+    // so the guard does not rely on a symmetric triangle.
+    auto magnetizing = WaveformProcessor::create_waveform(WaveformLabel::TRIANGULAR, 0.92, 100000, 0.3, 0.46);
+    auto sampled = WaveformProcessor::calculate_sampled_waveform(magnetizing, 100000);
+    sampled.set_ancillary_label(std::nullopt);
+    cases.push_back({"128-sample magnetizing current 0/0.92 A", sampled, 100000, 0.46, 0.3});
+    return cases;
+}
+}  // namespace
+
+TEST_CASE("Test_Triangle_Labelled_Bipolar_Rectangular_Throws_Instead_Of_A_Negative_Duty", "[processor][waveform-processor][abt-1878]") {
+    for (auto& testCase : abt1878_cases()) {
+        INFO(testCase.name);
+        auto waveform = testCase.waveform;
+        waveform.set_ancillary_label(WaveformLabel::BIPOLAR_RECTANGULAR);
+        auto harmonics = OpenMagnetics::Inputs::calculate_harmonics_data(testCase.waveform, testCase.frequency);
+        auto compressed = WaveformProcessor::compress_waveform(WaveformProcessor::calculate_sampled_waveform(waveform, testCase.frequency));
+        if (WaveformProcessor::is_waveform_sampled(testCase.waveform)) {
+            // Alf approved 2026-10-16, ABT #1878; detection of a mislabelled sample is ABT #1893.
+            // A sample is not held to its label's layout, so this only asserts that the label's
+            // reads stay in bounds: no throw from an out-of-bounds read, and a finite duty.
+            ProcessedWaveform processed;
+            REQUIRE_NOTHROW(processed = OpenMagnetics::Inputs::calculate_processed_data(harmonics, waveform, true));
+            REQUIRE(processed.get_duty_cycle());
+            CHECK(std::isfinite(processed.get_duty_cycle().value()));
+            REQUIRE_NOTHROW(processed = OpenMagnetics::Inputs::calculate_processed_data(waveform, testCase.frequency));
+            REQUIRE(processed.get_duty_cycle());
+            CHECK(std::isfinite(processed.get_duty_cycle().value()));
+            double dutyCycle = 0;
+            REQUIRE_NOTHROW(dutyCycle = WaveformProcessor::try_guess_duty_cycle(compressed, WaveformLabel::BIPOLAR_RECTANGULAR, testCase.frequency));
+            CHECK(std::isfinite(dutyCycle));
+            continue;
+        }
+        // What the WASM calculate_processed binding calls.
+        CHECK_THROWS_AS(OpenMagnetics::Inputs::calculate_processed_data(harmonics, waveform, true), std::invalid_argument);
+        CHECK_THROWS_AS(OpenMagnetics::Inputs::calculate_processed_data(waveform, testCase.frequency), std::invalid_argument);
+        CHECK_THROWS_AS(WaveformProcessor::try_guess_duty_cycle(compressed, WaveformLabel::BIPOLAR_RECTANGULAR, testCase.frequency), std::invalid_argument);
+    }
+}
+
+TEST_CASE("Test_Pre_1_0_Triangular_Label_Throws_Unmigrated_And_Gives_The_Triangle_Duty_Migrated", "[processor][waveform-processor][abt-1878]") {
+    for (auto& testCase : abt1878_cases()) {
+        INFO(testCase.name);
+        json waveformJson;
+        to_json(waveformJson, testCase.waveform);
+        waveformJson["ancillaryLabel"] = "Triangular";
+        auto harmonics = OpenMagnetics::Inputs::calculate_harmonics_data(testCase.waveform, testCase.frequency);
+
+        Waveform unmigrated;
+        from_json(waveformJson, unmigrated);
+        if (WaveformProcessor::is_waveform_sampled(testCase.waveform)) {
+            // Alf approved 2026-10-16, ABT #1878; detection of a mislabelled sample is ABT #1893.
+            // Only in bounds: no throw from an out-of-bounds read, and a finite duty.
+            ProcessedWaveform processed;
+            REQUIRE_NOTHROW(processed = OpenMagnetics::Inputs::calculate_processed_data(harmonics, unmigrated, true));
+            REQUIRE(processed.get_duty_cycle());
+            CHECK(std::isfinite(processed.get_duty_cycle().value()));
+        }
+        else {
+            CHECK_THROWS_AS(OpenMagnetics::Inputs::calculate_processed_data(harmonics, unmigrated, true), std::invalid_argument);
+        }
+
+        OpenMagnetics::compat::migrate_pre_1_0(waveformJson);
+        Waveform migrated;
+        from_json(waveformJson, migrated);
+        REQUIRE(migrated.get_ancillary_label() == WaveformLabel::TRIANGULAR);
+        for (const auto& waveform : {migrated, testCase.waveform}) {
+            auto processed = OpenMagnetics::Inputs::calculate_processed_data(harmonics, waveform, true);
+            CHECK(processed.get_label() == WaveformLabel::TRIANGULAR);
+            REQUIRE(processed.get_duty_cycle());
+            CHECK_THAT(processed.get_duty_cycle().value(), Catch::Matchers::WithinAbs(testCase.dutyCycle, 1.0 / 128));
+            CHECK_THAT(processed.get_offset(), Catch::Matchers::WithinRel(testCase.offset, 0.02));
+        }
+    }
+}
+
+// ABT #1878 (Alf, 2026-10-16: check before sampling). A label is checked on, and read off, the
+// waveform as given. A 0.5-duty bipolar rectangle with no dead time has the 10 vertices of its
+// label, and its 128-point sample compresses to fewer; the compressed copy is not held to the
+// layout. The second waveform is winding 1's voltage in the PQ 35/40 file (thermal_island_pq3540_*).
+TEST_CASE("Test_Bipolar_Rectangle_Without_Dead_Time_Is_Checked_As_Given_Not_As_Its_Compressed_Sample", "[processor][waveform-processor][abt-1878]") {
+    const double frequency = 200000;
+    const double period = 1 / frequency;
+    std::vector<std::pair<std::string, Waveform>> waveforms;
+    waveforms.push_back({"create_waveform bipolarRectangular D 0.5", WaveformProcessor::create_waveform(WaveformLabel::BIPOLAR_RECTANGULAR, 50, frequency, 0.5)});
+    waveforms.push_back({"PQ 35/40 winding 1 voltage", abt1878_waveform({0, 0, 25, 25, 0, 0, -25, -25, 0, 0},
+                                                                        {0, 0, 0, 0.5 * period, 0.5 * period, 0.5 * period, 0.5 * period, period, period, period},
+                                                                        WaveformLabel::BIPOLAR_RECTANGULAR)});
+    for (auto& [name, waveform] : waveforms) {
+        INFO(name);
+        REQUIRE(waveform.get_ancillary_label() == WaveformLabel::BIPOLAR_RECTANGULAR);
+        REQUIRE(waveform.get_data().size() == 10);
+        auto sampled = WaveformProcessor::calculate_sampled_waveform(waveform, frequency);
+        // The case this guards: the compressed sample has fewer vertices than the label's layout.
+        REQUIRE(WaveformProcessor::compress_waveform(sampled).get_data().size() < 10);
+        auto harmonics = OpenMagnetics::Inputs::calculate_harmonics_data(waveform, frequency);
+
+        std::vector<ProcessedWaveform> results;
+        ProcessedWaveform processed;
+        REQUIRE_NOTHROW(processed = OpenMagnetics::Inputs::calculate_processed_data(harmonics, waveform, true));
+        results.push_back(processed);
+        REQUIRE_NOTHROW(processed = OpenMagnetics::Inputs::calculate_processed_data(waveform, frequency));
+        results.push_back(processed);
+        // What process_operating_point calls: the signal and the sample of its waveform.
+        SignalDescriptor signal;
+        signal.set_waveform(waveform);
+        signal.set_harmonics(harmonics);
+        REQUIRE_NOTHROW(processed = OpenMagnetics::Inputs::calculate_processed_data(signal, sampled));
+        results.push_back(processed);
+        for (const auto& result : results) {
+            CHECK(result.get_label() == WaveformLabel::BIPOLAR_RECTANGULAR);
+            REQUIRE(result.get_duty_cycle());
+            CHECK_THAT(result.get_duty_cycle().value(), Catch::Matchers::WithinAbs(0.5, 1.0 / 128));
+            CHECK_THAT(result.get_offset(), Catch::Matchers::WithinAbs(0, 1e-9));
+        }
+    }
+}
+
+TEST_CASE("Test_Flyback_Waveform_On_A_Floor_Has_The_Peak_To_Peak_Of_Its_Ramp", "[processor][waveform-processor][abt-1843]") {
+    // ABT #1843: a flyback waveform's peak-to-peak is its ramp, max - offset (the synthesis reads
+    // max = peakToPeak + offset). It was max - min - offset, right only on a 0 floor: a flux density
+    // the DC point lifted onto a 0.27 T floor came out at -0.21 T, and iGSE raised it to a fractional
+    // power: NaN core losses.
+    const double floor = 0.3;
+    const double period = 5e-6;
+    const double dutyCycle = 0.4;
+    {
+        Waveform waveform;
+        waveform.set_time(std::vector<double>{0, 0, dutyCycle * period, dutyCycle * period, period});
+        waveform.set_data(std::vector<double>{floor, floor + 0.05, floor + 0.12, floor, floor});
+        auto processed = OpenMagnetics::Inputs::calculate_basic_processed_data(waveform);
+        REQUIRE(processed.get_label() == WaveformLabel::FLYBACK_PRIMARY);
+        CHECK_THAT(processed.get_offset(), Catch::Matchers::WithinAbs(floor + 0.05, 1e-12));
+        REQUIRE(processed.get_peak_to_peak());
+        CHECK_THAT(processed.get_peak_to_peak().value(), Catch::Matchers::WithinAbs(0.07, 1e-12));
+    }
+    {
+        Waveform waveform;
+        waveform.set_time(std::vector<double>{0, dutyCycle * period, dutyCycle * period, period, period});
+        waveform.set_data(std::vector<double>{floor, floor, floor + 0.12, floor + 0.05, floor});
+        auto processed = OpenMagnetics::Inputs::calculate_basic_processed_data(waveform);
+        REQUIRE(processed.get_label() == WaveformLabel::FLYBACK_SECONDARY);
+        CHECK_THAT(processed.get_offset(), Catch::Matchers::WithinAbs(floor + 0.05, 1e-12));
+        REQUIRE(processed.get_peak_to_peak());
+        CHECK_THAT(processed.get_peak_to_peak().value(), Catch::Matchers::WithinAbs(0.07, 1e-12));
     }
 }

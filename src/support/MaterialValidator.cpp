@@ -120,10 +120,20 @@ std::string point_label(double f, double b, double t) {
     return fmt(f / 1e3) + " kHz / " + fmt(b * 1e3) + " mT / " + fmt(t) + " C";
 }
 
+// The initial-permeability interpolators are keyed "name#<hash of the data>" (ABT #710): drop every
+// entry of this material, whatever data it was built from.
+template <typename Map>
+void erase_material_interpolators(Map& interps, const std::string& name) {
+    const std::string prefix = name + "#";
+    for (auto it = interps.lower_bound(prefix); it != interps.end() && it->first.compare(0, prefix.size(), prefix) == 0;) {
+        it = interps.erase(it);
+    }
+}
+
 void erase_name_keyed_caches(const std::string& name) {
-    initialPermeabilityTemperatureInterps.erase(name);
-    initialPermeabilityFrequencyInterps.erase(name);
-    initialPermeabilityMagneticFieldDcBiasInterps.erase(name);
+    erase_material_interpolators(initialPermeabilityTemperatureInterps, name);
+    erase_material_interpolators(initialPermeabilityFrequencyInterps, name);
+    erase_material_interpolators(initialPermeabilityMagneticFieldDcBiasInterps, name);
     lossFactorInterps.erase(name);
 }
 
@@ -157,6 +167,18 @@ class LossEvaluator {
     // material's data supports (CoreLosses::get_core_losses_model, without the by-name lookup).
     std::string select() {
         auto available = CoreLossesModel::get_methods(_material);
+        // An explicitly requested model (ABT #1497) is the only one MKF runs.
+        auto requested = settings.get_core_losses_requested_model();
+        if (requested) {
+            if (!CoreLosses::can_run_requested_model(requested.value(), available)) {
+                return "the explicitly requested loss model " + std::string(magic_enum::enum_name(requested.value())) +
+                       " cannot be evaluated with the record's loss data";
+            }
+            _model = requested.value();
+            _modelInstance = CoreLossesModel::factory(requested.value());
+            _modelName = std::string(magic_enum::enum_name(requested.value()));
+            return "";
+        }
         for (auto model : settings.get_core_losses_model_names()) {
             if (std::find(available.begin(), available.end(), model) != available.end()) {
                 _model = model;

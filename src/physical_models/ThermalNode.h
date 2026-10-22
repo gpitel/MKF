@@ -356,6 +356,9 @@ public:
     std::optional<size_t> turnDescriptionIndex;
     std::optional<size_t> coreSegmentIndex;
     std::optional<size_t> insulationLayerIndex;  // For INSULATION_LAYER nodes
+    // ABT #1735: concentric TURN / INSULATION_LAYER nodes of a coil with a winding on a lateral
+    // leg: the core column (processed index) the node is wound around. Unset otherwise.
+    std::optional<size_t> woundColumnIndex;
     
     // True if this is an inner half of a toroidal turn
     bool isInnerTurn = false;
@@ -687,6 +690,20 @@ struct ThermalResistanceElement {
     double length = 0.0;            // Conduction path length in m
     double thermalConductivity = 0.0; // Material thermal conductivity W/(m·K)
     SurfaceOrientation orientation = SurfaceOrientation::VERTICAL;
+
+    // ABT #1735: the boundary-layer length of THIS surface for the natural-convection law. When
+    // unset, recalculateConvectionResistances uses the component's height (ABT #461). A builder
+    // that knows its surfaces (the toroid: rim and bore vertical, annular faces horizontal) sets
+    // it together with the orientation.
+    std::optional<double> characteristicLength;
+
+    // ABT #1735: the fraction of THIS surface's radiation that leaves to the room, when the
+    // builder knows the surface looks into a cavity. Set for a toroid's bore wall, which sees
+    // the room only through the bore's two openings
+    // (ThermalResistance::calculateCylinderWallToOpeningsViewFactor) and otherwise sees itself;
+    // its radiation to ambient is built over area x this fraction. Unset: the surface faces the
+    // room openly, as every exterior surface of the other builders does.
+    std::optional<double> roomViewFactor;
 
     // ABT #838: the emissivity of THIS surface. Radiation used to read one config-wide value,
     // which is right for enamelled wire, insulation wrap and ferrite but not for bare copper.

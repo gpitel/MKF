@@ -5,8 +5,10 @@
 #include "support/Painter.h"
 #include "advisers/CoreAdviser.h"
 #include "advisers/CoilAdviser.h"
+#include "advisers/MagneticFilter.h"
 #include "processors/Inputs.h"
 #include "processors/MagneticSimulator.h"
+#include "processors/ResultsAnalyzer.h"
 #include "physical_models/StrayCapacitance.h"
 #include <magic_enum.hpp>
 #include "TestingUtils.h"
@@ -15,6 +17,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <chrono>
 #include <vector>
 
@@ -1294,7 +1297,15 @@ TEST_CASE("Test_CoilAdviser_Random_5", "[adviser][coil-adviser][bug]") {
     double magnetizingInductance = 0.002575;
     double temperature = 23;
     WaveformLabel waveShape = WaveformLabel::SINUSOIDAL;
-    double peakToPeak = 3;
+    // Fixture changed 2026-10-12 (ABT #838, Alf's decision): ripple 3 App -> 0.1 App. Through the
+    // 2.575 mH specification, 3 App at 592.5 kHz put 0.626 T peak-to-peak of volt-seconds on these 15
+    // turns (A_e 816 mm2): B_pk 0.313 T, below 3C91's 0.47 T at 23 C but above its 0.276 T at the
+    // 170.75 C the losses heat the core to, so every coil saturated at its operating temperature and
+    // the adviser returned none. With 0.1 App the core runs at B_pk 0.0104 T and 70 C (core 1.1 W,
+    // copper 13.2 W; B_sat 0.41 T there). 0.3 App still has no operating temperature (core 17.7 W and
+    // copper 59.8 W at 23 C, running away past 3C91's last mu_i(T) point at 220 C). The saturating
+    // 3 App fixture lives on in the guard below.
+    double peakToPeak = 0.1;
     double dutyCycle = 0.61;
     double dcCurrent = 5;
     settings.set_use_toroidal_cores(false);
@@ -1347,6 +1358,90 @@ TEST_CASE("Test_CoilAdviser_Random_5", "[adviser][coil-adviser][bug]") {
         painter.paint_coil_turns(masMagneticWithCoil.get_mutable_magnetic());
         painter.export_svg();
     }
+}
+
+// ABT #838 (Alf, 2026-10-12): a coil whose core saturates at the temperature its own losses heat
+// it to is REJECTED by the coil adviser's loss ranking, as the saturation filter rejects a
+// candidate (ABT #1740); the ranking used to rethrow it and abort the whole search. The fixture
+// is Test_CoilAdviser_Random_5's: 15 turns on an E 114/46/26 in 3C91 holding 2.575 mH against
+// 3 A peak to peak at 592.5 kHz, a 0.63 T flux swing (B_peak 0.31 T). That is below 3C91's
+// 0.47 T at the 23 C ambient, and above the 0.28 T left at the 171 C its losses drive it past.
+TEST_CASE("Coil adviser rejects a coil whose core saturates at its operating temperature", "[adviser][coil-adviser][abt-838]") {
+    settings.reset();
+    clear_databases();
+    std::vector<int64_t> numberTurns = {15, 36, 87, 60};
+    std::vector<double> turnsRatios = {15. / 36, 15. / 87, 15. / 60};
+    settings.set_use_toroidal_cores(false);
+    auto gapping = OpenMagneticsTesting::get_distributed_gap(0.003175, 1);
+    auto magnetic = OpenMagneticsTesting::get_quick_magnetic("E 114/46/26", gapping, numberTurns, 1, "3C91");
+    magnetic.get_mutable_coil().set_turns_alignment(magic_enum::enum_cast<CoilAlignment>(3).value());
+    magnetic.get_mutable_coil().set_winding_orientation(magic_enum::enum_cast<WindingOrientation>(0).value());
+    magnetic.get_mutable_coil().set_layers_orientation(magic_enum::enum_cast<WindingOrientation>(1).value());
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+        592535, 0.002575, 23, WaveformLabel::SINUSOIDAL, 3, 0.61, 5, turnsRatios);
+    inputs.get_mutable_design_requirements().set_isolation_sides(std::vector<IsolationSide>{
+        IsolationSide::DENARY, IsolationSide::NONARY, IsolationSide::QUATERNARY, IsolationSide::OCTONARY});
+    inputs.process();
+    OpenMagnetics::Mas masMagnetic;
+    masMagnetic.set_inputs(inputs);
+    masMagnetic.set_magnetic(magnetic);
+
+    // What the loss-temperature solve says about one of this core's wound coils. Asked for more
+    // coils than it can wind, the adviser returns them without ranking them, so this is a coil
+    // the ranking below meets.
+    auto unrankedCoils = CoilAdviser().get_advised_coil(masMagnetic, 100000);
+    REQUIRE(unrankedCoils.size() > 2);
+    // Since ABT #1855 (Alf approved this rewrite 2026-10-14) the loss-temperature solve no longer throws
+    // for a saturated core: the losses filter gives the solved outputs and refuses the coil, and the
+    // verdict is the saturation check analyze_results makes on them (the one the coil adviser uses).
+    auto core_saturates = [](OpenMagnetics::Mas& woundMas) {
+        std::vector<OpenMagnetics::Outputs> outputs;
+        std::pair<bool, double> verdict;
+        REQUIRE_NOTHROW(verdict = MagneticFilterLosses().evaluate_magnetic(&woundMas.get_mutable_magnetic(), &woundMas.get_mutable_inputs(), &outputs));
+        REQUIRE(outputs.size() == woundMas.get_inputs().get_operating_points().size());
+        bool saturates = false;
+        for (size_t index = 0; index < outputs.size(); ++index) {
+            REQUIRE(outputs[index].get_core_losses());
+            for (const auto& finding : ResultsAnalyzer::analyze_saturation(woundMas.get_magnetic(), woundMas.get_inputs().get_operating_points()[index],
+                                                                           outputs[index], index)) {
+                INFO(finding.message);
+                CHECK(finding.code == ResultFindingCode::CORE_SATURATES);
+                saturates = true;
+            }
+        }
+        if (saturates) {
+            // A saturating coil is refused by the filter.
+            CHECK_FALSE(verdict.first);
+        }
+        return saturates;
+    };
+    REQUIRE(core_saturates(unrankedCoils[0]));
+    {
+        // Its numbers: the core is solved at the temperature its losses heat it to, where its B peak is
+        // above the material's B_sat.
+        std::vector<OpenMagnetics::Outputs> outputs;
+        MagneticFilterLosses().evaluate_magnetic(&unrankedCoils[0].get_mutable_magnetic(), &unrankedCoils[0].get_mutable_inputs(), &outputs);
+        double coreTemperature = outputs[0].get_core_losses()->get_temperature();
+        double peak = ResultsAnalyzer::get_peak_flux_density(outputs[0].get_core_losses()->get_magnetic_flux_density().value());
+        auto verdict = ResultsAnalyzer::check_saturation(unrankedCoils[0].get_mutable_magnetic().get_mutable_core().resolve_material(), peak, coreTemperature);
+        INFO("core at " << coreTemperature << " C, B peak " << peak << " T, B_sat " << verdict.saturationFluxDensity << " T");
+        // Measured on this branch (2026-10-14): 0.3133 T at 220 C against B_sat 0.21 T there; the losses drive
+        // the core to the end of 3C91's data, where the loss solve holds it.
+        CHECK(verdict.saturates);
+        CHECK_THAT(peak, Catch::Matchers::WithinRel(0.3133, 0.02));
+        CHECK(coreTemperature > 200);
+        CHECK(std::isfinite(outputs[0].get_core_losses()->get_core_losses()));
+    }
+
+    // Ranking by losses: the adviser carries on past the saturating coils and returns none of them.
+    std::vector<OpenMagnetics::Mas> rankedCoils;
+    REQUIRE_NOTHROW(rankedCoils = CoilAdviser().get_advised_coil(masMagnetic, 2));
+    REQUIRE(rankedCoils.size() <= 2);
+    for (auto& rankedCoil : rankedCoils) {
+        INFO(rankedCoil.get_mutable_magnetic().get_reference());
+        CHECK_FALSE(core_saturates(rankedCoil));
+    }
+    settings.reset();
 }
 
 TEST_CASE("Test_CoilAdviser_Random_6", "[adviser][coil-adviser][bug]") {
@@ -1737,25 +1832,49 @@ TEST_CASE("Test_CoilAdviser_Random_11", "[adviser][coil-adviser][bug]") {
     masMagnetic.set_inputs(inputs);
     masMagnetic.set_magnetic(magnetic);
 
+    // Root cause (ABT #1855; Alf approved this rewrite 2026-10-14): these inputs cannot be wound.
+    // The magnetic as given (U 15/11/6, 3C91, 72 turns, one 1.424 mm gap) has L = 246.7 uH against
+    // the 86 uH required (2.9x), and the operating point is current-driven (19 A peak to peak), so
+    // B peak = 1.01 T already at the 23 C ambient, against 3C91's B_sat 0.473 T (0.37 T at 100 C,
+    // 0.21 T at the 220 C its losses drive it to). No turn count on this gap carries it either: the
+    // turns solve for 86 uH gives 43 turns at 0.60 T. Main passed this test only through the loss
+    // solve's thermal-runaway refusal (27,000 C), after which the coils came back unranked and
+    // invalid (current density > 12 A/mm2, 8-9 parallels against 5). Now the loss solve holds the
+    // core at the end of its data and the coil adviser rejects every wound coil because its core
+    // saturates: 0 coils is the right answer, and the rejection must say so.
+    {
+        auto operatingPoint = masMagnetic.get_inputs().get_operating_points()[0];
+        MagnetizingInductance magnetizingInductanceModel;
+        auto [magnetizingInductanceOutput, magneticFluxDensity] = magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(
+            masMagnetic.get_magnetic().get_core(), masMagnetic.get_magnetic().get_coil(), &operatingPoint);
+        double inductance = resolve_dimensional_values(magnetizingInductanceOutput.get_magnetizing_inductance());
+        double peak = ResultsAnalyzer::get_peak_flux_density(magneticFluxDensity);
+        auto verdict = ResultsAnalyzer::check_saturation(masMagnetic.get_mutable_magnetic().get_mutable_core().resolve_material(), peak, temperature);
+        INFO("L " << inductance << " H, B peak " << peak << " T, B_sat " << verdict.saturationFluxDensity << " T at " << temperature << " C");
+        CHECK_THAT(inductance, Catch::Matchers::WithinRel(246.7e-6, 0.02));
+        CHECK_THAT(peak, Catch::Matchers::WithinRel(1.01, 0.02));
+        CHECK_THAT(verdict.saturationFluxDensity, Catch::Matchers::WithinRel(0.473, 0.01));
+        CHECK(verdict.saturates);
+    }
+
+    Logger::getInstance().disableCollector();
+    Logger::getInstance().enableCollector(LogLevel::WARNING);
+    Logger::getInstance().drainCollected();
     CoilAdviser coilAdviser;
     auto masMagneticsWithCoil = coilAdviser.get_advised_coil(masMagnetic, 2);
-
-    // The adviser silently returning 0 candidates used to pass this test (the JsonLV failure mode).
-    REQUIRE(masMagneticsWithCoil.size() > 0);
-    if (masMagneticsWithCoil.size() > 0) {
-        auto masMagneticWithCoil = masMagneticsWithCoil[0];
-        // OpenMagneticsTesting::check_turns_description(masMagneticWithCoil.get_magnetic().get_coil());
-        auto outputFilePath = std::filesystem::path{ std::source_location::current().file_name() }.parent_path().append("..").append("output");
-        auto outFile = outputFilePath;
-        std::string filename = "Test_CoilAdviser" + std::to_string(OpenMagnetics::TestUtils::randomInt(0, RAND_MAX)) + ".svg";
-        outFile.append(filename);
-        Painter painter(outFile);
-
-        painter.paint_core(masMagneticWithCoil.get_mutable_magnetic());
-        painter.paint_bobbin(masMagneticWithCoil.get_mutable_magnetic());
-        painter.paint_coil_turns(masMagneticWithCoil.get_mutable_magnetic());
-        painter.export_svg();
+    size_t saturationRejections = 0;
+    for (const auto& record : Logger::getInstance().drainCollected()) {
+        if (record.message.find("rejected: its core saturates") != std::string::npos) {
+            INFO(record.message);
+            CHECK(record.message.find("B_sat") != std::string::npos);
+            saturationRejections += record.count;
+        }
     }
+    Logger::getInstance().disableCollector();
+
+    CHECK(saturationRejections > 0);
+    REQUIRE(masMagneticsWithCoil.size() == 0);
+    settings.reset();
 }
 
 TEST_CASE("Test_CoilAdviser_Random_12", "[adviser][coil-adviser][bug]") {
@@ -1981,7 +2100,7 @@ TEST_CASE("Test_CoilAdviser_Random_14", "[adviser][coil-adviser][bug]") {
 }
 
 TEST_CASE("Test_CoilAdviser_Random_15", "[adviser][coil-adviser][bug]") {
-    OpenMagnetics::Mas mas(json::parse(R"({"inputs":{"designRequirements":{"magnetizingInductance":{"nominal":0.0001},"minimumImpedance":[{"frequency":100000,"impedance":{"magnitude":1000}}],"name":"My Design Requirements","turnsRatios":[{"nominal":1}]},"operatingPoints":[{"name":"Operating Point No. 1","conditions":{"ambientTemperature":42},"excitationsPerWinding":[{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"data":[-5,5,-5],"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular","acEffectiveFrequency":110746.40291779551,"effectiveFrequency":110746.40291779551,"peak":5,"rms":2.8874560332150576,"thd":0.12151487440704967},"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}},"voltage":{"waveform":{"data":[-20.5,70.5,70.5,-20.5,-20.5],"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular","acEffectiveFrequency":591485.5360118389,"effectiveFrequency":553357.3374711702,"peak":70.5,"rms":51.572309672924284,"thd":0.4833151484524849},"harmonics":{"amplitudes":[24.2890625,57.92076613061847,1.421875,19.27588907896988,1.421875,11.528257939603122,1.421875,8.194467538528329,1.421875,6.331896912839248,1.421875,5.137996046859012,1.421875,4.304077056139349,1.421875,3.6860723299088454,1.421875,3.207698601961777,1.421875,2.8247804703632298,1.421875,2.509960393415185,1.421875,2.2453859950684323,1.421875,2.01890737840567,1.421875,1.8219644341144872,1.421875,1.6483482744897402,1.421875,1.4934420157473332,1.421875,1.3537375367153817,1.421875,1.2265178099275544,1.421875,1.1096421410704556,1.421875,1.0013973584174929,1.421875,0.9003924136274832,1.421875,0.8054822382572133,1.421875,0.7157117294021269,1.421875,0.6302738400635857,1.421875,0.5484777114167545,1.421875,0.46972405216147894,1.421875,0.3934858059809043,1.421875,0.31929270856030145,1.421875,0.24671871675852053,1.421875,0.17537155450693565,1.421875,0.10488380107099537,1.421875,0.034905072061178544],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}}},{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"ancillaryLabel":null,"data":[-5,5,-5],"numberPeriods":null,"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular","acEffectiveFrequency":110746.40291779551,"effectiveFrequency":110746.40291779551,"peak":5,"rms":2.8874560332150576,"thd":0.12151487440704967},"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}},"voltage":{"waveform":{"ancillaryLabel":null,"data":[-50,50,50,-50,-50],"numberPeriods":null,"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular","acEffectiveFrequency":591485.536011839,"effectiveFrequency":591449.4202715514,"peak":50,"rms":50,"thd":0.48331514845248497},"harmonics":{"amplitudes":[0.78125,63.64919355013018,1.5625,21.18229569117569,1.5625,12.668415318245188,1.5625,9.004909382998164,1.5625,6.958128475647527,1.5625,5.646149502042871,1.5625,4.729755006746538,1.5625,4.050628933965765,1.5625,3.524943518639316,1.5625,3.104154363036517,1.5625,2.7581982345221827,1.5625,2.467457137437843,1.5625,2.2185795367095267,1.5625,2.0021587188071255,1.5625,1.8113717302085082,1.5625,1.6411450722498175,1.5625,1.487623666720196,1.5625,1.3478217691511587,1.5625,1.2193869682092893,1.5625,1.100436657601639,1.5625,0.9894422127774558,1.5625,0.8851453167661671,1.5625,0.7864964059364037,1.5625,0.6926086154544899,1.5625,0.60272275979863,1.5625,0.5161802771005264,1.5625,0.43240198459440116,1.5625,0.3508711083080249,1.5625,0.27111946896540395,1.5625,0.192715993963664,1.5625,0.11525692425384548,1.5625,0.03835722204524927],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}}}]}]},"magnetic":{"coil":{"bobbin":{"distributorsInfo":null,"functionalDescription":null,"manufacturerInfo":null,"name":null,"processedDescription":{"columnDepth":0.00635,"columnShape":"rectangular","columnThickness":0,"columnWidth":0.0011999999999999997,"coordinates":[0,0,0],"pins":null,"wallThickness":0,"windingWindows":[{"angle":360,"area":0.00004901669937763475,"coordinates":[0.00395,0,0],"height":null,"radialHeight":0.00395,"sectionsAlignment":null,"sectionsOrientation":null,"shape":"round","width":null}]}},"functionalDescription":[{"isolationSide":"primary","name":"Primary","numberParallels":1,"numberTurns":45,"wire":"Dummy"},{"name":"Secondary","numberTurns":45,"numberParallels":1,"isolationSide":"secondary","wire":"Dummy"}],"layersDescription":null,"sectionsDescription":null,"turnsDescription":null},"core":{"distributorsInfo":[],"functionalDescription":{"coating":null,"gapping":[],"material":"67","numberStacks":1,"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0079},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127}},"family":"t","familySubtype":null,"magneticCircuit":"closed","name":"T 12.7/7.9/12.7","type":"standard"},"type":"toroidal","magneticCircuit":"closed"},"geometricalDescription":[{"coordinates":[0,0,0],"dimensions":null,"insulationMaterial":null,"machining":null,"material":"67","rotation":[1.5707963267948966,1.5707963267948966,0],"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0079},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127}},"family":"t","familySubtype":null,"magneticCircuit":"closed","name":"T 12.7/7.9/12.7","type":"standard"},"type":"toroidal"}],"manufacturerInfo":{"cost":null,"datasheetUrl":"https://fair-rite.com/product/toroids-5967001901/","family":null,"name":"Fair-Rite","orderCode":null,"reference":"5967001901","status":"production"},"name":"T 12.7/7.9/12.7 - 67 - Ungapped","processedDescription":{"columns":[{"area":0.000031,"coordinates":[0,0,0],"depth":0.0127,"height":0.03235840433197487,"minimumDepth":null,"minimumWidth":null,"shape":"rectangular","type":"central","width":0.0023999999999999994}],"depth":0.0127,"effectiveParameters":{"effectiveArea":0.000030479999999999996,"effectiveLength":0.03235840433197488,"effectiveVolume":9.862841640385941e-7,"minimumArea":0.00003047999999999999},"height":0.0127,"width":0.0127,"windingWindows":[{"angle":360,"area":0.00004901669937763475,"coordinates":[0.0023999999999999994,0],"height":null,"radialHeight":0.00395,"sectionsAlignment":null,"sectionsOrientation":null,"shape":null,"width":null}]}},"manufacturerInfo":{"name":"OpenMagnetics","reference":"My custom magnetic"}},"outputs":[]})"));
+    OpenMagnetics::Mas mas(json::parse(R"({"inputs":{"designRequirements":{"magnetizingInductance":{"nominal":0.0001},"minimumImpedance":[{"frequency":100000,"impedance":{"magnitude":1000}}],"name":"My Design Requirements","turnsRatios":[{"nominal":1}]},"operatingPoints":[{"name":"Operating Point No. 1","conditions":{"ambientTemperature":42},"excitationsPerWinding":[{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"data":[-5,5,-5],"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular","acEffectiveFrequency":110746.40291779551,"effectiveFrequency":110746.40291779551,"peak":5,"rms":2.8874560332150576,"thd":0.12151487440704967},"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}},"voltage":{"waveform":{"data":[-50, 50, 50, -50, -50],"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular","acEffectiveFrequency":591485.5360118389,"peak":50,"rms":50,"thd":0.4833151484524849}}},{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"ancillaryLabel":null,"data":[-5,5,-5],"numberPeriods":null,"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular","acEffectiveFrequency":110746.40291779551,"effectiveFrequency":110746.40291779551,"peak":5,"rms":2.8874560332150576,"thd":0.12151487440704967},"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}},"voltage":{"waveform":{"ancillaryLabel":null,"data":[-50,50,50,-50,-50],"numberPeriods":null,"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular","acEffectiveFrequency":591485.536011839,"effectiveFrequency":591449.4202715514,"peak":50,"rms":50,"thd":0.48331514845248497},"harmonics":{"amplitudes":[0.78125,63.64919355013018,1.5625,21.18229569117569,1.5625,12.668415318245188,1.5625,9.004909382998164,1.5625,6.958128475647527,1.5625,5.646149502042871,1.5625,4.729755006746538,1.5625,4.050628933965765,1.5625,3.524943518639316,1.5625,3.104154363036517,1.5625,2.7581982345221827,1.5625,2.467457137437843,1.5625,2.2185795367095267,1.5625,2.0021587188071255,1.5625,1.8113717302085082,1.5625,1.6411450722498175,1.5625,1.487623666720196,1.5625,1.3478217691511587,1.5625,1.2193869682092893,1.5625,1.100436657601639,1.5625,0.9894422127774558,1.5625,0.8851453167661671,1.5625,0.7864964059364037,1.5625,0.6926086154544899,1.5625,0.60272275979863,1.5625,0.5161802771005264,1.5625,0.43240198459440116,1.5625,0.3508711083080249,1.5625,0.27111946896540395,1.5625,0.192715993963664,1.5625,0.11525692425384548,1.5625,0.03835722204524927],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}}}]}]},"magnetic":{"coil":{"bobbin":{"distributorsInfo":null,"functionalDescription":null,"manufacturerInfo":null,"name":null,"processedDescription":{"columnDepth":0.00635,"columnShape":"rectangular","columnThickness":0,"columnWidth":0.0011999999999999997,"coordinates":[0,0,0],"pins":null,"wallThickness":0,"windingWindows":[{"angle":360,"area":0.00004901669937763475,"coordinates":[0.00395,0,0],"height":null,"radialHeight":0.00395,"sectionsAlignment":null,"sectionsOrientation":null,"shape":"round","width":null}]}},"functionalDescription":[{"isolationSide":"primary","name":"Primary","numberParallels":1,"numberTurns":45,"wire":"Dummy"},{"name":"Secondary","numberTurns":45,"numberParallels":1,"isolationSide":"secondary","wire":"Dummy"}],"layersDescription":null,"sectionsDescription":null,"turnsDescription":null},"core":{"distributorsInfo":[],"functionalDescription":{"coating":null,"gapping":[],"material":"67","numberStacks":1,"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0079},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127}},"family":"t","familySubtype":null,"magneticCircuit":"closed","name":"T 12.7/7.9/12.7","type":"standard"},"type":"toroidal","magneticCircuit":"closed"},"geometricalDescription":[{"coordinates":[0,0,0],"dimensions":null,"insulationMaterial":null,"machining":null,"material":"67","rotation":[1.5707963267948966,1.5707963267948966,0],"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0079},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127}},"family":"t","familySubtype":null,"magneticCircuit":"closed","name":"T 12.7/7.9/12.7","type":"standard"},"type":"toroidal"}],"manufacturerInfo":{"cost":null,"datasheetUrl":"https://fair-rite.com/product/toroids-5967001901/","family":null,"name":"Fair-Rite","orderCode":null,"reference":"5967001901","status":"production"},"name":"T 12.7/7.9/12.7 - 67 - Ungapped","processedDescription":{"columns":[{"area":0.000031,"coordinates":[0,0,0],"depth":0.0127,"height":0.03235840433197487,"minimumDepth":null,"minimumWidth":null,"shape":"rectangular","type":"central","width":0.0023999999999999994}],"depth":0.0127,"effectiveParameters":{"effectiveArea":0.000030479999999999996,"effectiveLength":0.03235840433197488,"effectiveVolume":9.862841640385941e-7,"minimumArea":0.00003047999999999999},"height":0.0127,"width":0.0127,"windingWindows":[{"angle":360,"area":0.00004901669937763475,"coordinates":[0.0023999999999999994,0],"height":null,"radialHeight":0.00395,"sectionsAlignment":null,"sectionsOrientation":null,"shape":null,"width":null}]}},"manufacturerInfo":{"name":"OpenMagnetics","reference":"My custom magnetic"}},"outputs":[]})"));
 
     for (size_t windingIndex = 0; windingIndex < mas.get_magnetic().get_coil().get_functional_description().size(); ++windingIndex) {
         mas.get_mutable_magnetic().get_mutable_coil().get_mutable_functional_description()[windingIndex].set_wire("Dummy");
@@ -1997,7 +2116,7 @@ TEST_CASE("Test_CoilAdviser_Random_15", "[adviser][coil-adviser][bug]") {
 }
 
 TEST_CASE("Test_CoilAdviser_Random_16", "[adviser][coil-adviser][bug]") {
-    OpenMagnetics::Mas mas(json::parse(R"({"inputs":{"designRequirements":{"magnetizingInductance":{"nominal":0.0001},"minimumImpedance":[{"frequency":100000,"impedance":{"magnitude":1000}}],"name":"My Design Requirements","turnsRatios":[{"nominal":1}]},"operatingPoints":[{"name":"Operating Point No. 1","conditions":{"ambientTemperature":42},"excitationsPerWinding":[{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"data":[-5,5,-5],"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular","acEffectiveFrequency":110746.40291779551,"effectiveFrequency":110746.40291779551,"peak":5,"rms":2.8874560332150576,"thd":0.12151487440704967},"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}},"voltage":{"waveform":{"data":[-20.5,70.5,70.5,-20.5,-20.5],"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular","acEffectiveFrequency":591485.5360118389,"effectiveFrequency":553357.3374711702,"peak":70.5,"rms":51.572309672924284,"thd":0.4833151484524849},"harmonics":{"amplitudes":[24.2890625,57.92076613061847,1.421875,19.27588907896988,1.421875,11.528257939603122,1.421875,8.194467538528329,1.421875,6.331896912839248,1.421875,5.137996046859012,1.421875,4.304077056139349,1.421875,3.6860723299088454,1.421875,3.207698601961777,1.421875,2.8247804703632298,1.421875,2.509960393415185,1.421875,2.2453859950684323,1.421875,2.01890737840567,1.421875,1.8219644341144872,1.421875,1.6483482744897402,1.421875,1.4934420157473332,1.421875,1.3537375367153817,1.421875,1.2265178099275544,1.421875,1.1096421410704556,1.421875,1.0013973584174929,1.421875,0.9003924136274832,1.421875,0.8054822382572133,1.421875,0.7157117294021269,1.421875,0.6302738400635857,1.421875,0.5484777114167545,1.421875,0.46972405216147894,1.421875,0.3934858059809043,1.421875,0.31929270856030145,1.421875,0.24671871675852053,1.421875,0.17537155450693565,1.421875,0.10488380107099537,1.421875,0.034905072061178544],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}}},{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"ancillaryLabel":null,"data":[-5,5,-5],"numberPeriods":null,"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular","acEffectiveFrequency":110746.40291779551,"effectiveFrequency":110746.40291779551,"peak":5,"rms":2.8874560332150576,"thd":0.12151487440704967},"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}},"voltage":{"waveform":{"ancillaryLabel":null,"data":[-50,50,50,-50,-50],"numberPeriods":null,"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular","acEffectiveFrequency":591485.536011839,"effectiveFrequency":591449.4202715514,"peak":50,"rms":50,"thd":0.48331514845248497},"harmonics":{"amplitudes":[0.78125,63.64919355013018,1.5625,21.18229569117569,1.5625,12.668415318245188,1.5625,9.004909382998164,1.5625,6.958128475647527,1.5625,5.646149502042871,1.5625,4.729755006746538,1.5625,4.050628933965765,1.5625,3.524943518639316,1.5625,3.104154363036517,1.5625,2.7581982345221827,1.5625,2.467457137437843,1.5625,2.2185795367095267,1.5625,2.0021587188071255,1.5625,1.8113717302085082,1.5625,1.6411450722498175,1.5625,1.487623666720196,1.5625,1.3478217691511587,1.5625,1.2193869682092893,1.5625,1.100436657601639,1.5625,0.9894422127774558,1.5625,0.8851453167661671,1.5625,0.7864964059364037,1.5625,0.6926086154544899,1.5625,0.60272275979863,1.5625,0.5161802771005264,1.5625,0.43240198459440116,1.5625,0.3508711083080249,1.5625,0.27111946896540395,1.5625,0.192715993963664,1.5625,0.11525692425384548,1.5625,0.03835722204524927],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}}}]}]},"magnetic":{"coil":{"bobbin":{"distributorsInfo":null,"functionalDescription":null,"manufacturerInfo":null,"name":null,"processedDescription":{"columnDepth":0.00635,"columnShape":"rectangular","columnThickness":0,"columnWidth":0.0011999999999999997,"coordinates":[0,0,0],"pins":null,"wallThickness":0,"windingWindows":[{"angle":360,"area":0.00004901669937763475,"coordinates":[0.00395,0,0],"height":null,"radialHeight":0.00395,"sectionsAlignment":null,"sectionsOrientation":null,"shape":"round","width":null}]}},"functionalDescription":[{"isolationSide":"primary","name":"Primary","numberParallels":1,"numberTurns":45,"wire":"Dummy"},{"name":"Secondary","numberTurns":45,"numberParallels":1,"isolationSide":"secondary","wire":"Dummy"}],"layersDescription":null,"sectionsDescription":null,"turnsDescription":null},"core":{"distributorsInfo":[],"functionalDescription":{"coating":null,"gapping":[],"material":"67","numberStacks":1,"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0079},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127}},"family":"t","familySubtype":null,"magneticCircuit":"closed","name":"T 12.7/7.9/12.7","type":"standard"},"type":"toroidal","magneticCircuit":"closed"},"geometricalDescription":[{"coordinates":[0,0,0],"dimensions":null,"insulationMaterial":null,"machining":null,"material":"67","rotation":[1.5707963267948966,1.5707963267948966,0],"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0079},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127}},"family":"t","familySubtype":null,"magneticCircuit":"closed","name":"T 12.7/7.9/12.7","type":"standard"},"type":"toroidal"}],"manufacturerInfo":{"cost":null,"datasheetUrl":"https://fair-rite.com/product/toroids-5967001901/","family":null,"name":"Fair-Rite","orderCode":null,"reference":"5967001901","status":"production"},"name":"T 12.7/7.9/12.7 - 67 - Ungapped","processedDescription":{"columns":[{"area":0.000031,"coordinates":[0,0,0],"depth":0.0127,"height":0.03235840433197487,"minimumDepth":null,"minimumWidth":null,"shape":"rectangular","type":"central","width":0.0023999999999999994}],"depth":0.0127,"effectiveParameters":{"effectiveArea":0.000030479999999999996,"effectiveLength":0.03235840433197488,"effectiveVolume":9.862841640385941e-7,"minimumArea":0.00003047999999999999},"height":0.0127,"width":0.0127,"windingWindows":[{"angle":360,"area":0.00004901669937763475,"coordinates":[0.0023999999999999994,0],"height":null,"radialHeight":0.00395,"sectionsAlignment":null,"sectionsOrientation":null,"shape":null,"width":null}]}},"manufacturerInfo":{"name":"OpenMagnetics","reference":"My custom magnetic"}},"outputs":[]})"));
+    OpenMagnetics::Mas mas(json::parse(R"({"inputs":{"designRequirements":{"magnetizingInductance":{"nominal":0.0001},"minimumImpedance":[{"frequency":100000,"impedance":{"magnitude":1000}}],"name":"My Design Requirements","turnsRatios":[{"nominal":1}]},"operatingPoints":[{"name":"Operating Point No. 1","conditions":{"ambientTemperature":42},"excitationsPerWinding":[{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"data":[-5,5,-5],"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular","acEffectiveFrequency":110746.40291779551,"effectiveFrequency":110746.40291779551,"peak":5,"rms":2.8874560332150576,"thd":0.12151487440704967},"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}},"voltage":{"waveform":{"data":[-50, 50, 50, -50, -50],"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular","acEffectiveFrequency":591485.5360118389,"peak":50,"rms":50,"thd":0.4833151484524849}}},{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"ancillaryLabel":null,"data":[-5,5,-5],"numberPeriods":null,"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular","acEffectiveFrequency":110746.40291779551,"effectiveFrequency":110746.40291779551,"peak":5,"rms":2.8874560332150576,"thd":0.12151487440704967},"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}},"voltage":{"waveform":{"ancillaryLabel":null,"data":[-50,50,50,-50,-50],"numberPeriods":null,"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular","acEffectiveFrequency":591485.536011839,"effectiveFrequency":591449.4202715514,"peak":50,"rms":50,"thd":0.48331514845248497},"harmonics":{"amplitudes":[0.78125,63.64919355013018,1.5625,21.18229569117569,1.5625,12.668415318245188,1.5625,9.004909382998164,1.5625,6.958128475647527,1.5625,5.646149502042871,1.5625,4.729755006746538,1.5625,4.050628933965765,1.5625,3.524943518639316,1.5625,3.104154363036517,1.5625,2.7581982345221827,1.5625,2.467457137437843,1.5625,2.2185795367095267,1.5625,2.0021587188071255,1.5625,1.8113717302085082,1.5625,1.6411450722498175,1.5625,1.487623666720196,1.5625,1.3478217691511587,1.5625,1.2193869682092893,1.5625,1.100436657601639,1.5625,0.9894422127774558,1.5625,0.8851453167661671,1.5625,0.7864964059364037,1.5625,0.6926086154544899,1.5625,0.60272275979863,1.5625,0.5161802771005264,1.5625,0.43240198459440116,1.5625,0.3508711083080249,1.5625,0.27111946896540395,1.5625,0.192715993963664,1.5625,0.11525692425384548,1.5625,0.03835722204524927],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}}}]}]},"magnetic":{"coil":{"bobbin":{"distributorsInfo":null,"functionalDescription":null,"manufacturerInfo":null,"name":null,"processedDescription":{"columnDepth":0.00635,"columnShape":"rectangular","columnThickness":0,"columnWidth":0.0011999999999999997,"coordinates":[0,0,0],"pins":null,"wallThickness":0,"windingWindows":[{"angle":360,"area":0.00004901669937763475,"coordinates":[0.00395,0,0],"height":null,"radialHeight":0.00395,"sectionsAlignment":null,"sectionsOrientation":null,"shape":"round","width":null}]}},"functionalDescription":[{"isolationSide":"primary","name":"Primary","numberParallels":1,"numberTurns":45,"wire":"Dummy"},{"name":"Secondary","numberTurns":45,"numberParallels":1,"isolationSide":"secondary","wire":"Dummy"}],"layersDescription":null,"sectionsDescription":null,"turnsDescription":null},"core":{"distributorsInfo":[],"functionalDescription":{"coating":null,"gapping":[],"material":"67","numberStacks":1,"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0079},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127}},"family":"t","familySubtype":null,"magneticCircuit":"closed","name":"T 12.7/7.9/12.7","type":"standard"},"type":"toroidal","magneticCircuit":"closed"},"geometricalDescription":[{"coordinates":[0,0,0],"dimensions":null,"insulationMaterial":null,"machining":null,"material":"67","rotation":[1.5707963267948966,1.5707963267948966,0],"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0079},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127}},"family":"t","familySubtype":null,"magneticCircuit":"closed","name":"T 12.7/7.9/12.7","type":"standard"},"type":"toroidal"}],"manufacturerInfo":{"cost":null,"datasheetUrl":"https://fair-rite.com/product/toroids-5967001901/","family":null,"name":"Fair-Rite","orderCode":null,"reference":"5967001901","status":"production"},"name":"T 12.7/7.9/12.7 - 67 - Ungapped","processedDescription":{"columns":[{"area":0.000031,"coordinates":[0,0,0],"depth":0.0127,"height":0.03235840433197487,"minimumDepth":null,"minimumWidth":null,"shape":"rectangular","type":"central","width":0.0023999999999999994}],"depth":0.0127,"effectiveParameters":{"effectiveArea":0.000030479999999999996,"effectiveLength":0.03235840433197488,"effectiveVolume":9.862841640385941e-7,"minimumArea":0.00003047999999999999},"height":0.0127,"width":0.0127,"windingWindows":[{"angle":360,"area":0.00004901669937763475,"coordinates":[0.0023999999999999994,0],"height":null,"radialHeight":0.00395,"sectionsAlignment":null,"sectionsOrientation":null,"shape":null,"width":null}]}},"manufacturerInfo":{"name":"OpenMagnetics","reference":"My custom magnetic"}},"outputs":[]})"));
 
     for (size_t windingIndex = 0; windingIndex < mas.get_magnetic().get_coil().get_functional_description().size(); ++windingIndex) {
         mas.get_mutable_magnetic().get_mutable_coil().get_mutable_functional_description()[windingIndex].set_wire("Dummy");
@@ -2069,7 +2188,7 @@ TEST_CASE("Test_SectionsAdviser_Web_1", "[adviser][coil-adviser][bug][smoke-test
         pattern.push_back(elem);
     }
     int repetitions = 1;
-    OpenMagnetics::Mas mas(json::parse(R"({"inputs":{"designRequirements":{"insulation":{"altitude":{"maximum":2000},"cti":"groupIIIB","pollutionDegree":"PD2","overvoltageCategory":"III","insulationType":"double","mainSupplyVoltage":{"maximum":400},"standards":["IEC 60664-1"]},"magnetizingInductance":{"nominal":0.0001},"name":"My Design Requirements","turnsRatios":[{"nominal":1}]},"operatingPoints":[{"name":"Operating Point No. 1","conditions":{"ambientTemperature":42},"excitationsPerWinding":[{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"data":[-5,5,-5],"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular","acEffectiveFrequency":110746.40291779551,"effectiveFrequency":110746.40291779551,"peak":5,"rms":2.8874560332150576,"thd":0.12151487440704967},"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}},"voltage":{"waveform":{"data":[-20.5,70.5,70.5,-20.5,-20.5],"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular","acEffectiveFrequency":591485.5360118389,"effectiveFrequency":553357.3374711702,"peak":70.5,"rms":51.572309672924284,"thd":0.4833151484524849},"harmonics":{"amplitudes":[24.2890625,57.92076613061847,1.421875,19.27588907896988,1.421875,11.528257939603122,1.421875,8.194467538528329,1.421875,6.331896912839248,1.421875,5.137996046859012,1.421875,4.304077056139349,1.421875,3.6860723299088454,1.421875,3.207698601961777,1.421875,2.8247804703632298,1.421875,2.509960393415185,1.421875,2.2453859950684323,1.421875,2.01890737840567,1.421875,1.8219644341144872,1.421875,1.6483482744897402,1.421875,1.4934420157473332,1.421875,1.3537375367153817,1.421875,1.2265178099275544,1.421875,1.1096421410704556,1.421875,1.0013973584174929,1.421875,0.9003924136274832,1.421875,0.8054822382572133,1.421875,0.7157117294021269,1.421875,0.6302738400635857,1.421875,0.5484777114167545,1.421875,0.46972405216147894,1.421875,0.3934858059809043,1.421875,0.31929270856030145,1.421875,0.24671871675852053,1.421875,0.17537155450693565,1.421875,0.10488380107099537,1.421875,0.034905072061178544],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}}},{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"data":[-5,5,-5],"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular"}},"voltage":{"waveform":{"data":[-20.5,70.5,70.5,-20.5,-20.5],"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular"}}}]}]},"magnetic":{"coil":{"bobbin":"Dummy","functionalDescription":[{"isolationSide":"primary","name":"Primary","numberParallels":1,"numberTurns":24,"wire":{"coating":{"breakdownVoltage":70,"grade":1,"material":null,"numberLayers":null,"temperatureRating":null,"thickness":null,"thicknessLayers":null,"type":"enamelled"},"conductingArea":null,"conductingDiameter":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.00001},"conductingHeight":null,"conductingWidth":null,"edgeRadius":null,"manufacturerInfo":{"cost":null,"datasheetUrl":null,"family":null,"name":"Elektrisola","orderCode":null,"reference":null,"status":null},"material":"copper","name":"Round 0.01 - Grade 1","numberConductors":1,"outerDiameter":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.000013000000000000001,"minimum":0.000012,"nominal":null},"outerHeight":null,"outerWidth":null,"standard":"IEC 60317","standardName":"0.01 mm","strand":null,"type":"round"}},{"name":"Secondary","numberTurns":1,"numberParallels":1,"isolationSide":"secondary","wire":"Dummy"}]},"core":{"distributorsInfo":[],"functionalDescription":{"coating":null,"gapping":[{"area":0.000071,"coordinates":[0,0.0005,0],"distanceClosestNormalSurface":0.01125,"distanceClosestParallelSurface":0.006625,"length":0.001,"sectionDimensions":[0.0095,0.0095],"shape":"round","type":"subtractive"},{"area":0.00006,"coordinates":[0.014533,0,0],"distanceClosestNormalSurface":0.012248,"distanceClosestParallelSurface":0.006625,"length":0.000005,"sectionDimensions":[0.006316,0.0095],"shape":"irregular","type":"residual"},{"area":0.00006,"coordinates":[-0.014533,0,0],"distanceClosestNormalSurface":0.012248,"distanceClosestParallelSurface":0.006625,"length":0.000005,"sectionDimensions":[0.006316,0.0095],"shape":"irregular","type":"residual"}],"material":"3C91","numberStacks":1,"shape":{"aliases":["EC 35/17/10"],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0353,"minimum":0.0337,"nominal":null},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.01745,"minimum":0.01715,"nominal":null},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0098,"minimum":0.0092,"nominal":null},"D":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0126,"minimum":0.0119,"nominal":null},"E":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0233,"minimum":0.0222,"nominal":null},"F":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0098,"minimum":0.0092,"nominal":null},"T":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0293,"minimum":0.0277,"nominal":null},"r":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0005},"s":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.003,"minimum":0.0025,"nominal":null}},"family":"ec","familySubtype":null,"magneticCircuit":"open","name":"EC 35/17/10","type":"standard"},"type":"twoPieceSet"},"geometricalDescription":[{"coordinates":[0,0,0],"dimensions":null,"insulationMaterial":null,"machining":[{"coordinates":[0,0.0005,0],"length":0.001}],"material":"3C91","rotation":[3.141592653589793,3.141592653589793,0],"shape":{"aliases":["EC 35/17/10"],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0353,"minimum":0.0337,"nominal":null},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.01745,"minimum":0.01715,"nominal":null},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0098,"minimum":0.0092,"nominal":null},"D":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0126,"minimum":0.0119,"nominal":null},"E":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0233,"minimum":0.0222,"nominal":null},"F":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0098,"minimum":0.0092,"nominal":null},"T":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0293,"minimum":0.0277,"nominal":null},"r":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0005},"s":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.003,"minimum":0.0025,"nominal":null}},"family":"ec","familySubtype":null,"magneticCircuit":"open","name":"EC 35/17/10","type":"standard"},"type":"halfSet"},{"coordinates":[0,0,0],"dimensions":null,"insulationMaterial":null,"machining":null,"material":"3C91","rotation":[0,0,0],"shape":{"aliases":["EC 35/17/10"],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0353,"minimum":0.0337,"nominal":null},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.01745,"minimum":0.01715,"nominal":null},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0098,"minimum":0.0092,"nominal":null},"D":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0126,"minimum":0.0119,"nominal":null},"E":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0233,"minimum":0.0222,"nominal":null},"F":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0098,"minimum":0.0092,"nominal":null},"T":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0293,"minimum":0.0277,"nominal":null},"r":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0005},"s":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.003,"minimum":0.0025,"nominal":null}},"family":"ec","familySubtype":null,"magneticCircuit":"open","name":"EC 35/17/10","type":"standard"},"type":"halfSet"}],"manufacturerInfo":{"cost":null,"datasheetUrl":"https://ferroxcube.com/upload/media/product/file/Pr_ds/EC35_17_10.pdf","family":null,"name":"Ferroxcube","orderCode":null,"reference":"EC35/17/10-3C91-G1000","status":"production"},"name":"EC 35/17/10 - 3C91 - Gapped 1.000 mm","processedDescription":{"columns":[{"area":0.000071,"coordinates":[0,0,0],"depth":0.0095,"height":0.0245,"minimumDepth":null,"minimumWidth":null,"shape":"round","type":"central","width":0.0095},{"area":0.00006,"coordinates":[0.014533,0,0],"depth":0.0095,"height":0.0245,"minimumDepth":null,"minimumWidth":0.005876,"shape":"irregular","type":"lateral","width":0.006316},{"area":0.00006,"coordinates":[-0.014533,0,0],"depth":0.0095,"height":0.0245,"minimumDepth":null,"minimumWidth":0.005876,"shape":"irregular","type":"lateral","width":0.006316}],"depth":0.0095,"effectiveParameters":{"effectiveArea":0.00008700294107630485,"effectiveLength":0.07610520812632617,"effectiveVolume":0.000006621376938214672,"minimumArea":0.0000708821842466197},"height":0.0346,"width":0.0345,"windingWindows":[{"angle":null,"area":0.0001623125,"coordinates":[0.00475,0],"height":0.0245,"radialHeight":null,"sectionsOrientation":null,"shape":null,"width":0.006625}]}}},"outputs":[]})"));
+    OpenMagnetics::Mas mas(json::parse(R"({"inputs":{"designRequirements":{"insulation":{"altitude":{"maximum":2000},"cti":"groupIIIB","pollutionDegree":"PD2","overvoltageCategory":"III","insulationType":"double","mainSupplyVoltage":{"maximum":400},"standards":["IEC 60664-1"]},"magnetizingInductance":{"nominal":0.0001},"name":"My Design Requirements","turnsRatios":[{"nominal":1}]},"operatingPoints":[{"name":"Operating Point No. 1","conditions":{"ambientTemperature":42},"excitationsPerWinding":[{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"data":[-5,5,-5],"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular","acEffectiveFrequency":110746.40291779551,"effectiveFrequency":110746.40291779551,"peak":5,"rms":2.8874560332150576,"thd":0.12151487440704967},"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}},"voltage":{"waveform":{"data":[-50, 50, 50, -50, -50],"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular","acEffectiveFrequency":591485.5360118389,"peak":50,"rms":50,"thd":0.4833151484524849}}},{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"data":[-5,5,-5],"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular"}},"voltage":{"waveform":{"data":[-50, 50, 50, -50, -50],"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular"}}}]}]},"magnetic":{"coil":{"bobbin":"Dummy","functionalDescription":[{"isolationSide":"primary","name":"Primary","numberParallels":1,"numberTurns":24,"wire":{"coating":{"breakdownVoltage":70,"grade":1,"material":null,"numberLayers":null,"temperatureRating":null,"thickness":null,"thicknessLayers":null,"type":"enamelled"},"conductingArea":null,"conductingDiameter":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.00001},"conductingHeight":null,"conductingWidth":null,"edgeRadius":null,"manufacturerInfo":{"cost":null,"datasheetUrl":null,"family":null,"name":"Elektrisola","orderCode":null,"reference":null,"status":null},"material":"copper","name":"Round 0.01 - Grade 1","numberConductors":1,"outerDiameter":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.000013000000000000001,"minimum":0.000012,"nominal":null},"outerHeight":null,"outerWidth":null,"standard":"IEC 60317","standardName":"0.01 mm","strand":null,"type":"round"}},{"name":"Secondary","numberTurns":1,"numberParallels":1,"isolationSide":"secondary","wire":"Dummy"}]},"core":{"distributorsInfo":[],"functionalDescription":{"coating":null,"gapping":[{"area":0.000071,"coordinates":[0,0.0005,0],"distanceClosestNormalSurface":0.01125,"distanceClosestParallelSurface":0.006625,"length":0.001,"sectionDimensions":[0.0095,0.0095],"shape":"round","type":"subtractive"},{"area":0.00006,"coordinates":[0.014533,0,0],"distanceClosestNormalSurface":0.012248,"distanceClosestParallelSurface":0.006625,"length":0.000005,"sectionDimensions":[0.006316,0.0095],"shape":"irregular","type":"residual"},{"area":0.00006,"coordinates":[-0.014533,0,0],"distanceClosestNormalSurface":0.012248,"distanceClosestParallelSurface":0.006625,"length":0.000005,"sectionDimensions":[0.006316,0.0095],"shape":"irregular","type":"residual"}],"material":"3C91","numberStacks":1,"shape":{"aliases":["EC 35/17/10"],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0353,"minimum":0.0337,"nominal":null},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.01745,"minimum":0.01715,"nominal":null},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0098,"minimum":0.0092,"nominal":null},"D":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0126,"minimum":0.0119,"nominal":null},"E":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0233,"minimum":0.0222,"nominal":null},"F":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0098,"minimum":0.0092,"nominal":null},"T":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0293,"minimum":0.0277,"nominal":null},"r":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0005},"s":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.003,"minimum":0.0025,"nominal":null}},"family":"ec","familySubtype":null,"magneticCircuit":"open","name":"EC 35/17/10","type":"standard"},"type":"twoPieceSet"},"geometricalDescription":[{"coordinates":[0,0,0],"dimensions":null,"insulationMaterial":null,"machining":[{"coordinates":[0,0.0005,0],"length":0.001}],"material":"3C91","rotation":[3.141592653589793,3.141592653589793,0],"shape":{"aliases":["EC 35/17/10"],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0353,"minimum":0.0337,"nominal":null},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.01745,"minimum":0.01715,"nominal":null},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0098,"minimum":0.0092,"nominal":null},"D":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0126,"minimum":0.0119,"nominal":null},"E":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0233,"minimum":0.0222,"nominal":null},"F":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0098,"minimum":0.0092,"nominal":null},"T":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0293,"minimum":0.0277,"nominal":null},"r":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0005},"s":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.003,"minimum":0.0025,"nominal":null}},"family":"ec","familySubtype":null,"magneticCircuit":"open","name":"EC 35/17/10","type":"standard"},"type":"halfSet"},{"coordinates":[0,0,0],"dimensions":null,"insulationMaterial":null,"machining":null,"material":"3C91","rotation":[0,0,0],"shape":{"aliases":["EC 35/17/10"],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0353,"minimum":0.0337,"nominal":null},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.01745,"minimum":0.01715,"nominal":null},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0098,"minimum":0.0092,"nominal":null},"D":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0126,"minimum":0.0119,"nominal":null},"E":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0233,"minimum":0.0222,"nominal":null},"F":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0098,"minimum":0.0092,"nominal":null},"T":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0293,"minimum":0.0277,"nominal":null},"r":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0005},"s":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.003,"minimum":0.0025,"nominal":null}},"family":"ec","familySubtype":null,"magneticCircuit":"open","name":"EC 35/17/10","type":"standard"},"type":"halfSet"}],"manufacturerInfo":{"cost":null,"datasheetUrl":"https://ferroxcube.com/upload/media/product/file/Pr_ds/EC35_17_10.pdf","family":null,"name":"Ferroxcube","orderCode":null,"reference":"EC35/17/10-3C91-G1000","status":"production"},"name":"EC 35/17/10 - 3C91 - Gapped 1.000 mm","processedDescription":{"columns":[{"area":0.000071,"coordinates":[0,0,0],"depth":0.0095,"height":0.0245,"minimumDepth":null,"minimumWidth":null,"shape":"round","type":"central","width":0.0095},{"area":0.00006,"coordinates":[0.014533,0,0],"depth":0.0095,"height":0.0245,"minimumDepth":null,"minimumWidth":0.005876,"shape":"irregular","type":"lateral","width":0.006316},{"area":0.00006,"coordinates":[-0.014533,0,0],"depth":0.0095,"height":0.0245,"minimumDepth":null,"minimumWidth":0.005876,"shape":"irregular","type":"lateral","width":0.006316}],"depth":0.0095,"effectiveParameters":{"effectiveArea":0.00008700294107630485,"effectiveLength":0.07610520812632617,"effectiveVolume":0.000006621376938214672,"minimumArea":0.0000708821842466197},"height":0.0346,"width":0.0345,"windingWindows":[{"angle":null,"area":0.0001623125,"coordinates":[0.00475,0],"height":0.0245,"radialHeight":null,"sectionsOrientation":null,"shape":null,"width":0.006625}]}}},"outputs":[]})"));
 
     auto bobbin = mas.get_magnetic().get_coil().get_bobbin();
     if (std::holds_alternative<std::string>(bobbin)) {
@@ -2093,7 +2212,7 @@ TEST_CASE("Test_SectionsAdviser_Web_2", "[adviser][coil-adviser][bug][smoke-test
         pattern.push_back(elem);
     }
     int repetitions = 1;
-    OpenMagnetics::Mas mas(json::parse(R"({"inputs":{"designRequirements":{"insulation":null,"isolationSides":null,"leakageInductance":null,"magnetizingInductance":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0001},"market":null,"maximumDimensions":null,"maximumWeight":null,"name":"My Design Requirements","operatingTemperature":null,"strayCapacitance":null,"terminalType":null,"topology":null,"turnsRatios":[],"wiringTechnology":null},"operatingPoints":[{"conditions":{"ambientRelativeHumidity":null,"ambientTemperature":42.0,"cooling":null,"name":null},"excitationsPerWinding":[{"current":{"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0.0,100000.0,200000.0,300000.0,400000.0,500000.0,600000.0,700000.0,800000.0,900000.0,1000000.0,1100000.0,1200000.0,1300000.0,1400000.0,1500000.0,1600000.0,1700000.0,1800000.0,1900000.0,2000000.0,2100000.0,2200000.0,2300000.0,2400000.0,2500000.0,2600000.0,2700000.0,2800000.0,2900000.0,3000000.0,3100000.0,3200000.0,3300000.0,3400000.0,3500000.0,3600000.0,3700000.0,3800000.0,3900000.0,4000000.0,4100000.0,4200000.0,4300000.0,4400000.0,4500000.0,4600000.0,4700000.0,4800000.0,4900000.0,5000000.0,5100000.0,5200000.0,5300000.0,5400000.0,5500000.0,5600000.0,5700000.0,5800000.0,5900000.0,6000000.0,6100000.0,6200000.0,6300000.0]},"processed":{"acEffectiveFrequency":110746.40291779551,"average":null,"dutyCycle":0.5,"effectiveFrequency":110746.40291779551,"label":"triangular","offset":0.0,"peak":5.0,"peakToPeak":10.0,"phase":null,"rms":2.8874560332150576,"thd":0.12151487440704967},"waveform":{"ancillaryLabel":null,"data":[-5.0,5.0,-5.0],"numberPeriods":null,"time":[0.0,5e-06,1e-05]}},"frequency":100000.0,"magneticFieldStrength":null,"magneticFluxDensity":null,"magnetizingCurrent":null,"name":"Primary winding excitation","voltage":{"harmonics":{"amplitudes":[24.2890625,57.92076613061847,1.421875,19.27588907896988,1.421875,11.528257939603122,1.421875,8.194467538528329,1.421875,6.331896912839248,1.421875,5.137996046859012,1.421875,4.304077056139349,1.421875,3.6860723299088454,1.421875,3.207698601961777,1.421875,2.8247804703632298,1.421875,2.509960393415185,1.421875,2.2453859950684323,1.421875,2.01890737840567,1.421875,1.8219644341144872,1.421875,1.6483482744897402,1.421875,1.4934420157473332,1.421875,1.3537375367153817,1.421875,1.2265178099275544,1.421875,1.1096421410704556,1.421875,1.0013973584174929,1.421875,0.9003924136274832,1.421875,0.8054822382572133,1.421875,0.7157117294021269,1.421875,0.6302738400635857,1.421875,0.5484777114167545,1.421875,0.46972405216147894,1.421875,0.3934858059809043,1.421875,0.31929270856030145,1.421875,0.24671871675852053,1.421875,0.17537155450693565,1.421875,0.10488380107099537,1.421875,0.034905072061178544],"frequencies":[0.0,100000.0,200000.0,300000.0,400000.0,500000.0,600000.0,700000.0,800000.0,900000.0,1000000.0,1100000.0,1200000.0,1300000.0,1400000.0,1500000.0,1600000.0,1700000.0,1800000.0,1900000.0,2000000.0,2100000.0,2200000.0,2300000.0,2400000.0,2500000.0,2600000.0,2700000.0,2800000.0,2900000.0,3000000.0,3100000.0,3200000.0,3300000.0,3400000.0,3500000.0,3600000.0,3700000.0,3800000.0,3900000.0,4000000.0,4100000.0,4200000.0,4300000.0,4400000.0,4500000.0,4600000.0,4700000.0,4800000.0,4900000.0,5000000.0,5100000.0,5200000.0,5300000.0,5400000.0,5500000.0,5600000.0,5700000.0,5800000.0,5900000.0,6000000.0,6100000.0,6200000.0,6300000.0]},"processed":{"acEffectiveFrequency":591485.5360118389,"average":null,"dutyCycle":0.5,"effectiveFrequency":553357.3374711702,"label":"rectangular","offset":0.0,"peak":70.5,"peakToPeak":100.0,"phase":null,"rms":51.572309672924284,"thd":0.4833151484524849},"waveform":{"ancillaryLabel":null,"data":[-20.5,70.5,70.5,-20.5,-20.5],"numberPeriods":null,"time":[0.0,0.0,5e-06,5e-06,1e-05]}}},{"current":{"harmonics":null,"processed":{"acEffectiveFrequency":null,"average":null,"dutyCycle":0.5,"effectiveFrequency":null,"label":"triangular","offset":0.0,"peak":null,"peakToPeak":10.0,"phase":null,"rms":null,"thd":null},"waveform":{"ancillaryLabel":null,"data":[-5.0,5.0,-5.0],"numberPeriods":null,"time":[0.0,5e-06,1e-05]}},"frequency":100000.0,"magneticFieldStrength":null,"magneticFluxDensity":null,"magnetizingCurrent":null,"name":"Primary winding excitation","voltage":{"harmonics":null,"processed":{"acEffectiveFrequency":null,"average":null,"dutyCycle":0.5,"effectiveFrequency":null,"label":"rectangular","offset":0.0,"peak":null,"peakToPeak":100.0,"phase":null,"rms":null,"thd":null},"waveform":{"ancillaryLabel":null,"data":[-20.5,70.5,70.5,-20.5,-20.5],"numberPeriods":null,"time":[0.0,0.0,5e-06,5e-06,1e-05]}}},{"current":{"harmonics":null,"processed":{"acEffectiveFrequency":null,"average":null,"dutyCycle":0.5,"effectiveFrequency":null,"label":"triangular","offset":0.0,"peak":null,"peakToPeak":10.0,"phase":null,"rms":null,"thd":null},"waveform":{"ancillaryLabel":null,"data":[-5.0,5.0,-5.0],"numberPeriods":null,"time":[0.0,5e-06,1e-05]}},"frequency":100000.0,"magneticFieldStrength":null,"magneticFluxDensity":null,"magnetizingCurrent":null,"name":"Primary winding excitation","voltage":{"harmonics":null,"processed":{"acEffectiveFrequency":null,"average":null,"dutyCycle":0.5,"effectiveFrequency":null,"label":"rectangular","offset":0.0,"peak":null,"peakToPeak":100.0,"phase":null,"rms":null,"thd":null},"waveform":{"ancillaryLabel":null,"data":[-20.5,70.5,70.5,-20.5,-20.5],"numberPeriods":null,"time":[0.0,0.0,5e-06,5e-06,1e-05]}}}],"name":"Operating Point No. 1"}]},"magnetic":{"coil":{"bobbin":{"distributorsInfo":null,"functionalDescription":null,"manufacturerInfo":null,"name":null,"processedDescription":{"columnDepth":0.003912540921738127,"columnShape":"round","columnThickness":0.0010750409217381266,"columnWidth":0.003912540921738127,"coordinates":[0.0,0.0,0.0],"pins":null,"wallThickness":0.0007636652757989004,"windingWindows":[{"angle":null,"area":2.0400047558919626e-05,"coordinates":[0.004956270460869064,0.0,0.0],"height":0.009772669448402199,"radialHeight":null,"sectionsOrientation":null,"shape":"rectangular","width":0.002087459078261874}]}},"functionalDescription":[{"connections":null,"isolationSide":"primary","name":"Primary","numberParallels":1,"numberTurns":32,"wire":{"coating":{"breakdownVoltage":70.0,"grade":1,"material":null,"numberLayers":null,"temperatureRating":null,"thickness":null,"thicknessLayers":null,"type":"enamelled"},"conductingArea":null,"conductingDiameter":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":1e-05},"conductingHeight":null,"conductingWidth":null,"edgeRadius":null,"manufacturerInfo":{"cost":null,"datasheetUrl":null,"family":null,"name":"Elektrisola","orderCode":null,"reference":null,"status":null},"material":"copper","name":"Round 0.01 - Grade 1","numberConductors":1,"outerDiameter":{"excludeMaximum":null,"excludeMinimum":null,"maximum":1.3000000000000001e-05,"minimum":1.2e-05,"nominal":null},"outerHeight":null,"outerWidth":null,"standard":"IEC 60317","standardName":"0.01 mm","strand":null,"type":"round"}}],"layersDescription":null,"sectionsDescription":null,"turnsDescription":null},"core":{"distributorsInfo":[],"functionalDescription":{"coating":null,"gapping":[{"area":2.6e-05,"coordinates":[0.0,0.0,0.0],"distanceClosestNormalSurface":0.005443,"distanceClosestParallelSurface":0.0031625000000000004,"length":0.000414,"sectionDimensions":[0.005675,0.005675],"shape":"round","type":"subtractive"},{"area":0.000163,"coordinates":[0.0,0.0,-0.007038],"distanceClosestNormalSurface":0.005648,"distanceClosestParallelSurface":0.0031625000000000004,"length":5e-06,"sectionDimensions":[0.078555,0.002075],"shape":"irregular","type":"residual"}],"material":"3C91","numberStacks":1,"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0184,"minimum":0.0176,"nominal":null},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0085,"minimum":0.0083,"nominal":null},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.01125,"minimum":0.01075,"nominal":null},"D":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0058,"minimum":0.0055,"nominal":null},"E":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0124,"minimum":0.0116,"nominal":null},"F":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.00585,"minimum":0.0055,"nominal":null},"K":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.002925,"minimum":null,"nominal":null}},"family":"ep","familySubtype":null,"magneticCircuit":"open","name":"EP 17","type":"standard"},"type":"twoPieceSet"},"geometricalDescription":[{"coordinates":[0.0,0.0,0.0],"dimensions":null,"insulationMaterial":null,"machining":[{"coordinates":[0.0,0.0001035,0.0],"length":0.000207}],"material":"3C91","rotation":[3.141592653589793,3.141592653589793,0.0],"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0184,"minimum":0.0176,"nominal":null},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0085,"minimum":0.0083,"nominal":null},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.01125,"minimum":0.01075,"nominal":null},"D":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0058,"minimum":0.0055,"nominal":null},"E":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0124,"minimum":0.0116,"nominal":null},"F":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.00585,"minimum":0.0055,"nominal":null},"K":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.002925,"minimum":null,"nominal":null}},"family":"ep","familySubtype":null,"magneticCircuit":"open","name":"EP 17","type":"standard"},"type":"halfSet"},{"coordinates":[0.0,0.0,0.0],"dimensions":null,"insulationMaterial":null,"machining":[{"coordinates":[0.0,-0.0001035,0.0],"length":0.000207}],"material":"3C91","rotation":[0.0,0.0,0.0],"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0184,"minimum":0.0176,"nominal":null},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0085,"minimum":0.0083,"nominal":null},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.01125,"minimum":0.01075,"nominal":null},"D":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0058,"minimum":0.0055,"nominal":null},"E":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0124,"minimum":0.0116,"nominal":null},"F":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.00585,"minimum":0.0055,"nominal":null},"K":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.002925,"minimum":null,"nominal":null}},"family":"ep","familySubtype":null,"magneticCircuit":"open","name":"EP 17","type":"standard"},"type":"halfSet"}],"manufacturerInfo":{"cost":null,"datasheetUrl":"https://ferroxcube.com/upload/media/product/file/Pr_ds/EP17.pdf","family":null,"name":"Ferroxcube","orderCode":null,"reference":"EP17-3C91-A100","status":"production"},"name":"EP 17 - 3C91 - Gapped 0.414 mm","processedDescription":{"columns":[{"area":2.6e-05,"coordinates":[0.0,0.0,0.0],"depth":0.005675,"height":0.0113,"minimumDepth":null,"minimumWidth":null,"shape":"round","type":"central","width":0.005675},{"area":0.000163,"coordinates":[0.0,0.0,-0.007038],"depth":0.002075,"height":0.0113,"minimumDepth":null,"minimumWidth":0.003001,"shape":"irregular","type":"lateral","width":0.078555}],"depth":0.011,"effectiveParameters":{"effectiveArea":3.4461049794381896e-05,"effectiveLength":0.02849715978271948,"effectiveVolume":9.820420422707531e-07,"minimumArea":2.5790801226066944e-05},"height":0.016800000000000002,"width":0.018000000000000002,"windingWindows":[{"angle":null,"area":3.573625e-05,"coordinates":[0.0028374999999999997,0.0],"height":0.0113,"radialHeight":null,"sectionsOrientation":null,"shape":null,"width":0.0031625000000000004}]}},"distributorsInfo":null,"manufacturerInfo":null,"rotation":null},"outputs":[]})"));
+    OpenMagnetics::Mas mas(json::parse(R"({"inputs":{"designRequirements":{"insulation":null,"isolationSides":null,"leakageInductance":null,"magnetizingInductance":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0001},"market":null,"maximumDimensions":null,"maximumWeight":null,"name":"My Design Requirements","operatingTemperature":null,"strayCapacitance":null,"terminalType":null,"topology":null,"turnsRatios":[],"wiringTechnology":null},"operatingPoints":[{"conditions":{"ambientRelativeHumidity":null,"ambientTemperature":42.0,"cooling":null,"name":null},"excitationsPerWinding":[{"current":{"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0.0,100000.0,200000.0,300000.0,400000.0,500000.0,600000.0,700000.0,800000.0,900000.0,1000000.0,1100000.0,1200000.0,1300000.0,1400000.0,1500000.0,1600000.0,1700000.0,1800000.0,1900000.0,2000000.0,2100000.0,2200000.0,2300000.0,2400000.0,2500000.0,2600000.0,2700000.0,2800000.0,2900000.0,3000000.0,3100000.0,3200000.0,3300000.0,3400000.0,3500000.0,3600000.0,3700000.0,3800000.0,3900000.0,4000000.0,4100000.0,4200000.0,4300000.0,4400000.0,4500000.0,4600000.0,4700000.0,4800000.0,4900000.0,5000000.0,5100000.0,5200000.0,5300000.0,5400000.0,5500000.0,5600000.0,5700000.0,5800000.0,5900000.0,6000000.0,6100000.0,6200000.0,6300000.0]},"processed":{"acEffectiveFrequency":110746.40291779551,"average":null,"dutyCycle":0.5,"effectiveFrequency":110746.40291779551,"label":"triangular","offset":0.0,"peak":5.0,"peakToPeak":10.0,"phase":null,"rms":2.8874560332150576,"thd":0.12151487440704967},"waveform":{"ancillaryLabel":null,"data":[-5.0,5.0,-5.0],"numberPeriods":null,"time":[0.0,5e-06,1e-05]}},"frequency":100000.0,"magneticFieldStrength":null,"magneticFluxDensity":null,"magnetizingCurrent":null,"name":"Primary winding excitation","voltage":{"processed":{"acEffectiveFrequency":591485.5360118389,"average":null,"dutyCycle":0.5,"label":"rectangular","offset":0.0,"peak":50,"peakToPeak":100.0,"phase":null,"rms":50,"thd":0.4833151484524849},"waveform":{"ancillaryLabel":null,"data":[-50, 50, 50, -50, -50],"numberPeriods":null,"time":[0.0,0.0,5e-06,5e-06,1e-05]}}},{"current":{"harmonics":null,"processed":{"acEffectiveFrequency":null,"average":null,"dutyCycle":0.5,"effectiveFrequency":null,"label":"triangular","offset":0.0,"peak":null,"peakToPeak":10.0,"phase":null,"rms":null,"thd":null},"waveform":{"ancillaryLabel":null,"data":[-5.0,5.0,-5.0],"numberPeriods":null,"time":[0.0,5e-06,1e-05]}},"frequency":100000.0,"magneticFieldStrength":null,"magneticFluxDensity":null,"magnetizingCurrent":null,"name":"Primary winding excitation","voltage":{"harmonics":null,"processed":{"acEffectiveFrequency":null,"average":null,"dutyCycle":0.5,"effectiveFrequency":null,"label":"rectangular","offset":0.0,"peak":null,"peakToPeak":100.0,"phase":null,"rms":null,"thd":null},"waveform":{"ancillaryLabel":null,"data":[-50, 50, 50, -50, -50],"numberPeriods":null,"time":[0.0,0.0,5e-06,5e-06,1e-05]}}},{"current":{"harmonics":null,"processed":{"acEffectiveFrequency":null,"average":null,"dutyCycle":0.5,"effectiveFrequency":null,"label":"triangular","offset":0.0,"peak":null,"peakToPeak":10.0,"phase":null,"rms":null,"thd":null},"waveform":{"ancillaryLabel":null,"data":[-5.0,5.0,-5.0],"numberPeriods":null,"time":[0.0,5e-06,1e-05]}},"frequency":100000.0,"magneticFieldStrength":null,"magneticFluxDensity":null,"magnetizingCurrent":null,"name":"Primary winding excitation","voltage":{"harmonics":null,"processed":{"acEffectiveFrequency":null,"average":null,"dutyCycle":0.5,"effectiveFrequency":null,"label":"rectangular","offset":0.0,"peak":null,"peakToPeak":100.0,"phase":null,"rms":null,"thd":null},"waveform":{"ancillaryLabel":null,"data":[-50, 50, 50, -50, -50],"numberPeriods":null,"time":[0.0,0.0,5e-06,5e-06,1e-05]}}}],"name":"Operating Point No. 1"}]},"magnetic":{"coil":{"bobbin":{"distributorsInfo":null,"functionalDescription":null,"manufacturerInfo":null,"name":null,"processedDescription":{"columnDepth":0.003912540921738127,"columnShape":"round","columnThickness":0.0010750409217381266,"columnWidth":0.003912540921738127,"coordinates":[0.0,0.0,0.0],"pins":null,"wallThickness":0.0007636652757989004,"windingWindows":[{"angle":null,"area":2.0400047558919626e-05,"coordinates":[0.004956270460869064,0.0,0.0],"height":0.009772669448402199,"radialHeight":null,"sectionsOrientation":null,"shape":"rectangular","width":0.002087459078261874}]}},"functionalDescription":[{"connections":null,"isolationSide":"primary","name":"Primary","numberParallels":1,"numberTurns":32,"wire":{"coating":{"breakdownVoltage":70.0,"grade":1,"material":null,"numberLayers":null,"temperatureRating":null,"thickness":null,"thicknessLayers":null,"type":"enamelled"},"conductingArea":null,"conductingDiameter":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":1e-05},"conductingHeight":null,"conductingWidth":null,"edgeRadius":null,"manufacturerInfo":{"cost":null,"datasheetUrl":null,"family":null,"name":"Elektrisola","orderCode":null,"reference":null,"status":null},"material":"copper","name":"Round 0.01 - Grade 1","numberConductors":1,"outerDiameter":{"excludeMaximum":null,"excludeMinimum":null,"maximum":1.3000000000000001e-05,"minimum":1.2e-05,"nominal":null},"outerHeight":null,"outerWidth":null,"standard":"IEC 60317","standardName":"0.01 mm","strand":null,"type":"round"}}],"layersDescription":null,"sectionsDescription":null,"turnsDescription":null},"core":{"distributorsInfo":[],"functionalDescription":{"coating":null,"gapping":[{"area":2.6e-05,"coordinates":[0.0,0.0,0.0],"distanceClosestNormalSurface":0.005443,"distanceClosestParallelSurface":0.0031625000000000004,"length":0.000414,"sectionDimensions":[0.005675,0.005675],"shape":"round","type":"subtractive"},{"area":0.000163,"coordinates":[0.0,0.0,-0.007038],"distanceClosestNormalSurface":0.005648,"distanceClosestParallelSurface":0.0031625000000000004,"length":5e-06,"sectionDimensions":[0.078555,0.002075],"shape":"irregular","type":"residual"}],"material":"3C91","numberStacks":1,"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0184,"minimum":0.0176,"nominal":null},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0085,"minimum":0.0083,"nominal":null},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.01125,"minimum":0.01075,"nominal":null},"D":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0058,"minimum":0.0055,"nominal":null},"E":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0124,"minimum":0.0116,"nominal":null},"F":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.00585,"minimum":0.0055,"nominal":null},"K":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.002925,"minimum":null,"nominal":null}},"family":"ep","familySubtype":null,"magneticCircuit":"open","name":"EP 17","type":"standard"},"type":"twoPieceSet"},"geometricalDescription":[{"coordinates":[0.0,0.0,0.0],"dimensions":null,"insulationMaterial":null,"machining":[{"coordinates":[0.0,0.0001035,0.0],"length":0.000207}],"material":"3C91","rotation":[3.141592653589793,3.141592653589793,0.0],"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0184,"minimum":0.0176,"nominal":null},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0085,"minimum":0.0083,"nominal":null},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.01125,"minimum":0.01075,"nominal":null},"D":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0058,"minimum":0.0055,"nominal":null},"E":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0124,"minimum":0.0116,"nominal":null},"F":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.00585,"minimum":0.0055,"nominal":null},"K":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.002925,"minimum":null,"nominal":null}},"family":"ep","familySubtype":null,"magneticCircuit":"open","name":"EP 17","type":"standard"},"type":"halfSet"},{"coordinates":[0.0,0.0,0.0],"dimensions":null,"insulationMaterial":null,"machining":[{"coordinates":[0.0,-0.0001035,0.0],"length":0.000207}],"material":"3C91","rotation":[0.0,0.0,0.0],"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0184,"minimum":0.0176,"nominal":null},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0085,"minimum":0.0083,"nominal":null},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.01125,"minimum":0.01075,"nominal":null},"D":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0058,"minimum":0.0055,"nominal":null},"E":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.0124,"minimum":0.0116,"nominal":null},"F":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.00585,"minimum":0.0055,"nominal":null},"K":{"excludeMaximum":null,"excludeMinimum":null,"maximum":0.002925,"minimum":null,"nominal":null}},"family":"ep","familySubtype":null,"magneticCircuit":"open","name":"EP 17","type":"standard"},"type":"halfSet"}],"manufacturerInfo":{"cost":null,"datasheetUrl":"https://ferroxcube.com/upload/media/product/file/Pr_ds/EP17.pdf","family":null,"name":"Ferroxcube","orderCode":null,"reference":"EP17-3C91-A100","status":"production"},"name":"EP 17 - 3C91 - Gapped 0.414 mm","processedDescription":{"columns":[{"area":2.6e-05,"coordinates":[0.0,0.0,0.0],"depth":0.005675,"height":0.0113,"minimumDepth":null,"minimumWidth":null,"shape":"round","type":"central","width":0.005675},{"area":0.000163,"coordinates":[0.0,0.0,-0.007038],"depth":0.002075,"height":0.0113,"minimumDepth":null,"minimumWidth":0.003001,"shape":"irregular","type":"lateral","width":0.078555}],"depth":0.011,"effectiveParameters":{"effectiveArea":3.4461049794381896e-05,"effectiveLength":0.02849715978271948,"effectiveVolume":9.820420422707531e-07,"minimumArea":2.5790801226066944e-05},"height":0.016800000000000002,"width":0.018000000000000002,"windingWindows":[{"angle":null,"area":3.573625e-05,"coordinates":[0.0028374999999999997,0.0],"height":0.0113,"radialHeight":null,"sectionsOrientation":null,"shape":null,"width":0.0031625000000000004}]}},"distributorsInfo":null,"manufacturerInfo":null,"rotation":null},"outputs":[]})"));
 
     auto bobbin = mas.get_magnetic().get_coil().get_bobbin();
     if (std::holds_alternative<std::string>(bobbin)) {
@@ -2762,7 +2881,11 @@ TEST_CASE("Test_WireAdviser_HFInductor_SynthesizesLitz", "[adviser][coil-adviser
     double magnetizingInductance = 100e-6;
     double temperature = 25;
 
-    auto gapping = OpenMagneticsTesting::get_ground_gap(0.0002);
+    // ABT #838: a 1.8 mm gap (was 0.2 mm). 30 turns on a 0.2 mm-gapped PQ 26/25 are 632 uH, and the 10 App
+    // of this fixture put 3C97 at Bpk 0.86 T (125 W at 25 C): with the core loss solved at the temperature
+    // it heats the core to, no operating point existed. 1.8 mm gives the fixture's own 100 uH (99 uH),
+    // Bpk 0.135 T, and keeps the 100 kHz, 10 App drive whose proximity loss litz is for.
+    auto gapping = OpenMagneticsTesting::get_ground_gap(0.0018);
     auto magnetic = OpenMagneticsTesting::get_quick_magnetic("PQ 26/25", gapping, numberTurns, 1, "3C97");
     auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
         frequency, magnetizingInductance, temperature, WaveformLabel::TRIANGULAR, 10, 0.5, 0, turnsRatios);
@@ -2802,7 +2925,11 @@ TEST_CASE("Test_Synthesized_Litz_0101mm_Strand_Simulates", "[coil-adviser][litz]
     auto& settings = OpenMagnetics::Settings::GetInstance();
     settings.reset();
 
-    auto gapping = OpenMagneticsTesting::get_ground_gap(0.0002);
+    // ABT #838: a 1.8 mm gap (was 0.2 mm). 30 turns on a 0.2 mm-gapped PQ 26/25 are 632 uH, and the 10 App
+    // of this fixture put 3C97 at Bpk 0.86 T (125 W at 25 C): with the core loss solved at the temperature
+    // it heats the core to, no operating point existed. 1.8 mm gives the fixture's own 100 uH (99 uH),
+    // Bpk 0.135 T, and keeps the 100 kHz, 10 App drive whose proximity loss litz is for.
+    auto gapping = OpenMagneticsTesting::get_ground_gap(0.0018);
     auto magnetic = OpenMagneticsTesting::get_quick_magnetic("PQ 26/25", gapping, {30}, 1, "3C97");
     auto litz = OpenMagnetics::Wire::create_quick_litz_wire(0.000101, 31);
     magnetic.set_coil(OpenMagnetics::Coil::create_quick_coil("PQ 26/25", {30}, {1}, {litz}));
@@ -2925,4 +3052,842 @@ TEST_CASE("Test_CoilAdviser_Basic_Insulation_Small_Bobbin_Is_Wire_Insulated", "[
     CHECK(anyRated);
 }
 
+TEST_CASE("Test_CoilAdviser_ABT1645_Buck_EPX7_IEC_60317", "[.][abt-1645]") {
+    // The default buck inductor of the web wizard (2 A rms, 15 turns, 100 kHz) on the EPX 7 the
+    // core adviser picks, wire advised with the metric user's preferred standard IEC 60317.
+    settings.reset();
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "abt1645_buck_epx7_builder.json");
+    std::ifstream file(path);
+    OpenMagnetics::Mas mas(json::parse(file));
+    for (size_t windingIndex = 0; windingIndex < mas.get_magnetic().get_coil().get_functional_description().size(); ++windingIndex) {
+        mas.get_mutable_magnetic().get_mutable_coil().get_mutable_functional_description()[windingIndex].set_wire("Dummy");
+    }
+    mas.get_mutable_magnetic().get_mutable_coil().set_turns_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_layers_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_sections_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_groups_description(std::nullopt);
+    settings.set_coil_delimit_and_compact(true);
+    settings.set_core_adviser_include_margin(true);
+    settings.set_preferred_wire_standard(WireStandard::IEC_60317);
+
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(mas, 1);
+    if (masMagneticsWithCoil.empty()) {
+        UNSCOPED_INFO(coilAdviser.get_last_no_results_reason().value_or("no reason recorded"));
+    }
+    else {
+        auto winding = masMagneticsWithCoil[0].get_magnetic().get_coil().get_functional_description()[0];
+        UNSCOPED_INFO("wire " + winding.resolve_wire().get_name().value_or("?") + " x" + std::to_string(winding.get_number_parallels()));
+    }
+    settings.reset();
+    REQUIRE(masMagneticsWithCoil.size() > 0);
+    REQUIRE(masMagneticsWithCoil[0].get_magnetic().get_coil().get_turns_description());
+}
+
 }  // namespace
+
+// ABT #1619: a design a scoring filter rejects (COST on a core material with no price law
+// returns {false, 0}) must not be ranked with the valid ones: their scores are normalised over
+// the valid designs only, and the rejected one goes to the rejected list.
+TEST_CASE("Test_CoilAdviser_Scoring_Excludes_Rejected_Designs", "[adviser][coil-adviser][abt-1619]") {
+    settings.reset();
+    clear_databases();
+    auto inputs = OpenMagneticsTesting::create_quick_test_inputs();
+    std::vector<OpenMagnetics::Mas> masMagnetics;
+    for (auto [material, turns] : std::vector<std::pair<std::string, int64_t>>{{"N87", 20}, {"N87", 40}, {"4W810", 20}}) {
+        std::vector<int64_t> numberTurns = {turns};
+        auto magnetic = OpenMagnetics::magnetic_autocomplete(OpenMagneticsTesting::get_quick_magnetic(
+            "E 42/21/15", OpenMagneticsTesting::get_ground_gap(0.001), numberTurns, 1, material));
+        MagneticManufacturerInfo manufacturerInfo;
+        manufacturerInfo.set_name("test");
+        manufacturerInfo.set_reference(material + " " + std::to_string(turns));
+        magnetic.set_manufacturer_info(manufacturerInfo);
+        OpenMagnetics::Mas mas;
+        mas.set_magnetic(magnetic);
+        mas.set_inputs(inputs);
+        masMagnetics.push_back(mas);
+    }
+    std::vector<MagneticFilterOperation> flow = {MagneticFilterOperation(MagneticFilters::COST, true, true, false, 1.0)};
+    CoilAdviser coilAdviser;
+    coilAdviser.load_filter_flow(flow, inputs);
+    std::vector<std::pair<OpenMagnetics::Mas, double>> rejected;
+    auto scored = coilAdviser.score_magnetics(masMagnetics, flow, &rejected);
+
+    REQUIRE(scored.size() == 2);
+    REQUIRE(rejected.size() == 1);
+    CHECK(rejected[0].first.get_magnetic().get_reference() == "4W810 20");
+    // The cheaper 20-turn design wins, and both scores are real numbers on the valid designs' scale.
+    for (auto& [mas, score] : scored) {
+        CHECK(std::isfinite(score));
+    }
+    double score20 = scored[0].first.get_magnetic().get_reference() == "N87 20" ? scored[0].second : scored[1].second;
+    double score40 = scored[0].first.get_magnetic().get_reference() == "N87 40" ? scored[0].second : scored[1].second;
+    CHECK(score20 > score40);
+    // The scale is set by the valid designs alone: the best of the two scores the full weight and
+    // the worst scores 0. Normalised together with the rejected design's zero cost, the valid
+    // designs would sit far from both ends of the scale.
+    CHECK_THAT(score20, Catch::Matchers::WithinAbs(1.0, 1e-9));
+    CHECK_THAT(score40, Catch::Matchers::WithinAbs(0.0, 1e-9));
+}
+
+TEST_CASE("Test_CoilAdviser_Web_Default_Two_Winding_PQ2715", "[adviser][coil-adviser][bug]") {
+    // ABT #1446: the web's DEFAULT design (100 uH, 100 kHz, triangular 10 App) with two 1:1
+    // windings. The core adviser picks PQ 27/15 Fair-Rite 95, 13 + 13 turns, and "Advise all"
+    // (calculate_advised_coil) answered "No coil found". 26 turns of a 2.9 A rms winding fit a
+    // 4.55 x 4.59 mm window many times over. Same preparation as the web entry point.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "default_two_winding_pq2715_no_coil_found.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    OpenMagnetics::Mas mas(json::parse(file));
+    settings.reset();
+    settings.set_coil_delimit_and_compact(true);
+    // The web sends IEC 60317 as the preferred wire standard; with it the wire adviser's top
+    // candidates per configuration were all ~0.8 mm litz that fit the section by bulk area but
+    // not in whole turns per layer, so the winder rejected every one.
+    settings.set_preferred_wire_standard(MAS::WireStandard::IEC_60317);
+
+    for (size_t windingIndex = 0; windingIndex < mas.get_magnetic().get_coil().get_functional_description().size(); ++windingIndex) {
+        mas.get_mutable_magnetic().get_mutable_coil().get_mutable_functional_description()[windingIndex].set_wire("Dummy");
+    }
+    mas.get_mutable_magnetic().get_mutable_coil().set_turns_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_layers_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_sections_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_groups_description(std::nullopt);
+
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(mas, 1);
+    settings.reset();
+    INFO(coilAdviser.get_last_no_results_reason().value_or("returned results"));
+    REQUIRE(masMagneticsWithCoil.size() == 1);
+    auto coil = masMagneticsWithCoil[0].get_magnetic().get_coil();
+    REQUIRE(coil.get_turns_description());
+    CHECK(coil.get_functional_description()[0].get_number_turns() == 13);
+    CHECK(coil.get_functional_description()[1].get_number_turns() == 13);
+}
+
+// ABT #1718: the default two-winding fixture, prepared as the web does, with its primary voltage
+// either as captured (-20.5 / +70.5 V square, mean +25 V: not volt-second balanced) or replaced
+// by a balanced +-50 V square of the same timing.
+static OpenMagnetics::Mas load_default_two_winding_for_balance_check(bool balanced) {
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "default_two_winding_pq2715_no_coil_found.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    OpenMagnetics::Mas mas(json::parse(file));
+    for (size_t windingIndex = 0; windingIndex < mas.get_magnetic().get_coil().get_functional_description().size(); ++windingIndex) {
+        mas.get_mutable_magnetic().get_mutable_coil().get_mutable_functional_description()[windingIndex].set_wire("Dummy");
+    }
+    mas.get_mutable_magnetic().get_mutable_coil().set_turns_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_layers_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_sections_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_groups_description(std::nullopt);
+    if (balanced) {
+        auto& excitations = mas.get_mutable_inputs().get_mutable_operating_points()[0].get_mutable_excitations_per_winding();
+        // Primary: +50 V for the first half period, -50 V for the second; the secondary (1:1)
+        // carries the same square on its own time axis.
+        std::vector<std::vector<double>> balancedData = {{-50, 50, 50, -50, -50}, {50, 50, -50, -50, 50}};
+        for (size_t windingIndex = 0; windingIndex < excitations.size(); ++windingIndex) {
+            auto& excitation = excitations[windingIndex];
+            auto waveform = excitation.get_voltage()->get_waveform().value();
+            REQUIRE(waveform.get_data().size() == balancedData[windingIndex].size());
+            waveform.set_data(balancedData[windingIndex]);
+            SignalDescriptor voltage;
+            voltage.set_waveform(waveform);
+            auto sampled = OpenMagnetics::Inputs::calculate_sampled_waveform(waveform, excitation.get_frequency());
+            voltage.set_harmonics(OpenMagnetics::Inputs::calculate_harmonics_data(waveform, sampled, excitation.get_frequency()));
+            voltage.set_processed(OpenMagnetics::Inputs::calculate_processed_data(voltage, sampled, false));
+            excitation.set_voltage(voltage);
+        }
+    }
+    return mas;
+}
+
+TEST_CASE("Test_CoilAdviser_Unbalanced_Voltage_Rejected_Before_Winding", "[adviser][coil-adviser][bug][abt-1718]") {
+    // ABT #1718: the loss ranking (since 38b37cc3) integrates the primary voltage of every wound
+    // coil, and an unbalanced voltage throws there (ABT #1585) — after every coil was wound. The
+    // adviser now rejects it once, up front: the message prefix belongs only to that check (the
+    // loss path's own rejection starts "Excitation '...'"), names the winding and the mean.
+    settings.reset();
+    settings.set_coil_delimit_and_compact(true);
+    settings.set_preferred_wire_standard(MAS::WireStandard::IEC_60317);
+    auto mas = load_default_two_winding_for_balance_check(false);
+    CoilAdviser coilAdviser;
+    std::string message;
+    try {
+        coilAdviser.get_advised_coil(mas, 1);
+    }
+    catch (const OpenMagnetics::InvalidInputException& e) {
+        message = e.what();
+    }
+    settings.reset();
+    INFO(message);
+    REQUIRE(message.find("Adviser inputs are invalid: operating point 0") != std::string::npos);
+    CHECK(message.find("winding 0 ('Primary')") != std::string::npos);
+    // The captured primary is -20.5 / +70.5 V at 50 % duty: a mean of +25 V.
+    auto meanPosition = message.find("not volt-second balanced (mean ");
+    REQUIRE(meanPosition != std::string::npos);
+    double reportedMean = std::stod(message.substr(meanPosition + std::string("not volt-second balanced (mean ").size()));
+    CHECK_THAT(reportedMean, Catch::Matchers::WithinAbs(25, 0.5));
+}
+
+TEST_CASE("Test_CoilAdviser_Balanced_Voltage_Still_Advised", "[adviser][coil-adviser][bug][abt-1718]") {
+    // ABT #1718 counterpart: the same design with a balanced +-50 V primary passes the up-front
+    // check and returns coils.
+    settings.reset();
+    settings.set_coil_delimit_and_compact(true);
+    settings.set_preferred_wire_standard(MAS::WireStandard::IEC_60317);
+    auto mas = load_default_two_winding_for_balance_check(true);
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(mas, 1);
+    settings.reset();
+    INFO(coilAdviser.get_last_no_results_reason().value_or("returned results"));
+    REQUIRE(masMagneticsWithCoil.size() == 1);
+    REQUIRE(masMagneticsWithCoil[0].get_magnetic().get_coil().get_turns_description());
+}
+
+TEST_CASE("Test_CoilAdviser_Web_Flyback_Advise_All_Turns_Inside_Window", "[adviser][coil-adviser][bug][abt-1699]") {
+    // ABT #1699: the web's default flyback -> core Advise (95 EQ 26/19/7, 0.18 mm gap, 42:5)
+    // -> wire "Advise All" (calculate_advised_coil), replayed with the settings captured at the
+    // engine proxy. The advised Secondary (5 turns x 4 parallels of a 0.663 mm round wire) could
+    // not be rebuilt with real winding geometry: "5 turn(s) ... already span 33 layers".
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/flyback_calculate_advised_coil.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    auto fixture = json::parse(file);
+    settings.reset();
+    OpenMagneticsTesting::apply_web_engine_settings(fixture.at("engineSettingsAtCall"));
+    settings.set_coil_delimit_and_compact(true);
+    OpenMagnetics::Mas mas(fixture.at("mas"));
+    for (size_t windingIndex = 0; windingIndex < mas.get_magnetic().get_coil().get_functional_description().size(); ++windingIndex) {
+        mas.get_mutable_magnetic().get_mutable_coil().get_mutable_functional_description()[windingIndex].set_wire("Dummy");
+    }
+    mas.get_mutable_magnetic().get_mutable_coil().set_turns_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_layers_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_sections_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_groups_description(std::nullopt);
+
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(mas, 1);
+    INFO(coilAdviser.get_last_no_results_reason().value_or("returned results"));
+    REQUIRE(masMagneticsWithCoil.size() == 1);
+    auto coil = masMagneticsWithCoil[0].get_magnetic().get_coil();
+    REQUIRE(coil.get_turns_description());
+    REQUIRE(coil.get_layers_description());
+
+    // Layers per winding of the advised (ideal) layout.
+    std::map<std::string, size_t> layersPerWinding;
+    const auto layers = coil.get_layers_description().value();
+    for (const auto& layer : layers) {
+        if (layer.get_type() == MAS::ElectricalType::CONDUCTION) {
+            layersPerWinding[layer.get_partial_windings()[0].get_winding()]++;
+        }
+    }
+    const auto windings = coil.get_functional_description();
+    for (const auto& winding : windings) {
+        auto wire = std::get<OpenMagnetics::Wire>(winding.get_wire());
+        std::cout << "[abt-1699] " << winding.get_name() << ": " << winding.get_number_turns() << " turns x "
+                  << winding.get_number_parallels() << " parallels of " << wire.get_name().value_or("?") << " in "
+                  << layersPerWinding[winding.get_name()] << " layers" << std::endl;
+    }
+
+    // Every turn of the advised layout, with its wire's outer dimensions, lies inside the winding
+    // window: the check real winding applies before it routes leads (Coil "[fit]").
+    // Not asserted here: the web's next step, rebuilding this coil from its stored JSON with real
+    // winding geometry (MVB++ magnetic_autocomplete_safe). This MKF refuses it for the design advised
+    // now (5 turns x 4 parallels of a 0.663 mm wire: the per-layer crossing stations do not converge)
+    // and for the one advised before ABT #1446 (5 x 2 Litz 180x0.05: the stored-design re-wind puts a
+    // secondary turn outside the window, so blocking is not applied).
+    auto bobbin = coil.resolve_bobbin();
+    REQUIRE(bobbin.get_processed_description());
+    const auto windingWindows = bobbin.get_processed_description()->get_winding_windows();
+    REQUIRE(windingWindows.size() == 1);
+    const auto& window = windingWindows[0];
+    REQUIRE(window.get_coordinates());
+    REQUIRE(window.get_width());
+    REQUIRE(window.get_height());
+    const double xCenter = std::abs(window.get_coordinates().value()[0]);
+    const double yCenter = window.get_coordinates().value()[1];
+    const double x0 = xCenter - window.get_width().value() / 2;
+    const double x1 = xCenter + window.get_width().value() / 2;
+    const double y0 = yCenter - window.get_height().value() / 2;
+    const double y1 = yCenter + window.get_height().value() / 2;
+    auto wires = coil.get_wires();
+    const auto turns = coil.get_turns_description().value();
+    const double tolerance = 1e-9;
+    for (const auto& turn : turns) {
+        auto& wire = wires[coil.get_winding_index_by_name(turn.get_winding())];
+        const double halfWidth = wire.get_maximum_outer_width() / 2;
+        const double halfHeight = wire.get_maximum_outer_height() / 2;
+        const auto coordinates = turn.get_coordinates();
+        INFO(turn.get_name() << " at (" << coordinates[0] << ", " << coordinates[1] << "), window x[" << x0 << ", " << x1 << "] y[" << y0 << ", " << y1 << "]");
+        CHECK(coordinates[0] - halfWidth >= x0 - tolerance);
+        CHECK(coordinates[0] + halfWidth <= x1 + tolerance);
+        CHECK(coordinates[1] - halfHeight >= y0 - tolerance);
+        CHECK(coordinates[1] + halfHeight <= y1 + tolerance);
+    }
+    settings.reset();
+}
+
+TEST_CASE("Coil adviser returns only coils whose insulation fits the winding window", "[adviser][coil-adviser][bug][abt-838]") {
+    // ABT #838: the adviser's fit verdict tested the copper only. Two advised coils carried an outer
+    // wrap of insulation tape past the window edge (ETD 59 16 x 25 um ending 24.6 um beyond it, the
+    // web flyback on EQ 26/19/7 4 x 25 um ending 15 um beyond it) and the thermal network, which
+    // builds a node per layer, was the first to notice. Many results are asked for so the loss
+    // ranking (whose thermal network would throw on such a coil) does not run: every coil the walk
+    // accepted is returned and judged here.
+    auto requireInsulationInside = [](std::vector<OpenMagnetics::Mas>& advised, CoilAdviser& coilAdviser) {
+        INFO(coilAdviser.get_last_no_results_reason().value_or("returned results"));
+        REQUIRE(!advised.empty());
+        for (auto& mas : advised) {
+            auto& coil = mas.get_mutable_magnetic().get_mutable_coil();
+            INFO(mas.get_magnetic().get_reference() << ": " << coil.get_last_fit_failure());
+            CHECK(coil.are_insulation_layers_inside_winding_window());
+            CHECK(coil.are_turns_inside_winding_window());
+        }
+    };
+    SECTION("Web flyback, EQ 26/19/7, 42:5") {
+        auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/flyback_calculate_advised_coil.json");
+        std::ifstream file(path);
+        REQUIRE(file.good());
+        auto fixture = json::parse(file);
+        settings.reset();
+        OpenMagneticsTesting::apply_web_engine_settings(fixture.at("engineSettingsAtCall"));
+        settings.set_coil_delimit_and_compact(true);
+        OpenMagnetics::Mas mas(fixture.at("mas"));
+        for (size_t windingIndex = 0; windingIndex < mas.get_magnetic().get_coil().get_functional_description().size(); ++windingIndex) {
+            mas.get_mutable_magnetic().get_mutable_coil().get_mutable_functional_description()[windingIndex].set_wire("Dummy");
+        }
+        mas.get_mutable_magnetic().get_mutable_coil().set_turns_description(std::nullopt);
+        mas.get_mutable_magnetic().get_mutable_coil().set_layers_description(std::nullopt);
+        mas.get_mutable_magnetic().get_mutable_coil().set_sections_description(std::nullopt);
+        mas.get_mutable_magnetic().get_mutable_coil().set_groups_description(std::nullopt);
+        CoilAdviser coilAdviser;
+        auto advised = coilAdviser.get_advised_coil(mas, 50);
+        settings.reset();
+        requireInsulationInside(advised, coilAdviser);
+    }
+    SECTION("ETD 59 82:5, basic insulation from IEC 62368-1, no margin tape") {
+        settings.reset();
+        std::vector<int64_t> numberTurns = {82, 5};
+        std::vector<double> turnsRatios = {double(numberTurns[0]) / numberTurns[1]};
+        auto magnetic = OpenMagneticsTesting::get_quick_magnetic("ETD 59", OpenMagneticsTesting::get_ground_gap(0.003), numberTurns, 1, "3C91");
+        auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(175590, 10e-6, 25, WaveformLabel::SINUSOIDAL, 20, 0.5, 0, turnsRatios);
+        DimensionWithTolerance altitude;
+        DimensionWithTolerance mainSupplyVoltage;
+        altitude.set_maximum(2000);
+        mainSupplyVoltage.set_nominal(400);
+        auto insulationRequirements = OpenMagneticsTesting::get_quick_insulation_requirements(
+            altitude, Cti::GROUP_I, IsolationClass::BASIC, mainSupplyVoltage, OvervoltageCategory::IV, PollutionDegree::PD1,
+            std::vector<InsulationStandards>{InsulationStandards::IEC_606641, InsulationStandards::IEC_623681});
+        inputs.get_mutable_design_requirements().set_insulation(insulationRequirements);
+        inputs.process();
+        OpenMagnetics::Mas mas;
+        mas.set_inputs(inputs);
+        mas.set_magnetic(magnetic);
+        settings.set_coil_allow_margin_tape(false);
+        settings.set_coil_allow_insulated_wire(true);
+        settings.set_coil_try_rewind(false);
+        settings.set_coil_adviser_maximum_number_wires(1000);
+        CoilAdviser coilAdviser;
+        auto advised = coilAdviser.get_advised_coil(mas, 50);
+        settings.reset();
+        requireInsulationInside(advised, coilAdviser);
+    }
+}
+
+TEST_CASE("Test_CoilAdviser_Beyond_Wire_Limits_Only_As_Invalid", "[adviser][coil-adviser]") {
+    // A coil wound beyond the wire limits (more than defaults.maximumNumberParallels parallels, or
+    // above defaults.maximumEffectiveCurrentDensity) is never a valid design: when nothing fits an
+    // ETD 59 within them (82:5 turns, 20 A peak to peak at 176 kHz, 328 A on the secondary) the
+    // adviser still answers, but every such coil is marked INVALID with the limit it breaks.
+    settings.reset();
+    auto gapping = OpenMagneticsTesting::get_ground_gap(0.003);
+    std::vector<int64_t> numberTurns = {82, 5};
+    std::vector<double> turnsRatios = {double(numberTurns[0]) / numberTurns[1]};
+    auto magnetic = OpenMagneticsTesting::get_quick_magnetic("ETD 59", gapping, numberTurns, 1, "3C91");
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(175590, 10e-6, 25, WaveformLabel::SINUSOIDAL,
+                                                                                   20, 0.5, 0, turnsRatios);
+    OpenMagnetics::Mas masMagnetic;
+    inputs.process();
+    masMagnetic.set_inputs(inputs);
+    masMagnetic.set_magnetic(magnetic);
+    settings.set_coil_allow_margin_tape(false);
+    settings.set_coil_allow_insulated_wire(true);
+    settings.set_coil_try_rewind(false);
+    settings.set_coil_adviser_maximum_number_wires(1000);
+
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(masMagnetic, 2);
+    REQUIRE(masMagneticsWithCoil.size() > 0);
+    for (auto& masMagneticWithCoil : masMagneticsWithCoil) {
+        auto reference = masMagneticWithCoil.get_magnetic().get_manufacturer_info()->get_reference().value();
+        INFO(reference);
+        if (coil_failed_validity_filters(masMagneticWithCoil)) {
+            CHECK(reference.find(" [violates: ") != std::string::npos);
+        }
+        else {
+            for (const auto& winding : masMagneticWithCoil.get_magnetic().get_coil().get_functional_description()) {
+                CHECK(winding.get_number_parallels() <= Defaults().maximumNumberParallels);
+            }
+        }
+    }
+
+    // 32 A peak to peak: nothing within the limits fits, and the answer says which limit each
+    // returned coil breaks.
+    auto overloadedInputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(175590, 10e-6, 25, WaveformLabel::SINUSOIDAL,
+                                                                                             32, 0.5, 0, turnsRatios);
+    overloadedInputs.process();
+    masMagnetic.set_inputs(overloadedInputs);
+    auto overloadedResults = coilAdviser.get_advised_coil(masMagnetic, 2);
+    REQUIRE(overloadedResults.size() > 0);
+    for (auto& masMagneticWithCoil : overloadedResults) {
+        auto reference = masMagneticWithCoil.get_magnetic().get_manufacturer_info()->get_reference().value();
+        INFO(reference);
+        REQUIRE(coil_failed_validity_filters(masMagneticWithCoil));
+        CHECK(reference.find(" [violates: EFFECTIVE_CURRENT_DENSITY above 12") != std::string::npos);
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_CoilAdviser_Ranks_The_Wound_Coils_By_Losses", "[adviser][coil-adviser]") {
+    // A 300 kHz, 10 A peak-to-peak AC inductor (15 turns on an ETD 49). The first wire that fits is
+    // a 3.7 mm solid round wire (Round 7.0), some thirty skin depths thick at this frequency; the
+    // adviser used to return it because it fitted first. It now winds a pool of coils and keeps
+    // the one with the lowest losses (MagneticFilterLosses), which is not that one.
+    settings.reset();
+    auto gapping = OpenMagneticsTesting::get_ground_gap(0.002);
+    std::vector<int64_t> numberTurns = {15};
+    auto magnetic = OpenMagneticsTesting::get_quick_magnetic("ETD 49", gapping, numberTurns, 1, "3C95");
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(300000, 100e-6, 25, WaveformLabel::TRIANGULAR,
+                                                                                   10, 0.5, 0);
+    inputs.process();
+    OpenMagnetics::Mas masMagnetic;
+    masMagnetic.set_inputs(inputs);
+    masMagnetic.set_magnetic(magnetic);
+    settings.set_coil_allow_margin_tape(false);
+    settings.set_coil_try_rewind(false);
+
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(masMagnetic, 1);
+    REQUIRE(masMagneticsWithCoil.size() == 1);
+    REQUIRE(!coil_failed_validity_filters(masMagneticsWithCoil[0]));
+    auto advisedMagnetic = masMagneticsWithCoil[0].get_magnetic();
+    auto advisedWinding = advisedMagnetic.get_coil().get_functional_description()[0];
+    INFO(OpenMagnetics::Coil::resolve_wire(advisedWinding).get_name().value() << " x" << advisedWinding.get_number_parallels());
+
+    // The same core and turns wound with the first-fitting thick solid wire.
+    auto thickMagnetic = advisedMagnetic;
+    auto thickCoil = thickMagnetic.get_coil();
+    auto functionalDescription = thickCoil.get_functional_description();
+    functionalDescription[0].set_wire("Round 7.0 - Triple Build");
+    functionalDescription[0].set_number_parallels(1);
+    OpenMagnetics::Coil rewoundCoil;
+    rewoundCoil.set_bobbin(thickCoil.get_bobbin());
+    rewoundCoil.set_functional_description(functionalDescription);
+    REQUIRE(rewoundCoil.wind());
+    thickMagnetic.set_coil(rewoundCoil);
+
+    MagneticFilterLosses lossesFilter;
+    auto [advisedValid, advisedLosses] = lossesFilter.evaluate_magnetic(&advisedMagnetic, &inputs);
+    auto [thickValid, thickLosses] = lossesFilter.evaluate_magnetic(&thickMagnetic, &inputs);
+    REQUIRE(advisedValid);
+    REQUIRE(thickValid);
+    INFO("advised " << advisedLosses << " W, Round 7.0 " << thickLosses << " W");
+    CHECK(advisedLosses < thickLosses);
+    settings.reset();
+}
+
+TEST_CASE("Test_CoilAdviser_Coils_Whose_Losses_Cannot_Be_Evaluated_Are_Dropped_From_The_Ranking_With_A_Reason", "[adviser][coil-adviser]") {
+    // Material 67's Steinmetz fit spans 2-20 MHz and this operating point runs at 100 kHz, so
+    // MagneticFilterLosses cannot evaluate any wound coil. The loss ranking must not throw for
+    // that and must not invent a loss: each coil is dropped from the ranking with a logged
+    // reason naming the coil, the material, the frequency and the exception, and a core with
+    // no rankable coil keeps its coils in winding order.
+    OpenMagnetics::Mas mas(json::parse(R"({"inputs":{"designRequirements":{"magnetizingInductance":{"nominal":0.0001},"minimumImpedance":[{"frequency":100000,"impedance":{"magnitude":1000}}],"name":"My Design Requirements","turnsRatios":[{"nominal":1}]},"operatingPoints":[{"name":"Operating Point No. 1","conditions":{"ambientTemperature":42},"excitationsPerWinding":[{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"data":[-5,5,-5],"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular","acEffectiveFrequency":110746.40291779551,"effectiveFrequency":110746.40291779551,"peak":5,"rms":2.8874560332150576,"thd":0.12151487440704967},"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}},"voltage":{"waveform":{"data":[-50, 50, 50, -50, -50],"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular","acEffectiveFrequency":591485.5360118389,"peak":50,"rms":50,"thd":0.4833151484524849}}},{"name":"Primary winding excitation","frequency":100000,"current":{"waveform":{"ancillaryLabel":null,"data":[-5,5,-5],"numberPeriods":null,"time":[0,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":10,"offset":0,"label":"triangular","acEffectiveFrequency":110746.40291779551,"effectiveFrequency":110746.40291779551,"peak":5,"rms":2.8874560332150576,"thd":0.12151487440704967},"harmonics":{"amplitudes":[1.1608769501236793e-14,4.05366124583194,1.787369544444173e-15,0.4511310569983995,9.749053004706756e-16,0.16293015292554872,4.036157626725542e-16,0.08352979924600704,3.4998295008010614e-16,0.0508569581336163,3.1489164048780735e-16,0.034320410449418075,3.142469873118059e-16,0.024811988673843106,2.3653352035940994e-16,0.018849001010678823,2.9306524147249266e-16,0.014866633059596499,1.796485796132569e-16,0.012077180559557785,1.6247782523152451e-16,0.010049063750920609,1.5324769149805092e-16,0.008529750975091871,1.0558579733068502e-16,0.007363501410705499,7.513269775674661e-17,0.006450045785294609,5.871414177162291e-17,0.005722473794997712,9.294731722001391e-17,0.005134763398167541,1.194820309200107e-16,0.004654430423785411,8.2422739080512e-17,0.004258029771397032,9.5067306351894e-17,0.0039283108282380024,1.7540347128474968e-16,0.0036523670873925395,9.623794010508822e-17,0.0034204021424253787,1.4083470894369491e-16,0.0032248884817922927,1.4749333016985644e-16,0.0030599828465501895,1.0448590642474364e-16,0.002921112944200383,7.575487373767413e-18,0.002804680975178716,7.419510610361002e-17,0.0027078483284668376,3.924741709073613e-17,0.0026283777262804953,2.2684279102637236e-17,0.0025645167846443107,8.997077625295079e-17,0.0025149120164513483,7.131074184849219e-17,0.0024785457043284276,9.354417496250849e-17,0.0024546904085875065,1.2488589642405877e-16,0.0024428775264784264],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}},"voltage":{"waveform":{"ancillaryLabel":null,"data":[-50,50,50,-50,-50],"numberPeriods":null,"time":[0,0,0.000005,0.000005,0.00001]},"processed":{"dutyCycle":0.5,"peakToPeak":100,"offset":0,"label":"rectangular","acEffectiveFrequency":591485.536011839,"effectiveFrequency":591449.4202715514,"peak":50,"rms":50,"thd":0.48331514845248497},"harmonics":{"amplitudes":[0.78125,63.64919355013018,1.5625,21.18229569117569,1.5625,12.668415318245188,1.5625,9.004909382998164,1.5625,6.958128475647527,1.5625,5.646149502042871,1.5625,4.729755006746538,1.5625,4.050628933965765,1.5625,3.524943518639316,1.5625,3.104154363036517,1.5625,2.7581982345221827,1.5625,2.467457137437843,1.5625,2.2185795367095267,1.5625,2.0021587188071255,1.5625,1.8113717302085082,1.5625,1.6411450722498175,1.5625,1.487623666720196,1.5625,1.3478217691511587,1.5625,1.2193869682092893,1.5625,1.100436657601639,1.5625,0.9894422127774558,1.5625,0.8851453167661671,1.5625,0.7864964059364037,1.5625,0.6926086154544899,1.5625,0.60272275979863,1.5625,0.5161802771005264,1.5625,0.43240198459440116,1.5625,0.3508711083080249,1.5625,0.27111946896540395,1.5625,0.192715993963664,1.5625,0.11525692425384548,1.5625,0.03835722204524927],"frequencies":[0,100000,200000,300000,400000,500000,600000,700000,800000,900000,1000000,1100000,1200000,1300000,1400000,1500000,1600000,1700000,1800000,1900000,2000000,2100000,2200000,2300000,2400000,2500000,2600000,2700000,2800000,2900000,3000000,3100000,3200000,3300000,3400000,3500000,3600000,3700000,3800000,3900000,4000000,4100000,4200000,4300000,4400000,4500000,4600000,4700000,4800000,4900000,5000000,5100000,5200000,5300000,5400000,5500000,5600000,5700000,5800000,5900000,6000000,6100000,6200000,6300000]}}}]}]},"magnetic":{"coil":{"bobbin":{"distributorsInfo":null,"functionalDescription":null,"manufacturerInfo":null,"name":null,"processedDescription":{"columnDepth":0.00635,"columnShape":"rectangular","columnThickness":0,"columnWidth":0.0011999999999999997,"coordinates":[0,0,0],"pins":null,"wallThickness":0,"windingWindows":[{"angle":360,"area":0.00004901669937763475,"coordinates":[0.00395,0,0],"height":null,"radialHeight":0.00395,"sectionsAlignment":null,"sectionsOrientation":null,"shape":"round","width":null}]}},"functionalDescription":[{"isolationSide":"primary","name":"Primary","numberParallels":1,"numberTurns":45,"wire":"Dummy"},{"name":"Secondary","numberTurns":45,"numberParallels":1,"isolationSide":"secondary","wire":"Dummy"}],"layersDescription":null,"sectionsDescription":null,"turnsDescription":null},"core":{"distributorsInfo":[],"functionalDescription":{"coating":null,"gapping":[],"material":"67","numberStacks":1,"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0079},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127}},"family":"t","familySubtype":null,"magneticCircuit":"closed","name":"T 12.7/7.9/12.7","type":"standard"},"type":"toroidal","magneticCircuit":"closed"},"geometricalDescription":[{"coordinates":[0,0,0],"dimensions":null,"insulationMaterial":null,"machining":null,"material":"67","rotation":[1.5707963267948966,1.5707963267948966,0],"shape":{"aliases":[],"dimensions":{"A":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127},"B":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0079},"C":{"excludeMaximum":null,"excludeMinimum":null,"maximum":null,"minimum":null,"nominal":0.0127}},"family":"t","familySubtype":null,"magneticCircuit":"closed","name":"T 12.7/7.9/12.7","type":"standard"},"type":"toroidal"}],"manufacturerInfo":{"cost":null,"datasheetUrl":"https://fair-rite.com/product/toroids-5967001901/","family":null,"name":"Fair-Rite","orderCode":null,"reference":"5967001901","status":"production"},"name":"T 12.7/7.9/12.7 - 67 - Ungapped","processedDescription":{"columns":[{"area":0.000031,"coordinates":[0,0,0],"depth":0.0127,"height":0.03235840433197487,"minimumDepth":null,"minimumWidth":null,"shape":"rectangular","type":"central","width":0.0023999999999999994}],"depth":0.0127,"effectiveParameters":{"effectiveArea":0.000030479999999999996,"effectiveLength":0.03235840433197488,"effectiveVolume":9.862841640385941e-7,"minimumArea":0.00003047999999999999},"height":0.0127,"width":0.0127,"windingWindows":[{"angle":360,"area":0.00004901669937763475,"coordinates":[0.0023999999999999994,0],"height":null,"radialHeight":0.00395,"sectionsAlignment":null,"sectionsOrientation":null,"shape":null,"width":null}]}},"manufacturerInfo":{"name":"OpenMagnetics","reference":"My custom magnetic"}},"outputs":[]})"));
+
+    for (size_t windingIndex = 0; windingIndex < mas.get_magnetic().get_coil().get_functional_description().size(); ++windingIndex) {
+        mas.get_mutable_magnetic().get_mutable_coil().get_mutable_functional_description()[windingIndex].set_wire("Dummy");
+    }
+    mas.get_mutable_magnetic().get_mutable_coil().set_turns_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_layers_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_sections_description(std::nullopt);
+
+    OpenMagnetics::read_log();  // drain, so the assertions below see only this run
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(mas, 1);
+    auto log = OpenMagnetics::read_log();
+    INFO(log);
+    REQUIRE(masMagneticsWithCoil.size() == 1);
+    CHECK(log.find("dropped from the loss ranking") != std::string::npos);
+    CHECK(log.find("(material 67, frequency 100000.000000 Hz)") != std::string::npos);
+    CHECK(log.find("Steinmetz loss coefficients are fitted over 2000000.000000 Hz to 20000000.000000 Hz") != std::string::npos);
+    CHECK(log.find("could be ranked by losses; returning them in winding order, unranked") != std::string::npos);
+}
+
+// ABT #1699: a coil advised with real winding geometry on is one the real winder builds from its
+// stored form: real_winding_refusal accepts it, and rebuilt as the web does (MVB++
+// magnetic_autocomplete_safe) it applies its connection blocking with every turn inside the window.
+static void check_advised_coils_are_real_windable(std::vector<OpenMagnetics::Mas>& advised) {
+    for (auto& advisedMas : advised) {
+        const auto windings = advisedMas.get_magnetic().get_coil().get_functional_description();
+        for (const auto& winding : windings) {
+            std::cout << "[abt-1699 real winding] " << winding.get_name() << ": " << winding.get_number_turns() << " turns x "
+                      << winding.get_number_parallels() << " parallels of "
+                      << std::get<OpenMagnetics::Wire>(winding.get_wire()).get_name().value_or("?") << std::endl;
+        }
+        auto refusal = OpenMagnetics::real_winding_refusal(advisedMas.get_magnetic(), advisedMas.get_inputs());
+        INFO(refusal.value_or("accepted"));
+        CHECK(!refusal);
+        auto rebuilt = OpenMagneticsTesting::rebuild_with_real_winding_as_web(advisedMas.get_magnetic());
+        INFO(rebuilt.get_mutable_coil().get_last_fit_failure());
+        CHECK(rebuilt.get_coil().is_real_winding_blocking_applied());
+        const auto outside = OpenMagneticsTesting::turns_outside_winding_window(rebuilt.get_mutable_coil());
+        for (const auto& turn : outside) {
+            INFO(turn);
+            CHECK(false);
+        }
+    }
+}
+
+// A web wire "Advise all" call (WebLibMKF calculate_advised_coil): the engine settings at the
+// call, then the MAS with every wire Dummy and the coil's descriptions cleared, as the web does.
+static OpenMagnetics::Mas load_web_advise_all(const std::string& fixtureName) {
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/" + fixtureName);
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    auto fixture = json::parse(file);
+    settings.reset();
+    OpenMagneticsTesting::apply_web_engine_settings(fixture.at("engineSettingsAtCall"));
+    settings.set_coil_delimit_and_compact(true);
+    OpenMagnetics::Mas mas(fixture.at("mas"));
+    for (size_t windingIndex = 0; windingIndex < mas.get_magnetic().get_coil().get_functional_description().size(); ++windingIndex) {
+        mas.get_mutable_magnetic().get_mutable_coil().get_mutable_functional_description()[windingIndex].set_wire("Dummy");
+    }
+    mas.get_mutable_magnetic().get_mutable_coil().set_turns_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_layers_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_sections_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_groups_description(std::nullopt);
+    return mas;
+}
+
+static OpenMagnetics::Mas load_web_flyback_advise_all(bool realWinding) {
+    auto mas = load_web_advise_all("flyback_calculate_advised_coil.json");
+    settings.set_coil_use_real_winding_geometry(realWinding);
+    return mas;
+}
+
+TEST_CASE("Test_CoilAdviser_Web_Cmc_Advise_All_Ranks_Coils_Without_A_Given_Magnetizing_Current", "[adviser][coil-adviser][bug]") {
+    // The web's default CMC (T 10.5/5.5/20 in R12KZ; a 150 kHz common-mode point and a 50 Hz line
+    // point whose windings carry opposite currents and no voltage), wire "Advise all". The loss
+    // ranking of the wound coils asked MagneticSimulator for core losses, which copied the
+    // excitation before the magnetizing-inductance model stamped the magnetizing current into the
+    // operating point, and the loss-factor model refused the copy: "Missing magnetizing current
+    // in excitation", no coil.
+    auto mas = load_web_advise_all("cmc_calculate_advised_coil.json");
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(mas, 1);
+    INFO(coilAdviser.get_last_no_results_reason().value_or("returned results"));
+    REQUIRE(masMagneticsWithCoil.size() == 1);
+    for (const auto& winding : masMagneticsWithCoil[0].get_magnetic().get_coil().get_functional_description()) {
+        auto wire = winding.get_wire();
+        CHECK(!(std::holds_alternative<std::string>(wire) && std::get<std::string>(wire) == "Dummy"));
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_CoilAdviser_Real_Winding_Web_Flyback_Advise_All_Is_Real_Windable", "[adviser][coil-adviser][bug][abt-1699]") {
+    // ABT #1699 flow 3: the web's default flyback (95 EQ 26/19/7, 42:5), wire "Advise All" with real
+    // winding geometry on. The adviser proposed wires laid out with no crossing stations (the
+    // Secondary as 5 turns x 4 parallels of a 0.663 mm wire, or 5 x 2 of a 1.02 mm litz filling its
+    // 2 layers exactly) that the real winder cannot build: it found nothing. Now the whole-turn
+    // packing filter reserves one crossing station per layer and parallel, and the coils returned
+    // are vetted by the real winder from their stored form.
+    auto mas = load_web_flyback_advise_all(true);
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(mas, 1);
+    INFO(coilAdviser.get_last_no_results_reason().value_or("returned results"));
+    REQUIRE(masMagneticsWithCoil.size() >= 1);
+    check_advised_coils_are_real_windable(masMagneticsWithCoil);
+    settings.reset();
+}
+
+TEST_CASE("Test_CoilAdviser_Real_Winding_Web_Default_Two_Winding_PQ2715_Is_Not_Real_Windable", "[adviser][coil-adviser][bug][abt-1699]") {
+    // ABT #1699 flow 3 (Alf, 2026-10-10): the web's default two-winding design on PQ 27/15 (13 + 13
+    // turns, 2.9 A rms), with the balanced +-50 V primary built in-test (the captured one is refused
+    // up front, ABT #1718/#1719), advised with real winding geometry on. No coil the adviser may
+    // propose is real-windable in this window: with one crossing station per layer and parallel
+    // and the slots the connection leads block, every wire within the current-density limit needs
+    // more layers than a P|S section has. The adviser must return nothing, and say so: the reason
+    // names the stations and the lead blocking.
+    settings.reset();
+    settings.set_coil_delimit_and_compact(true);
+    settings.set_preferred_wire_standard(MAS::WireStandard::IEC_60317);
+    settings.set_coil_use_real_winding_geometry(true);
+    auto mas = load_default_two_winding_for_balance_check(true);
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(mas, 1);
+    settings.reset();
+    CHECK(masMagneticsWithCoil.empty());
+    REQUIRE(coilAdviser.get_last_no_results_reason());
+    auto reason = coilAdviser.get_last_no_results_reason().value();
+    INFO(reason);
+    CHECK(reason.find("not real-windable in this window") != std::string::npos);
+    CHECK(reason.find("crossing stations") != std::string::npos);
+    CHECK(reason.find("connection-lead blocking") != std::string::npos);
+}
+
+TEST_CASE("Test_MagneticFilterAreaWithParallels_Reserves_Crossing_Stations_Only_With_Real_Winding", "[adviser][coil-adviser][magnetic-filter][bug][abt-1699]") {
+    // ABT #1699: 5 turns x 2 parallels of a 1.02 mm wire in a section 5.65 mm along the layer and
+    // 2.04 mm deep. Ideally that is 5 turns per layer in 2 layers: it packs. With real winding
+    // geometry each layer also carries one crossing station per parallel (ABT #685), so a layer
+    // holds 3 turns and the 10 turns need 4 layers (4.08 mm): it does not.
+    OpenMagnetics::Wire wire;
+    wire.set_type(MAS::WireType::ROUND);
+    wire.set_name("abt1699 round 1.02");
+    wire.set_nominal_value_conducting_diameter(0.0010);
+    wire.set_nominal_value_outer_diameter(0.00102);
+    wire.set_nominal_value_conducting_area(std::numbers::pi * 0.0005 * 0.0005);
+    wire.set_material("copper");
+    wire.set_number_conductors(1);
+    OpenMagnetics::Winding winding;
+    winding.set_name("Secondary");
+    winding.set_number_turns(5);
+    winding.set_number_parallels(2);
+    winding.set_isolation_side(MAS::IsolationSide::SECONDARY);
+    winding.set_wire(wire);
+    MAS::Section section;
+    section.set_name("Secondary section 0");
+    section.set_type(MAS::ElectricalType::CONDUCTION);
+    section.set_coordinate_system(MAS::CoordinateSystem::CARTESIAN);
+    section.set_layers_orientation(MAS::WindingOrientation::OVERLAPPING);
+    section.set_dimensions({0.00204, 0.00565});
+    section.set_coordinates({0.01, 0, 0});
+    const double sectionArea = 0.00204 * 0.00565;
+    MagneticFilterAreaWithParallels filter;
+
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(false);
+    CHECK(filter.evaluate_magnetic(winding, section, 1, sectionArea, false).first);
+    settings.set_coil_use_real_winding_geometry(true);
+    CHECK(!filter.evaluate_magnetic(winding, section, 1, sectionArea, false).first);
+    // A one-turn winding is an omega: no crossing station is charged. ABT #1496 (Alf, 2026-10-11):
+    // its 9 parallels' leads still block their slots, and with them the omega needs 6.12 mm along
+    // a 5.65 mm section: the real winder refuses it, and the filter says why.
+    winding.set_number_turns(1);
+    winding.set_number_parallels(9);
+    MagneticFilterAreaWithParallels omegaFilter;
+    CHECK(!omegaFilter.evaluate_magnetic(winding, section, 1, sectionArea, false).first);
+    INFO(omegaFilter.get_first_real_winding_refusal());
+    CHECK(!omegaFilter.get_first_real_winding_refusal().empty());
+    settings.reset();
+}
+
+TEST_CASE("Test_MagneticFilterAreaWithParallels_Reserves_Lead_Blocking_Only_With_Real_Winding", "[adviser][coil-adviser][magnetic-filter][bug][abt-1699]") {
+    // ABT #1699 (Alf, 2026-10-10: model lead blocking too): 8 turns of a 1.02 mm wire in a section
+    // 5.65 mm along the layer (5 positions). With the crossing stations alone a layer holds 4 turns
+    // and 2 layers (2.04 mm) close it. The real winder also blocks a slot of every outer layer for
+    // the entrance lead that crosses it (blocked={0+0,0+1,...}), so the second layer holds 3 and a
+    // third layer is needed: in a 2.04 mm deep section it does not pack, in a 3.06 mm one it does.
+    // With the setting off neither the stations nor the leads are charged.
+    OpenMagnetics::Wire wire;
+    wire.set_type(MAS::WireType::ROUND);
+    wire.set_name("abt1699 round 1.02");
+    wire.set_nominal_value_conducting_diameter(0.0010);
+    wire.set_nominal_value_outer_diameter(0.00102);
+    wire.set_nominal_value_conducting_area(std::numbers::pi * 0.0005 * 0.0005);
+    wire.set_material("copper");
+    wire.set_number_conductors(1);
+    OpenMagnetics::Winding winding;
+    winding.set_name("Primary");
+    winding.set_number_turns(8);
+    winding.set_number_parallels(1);
+    winding.set_isolation_side(MAS::IsolationSide::PRIMARY);
+    winding.set_wire(wire);
+    auto sectionOfDepth = [](double depth) {
+        MAS::Section section;
+        section.set_name("Primary section 0");
+        section.set_type(MAS::ElectricalType::CONDUCTION);
+        section.set_coordinate_system(MAS::CoordinateSystem::CARTESIAN);
+        section.set_layers_orientation(MAS::WindingOrientation::OVERLAPPING);
+        section.set_dimensions({depth, 0.00565});
+        section.set_coordinates({0.01, 0, 0});
+        return section;
+    };
+
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(false);
+    {
+        MagneticFilterAreaWithParallels filter;
+        CHECK(filter.evaluate_magnetic(winding, sectionOfDepth(0.00204), 1, 0.00204 * 0.00565, false).first);
+    }
+    settings.set_coil_use_real_winding_geometry(true);
+    {
+        MagneticFilterAreaWithParallels filter;
+        CHECK(!filter.evaluate_magnetic(winding, sectionOfDepth(0.00204), 1, 0.00204 * 0.00565, false).first);
+        CHECK(filter.get_real_winding_refusals() == 1);
+        INFO(filter.get_first_real_winding_refusal());
+        CHECK(filter.get_first_real_winding_refusal().find("Primary section 0") != std::string::npos);
+    }
+    {
+        MagneticFilterAreaWithParallels filter;
+        CHECK(filter.evaluate_magnetic(winding, sectionOfDepth(0.00306), 1, 0.00306 * 0.00565, false).first);
+        CHECK(filter.get_real_winding_refusals() == 0);
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_CoilAdviser_Real_Winding_Selection_Drops_What_The_Real_Winder_Refuses", "[adviser][coil-adviser][bug][abt-1699]") {
+    // ABT #1699 (b): with real winding geometry on, the coils the adviser returns are vetted by the
+    // real winder on their stored form. A web-flyback candidate the real winder refuses when it is
+    // rebuilt from its stored form ('Secondary 0 section 0' cannot hold its turns once the
+    // connection corridors are blocked) is not returned; with the setting off the selection is the
+    // first maximumNumberResults, as before.
+    auto mas = load_web_flyback_advise_all(true);
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/flyback_interleaved_candidate_stored.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    auto stored = json::parse(file).at("magnetic");
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(OpenMagnetics::Core(stored.at("core")));
+    magnetic.set_coil(OpenMagnetics::Coil(stored.at("coil"), false));
+    mas.set_magnetic(magnetic);
+
+    MagneticFilterRealWinding filter;
+    CHECK(!filter.evaluate_magnetic(&mas.get_mutable_magnetic(), &mas.get_mutable_inputs()).first);
+    INFO(filter.get_last_reason());
+    CHECK(filter.get_last_reason().find("cannot hold its") != std::string::npos);
+
+    CoilAdviser coilAdviser;
+    CHECK(coilAdviser.select_real_windable({mas}, 1).empty());
+    settings.set_coil_use_real_winding_geometry(false);
+    CHECK(coilAdviser.select_real_windable({mas}, 1).size() == 1);
+    settings.reset();
+}
+
+TEST_CASE("Test_CoilAdviser_Random_15_Real_Winding", "[adviser][coil-adviser][real-geometry][bug]") {
+    // ABT #1734: the Random_15/16 design (T 12.7/7.9/12.7, 45 + 45 turns) advised with real
+    // winding on. The toroidal placer laid 20 stations into 19-slot bifilar rings, the outer-
+    // crossing sweep threw CALCULATION_INVALID_RESULT on the overrun ring, and the whole advise
+    // aborted. The adviser must return a design.
+    auto jsonPath = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "test_coiladviser_random_15_real_winding.json");
+    std::ifstream jsonFile(jsonPath);
+    OpenMagnetics::Mas mas(json::parse(jsonFile));
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    mas.get_mutable_magnetic().get_mutable_coil().set_turns_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_layers_description(std::nullopt);
+    mas.get_mutable_magnetic().get_mutable_coil().set_sections_description(std::nullopt);
+    // Since ABT #1699 the adviser counts a COIL_WINDING_ERROR as that candidate's refusal and walks
+    // on, so "returns a design" alone would pass with the defect back. The refusals are logged at
+    // INFO: none of them may be the outer-crossing sweep's.
+    Logger::getInstance().disableCollector();
+    Logger::getInstance().enableCollector(LogLevel::INFO);
+    Logger::getInstance().drainCollected();
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(mas, 1);
+    size_t outerCrossingRefusals = 0;
+    for (const auto& record : Logger::getInstance().drainCollected()) {
+        if (record.message.find("NO outer-crossing azimuth") != std::string::npos) {
+            INFO(record.message);
+            ++outerCrossingRefusals;
+        }
+    }
+    Logger::getInstance().disableCollector();
+    CHECK(outerCrossingRefusals == 0);
+    REQUIRE(masMagneticsWithCoil.size() > 0);
+    OpenMagneticsTesting::check_turns_description(masMagneticsWithCoil[0].get_magnetic().get_coil());
+    // Every ring stays in its own winding's sector (ABT #1734, see the bifilar toroid guard in
+    // TestCoil.cpp).
+    OpenMagneticsTesting::check_toroidal_sections_keep_their_sectors(masMagneticsWithCoil[0].get_magnetic().get_coil());
+    for (auto& advisedMas : masMagneticsWithCoil) {
+        auto refusal = OpenMagnetics::real_winding_refusal(advisedMas.get_magnetic(), advisedMas.get_inputs());
+        INFO(refusal.value_or("accepted"));
+        CHECK(!refusal);
+    }
+    settings.reset();
+}
+
+// ABT #1896: the web's default flyback after Core Advise (97 EQ 26/19/7 gapped 0.18 mm, 42:5 with
+// 2 secondary parallels), wire "Advise all" (WebLibMKF calculate_advised_coil), then the builder's
+// simulate (IGSE core losses, Zhang gap reluctance, Maniktala core temperature).
+static OpenMagnetics::Mas simulate_like_the_web_builder(const OpenMagnetics::Inputs& inputs, const OpenMagnetics::Magnetic& magnetic) {
+    settings.set_core_temperature_model(CoreTemperatureModels::MANIKTALA);
+    MagneticSimulator magneticSimulator;
+    magneticSimulator.set_core_losses_model_name(CoreLossesModels::IGSE);
+    magneticSimulator.set_reluctance_model_name(ReluctanceModels::ZHANG);
+    return magneticSimulator.simulate(inputs, magnetic);
+}
+
+TEST_CASE("Test_CoilAdviser_Web_Flyback_97_Advise_All_Coil_Stays_In_Its_Window", "[adviser][coil-adviser][coil][bug][abt-1896]") {
+    // The builder's coil after "Advise all" laid the Secondary's 5 turns x 2 parallels of a 1.05 mm
+    // served litz as ONE layer 10.5 mm tall in a 5.65 mm window: 'Secondary 0 parallel 1 turn 4'
+    // ended 4.875 mm above it, and the thermal network refused it ('overlaps its enclosure by
+    // 4.875 mm'). The thermal check is right: that copper is outside the window.
+    {
+        auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/flyback_97_advised_coil_simulate.json");
+        std::ifstream file(path);
+        REQUIRE(file.good());
+        auto call = json::parse(file);
+        OpenMagnetics::Inputs inputs(call.at("inputs"));
+        OpenMagnetics::Magnetic magnetic(call.at("magnetic"));
+        auto outside = OpenMagneticsTesting::turns_outside_winding_window(magnetic.get_mutable_coil());
+        REQUIRE(!outside.empty());
+        CHECK(outside.back().find("Secondary 0 parallel 1 turn 4") == 0);
+        CHECK_THROWS_WITH(simulate_like_the_web_builder(inputs, magnetic), Catch::Matchers::ContainsSubstring("overlaps its enclosure"));
+    }
+
+    // The adviser's own coil fits (2 Secondary layers, 4.237 mm of the 4.25 mm window).
+    auto mas = load_web_advise_all("flyback_97_calculate_advised_coil.json");
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(mas, 1);
+    INFO(coilAdviser.get_last_no_results_reason().value_or("returned results"));
+    REQUIRE(masMagneticsWithCoil.size() == 1);
+    auto advisedCoil = masMagneticsWithCoil[0].get_magnetic().get_coil();
+    CHECK(OpenMagneticsTesting::turns_outside_winding_window(advisedCoil).empty());
+
+    // The builder then re-winds it as WebLibMKF wind_impl does: a fresh coil from the bobbin and the
+    // windings, the panel's 0 mm interlayer and 0.1 mm intersection insulation, the 48/52 split of
+    // the advised sections, and wind-even-if-not-fit. The 0 mm interlayer sheets kept the window's
+    // height while compaction shrank their sections to the copper, the fitting layout was judged
+    // unfit, and try_rewind's re-split collapsed the Secondary into one overflowing layer.
+    settings.set_coil_wind_even_if_not_fit(true);
+    settings.set_coil_delimit_and_compact(true);
+    settings.set_coil_include_additional_coordinates(true);
+    OpenMagnetics::Coil coil;
+    coil.set_bobbin(advisedCoil.get_bobbin());
+    coil.set_functional_description(advisedCoil.get_functional_description());
+    coil.preload_margins({{0, 0}, {0, 0}});
+    coil.set_turns_alignment(CoilAlignment::CENTERED, "Primary section 0");
+    coil.set_turns_alignment(CoilAlignment::CENTERED, "Secondary 0 section 0");
+    coil.set_layers_orientation(WindingOrientation::OVERLAPPING, "Primary section 0");
+    coil.set_layers_orientation(WindingOrientation::OVERLAPPING, "Secondary 0 section 0");
+    coil.set_interlayer_insulation(0, std::nullopt, std::nullopt, false);
+    coil.set_intersection_insulation(0.0001, 1, std::nullopt, std::nullopt, false);
+    CHECK(coil.wind({0.48, 0.52}, {0, 1}, 1));
+    REQUIRE(coil.get_turns_description());
+    coil.delimit_and_compact();
+    for (const auto& turn : OpenMagneticsTesting::turns_outside_winding_window(coil)) {
+        INFO(turn);
+        CHECK(false);
+    }
+    // Every layer, the interlayer sheets included, stays inside its own section.
+    const auto layers = coil.get_layers_description().value();
+    for (const auto& layer : layers) {
+        if (!layer.get_section()) {
+            continue;
+        }
+        auto section = coil.get_section_by_name(layer.get_section().value());
+        INFO(layer.get_name());
+        CHECK(layer.get_coordinates()[1] + layer.get_dimensions()[1] / 2 <= section.get_coordinates()[1] + section.get_dimensions()[1] / 2 + 1e-9);
+        CHECK(layer.get_coordinates()[1] - layer.get_dimensions()[1] / 2 >= section.get_coordinates()[1] - section.get_dimensions()[1] / 2 - 1e-9);
+    }
+    CHECK(coil.get_layers_by_winding_index(1).size() == 2);
+
+    // The builder simulates the re-wound coil from its stored form.
+    auto magnetic = masMagneticsWithCoil[0].get_magnetic();
+    magnetic.set_coil(coil);
+    json stored;
+    to_json(stored, magnetic);
+    OpenMagnetics::Magnetic reloaded(stored);
+    CHECK_NOTHROW(simulate_like_the_web_builder(masMagneticsWithCoil[0].get_inputs(), reloaded));
+    settings.reset();
+}

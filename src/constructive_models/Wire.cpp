@@ -121,7 +121,7 @@ namespace OpenMagnetics {
 
     }
 
-    WireRound Wire::resolve_strand() {
+    WireRound Wire::resolve_strand() const {
         if (!get_strand())
             throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Litz wire is missing strand information");
 
@@ -137,7 +137,7 @@ namespace OpenMagnetics {
 
     }
 
-    WireMaterial Wire::resolve_material() { 
+    WireMaterial Wire::resolve_material() const { 
         if (get_type() == WireType::LITZ) {
             auto strand = resolve_strand();
             return resolve_material(strand);
@@ -160,6 +160,31 @@ namespace OpenMagnetics {
         else {
             return std::get<WireMaterial>(material);
         }
+    }
+
+    double Wire::get_thermal_conductivity(const WireMaterial& material, double temperature) {
+        const auto table = material.get_thermal_conductivity();
+        if (!table || table->empty())
+            throw InvalidInputException(ErrorCode::MISSING_DATA,
+                                        "Wire material '" + material.get_name() + "' has no thermalConductivity in MAS");
+        std::vector<std::pair<double, double>> points;
+        for (const auto& p : *table) points.emplace_back(p.get_temperature(), p.get_value());
+        std::sort(points.begin(), points.end());
+        for (size_t i = 1; i < points.size(); ++i)
+            if (points[i].first == points[i - 1].first)
+                throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                                            "Wire material '" + material.get_name() + "' tabulates its thermal conductivity twice at " +
+                                            std::to_string(points[i].first) + " C");
+        if (temperature < points.front().first || temperature > points.back().first)
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                                        "Wire material '" + material.get_name() + "': thermal conductivity is tabulated from " +
+                                        std::to_string(points.front().first) + " to " + std::to_string(points.back().first) +
+                                        " C, asked at " + std::to_string(temperature) + " C");
+        for (size_t i = 0; i + 1 < points.size(); ++i)
+            if (temperature <= points[i + 1].first)
+                return std::lerp(points[i].second, points[i + 1].second,
+                                 (temperature - points[i].first) / (points[i + 1].first - points[i].first));
+        return points.back().second;   // temperature == the single tabulated point
     }
 
     WireMaterial Wire::resolve_material(Wire wire) {
@@ -1105,10 +1130,20 @@ namespace OpenMagnetics {
                     return resolve_dimensional_values(wire.get_conducting_width().value(), preferredValue);
                 }
             }
-            case WireType::FOIL:
-                // The interleaved film: the pitch a foil layer occupies is foil + film.
-                return resolve_dimensional_values(wire.get_conducting_width().value(), preferredValue) +
-                       Wire::get_foil_interlayer_insulation(wire);
+            case WireType::FOIL: {
+                // ABT #1151 (Alf, 2026-10-18: "outer = conductor"): a foil's outer width is its
+                // conductor, plus a coating only when the wire DECLARES one. The film an undeclared
+                // foil is wound with is a separate interleaf, counted once per turn interval in the
+                // wound width (get_maximum_outer_width), never in the wire's own outer size: a wire
+                // that states no coating but an outer size 25 um past its conductor contradicts
+                // itself (OMFEM refused it as INVALID_WIRE_DATA).
+                const double conducting = resolve_dimensional_values(wire.get_conducting_width().value(), preferredValue);
+                auto coating = Wire::resolve_coating(wire);
+                if (coating && coating->get_type() != InsulationWireCoatingType::BARE) {
+                    return conducting + Wire::get_coating_thickness(coating.value());
+                }
+                return conducting;
+            }
             case WireType::PLANAR:
                 return resolve_dimensional_values(wire.get_conducting_width().value(), preferredValue);
             default:
@@ -1182,14 +1217,20 @@ namespace OpenMagnetics {
         return calculate_outer_diameter(*this, preferredValue);
     }
 
+    int64_t Wire::resolve_number_conductors() const {
+        if (get_number_conductors()) {
+            return get_number_conductors().value();
+        }
+        if (get_type() == WireType::LITZ) {
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Missing number of conductors for litz wire" +
+                                        (get_name() ? " " + get_name().value() : std::string()));
+        }
+        return 1;
+    }
+
     double Wire::calculate_conducting_area() {
         if (!get_number_conductors()) {
-            if (get_type() == WireType::LITZ) {
-                throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Missing number of conductors for wire");
-            }
-            else {
-                set_number_conductors(1);
-            }
+            set_number_conductors(resolve_number_conductors());
         }
         switch (get_type()) {
             case WireType::LITZ:
@@ -1249,12 +1290,7 @@ namespace OpenMagnetics {
 
     double Wire::calculate_outer_area() {
         if (!get_number_conductors()) {
-            if (get_type() == WireType::LITZ) {
-                throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Missing number of conductors for wire");
-            }
-            else {
-                set_number_conductors(1);
-            }
+            set_number_conductors(resolve_number_conductors());
         }
         switch (get_type()) {
             case WireType::LITZ:
@@ -1526,9 +1562,11 @@ namespace OpenMagnetics {
         return numberParallels;
     }
 
-    double Wire::get_maximum_outer_width() {
+    double Wire::get_maximum_outer_width() const {
         switch (get_type()) {
             case WireType::LITZ:
+                if (_woundFootprint)
+                    return _woundFootprint->first;
                 if (get_outer_diameter())
                     return resolve_dimensional_values(get_outer_diameter().value());
                 else
@@ -1546,19 +1584,51 @@ namespace OpenMagnetics {
                     return get_maximum_conducting_width();
             case WireType::PLANAR:
             case WireType::RECTANGULAR:
-            case WireType::FOIL:
                 if (get_outer_width())
                     return resolve_dimensional_values(get_outer_width().value());
-                else 
+                else
                     return resolve_dimensional_values(get_conducting_width().value());
+            case WireType::FOIL: {
+                // ABT #1151: the WOUND width of a foil -- the slot it takes in its layer -- is its
+                // conductor plus the interleaved film (get_foil_interlayer_insulation), counted once
+                // per turn interval. Like a litz bundle's wound footprint, it is not the wire's own
+                // outerWidth, which is the conductor (+ a declared coating). A foil that DECLARES
+                // its coating carries that insulation itself, so its stated outerWidth is the slot.
+                // For one that declares none, an outerWidth that is neither the conductor nor the
+                // conductor plus its film (the value MKF itself wrote before ABT #1151) states
+                // insulation nothing accounts for, and is refused.
+                if (!get_conducting_width()) {
+                    throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA,
+                        "Foil wire '" + get_name().value_or("<unnamed>") + "' has no conductingWidth (its thickness)");
+                }
+                const double conducting = resolve_dimensional_values(get_conducting_width().value());
+                if (Wire::resolve_coating(*this) && get_outer_width()) {
+                    return resolve_dimensional_values(get_outer_width().value());
+                }
+                const double film = Wire::get_foil_interlayer_insulation(*this);
+                if (get_outer_width()) {
+                    const double outer = resolve_dimensional_values(get_outer_width().value());
+                    const double tolerance = 1e-9 + 1e-9 * conducting;
+                    if (std::abs(outer - conducting) > tolerance && std::abs(outer - (conducting + film)) > tolerance) {
+                        throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA,
+                            "Foil wire '" + get_name().value_or("<unnamed>") + "' states outerWidth " +
+                            std::to_string(outer) + " m for a conductor of " + std::to_string(conducting) +
+                            " m: a foil's outer width is its conductor, and the film it is wound with (" +
+                            std::to_string(film) + " m) is its interleaf. Declare the insulation as the wire's coating.");
+                    }
+                }
+                return conducting + film;
+            }
             default:
                 throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Unknown type of wire");
         }
     }
 
-    double Wire::get_maximum_outer_height() {
+    double Wire::get_maximum_outer_height() const {
         switch (get_type()) {
             case WireType::LITZ:
+                if (_woundFootprint)
+                    return _woundFootprint->second;
                 if (get_outer_diameter())
                     return resolve_dimensional_values(get_outer_diameter().value());
                 else
@@ -1584,11 +1654,129 @@ namespace OpenMagnetics {
     }
 
 
+    double Wire::minimum_litz_flattening(const Wire& wire) {
+        if (wire.get_type() != WireType::LITZ) {
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "only a litz bundle flattens in a wound layer");
+        }
+        auto coating = Wire::resolve_coating(wire);
+        if (!coating || !coating->get_type()) {
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA,
+                                        "litz wire '" + wire.get_name().value_or("unnamed") + "' has no coating type: served or bare decides how far it may flatten");
+        }
+        switch (coating->get_type().value()) {
+            case InsulationWireCoatingType::SERVED: return 0.90;
+            case InsulationWireCoatingType::BARE: return 0.85;
+            default: return 1.0;   // taped or extruded insulation: no source says it flattens
+        }
+    }
+
+    std::pair<double, double> Wire::flattened_litz_sides(double outerDiameter, double k) {
+        if (!(outerDiameter > 0) || !(k > 0) || k > 1) {
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "flattened_litz_sides: needs OD > 0 and 0 < k <= 1");
+        }
+        // Stadium of short side h and long side w has area h (w - h) + pi h^2 / 4; equal to the
+        // bundle's pi OD^2 / 4: w = h + (pi / 4) (OD^2 - h^2) / h.
+        const double h = k * outerDiameter;
+        const double w = h + std::numbers::pi / 4 * (outerDiameter * outerDiameter - h * h) / h;
+        return {h, w};
+    }
+
+    void Wire::set_wound_footprint(double width, double height) {
+        if (get_type() != WireType::LITZ) {
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "only a litz bundle takes a wound footprint");
+        }
+        if (!(width > 0) || !(height > 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "a wound footprint needs a positive width and height");
+        }
+        _woundFootprint = std::make_pair(width, height);
+    }
+
     double Wire::get_maximum_outer_dimension() {
         return std::max(get_maximum_outer_width(), get_maximum_outer_height());
     }
 
-    double Wire::get_maximum_conducting_width() {
+    std::size_t Wire::calculate_loss_factor_cache_key(const Wire& wire) {
+        std::size_t seed = 0;
+        auto combine = [&seed](std::size_t value) {
+            seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+        };
+        combine(std::hash<std::string>{}(wire.get_name() ? wire.get_name().value() : std::string()));
+        combine(std::hash<int>{}(static_cast<int>(wire.get_type())));
+        combine(std::hash<int64_t>{}(wire.get_number_conductors() ? wire.get_number_conductors().value() : 1));
+        // the material as stated (a litz wire states it on its strand); no material database lookup
+        std::optional<WireMaterialDataOrNameUnion> material = wire.get_material();
+        if (wire.get_type() == WireType::LITZ) {
+            // resolved once: the conducting dimensions of a litz wire are its strand's
+            auto strand = wire.resolve_strand();
+            const double strandConductingDiameter = resolve_dimensional_values(strand.get_conducting_diameter());
+            combine(std::hash<double>{}(strandConductingDiameter));
+            if (strand.get_outer_diameter()) {
+                combine(std::hash<double>{}(resolve_dimensional_values(strand.get_outer_diameter().value())));
+            }
+            if (!material) {
+                material = strand.get_material();
+            }
+        }
+        else {
+            combine(std::hash<double>{}(wire.get_maximum_conducting_width()));
+            combine(std::hash<double>{}(wire.get_maximum_conducting_height()));
+        }
+        if (wire.get_type() == WireType::LITZ && !wire.get_outer_diameter() && !wire.get_wound_footprint()) {
+            // The bundle envelope is derived (calculate_outer_diameter) from the strand, the strand
+            // count and the coating, so those are the key: deriving it on every cache lookup would
+            // cost more than the lookup saves.
+            const auto optionalCoating = wire.get_coating();
+            if (optionalCoating) {
+                const auto& coating = optionalCoating.value();
+                if (std::holds_alternative<std::string>(coating)) {
+                    combine(std::hash<std::string>{}(std::get<std::string>(coating)));
+                }
+                else {
+                    // what calculate_outer_diameter reads, field by field (a json dump per lookup cost
+                    // more than the cached factor saves)
+                    const auto& inlineCoating = std::get<InsulationWireCoating>(coating);
+                    auto combineOptional = [&combine](const auto& value) {
+                        combine(value ? std::hash<double>{}(static_cast<double>(value.value())) : 0x51ed270b);
+                    };
+                    combineOptional(inlineCoating.get_grade());
+                    combineOptional(inlineCoating.get_number_layers());
+                    combineOptional(inlineCoating.get_thickness_layers());
+                    combineOptional(inlineCoating.get_breakdown_voltage());
+                    const auto thickness = inlineCoating.get_thickness();
+                    combine(thickness ? std::hash<double>{}(resolve_dimensional_values(thickness.value())) : 0x51ed270b);
+                    const auto type = inlineCoating.get_type();
+                    combine(type ? std::hash<int>{}(static_cast<int>(type.value()) + 1) : 0);
+                    const auto coatingMaterial = inlineCoating.get_material();
+                    if (coatingMaterial) {
+                        combine(std::hash<std::string>{}(std::holds_alternative<std::string>(coatingMaterial.value())
+                                                             ? std::get<std::string>(coatingMaterial.value())
+                                                             : std::get<MAS::InsulationMaterial>(coatingMaterial.value()).get_name()));
+                    }
+                }
+            }
+        }
+        else {
+            combine(std::hash<double>{}(wire.get_maximum_outer_width()));
+            combine(std::hash<double>{}(wire.get_maximum_outer_height()));
+        }
+        if (material) {
+            if (std::holds_alternative<std::string>(material.value())) {
+                combine(std::hash<std::string>{}(std::get<std::string>(material.value())));
+            }
+            else {
+                // an inline material is keyed by what the factors read from it, not by its name alone
+                const auto& wireMaterial = std::get<WireMaterial>(material.value());
+                combine(std::hash<std::string>{}(wireMaterial.get_name()));
+                combine(std::hash<double>{}(wireMaterial.get_permeability()));
+                combine(std::hash<double>{}(wireMaterial.get_resistivity().get_reference_value()));
+                combine(std::hash<double>{}(wireMaterial.get_resistivity().get_reference_temperature()));
+                combine(std::hash<double>{}(wireMaterial.get_resistivity().get_temperature_coefficient()));
+            }
+        }
+        return seed;
+    }
+
+    double Wire::get_maximum_conducting_width() const {
         switch (get_type()) {
             case WireType::LITZ:
                 {
@@ -1606,7 +1794,7 @@ namespace OpenMagnetics {
         }
     }
 
-    double Wire::get_maximum_conducting_height() {
+    double Wire::get_maximum_conducting_height() const {
         switch (get_type()) {
             case WireType::LITZ:
                 {
@@ -1644,6 +1832,9 @@ namespace OpenMagnetics {
     }
 
     double Wire::get_minimum_outer_dimension() {
+        if (get_type() == WireType::LITZ && _woundFootprint) {
+            return std::min(_woundFootprint->first, _woundFootprint->second);
+        }
         switch (get_type()) {
             case WireType::LITZ:
             case WireType::ROUND:
@@ -1688,11 +1879,11 @@ namespace OpenMagnetics {
         }
         dimensionWithTolerance.set_maximum(cutHeight);
         set_conducting_height(dimensionWithTolerance);
-        // The width the layer occupies is the foil PLUS its interleaved film (see
-        // get_foil_interlayer_insulation); the height is the foil's own.
+        // The wire's outer width is its conductor (+ a declared coating, ABT #1151); the width the
+        // layer occupies, foil PLUS its interleaved film, is the wound width
+        // (get_maximum_outer_width). The height is the foil's own.
         DimensionWithTolerance outerWidth;
-        outerWidth.set_nominal(resolve_dimensional_values(get_conducting_width().value()) +
-                               Wire::get_foil_interlayer_insulation(*this));
+        outerWidth.set_nominal(Wire::calculate_outer_width(*this));
         set_outer_width(outerWidth);
         set_outer_height(get_conducting_height());
     }

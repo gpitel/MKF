@@ -12,6 +12,8 @@
 #include <exception>
 #include <string>
 #include <sstream>
+#include <optional>
+#include <utility>
 
 namespace OpenMagnetics {
 
@@ -46,6 +48,8 @@ enum class ErrorCode : int {
     MATERIAL_INVALID_PROPERTY = 302,
     MATERIAL_FREQUENCY_OUT_OF_SPAN = 303,  // f outside every fitted loss range (ABT #1456)
     MATERIAL_ABOVE_CURIE_TEMPERATURE = 304,  // loss asked of a material hotter than its Curie point (ABT #1485)
+    MATERIAL_REQUESTED_LOSS_MODEL_NOT_AVAILABLE = 305,  // an explicitly requested core-loss model the material cannot run (ABT #1497)
+    MATERIAL_TEMPERATURE_OUT_OF_RANGE = 306,  // mu_i(T) asked below Curie but outside the tabulated temperatures (ABT #1739)
     
     // Calculation errors (400-499)
     CALCULATION_NAN_RESULT = 400,
@@ -88,7 +92,8 @@ enum class ErrorCode : int {
     // Calculation result errors (1300-1399)
     CALCULATION_INVALID_RESULT = 1300,
     CALCULATION_TIMEOUT = 1301,
-    INVALID_LOSS_DATA = 1302
+    INVALID_LOSS_DATA = 1302,
+    CALCULATION_CORE_SATURATES = 1303
 };
 
 /**
@@ -116,6 +121,8 @@ inline std::string to_string(ErrorCode code) {
         case ErrorCode::MATERIAL_INVALID_PROPERTY: return "MATERIAL_INVALID_PROPERTY";
         case ErrorCode::MATERIAL_FREQUENCY_OUT_OF_SPAN: return "MATERIAL_FREQUENCY_OUT_OF_SPAN";
         case ErrorCode::MATERIAL_ABOVE_CURIE_TEMPERATURE: return "MATERIAL_ABOVE_CURIE_TEMPERATURE";
+        case ErrorCode::MATERIAL_REQUESTED_LOSS_MODEL_NOT_AVAILABLE: return "MATERIAL_REQUESTED_LOSS_MODEL_NOT_AVAILABLE";
+        case ErrorCode::MATERIAL_TEMPERATURE_OUT_OF_RANGE: return "MATERIAL_TEMPERATURE_OUT_OF_RANGE";
         case ErrorCode::CALCULATION_NAN_RESULT: return "CALCULATION_NAN_RESULT";
         case ErrorCode::CALCULATION_DIVERGED: return "CALCULATION_DIVERGED";
         case ErrorCode::CALCULATION_INVALID_INPUT: return "CALCULATION_INVALID_INPUT";
@@ -139,6 +146,7 @@ inline std::string to_string(ErrorCode code) {
         case ErrorCode::CALCULATION_INVALID_RESULT: return "CALCULATION_INVALID_RESULT";
         case ErrorCode::CALCULATION_TIMEOUT: return "CALCULATION_TIMEOUT";
         case ErrorCode::INVALID_LOSS_DATA: return "INVALID_LOSS_DATA";
+        case ErrorCode::CALCULATION_CORE_SATURATES: return "CALCULATION_CORE_SATURATES";
         default: return "UNKNOWN";
     }
 }
@@ -312,6 +320,94 @@ public:
     double span_maximum() const noexcept { return _spanMaximum; }
 };
 
+/**
+ * @brief Complex permeability was asked for at a frequency outside the material's tabulated range.
+ *
+ * The complex permeability of a material is a table of measured (or, for materials that only carry
+ * a frequency-dependent initial permeability, derived) points. Outside that table there is no data:
+ * holding the last point made every higher frequency read the same mu' and mu'' (stale K081 data
+ * tabulated 1 Hz to 1 MHz returned its 1 MHz point at 350 MHz and put a common-mode choke's
+ * resonance there). Nothing clamps.
+ *
+ * ComplexPermeability::get_tabulated_complex_permeability throws this outside the tabulated range
+ * (the advisers and filters, which stay on the data). ComplexPermeability::get_complex_permeability
+ * estimates the missing range instead (ComplexPermeabilityEstimator, ABT #1861) and throws only the
+ * subclass ComplexPermeabilityEstimateUnavailableException, for the materials it cannot estimate.
+ */
+class ComplexPermeabilityFrequencyOutOfRangeException : public MaterialException {
+    std::string _materialName;
+    double _frequency;
+    double _rangeMinimum;
+    double _rangeMaximum;
+public:
+    ComplexPermeabilityFrequencyOutOfRangeException(const std::string& materialName, double frequency,
+                                                    double rangeMinimum, double rangeMaximum,
+                                                    const std::string& reason = "")
+        : MaterialException(ErrorCode::MATERIAL_FREQUENCY_OUT_OF_SPAN,
+                            "Material " + materialName + ": complex permeability is tabulated from " +
+                            std::to_string(rangeMinimum) + " Hz to " + std::to_string(rangeMaximum) +
+                            " Hz; " + std::to_string(frequency) + " Hz is " +
+                            (frequency < rangeMinimum ? "below" : "above") +
+                            " that range and there is no data there" + (reason.empty() ? "" : "; " + reason),
+                            materialName),
+          _materialName(materialName), _frequency(frequency), _rangeMinimum(rangeMinimum), _rangeMaximum(rangeMaximum) {}
+
+    const std::string& material_name() const noexcept { return _materialName; }
+    double frequency() const noexcept { return _frequency; }
+    double range_minimum() const noexcept { return _rangeMinimum; }
+    double range_maximum() const noexcept { return _rangeMaximum; }
+};
+
+/**
+ * @brief Complex permeability outside the tabulated range, for a material the estimator cannot cover.
+ *
+ * ComplexPermeability::get_complex_permeability estimates a material's missing frequency range from
+ * the other materials of its class (ComplexPermeabilityEstimator, ABT #1861). It cannot for: a class
+ * other than FERRITE MN_ZN / NI_ZN (powders, MgZn, a proprietary or missing composition), a material
+ * whose complex permeability is derived from its initial permeability (no tabulated MAS data), a
+ * class with fewer than 3 donors, and a material whose own data next to the gap cannot be matched.
+ * reason() says which; the message names the material, the frequency and the tabulated range.
+ */
+class ComplexPermeabilityEstimateUnavailableException : public ComplexPermeabilityFrequencyOutOfRangeException {
+    std::string _reason;
+public:
+    ComplexPermeabilityEstimateUnavailableException(const std::string& materialName, double frequency,
+                                                    double rangeMinimum, double rangeMaximum, const std::string& reason)
+        : ComplexPermeabilityFrequencyOutOfRangeException(materialName, frequency, rangeMinimum, rangeMaximum,
+                                                          "and it cannot be estimated: " + reason),
+          _reason(reason) {}
+
+    const std::string& reason() const noexcept { return _reason; }
+};
+
+/**
+ * @brief None of a requirement's frequencies lies inside the material's tabulated mu(f) range.
+ *
+ * A minimum-impedance requirement is judged only at the frequencies where the core material has
+ * complex-permeability data; the points outside are not judged at all. When that leaves no point,
+ * nothing about the requirement can be said for the part: it is not ranked, and the adviser reports
+ * it with this error (MagneticAdviser::get_failed_candidates).
+ */
+class RequirementOutsideMaterialDataException : public MaterialException {
+public:
+    RequirementOutsideMaterialDataException(const std::string& materialName, const std::string& requirement,
+                                            double requirementMinimum, double requirementMaximum,
+                                            double rangeMinimum, double rangeMaximum,
+                                            std::optional<std::pair<double, double>> measuredRange = std::nullopt)
+        : MaterialException(ErrorCode::MATERIAL_FREQUENCY_OUT_OF_SPAN,
+                            "Material " + materialName + ": complex permeability is tabulated from " +
+                            std::to_string(rangeMinimum) + " Hz to " + std::to_string(rangeMaximum) +
+                            " Hz" +
+                            (measuredRange ? "; the part's measured impedance spans " + std::to_string(measuredRange->first) +
+                                             " Hz to " + std::to_string(measuredRange->second) + " Hz"
+                                           : std::string()) +
+                            "; no " + requirement + " frequency (" + std::to_string(requirementMinimum) +
+                            " Hz to " + std::to_string(requirementMaximum) +
+                            " Hz) lies inside " + (measuredRange ? "either range" : "that range") +
+                            ", so the requirement cannot be judged on this part",
+                            materialName) {}
+};
+
 // A ferrite above its Curie point is paramagnetic: no loss model describes it, and the magnetic
 // no longer works as designed (ABT #1485).
 class MaterialAboveCurieTemperatureException : public MaterialException {
@@ -330,6 +426,59 @@ public:
     const std::string& material_name() const noexcept { return _materialName; }
     double temperature() const noexcept { return _temperature; }
     double curie_temperature() const noexcept { return _curieTemperature; }
+};
+
+// The initial permeability of a material was asked at a temperature below its Curie point but outside
+// the temperatures its mu_i(T) table covers. There is no data there: the spline through the table is
+// not a model of the material outside it (it ran 3C96's 180 C table to the Curie point and floored
+// the result at 1). Above the Curie point the material is paramagnetic and mu_i = 1 is returned
+// instead; Settings::allowMaterialDataExtrapolation turns this into an evaluation with a WARNING
+// (ABT #1739).
+class MaterialTemperatureOutOfRangeException : public MaterialException {
+    std::string _materialName;
+    double _temperature;
+    double _tableMinimum;
+    double _tableMaximum;
+public:
+    MaterialTemperatureOutOfRangeException(const std::string& materialName, double temperature,
+                                           double tableMinimum, double tableMaximum,
+                                           std::optional<double> curieTemperature)
+        : MaterialException(ErrorCode::MATERIAL_TEMPERATURE_OUT_OF_RANGE,
+                            "Material " + materialName + ": initial permeability is tabulated from " +
+                            std::to_string(tableMinimum) + " C to " + std::to_string(tableMaximum) + " C" +
+                            (curieTemperature ? ", Curie temperature " + std::to_string(curieTemperature.value()) + " C"
+                                              : std::string(", no Curie temperature")) +
+                            "; " + std::to_string(temperature) + " C is " +
+                            (temperature < tableMinimum ? "below" : "above") +
+                            " that table and there is no data there",
+                            materialName),
+          _materialName(materialName), _temperature(temperature), _tableMinimum(tableMinimum), _tableMaximum(tableMaximum) {}
+
+    const std::string& material_name() const noexcept { return _materialName; }
+    double temperature() const noexcept { return _temperature; }
+    double table_minimum() const noexcept { return _tableMinimum; }
+    double table_maximum() const noexcept { return _tableMaximum; }
+};
+
+// A caller explicitly asked for one core-loss model and the material cannot be evaluated with it
+// (no data for it). Only an explicit request throws this; the default preference walks its cascade
+// to the material's own model instead (ABT #1497).
+class RequestedCoreLossesModelNotAvailableException : public MaterialException {
+    std::string _materialName;
+    std::string _modelName;
+    std::string _reason;
+public:
+    RequestedCoreLossesModelNotAvailableException(const std::string& materialName, const std::string& modelName,
+                                                  const std::string& reason)
+        : MaterialException(ErrorCode::MATERIAL_REQUESTED_LOSS_MODEL_NOT_AVAILABLE,
+                            "Material " + materialName + ": core-loss model " + modelName +
+                            " was explicitly requested but cannot be used: " + reason,
+                            materialName),
+          _materialName(materialName), _modelName(modelName), _reason(reason) {}
+
+    const std::string& material_name() const noexcept { return _materialName; }
+    const std::string& model_name() const noexcept { return _modelName; }
+    const std::string& reason() const noexcept { return _reason; }
 };
 
 // ============================================================================
@@ -356,6 +505,45 @@ public:
     
     InvalidInputException(ErrorCode code, const std::string& message)
         : CalculationException(code, message) {}
+};
+
+// The core saturates at the given operating point: a physics verdict on the design (this material,
+// turn count, gap and core cannot carry that flux), not malformed input and not a failed calculation.
+// An adviser rejects the candidate on exactly this exception; every other one still stops the run
+// (ABT #1534, #1740). The message names the operating point and the flux against B_sat.
+class SaturationException : public CalculationException {
+    std::optional<int64_t> _numberTurns;
+public:
+    explicit SaturationException(const std::string& message)
+        : CalculationException(ErrorCode::CALCULATION_CORE_SATURATES, message) {}
+    // The turns-from-inductance solve refuses at a definite turn count. It carries that count so a caller
+    // that can re-gap from it (the core adviser's seeding, ABT #1875) reads it here, never from the text.
+    SaturationException(const std::string& message, int64_t numberTurns)
+        : CalculationException(ErrorCode::CALCULATION_CORE_SATURATES, message), _numberTurns(numberTurns) {}
+
+    // The turn count the refused solution had; empty when the refusal is not about one turn count.
+    std::optional<int64_t> number_turns() const noexcept { return _numberTurns; }
+};
+
+// The thermal network's fixed point did not converge within its iteration limit (Temperature::
+// calculateTemperatures with requireConvergence): the losses it was given have no steady temperature on
+// that network. Its own type so the loss <-> temperature solve can tell it from every other calculation
+// error (ABT #1876): inside that solve it means the operating point has no thermal operating point.
+class ThermalNetworkNotConvergedException : public CalculationException {
+public:
+    explicit ThermalNetworkNotConvergedException(const std::string& message)
+        : CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, message) {}
+};
+
+// A requirement point outside the material's mu(f) range is judged on the part's own measured
+// common-mode |Z| (datasheet impedancePoints). This says why that measured curve cannot be read:
+// a point with a non-positive or non-finite frequency or magnitude, two values at one frequency,
+// or more than one zero-bias curve to choose from. Malformed data, never a reason to guess.
+class InvalidDatasheetImpedanceException : public InvalidInputException {
+public:
+    InvalidDatasheetImpedanceException(const std::string& reference, const std::string& reason)
+        : InvalidInputException(ErrorCode::INVALID_INPUT,
+                                "Magnetic " + reference + ": datasheet commonModeChoke impedancePoints cannot be used: " + reason) {}
 };
 
 // ============================================================================

@@ -1,5 +1,6 @@
 #include <source_location>
 #include "processors/CircuitSimulatorInterface.h"
+#include "processors/ResultsAnalyzer.h"
 #include "physical_models/MagnetizingInductance.h"
 #include "physical_models/InitialPermeability.h"
 #include "constructive_models/CorePiece.h"
@@ -12,6 +13,7 @@
 #include "json.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <chrono>
 #include <filesystem>
@@ -774,7 +776,10 @@ namespace {
         MagnetizingInductance magnetizing_inductance("ZHANG");
 
         double expectedInductanceValue = 215e-6;
-        double currentPeakToPeak = 20;
+        // 10 A peak-to-peak puts B_peak = L I_pk / (N A_e) = 0.335 T in the 3C97, against B_sat ~ 0.53 T at
+        // 25 C. It was 20 A, a 0.669 T peak the material cannot carry, which the inductance model now refuses
+        // as a saturation (ABT #1740).
+        double currentPeakToPeak = 10;
         double voltagePeakToPeak = 2 * M_PI * frequency * expectedInductanceValue * currentPeakToPeak;
 
         prepare_test_parameters(dcCurrent, ambientTemperature, frequency, numberTurns, -1, gapping, coreShape,
@@ -818,7 +823,11 @@ namespace {
         settings.reset();
         clear_databases();
 
-        // This tests checks that the operating is not crashing
+        // A web request: ETD 54 3C95 with ONE turn, 46.5 uH, current-only excitation -3..7 A at 100 kHz.
+        // No gap gives 46.5 uH with one turn on an unsaturated core: B pk = 1.16 T against
+        // B_sat 0.53 T (3C95, 25 C). The gap solve must REFUSE with CALCULATION_CORE_SATURATES naming
+        // B and B_sat, never return an air-core gap as a design. (Formerly asserted a returned gap and
+        // an induced voltage; rewritten to expect the refusal, Alf approved 2026-10-14, ABT #1855.)
         json coreData = json::parse(
             R"({"functionalDescription": {"bobbin": null, "gapping": [{"area": 0.000369, "coordinates": [0.0,
             0.0, 0.0], "distanceClosestNormalSurface": 0.022448, "distanceClosestParallelSurface":
@@ -855,35 +864,20 @@ namespace {
         OpenMagnetics::Coil winding(windingData);
         OpenMagnetics::Inputs inputs(inputsData);
         MagnetizingInductance magnetizing_inductance("CLASSIC");
-        auto gapping =
+        bool refused = false;
+        try {
             magnetizing_inductance.calculate_gapping_from_number_turns_and_inductance(core, winding, &inputs, gappingType, 5);
-        auto primaryExcitation = inputs.get_operating_point(0).get_mutable_excitations_per_winding()[0];
-        double currentPeakToPeak = 10;
-
-        REQUIRE(bool(primaryExcitation.get_voltage()));
-        REQUIRE(bool(primaryExcitation.get_current()));
-        REQUIRE(bool(primaryExcitation.get_magnetizing_current()));
-
-        if (primaryExcitation.get_current()) {
-            auto currentProcessed = primaryExcitation.get_current().value().get_processed().value();
-            auto magnetizingCurrentProcessed = primaryExcitation.get_current().value().get_processed().value();
-            REQUIRE_THAT(currentPeakToPeak, Catch::Matchers::WithinAbs(inputs.get_operating_point(0)
-                            .get_mutable_excitations_per_winding()[0]
-                            .get_magnetizing_current()
-                            .value()
-                            .get_processed()
-                            .value()
-                            .get_peak_to_peak()
-                            .value(), max_error * currentPeakToPeak));
-            REQUIRE_THAT(currentPeakToPeak, Catch::Matchers::WithinAbs(inputs.get_operating_point(0)
-                            .get_mutable_excitations_per_winding()[0]
-                            .get_current()
-                            .value()
-                            .get_processed()
-                            .value()
-                            .get_peak_to_peak()
-                            .value(), max_error * currentPeakToPeak));
         }
+        catch (const SaturationException& e) {
+            refused = true;
+            CHECK(e.code() == OpenMagnetics::ErrorCode::CALCULATION_CORE_SATURATES);
+            const std::string message = e.what();
+            CHECK_THAT(message, Catch::Matchers::ContainsSubstring("CALCULATION_CORE_SATURATES"));
+            CHECK_THAT(message, Catch::Matchers::ContainsSubstring("B peak = 1.16"));
+            CHECK_THAT(message, Catch::Matchers::ContainsSubstring("B_sat = 0.53"));
+            CHECK_THAT(message, Catch::Matchers::ContainsSubstring("3C95"));
+        }
+        REQUIRE(refused);
     }
 
     TEST_CASE("Test_Inductance_Ferrite_Web_No_Voltage", "[physical-model][magnetizing-inductance][smoke-test]") {
@@ -989,6 +983,55 @@ namespace {
             magnetizing_inductance.calculate_inductance_from_number_turns_and_gapping(core, winding, &operatingPoint).get_magnetizing_inductance().get_nominal().value();
 
         REQUIRE_THAT(expectedValue, Catch::Matchers::WithinAbs(magnetizingInductance, max_error * expectedValue));
+    }
+
+    TEST_CASE("Test_Magnetizing_Inductance_Gapless_Core_Has_No_Gap_Fields", "[physical-model][magnetizing-inductance][reluctance][bug][abt-1714]") {
+        // ABT #1714: a gapless core (here a toroid) got gappingReluctance = 0, maximumFringingFactor = 1,
+        // maximumStorableMagneticEnergyGapping = 0 and reluctancePerGap = [] in its magnetizing
+        // inductance output. MAS gappingReluctance has exclusiveMinimum 0, so every exported MAS of a
+        // toroid failed schema validation. With no gap those fields describe nothing: they are absent.
+        settings.reset();
+        clear_databases();
+        double numberTurns = 42;
+        std::vector<CoreGap> noGaps = {};
+        Core toroid;
+        OpenMagnetics::Coil toroidWinding;
+        OpenMagnetics::Inputs toroidInputs;
+        prepare_test_parameters(0, 25, 20000, numberTurns, -1, noGaps, "T 58/41/18", "3C95", toroid, toroidWinding, toroidInputs);
+        auto toroidOperatingPoint = toroidInputs.get_operating_point(0);
+        MagnetizingInductance magnetizingInductanceModel("ZHANG");
+        auto toroidOutput = magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(toroid, toroidWinding, &toroidOperatingPoint);
+        // MAS.hpp serialises an unset optional as null (as it does measurementCondition); the MAS
+        // exporters drop nulls, so null here is an absent field in the exported file.
+        json toroidJson;
+        to_json(toroidJson, toroidOutput);
+        INFO(toroidJson.dump());
+        CHECK(toroidJson.value("gappingReluctance", json()).is_null());
+        CHECK(toroidJson.value("maximumFringingFactor", json()).is_null());
+        CHECK(toroidJson.value("maximumStorableMagneticEnergyGapping", json()).is_null());
+        CHECK(toroidJson.value("reluctancePerGap", json()).is_null());
+        REQUIRE(toroidJson.contains("coreReluctance"));
+        CHECK(toroidJson.at("coreReluctance").get<double>() > 0);
+        // No gap in series: the core reluctance is the material's alone.
+        CHECK(toroidJson.at("coreReluctance").get<double>() == toroidJson.at("ungappedCoreReluctance").get<double>());
+        CHECK(toroidOutput.get_magnetizing_inductance().get_nominal().value() > 0);
+
+        // A gapped core keeps every gap field, and each is a positive number.
+        auto gapping = OpenMagneticsTesting::get_ground_gap(0.001);
+        Core gapped;
+        OpenMagnetics::Coil gappedWinding;
+        OpenMagnetics::Inputs gappedInputs;
+        prepare_test_parameters(0, 25, 20000, numberTurns, -1, gapping, "ETD 29", "3C95", gapped, gappedWinding, gappedInputs);
+        auto gappedOperatingPoint = gappedInputs.get_operating_point(0);
+        auto gappedOutput = magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(gapped, gappedWinding, &gappedOperatingPoint);
+        REQUIRE(gappedOutput.get_gapping_reluctance());
+        CHECK(gappedOutput.get_gapping_reluctance().value() > 0);
+        REQUIRE(gappedOutput.get_maximum_fringing_factor());
+        CHECK(gappedOutput.get_maximum_fringing_factor().value() > 0);
+        REQUIRE(gappedOutput.get_maximum_storable_magnetic_energy_gapping());
+        CHECK(gappedOutput.get_maximum_storable_magnetic_energy_gapping().value() > 0);
+        REQUIRE(gappedOutput.get_reluctance_per_gap());
+        CHECK(!gappedOutput.get_reluctance_per_gap()->empty());
     }
 
     TEST_CASE("Test_Magnetizing_Inductance_Toroid_Stacks", "[physical-model][magnetizing-inductance][smoke-test]") {
@@ -1744,7 +1787,7 @@ TEST_CASE("Test_Drum_Semishielded_Inductance", "[physical-model][magnetizing-ind
         return core;
     };
     auto glueCoating = [](const std::string& materialName) {
-        return json{{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", materialName}};
+        return json{{"type", "magneticEpoxy"}, {"thickness", {{"nominal", 0.0001}}}, {"material", materialName}};
     };
 
     // Bare drum with the SAME drum dimensions: the air return the glue replaces.
@@ -1794,7 +1837,7 @@ TEST_CASE("Test_Drum_Semishielded_Inductance", "[physical-model][magnetizing-ind
     CHECK_THROWS(MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(
         buildCore(json()), numberTurns, 25));  // no coating at all
     CHECK_THROWS(MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(
-        buildCore(json{{"type", "epoxy"}, {"thickness", 0.0001}}), numberTurns, 25));  // non-magnetic coating
+        buildCore(json{{"type", "epoxy"}, {"thickness", {{"nominal", 0.0001}}}}), numberTurns, 25));  // non-magnetic coating
     CHECK_THROWS(MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(
         buildCore(glueCoating("No Such Glue")), numberTurns, 25));  // unknown shell material
     settings.reset();
@@ -1993,16 +2036,21 @@ TEST_CASE("Test_Molded_Per_Region_Inductance", "[physical-model][magnetizing-ind
     biasedCore.process_data();
     biasedCore.process_gap();
     double unbiased = MagnetizingInductance::calculate_molded_magnetizing_inductance(biasedCore, numberTurns, 25, referenceFrequency);
-    double biased = MagnetizingInductance::calculate_molded_magnetizing_inductance(biasedCore, numberTurns, 25, referenceFrequency, 20.0);
-    double moreBiased = MagnetizingInductance::calculate_molded_magnetizing_inductance(biasedCore, numberTurns, 25, referenceFrequency, 60.0);
-    UNSCOPED_INFO("unbiased " << unbiased * 1e6 << " uH, 20 A " << biased * 1e6 << " uH, 60 A " << moreBiased * 1e6 << " uH");
+    double biased = MagnetizingInductance::calculate_molded_magnetizing_inductance(biasedCore, numberTurns, 25, referenceFrequency, 1.0);
+    // 1 A and 2 A put B = I L / (N A_post) = 0.13 T and 0.22 T in the Kool Mu 60 post (B_sat about 1.0 T),
+    // where the flux still rises with the current. It was 20 A and 60 A: from about 3 A on, this per-region
+    // iteration's flux FALLS with current (ABT #1765), and from about 10 A its iterate reaches 71 kA/m,
+    // where the fit gives mu_r 0.93, below the vacuum's, which the permeability model now refuses as a
+    // saturation (ABT #1740).
+    double moreBiased = MagnetizingInductance::calculate_molded_magnetizing_inductance(biasedCore, numberTurns, 25, referenceFrequency, 2.0);
+    UNSCOPED_INFO("unbiased " << unbiased * 1e6 << " uH, 1 A " << biased * 1e6 << " uH, 2 A " << moreBiased * 1e6 << " uH");
     CHECK(biased < unbiased);
     CHECK(moreBiased < biased);
     CHECK_THAT(unbiased, Catch::Matchers::WithinRel(stiffPost, 1e-6));
 
     // Through the public entry point WITH an operating point, the way every consumer calls it:
     // a raw current waveform (no processed data, no harmonics) whose DC component is the bias.
-    // A symmetric ripple reproduces the unbiased figure; a 20 A offset reproduces the biased one.
+    // A symmetric ripple reproduces the unbiased figure; a 1 A offset reproduces the biased one.
     auto operatingPointWithOffset = [&](double offset) {
         json operatingPointJson = json::parse(R"({"conditions": {"ambientTemperature": 25.0},
             "excitationsPerWinding": [{"name": "Primary", "frequency": 100000,
@@ -2014,7 +2062,7 @@ TEST_CASE("Test_Molded_Per_Region_Inductance", "[physical-model][magnetizing-ind
         return OperatingPoint(operatingPointJson);
     };
     auto rippleOnly = operatingPointWithOffset(0);
-    auto withOffset = operatingPointWithOffset(20);
+    auto withOffset = operatingPointWithOffset(1);
     auto rippleOutput = magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(biasedCore, winding, &rippleOnly);
     auto offsetOutput = magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(biasedCore, winding, &withOffset);
     CHECK(rippleOutput.get_method_used() == "MoldedPerRegionReluctance");
@@ -2048,18 +2096,21 @@ TEST_CASE("Test_Number_Turns_From_Inductance_Unreachable_Under_Dc_Bias_Throws", 
             excitation.set_current(current);
         }
     }
-    auto magneticFor = [](const std::string& shape) {
+    // ABT #1496: magnetic_autocomplete now throws when the winding does not fit its window, and a
+    // 1.25 mm wire does not fit the 0.635 mm ring of T 2.03/1.27/0.64; the tiny toroids are wound
+    // with a wire they hold, so the inductance solve is what is under test (Alf, 2026-10-11).
+    auto magneticFor = [](const std::string& shape, const std::string& wireName) {
         return magnetic_autocomplete(OpenMagnetics::Magnetic(json{
             {"core", {{"name", shape}, {"functionalDescription", {{"type", "toroidal"}, {"shape", shape}, {"material", "75-Series 26"},
                                                                   {"gapping", json::array()}, {"numberStacks", 1}}}}},
             {"coil", {{"bobbin", "Basic"}, {"functionalDescription", {{{"name", "Primary"}, {"numberTurns", 1}, {"numberParallels", 1},
-                                                                        {"isolationSide", "primary"}, {"wire", "Round 1.25 - Grade 1"}}}}}}}));
+                                                                        {"isolationSide", "primary"}, {"wire", wireName}}}}}}}));
     };
     MagnetizingInductance magnetizingInductance(ReluctanceModels::ZHANG);
 
     for (const std::string shape : {"T 2.03/1.27/0.64", "T 3.94/2.24/1.8"}) {
         INFO(shape);
-        auto magnetic = magneticFor(shape);
+        auto magnetic = magneticFor(shape, "Round 0.2 - Grade 1");
         auto start = std::chrono::steady_clock::now();
         CHECK_THROWS_AS(magnetizingInductance.calculate_number_turns_from_gapping_and_inductance(magnetic.get_core(), magnetic.get_coil(), &inputs),
                         CalculationException);
@@ -2069,7 +2120,7 @@ TEST_CASE("Test_Number_Turns_From_Inductance_Unreachable_Under_Dc_Bias_Throws", 
     }
 
     // Control: a core that does reach the target keeps an answer, and that answer meets it.
-    auto magnetic = magneticFor("T 21/12/14");
+    auto magnetic = magneticFor("T 21/12/14", "Round 1.25 - Grade 1");
     int numberTurns = magnetizingInductance.calculate_number_turns_from_gapping_and_inductance(magnetic.get_core(), magnetic.get_coil(), &inputs);
     auto coil = magnetic.get_coil();
     coil.get_mutable_functional_description()[0].set_number_turns(numberTurns);
@@ -2079,4 +2130,442 @@ TEST_CASE("Test_Number_Turns_From_Inductance_Unreachable_Under_Dc_Bias_Throws", 
     INFO(numberTurns << " turns, " << inductance * 1e6 << " uH");
     CHECK(inductance >= 17.6e-6);
     CHECK(inductance <= 26.4e-6);
+}
+
+TEST_CASE("Test_Gap_From_Inductance_Refuses_A_Bias_That_Collapses_The_Permeability", "[physical-model][magnetizing-inductance][gapping][abt-1855]") {
+    // ABT #1855 (Alf, 2026-10-14): a design operation refuses a solution the saturation check flags. 3C95's
+    // permeability model falls to the vacuum's at a field strength where its magnetisation curve still
+    // carries less than B_sat (criterion 2). Sizing a gap for a DC bias there used to throw from the
+    // permeability (main's SaturationException); with mu_r = 1 taken past the knee it would return the
+    // gap of an air core instead.
+    settings.reset();
+    clear_databases();
+    const double ambientTemperature = 25;
+    const double frequency = 100000;
+    const double numberTurns = 20;
+    const double desiredMagnetizingInductance = 100e-6;
+    const std::string coreMaterial = "3C95";
+    Core core;
+    OpenMagnetics::Coil coil;
+    OpenMagnetics::Inputs inputs;
+    prepare_test_parameters(0, ambientTemperature, frequency, numberTurns, desiredMagnetizingInductance, {}, "E 42/21/20",
+                            coreMaterial, core, coil, inputs);
+    const auto material = core.resolve_material();
+    std::optional<double> collapseField;
+    for (double field = 10; field < 1e6; field *= 1.05) {
+        if (InitialPermeability::get_initial_permeability_model_value(material, ambientTemperature, field, frequency) <= 1) {
+            collapseField = field;
+            break;
+        }
+    }
+    REQUIRE(collapseField);
+    const double collapseFluxDensity = InitialPermeability::get_flux_density_for_magnetic_field_dc_bias(material, collapseField.value(), ambientTemperature, frequency);
+    const double saturationFluxDensity = Core::get_magnetic_flux_density_saturation(material, ambientTemperature, false);
+    INFO("3C95 permeability model collapses at H = " << collapseField.value() << " A/m, B = " << collapseFluxDensity
+         << " T on its curve, B_sat " << saturationFluxDensity << " T");
+    REQUIRE(collapseFluxDensity < 0.97 * saturationFluxDensity);
+    const double effectiveArea = core.get_processed_description()->get_effective_parameters().get_effective_area();
+    // B = L I / (N A_e) at the solution; a 0.1 A ripple keeps the peak within B_sat.
+    auto inputsWithBiasFluxDensity = [&](double biasFluxDensity) {
+        OpenMagnetics::Coil unused;
+        Core unusedCore;
+        OpenMagnetics::Inputs biasedInputs;
+        prepare_test_parameters(biasFluxDensity * numberTurns * effectiveArea / desiredMagnetizingInductance, ambientTemperature, frequency,
+                                numberTurns, desiredMagnetizingInductance, {}, "E 42/21/20", coreMaterial, unusedCore, unused, biasedInputs, 0.1);
+        return biasedInputs;
+    };
+    MagnetizingInductance magnetizingInductance("ZHANG");
+
+    auto collapsing = inputsWithBiasFluxDensity(0.5 * (collapseFluxDensity + 0.97 * saturationFluxDensity));
+    REQUIRE_THROWS_AS(magnetizingInductance.calculate_gapping_from_number_turns_and_inductance(core, coil, &collapsing, GappingType::GROUND),
+                      SaturationException);
+    REQUIRE_THROWS_WITH(magnetizingInductance.calculate_gapping_from_number_turns_and_inductance(core, coil, &collapsing, GappingType::GROUND),
+                        Catch::Matchers::ContainsSubstring("permeability model"));
+
+    // Control: half that bias keeps a real gap.
+    auto moderate = inputsWithBiasFluxDensity(0.5 * collapseFluxDensity);
+    std::vector<CoreGap> gapping;
+    REQUIRE_NOTHROW(gapping = magnetizingInductance.calculate_gapping_from_number_turns_and_inductance(core, coil, &moderate, GappingType::GROUND));
+    REQUIRE(!gapping.empty());
+    CHECK(gapping[0].get_length() > 0);
+}
+
+TEST_CASE("Test_Dc_Bias_Is_The_Time_Average_Not_The_Midpoint", "[physical-model][magnetizing-inductance][dc-bias][abt-1223]") {
+    // A voltage with zero volt-second average carries no DC, whatever its shape. With a dead time
+    // (+V for T/4, -V for T/4, 0 for T/2) the flux is a triangle followed by a flat stretch at its
+    // minimum: its time average sits a quarter of the swing above the minimum, its midpoint,
+    // (max + min) / 2, half the swing above it. With the DC taken as the average the midpoint is
+    // swing / 4 away from zero; read as a bias, it would drive the permeability of this ungapped
+    // Nanoperm toroid down the curve. (A plain triangle cannot test this: whatever its duty, its
+    // midpoint IS its average, ABT #1467.) The inductance must equal the symmetric square wave's and
+    // the unbiased small-signal value.
+    auto core = Core(json::parse(R"({"functionalDescription": {"gapping": [], "material": "Nanoperm 80000", "numberStacks": 1, "shape": {"magneticCircuit": "closed", "type": "custom", "family": "t", "aliases": [], "name": "T 63/50/30", "dimensions": {"A": {"nominal": 0.063}, "B": {"nominal": 0.050}, "C": {"nominal": 0.030}}}, "type": "toroidal"}, "manufacturerInfo": null, "name": "My Core"})"));
+    auto coil = OpenMagnetics::Coil(json::parse(R"({"bobbin": "Dummy", "functionalDescription": [{"isolationSide": "primary", "name": "Primary", "numberParallels": 1, "numberTurns": 1, "wire": "Dummy"}]})"));
+    const double period = 1e-5;
+    auto operatingPointWith = [period](std::vector<double> data, std::vector<double> time) {
+        json excitationJson;
+        excitationJson["frequency"] = 1 / period;
+        excitationJson["name"] = "Primary";
+        excitationJson["voltage"]["waveform"]["data"] = data;
+        excitationJson["voltage"]["waveform"]["time"] = time;
+        json operatingPointJson;
+        operatingPointJson["conditions"]["ambientTemperature"] = 25.0;
+        operatingPointJson["excitationsPerWinding"] = json::array({excitationJson});
+        return OperatingPoint(operatingPointJson);
+    };
+    MagnetizingInductance magnetizingInductance(ReluctanceModels::ZHANG);
+
+    // Same volt-seconds per excursion in both (68.85 V for T/4 = 34.425 V for T/2), so the same flux
+    // swing, about 1.1 T peak to peak: below Nanoperm's saturation.
+    const double voltage = 68.85;
+    auto deadTime = operatingPointWith({voltage, voltage, -voltage, -voltage, 0, 0},
+                                       {0, period / 4, period / 4, period / 2, period / 2, period});
+    auto symmetric = operatingPointWith({voltage / 2, voltage / 2, -voltage / 2, -voltage / 2, voltage / 2},
+                                        {0, period / 2, period / 2, period, period});
+    auto [deadTimeOutput, deadTimeFluxDensity] = magnetizingInductance.calculate_inductance_and_magnetic_flux_density(core, coil, &deadTime);
+    auto [symmetricOutput, symmetricFluxDensity] = magnetizingInductance.calculate_inductance_and_magnetic_flux_density(core, coil, &symmetric);
+    double deadTimeInductance = resolve_dimensional_values(deadTimeOutput.get_magnetizing_inductance());
+    double symmetricInductance = resolve_dimensional_values(symmetricOutput.get_magnetizing_inductance());
+
+    auto fluxData = deadTimeFluxDensity.get_waveform().value().get_data();
+    double swing = *std::max_element(fluxData.begin(), fluxData.end()) - *std::min_element(fluxData.begin(), fluxData.end());
+    double midpoint = deadTimeFluxDensity.get_processed().value().get_offset();
+    double average = OpenMagnetics::Inputs::calculate_waveform_average(deadTimeFluxDensity.get_waveform().value());
+    INFO("dead-time flux: swing " << swing << " T, midpoint " << midpoint << " T, average " << average << " T; L " << deadTimeInductance * 1e6 << " uH vs " << symmetricInductance * 1e6 << " uH");
+    // The case is meaningful only if the midpoint is far from the average: a quarter of the swing.
+    REQUIRE(swing > 0.5);
+    // (The shape alone: midpoint - average does not depend on the DC the model assigns.)
+    REQUIRE_THAT(midpoint - average, Catch::Matchers::WithinAbs(swing / 4, 0.02 * swing));
+
+    double unbiasedPermeability = InitialPermeability().get_initial_permeability(core.resolve_material(), 25.0, std::nullopt, 1e5);
+    double unbiasedInductance = 1.0 / ReluctanceModel::factory(ReluctanceModels::ZHANG)->get_core_reluctance(core, unbiasedPermeability).get_core_reluctance();
+    INFO("unbiased L " << unbiasedInductance * 1e6 << " uH");
+    CHECK_THAT(deadTimeInductance, Catch::Matchers::WithinRel(symmetricInductance, 1e-3));
+    CHECK_THAT(deadTimeInductance, Catch::Matchers::WithinRel(unbiasedInductance, 1e-2));
+    // Zero net volt-seconds: no DC flux.
+    CHECK_THAT(average, Catch::Matchers::WithinAbs(0, 0.01 * swing));
+}
+
+TEST_CASE("Test_Volt_Seconds_That_Saturate_The_Core_Are_Refused_Before_The_Dc_Bias_Runs_Away", "[physical-model][magnetizing-inductance][dc-bias][abt-1740]") {
+    // The 3C96 Icepak flyback fixture (E 25/13/7, A_e 51.8 mm2, 24:13 on a 0.8 mm gap) used to carry a
+    // second operating point of 911 uVs, a 0.73 T swing on a material that saturates at about 0.5 T. The
+    // DC-bias fixed point ran away on it (H 224 -> 3.6e17 A/m, mu 309 -> 8e-13) and reported "biased
+    // permeability at mu = 0.000000 is 0.000000". That point is gone from the fixture; the same swing is
+    // reproduced here from its first operating point (595 uVs, 0.48 T on 24 turns) with 16 turns:
+    // 0.48 * 24 / 16 = 0.72 T. It must say the core saturates, naming the operating point and winding.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "concentric_flyback_rectangular_column.json");
+    auto mas = OpenMagneticsTesting::mas_loader(path.string());
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+    auto inputs = mas.get_inputs();
+    MagnetizingInductance magnetizingInductance(ReluctanceModels::ZHANG);
+    REQUIRE(inputs.get_operating_point(0).get_name().value() == "Min. input volt. (simulated)");
+    auto coilWithTurns = [&](int numberTurns) {
+        auto coil = magnetic.get_coil();
+        coil.get_mutable_functional_description()[0].set_number_turns(numberTurns);
+        return coil;
+    };
+
+    // Until ABT #1855 both were refused (SaturationException naming the operating point and winding).
+    // Since then (Alf approved this rewrite 2026-10-14, ABT #1855) the model gives its numbers for a
+    // saturated core, the DC-bias fixed point still settles (it no longer runs away), and the saturation
+    // is the verdict of the shared check analyze_results makes, ResultsAnalyzer::check_saturation.
+    auto material = magnetic.get_core().resolve_material();
+    double temperature = inputs.get_operating_point(0).get_conditions().get_ambient_temperature();
+    auto swingOf = [](const SignalDescriptor& fluxDensity) {
+        auto data = fluxDensity.get_waveform().value().get_data();
+        return *std::max_element(data.begin(), data.end()) - *std::min_element(data.begin(), data.end());
+    };
+
+    auto real = inputs.get_operating_point(0);
+    auto realFluxDensity = magnetizingInductance.calculate_inductance_and_magnetic_flux_density(magnetic.get_core(), magnetic.get_coil(), &real).second;
+    double realSwing = swingOf(realFluxDensity);
+
+    auto saturating = inputs.get_operating_point(0);
+    auto start = std::chrono::steady_clock::now();
+    std::pair<MagnetizingInductanceOutput, SignalDescriptor> saturatingResult;
+    REQUIRE_NOTHROW(saturatingResult = magnetizingInductance.calculate_inductance_and_magnetic_flux_density(magnetic.get_core(), coilWithTurns(16), &saturating));
+    CHECK(std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < 30);
+    double saturatingInductance = resolve_dimensional_values(saturatingResult.first.get_magnetizing_inductance());
+    double saturatingSwing = swingOf(saturatingResult.second);
+    double saturatingPeak = ResultsAnalyzer::get_peak_flux_density(saturatingResult.second);
+    auto saturatingVerdict = ResultsAnalyzer::check_saturation(material, saturatingPeak, temperature);
+    INFO("16 turns: L " << saturatingInductance * 1e6 << " uH, swing " << saturatingSwing << " T, B peak " << saturatingPeak
+         << " T, B_sat " << saturatingVerdict.saturationFluxDensity << " T; 24 turns: swing " << realSwing << " T");
+    CHECK(std::isfinite(saturatingInductance));
+    CHECK(saturatingInductance > 0);
+    // Faraday: the same volt-seconds on 16 turns instead of 24.
+    CHECK_THAT(saturatingSwing, Catch::Matchers::WithinRel(realSwing * 24 / 16, 0.01));
+    CHECK(saturatingVerdict.saturates);
+    CHECK_THAT(saturatingVerdict.message, Catch::Matchers::ContainsSubstring("The core saturates"));
+
+    // 8 turns triple the swing to about 1.4 T peak-to-peak: more than twice B_sat, which no bias can hold.
+    auto tooFewTurns = inputs.get_operating_point(0);
+    std::pair<MagnetizingInductanceOutput, SignalDescriptor> tooFewTurnsResult;
+    REQUIRE_NOTHROW(tooFewTurnsResult = magnetizingInductance.calculate_inductance_and_magnetic_flux_density(magnetic.get_core(), coilWithTurns(8), &tooFewTurns));
+    double tooFewTurnsSwing = swingOf(tooFewTurnsResult.second);
+    INFO("8 turns: swing " << tooFewTurnsSwing << " T");
+    CHECK_THAT(tooFewTurnsSwing, Catch::Matchers::WithinRel(realSwing * 3, 0.01));
+    CHECK(tooFewTurnsSwing / 2 > saturatingVerdict.saturationFluxDensity);
+    CHECK(ResultsAnalyzer::check_saturation(material, ResultsAnalyzer::get_peak_flux_density(tooFewTurnsResult.second), temperature).saturates);
+
+    // Control: the real coil (24 turns, 0.48 T swing) has a DC point and keeps its answer, the ~64 uH
+    // the fixture's design requirements now state.
+    auto converging = inputs.get_operating_point(0);
+    auto [output, fluxDensity] = magnetizingInductance.calculate_inductance_and_magnetic_flux_density(magnetic.get_core(), magnetic.get_coil(), &converging);
+    double inductance = resolve_dimensional_values(output.get_magnetizing_inductance());
+    INFO("L " << inductance * 1e6 << " uH, B peak " << fluxDensity.get_processed().value().get_peak().value() << " T");
+    CHECK(inductance >= 60e-6);
+    CHECK(inductance <= 67e-6);
+}
+
+TEST_CASE("Test_Magnetic_Flux_Density_Dcm_Flyback_Keeps_The_Dead_Time", "[physical-model][magnetizing-inductance][abt-1467]") {
+    // ABT #1467: the core-loss path routes a flyback-labelled multi-winding operating point to the
+    // multiport-inductor branch, which rebuilt the magnetizing current as a triangle rising over D
+    // and falling over all of 1 - D. A DCM flyback's flux is flat through the dead time (0 V on
+    // every winding for the last 42 of 128 samples); Faraday on the primary voltage keeps it. The
+    // fixture is the #1463 flyback with its reset balanced (-235 * 32 / 54 V instead of -137.2 V):
+    // the mean removed from an unbalanced voltage would tilt the dead time.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "Test_Magnetizing_Current_Dcm_Flyback_Balanced.json");
+    std::ifstream in(path);
+    json masJson = json::parse(in);
+    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+    for (auto& excitation : masJson["inputs"]["operatingPoints"][0]["excitationsPerWinding"]) {
+        excitation.erase("magnetizingCurrent");
+    }
+    OperatingPoint operatingPoint(masJson["inputs"]["operatingPoints"][0]);
+    MagnetizingInductance magnetizingInductance;
+    auto [output, magneticFluxDensity] = magnetizingInductance.calculate_inductance_and_magnetic_flux_density(magnetic.get_core(), magnetic.get_coil(), &operatingPoint);
+    // Stored compressed (corner points only): sample it over the period.
+    auto sampledFluxDensity = OpenMagnetics::Inputs::calculate_sampled_waveform(magneticFluxDensity.get_waveform().value(), 100000);
+    const auto data = sampledFluxDensity.get_data();
+    REQUIRE(data.size() >= 128);
+    double maximum = *std::max_element(data.begin(), data.end());
+    double minimum = *std::min_element(data.begin(), data.end());
+    double deadTimeLevel = data.back();
+    size_t flatSamples = 0;
+    for (auto value : data) {
+        if (std::fabs(value - deadTimeLevel) <= 1e-6 * (maximum - minimum)) {
+            flatSamples++;
+        }
+    }
+    double flatFraction = static_cast<double>(flatSamples) / data.size();
+    // Faraday: B swing = V t_on / (N_p A_e).
+    double effectiveArea = magnetic.get_core().get_processed_description()->get_effective_parameters().get_effective_area();
+    double faradaySwing = 235.0 * 2.5e-6 / (42 * effectiveArea);
+    INFO("B max " << maximum << " T, min " << minimum << " T, flat fraction " << flatFraction << ", Faraday swing " << faradaySwing << " T");
+    CHECK(flatFraction >= 0.3);
+    CHECK_THAT(maximum - minimum, Catch::Matchers::WithinRel(faradaySwing, 0.03));
+}
+
+TEST_CASE("Test_Multiport_Flyback_Without_Voltage_Is_The_Ampere_Turn_Sum", "[physical-model][magnetizing-inductance][abt-1467]") {
+    // ABT #1467: a flyback-labelled operating point with no primary voltage. Its magnetizing current
+    // is the windings' ampere-turn sum referred to the primary (secondary signed by its isolation
+    // side), exact while either winding conducts: it keeps the DCM dead time (both currents zero)
+    // where the FLYBACK label's triangle fell over all of 1 - D.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "Test_Winding_Losses_Abt1463_Flyback.json");
+    std::ifstream in(path);
+    json masJson = json::parse(in);
+    for (auto& excitation : masJson["inputs"]["operatingPoints"][0]["excitationsPerWinding"]) {
+        excitation.erase("magnetizingCurrent");
+        excitation.erase("voltage");
+    }
+    OperatingPoint operatingPoint(masJson["inputs"]["operatingPoints"][0]);
+    auto magnetizingCurrent = OpenMagnetics::Inputs::get_multiport_inductor_magnetizing_current(
+        operatingPoint, 250e-6, {7.0}, std::vector<IsolationSide>{IsolationSide::PRIMARY, IsolationSide::SECONDARY});
+    auto waveform = magnetizingCurrent.get_waveform().value();
+    const auto& data = waveform.get_data();
+    double maximum = *std::max_element(data.begin(), data.end());
+    double minimum = *std::min_element(data.begin(), data.end());
+    size_t zeroSamples = 0;
+    for (auto value : data) {
+        if (std::fabs(value) <= 1e-9 * maximum) {
+            zeroSamples++;
+        }
+    }
+    INFO("i_m max " << maximum << " A, min " << minimum << " A, " << zeroSamples << " of " << data.size() << " samples at zero");
+    // Peak: the primary's 128-sample peak, 2.277 A; the secondary's 16.16 A / 7 = 2.309 A at commutation.
+    CHECK_THAT(maximum, Catch::Matchers::WithinRel(2.31, 0.02));
+    CHECK(minimum > -1e-9 * maximum);
+    // Dead time: the last 42 of 128 samples carry no current on either winding.
+    CHECK(static_cast<double>(zeroSamples) / data.size() >= 40.0 / 128);
+}
+
+TEST_CASE("Test_Forward_Transformer_Load_Current_Is_Not_Core_Bias", "[physical-model][magnetizing-inductance][abt-1467][abt-1814]") {
+    // ABT #1814, fixed by ABT #1467: MAS example 04 (forward transformer, E 32/16 N87, 3 windings).
+    // The primary's load current used to be taken as the core's DC bias: B offset 0.4055 T and an
+    // inductance of 34.304 uH at the operating point, 5 % of the unbiased 673.212 uH. The magnetizing
+    // current is Faraday on the winding voltage, so the load ampere-turns, which the secondary
+    // cancels, do not bias the core: |B offset| is about 3.5 mT and the inductance is the unbiased one.
+    settings.reset();
+    clear_databases();
+    std::ifstream file(std::string(__FILE__).substr(0, std::string(__FILE__).rfind('/'))
+                       + "/../MAS/examples/04_forward_xfmr_e3216_n87.json");
+    REQUIRE(file.is_open());
+    json masJson = json::parse(file);
+    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+    magnetic = magnetic_autocomplete(magnetic);
+    for (auto& operatingPointJson : masJson["inputs"]["operatingPoints"]) {
+        for (auto& excitationJson : operatingPointJson["excitationsPerWinding"]) {
+            excitationJson.erase("magnetizingCurrent");
+        }
+    }
+    OpenMagnetics::Inputs inputs(masJson["inputs"], false);
+    REQUIRE(inputs.get_operating_points().size() >= 1);
+    OperatingPoint operatingPoint = inputs.get_operating_points()[0];
+    REQUIRE(operatingPoint.get_excitations_per_winding().size() == 3);
+
+    MagnetizingInductance model;
+    double unbiasedInductance = resolve_dimensional_values(
+        model.calculate_inductance_from_number_turns_and_gapping(magnetic.get_core(), magnetic.get_coil()).get_magnetizing_inductance());
+    auto [output, magneticFluxDensity] = model.calculate_inductance_and_magnetic_flux_density(magnetic.get_core(), magnetic.get_coil(), &operatingPoint);
+    double inductanceAtOperatingPoint = resolve_dimensional_values(output.get_magnetizing_inductance());
+
+    CHECK_THAT(unbiasedInductance, Catch::Matchers::WithinRel(673.212e-6, 0.01));
+    CHECK_THAT(inductanceAtOperatingPoint, Catch::Matchers::WithinRel(unbiasedInductance, 0.01));
+    CHECK(std::abs(magneticFluxDensity.get_processed()->get_offset()) < 0.01);
+}
+
+TEST_CASE("Test_Forward_And_Multi_Operating_Point_Transformers_Load_Current_Is_Not_Core_Bias", "[physical-model][magnetizing-inductance][abt-1814]") {
+    // ABT #1814, the two other MAS examples the collapse hit (only 04 was guarded): the primary's
+    // reflected load current was taken as the core's DC bias. 22 (forward, E 42/21/20 3C95, 2
+    // windings) fell from 3438 uH to 359.7 uH with a B offset of 0.377 T; 19 (2 operating points,
+    // ETD 39/20 PC95) fell at its first operating point from 1583 uH to 954 uH with 0.302 T. Their
+    // windings' net ampere-turns average zero, so the B offset is a few mT at every operating point
+    // and the inductance stays near the unbiased one (19's sits 1.7 % above it: the permeability at
+    // its small flux swing and temperature).
+    struct Example { std::string file; double unbiasedInductance; double tolerance; };
+    for (const auto& example : {Example{"22_margin_tape_forward_e4218_3c95", 3438.18e-6, 0.01},
+                                Example{"19_multi_op_xfmr_etd3920_pc95", 1583.49e-6, 0.03}}) {
+        settings.reset();
+        clear_databases();
+        std::ifstream file(std::string(__FILE__).substr(0, std::string(__FILE__).rfind('/'))
+                           + "/../MAS/examples/" + example.file + ".json");
+        REQUIRE(file.is_open());
+        json masJson = json::parse(file);
+        OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+        magnetic = magnetic_autocomplete(magnetic);
+        for (auto& operatingPointJson : masJson["inputs"]["operatingPoints"]) {
+            for (auto& excitationJson : operatingPointJson["excitationsPerWinding"]) {
+                excitationJson.erase("magnetizingCurrent");
+            }
+        }
+        OpenMagnetics::Inputs inputs(masJson["inputs"], false);
+        REQUIRE(inputs.get_operating_points().size() >= 1);
+
+        MagnetizingInductance model;
+        double unbiasedInductance = resolve_dimensional_values(
+            model.calculate_inductance_from_number_turns_and_gapping(magnetic.get_core(), magnetic.get_coil()).get_magnetizing_inductance());
+        CHECK_THAT(unbiasedInductance, Catch::Matchers::WithinRel(example.unbiasedInductance, 0.01));
+        for (size_t operatingPointIndex = 0; operatingPointIndex < inputs.get_operating_points().size(); ++operatingPointIndex) {
+            OperatingPoint operatingPoint = inputs.get_operating_points()[operatingPointIndex];
+            REQUIRE(operatingPoint.get_excitations_per_winding().size() >= 2);
+            auto [output, magneticFluxDensity] = model.calculate_inductance_and_magnetic_flux_density(magnetic.get_core(), magnetic.get_coil(), &operatingPoint);
+            double inductanceAtOperatingPoint = resolve_dimensional_values(output.get_magnetizing_inductance());
+            INFO(example.file << " operating point " << operatingPointIndex << ": L " << inductanceAtOperatingPoint * 1e6
+                 << " uH (unbiased " << unbiasedInductance * 1e6 << " uH), B offset " << magneticFluxDensity.get_processed()->get_offset() << " T");
+            CHECK_THAT(inductanceAtOperatingPoint, Catch::Matchers::WithinRel(unbiasedInductance, example.tolerance));
+            CHECK(std::abs(magneticFluxDensity.get_processed()->get_offset()) < 0.01);
+        }
+    }
+}
+
+TEST_CASE("Test_Magnetizing_Current_Throws_When_A_Winding_Has_No_Current", "[physical-model][magnetizing-inductance][abt-1814]") {
+    // ABT #1814 (3): the DC of a multi-winding magnetizing current comes from the sum of every
+    // winding's ampere-turns. With a current on the primary and none on a secondary that sum
+    // cannot be formed; the conduction map used to come back empty and the magnetizing current
+    // silently lost its DC. It throws now, naming the winding. An operating point given by its
+    // voltages alone (no winding with a current) stays a voltage-only one: no DC from currents.
+    settings.reset();
+    clear_databases();
+    std::ifstream file(std::string(__FILE__).substr(0, std::string(__FILE__).rfind('/'))
+                       + "/../MAS/examples/04_forward_xfmr_e3216_n87.json");
+    REQUIRE(file.is_open());
+    json masJson = json::parse(file);
+    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+    magnetic = magnetic_autocomplete(magnetic);
+    for (auto& excitationJson : masJson["inputs"]["operatingPoints"][0]["excitationsPerWinding"]) {
+        excitationJson.erase("magnetizingCurrent");
+    }
+    json partialJson = masJson["inputs"]["operatingPoints"][0];
+    partialJson["excitationsPerWinding"][2].erase("current");
+    OperatingPoint partial(partialJson);
+    REQUIRE(partial.get_excitations_per_winding()[0].get_current());
+    REQUIRE_FALSE(partial.get_excitations_per_winding()[2].get_current());
+
+    CHECK_THROWS_WITH(OpenMagnetics::Inputs::calculate_winding_conduction(partial),
+                      Catch::Matchers::ContainsSubstring("winding 2 has no current"));
+    CHECK_THROWS_WITH(OpenMagnetics::Inputs::calculate_magnetizing_current(partial, 0, 673e-6, magnetic.get_coil().get_turns_ratios(), false),
+                      Catch::Matchers::ContainsSubstring("winding 2 has no current"));
+    CHECK_THROWS_WITH(OpenMagnetics::Inputs::include_dc_offset_into_magnetizing_current(partial, magnetic.get_coil().get_turns_ratios()),
+                      Catch::Matchers::ContainsSubstring("winding 2 has no current"));
+
+    json voltageOnlyJson = masJson["inputs"]["operatingPoints"][0];
+    for (auto& excitationJson : voltageOnlyJson["excitationsPerWinding"]) {
+        excitationJson.erase("current");
+    }
+    OperatingPoint voltageOnly(voltageOnlyJson);
+    CHECK_FALSE(OpenMagnetics::Inputs::calculate_winding_conduction(voltageOnly).has_value());
+    CHECK_NOTHROW(OpenMagnetics::Inputs::calculate_magnetizing_current(voltageOnly, 0, 673e-6, magnetic.get_coil().get_turns_ratios(), false));
+}
+
+TEST_CASE("Test_Gapping_Reads_The_Magnetizing_Current_Of_The_Target_Inductance", "[physical-model][magnetizing-inductance][gapping][abt-1902]") {
+    // ABT #1902: a forward transformer carried in a magnetizing current a converter model had derived from the
+    // winding voltage for its minimum inductance; the gap solve read that current against the reluctance of the
+    // (eight times larger) target and found a B peak eight times the volt-seconds' one: "no gap holds it, the
+    // core saturates". With a voltage the flux is Faraday's, and the gap solve derives the magnetizing current
+    // at the target inductance, as the inductance model does: the carried current does not change the gaps.
+    settings.reset();
+    clear_databases();
+    std::ifstream file(std::string(__FILE__).substr(0, std::string(__FILE__).rfind('/'))
+                       + "/../MAS/examples/04_forward_xfmr_e3216_n87.json");
+    REQUIRE(file.is_open());
+    json masJson = json::parse(file);
+    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+    magnetic = magnetic_autocomplete(magnetic);
+    for (auto& operatingPointJson : masJson["inputs"]["operatingPoints"]) {
+        for (auto& excitationJson : operatingPointJson["excitationsPerWinding"]) {
+            excitationJson.erase("magnetizingCurrent");
+        }
+    }
+    OpenMagnetics::Inputs inputs(masJson["inputs"], false);
+    REQUIRE(inputs.get_operating_points().size() >= 1);
+    REQUIRE(inputs.get_operating_points()[0].get_excitations_per_winding()[0].get_voltage());
+
+    MagnetizingInductance model;
+    double unbiasedInductance = resolve_dimensional_values(
+        model.calculate_inductance_from_number_turns_and_gapping(magnetic.get_core(), magnetic.get_coil()).get_magnetizing_inductance());
+    double targetInductance = unbiasedInductance / 2;
+    DimensionWithTolerance target;
+    target.set_nominal(targetInductance);
+    inputs.get_mutable_design_requirements().set_magnetizing_inductance(target);
+
+    auto inputsWithCurrentAt = [&](double inductance) {
+        OpenMagnetics::Inputs stamped = inputs;
+        auto operatingPoint = stamped.get_operating_point(0);
+        auto magnetizingCurrent = OpenMagnetics::Inputs::calculate_magnetizing_current(operatingPoint, 0, inductance,
+                                                                                         magnetic.get_coil().get_turns_ratios(), false);
+        operatingPoint.get_mutable_excitations_per_winding()[0].set_magnetizing_current(magnetizingCurrent);
+        stamped.set_operating_point_by_index(operatingPoint, 0);
+        return stamped;
+    };
+    auto staleInputs = inputsWithCurrentAt(targetInductance / 8);
+    auto targetInputs = inputsWithCurrentAt(targetInductance);
+
+    auto gapsFromTarget = model.calculate_gapping_from_number_turns_and_inductance(magnetic.get_core(), magnetic.get_coil(), &targetInputs, GappingType::GROUND, 6);
+    std::vector<CoreGap> gapsFromStale;
+    REQUIRE_NOTHROW(gapsFromStale = model.calculate_gapping_from_number_turns_and_inductance(magnetic.get_core(), magnetic.get_coil(), &staleInputs, GappingType::GROUND, 6));
+    REQUIRE(gapsFromStale.size() == gapsFromTarget.size());
+    for (size_t i = 0; i < gapsFromStale.size(); ++i) {
+        CHECK(gapsFromStale[i].get_length() == gapsFromTarget[i].get_length());
+    }
+
+    Core gappedCore = magnetic.get_core();
+    gappedCore.set_processed_description(std::nullopt);
+    gappedCore.set_geometrical_description(std::nullopt);
+    gappedCore.get_mutable_functional_description().set_gapping(gapsFromStale);
+    gappedCore.process_data();
+    gappedCore.process_gap();
+    double gappedInductance = resolve_dimensional_values(
+        model.calculate_inductance_from_number_turns_and_gapping(gappedCore, magnetic.get_coil()).get_magnetizing_inductance());
+    CHECK_THAT(gappedInductance, Catch::Matchers::WithinRel(targetInductance, 0.05));
 }

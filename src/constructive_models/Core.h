@@ -5,6 +5,7 @@
 
 #include <MAS.hpp>
 #include "Defaults.h"
+#include "Definitions.h"
 #include "CorePiece.h"
 
 #include <vector>
@@ -138,10 +139,14 @@ class Core : public MAS::MagneticCore {
     std::string get_reference() const;
 
     const std::vector<CoreGap>& get_gapping() const { return get_functional_description().get_gapping(); }
-    // Coating thickness per surface, in m. 0 when the core has no coating. An explicit
-    // thickness (CoreCoating object) is used as-is; a name-only coating (legacy string
-    // form) resolves to the datasheet default thickness for that coating type.
-    double get_coating_thickness() const;
+    // Coating thickness per surface, in m. An explicit CoreCoating.thickness is a MAS
+    // dimensionWithTolerance (sources bound it: ACME's 0.6 mm is a maximum, the LoPs give
+    // minima), collapsed with resolve_dimensional_values(preferred). An explicit 0 means a
+    // core checked and found bare; a core that declares no coating is bare too (0). A name-only coating (legacy string form) resolves to the
+    // datasheet default thickness for that coating type. Throws on a negative thickness.
+    // Fit/envelope checks (does the coated ring fit a base?) pass MAXIMUM; the dielectric
+    // and winding-geometry paths use the NOMINAL default.
+    double get_coating_thickness(DimensionalValues preferredValue = DimensionalValues::NOMINAL) const;
     // Relative permittivity of the coating dielectric, from its insulation material.
     // Explicit CoreCoating.material wins; otherwise the datasheet default material for
     // the coating type. Throws if the core has no coating or the type has no material.
@@ -160,25 +165,25 @@ class Core : public MAS::MagneticCore {
     // corner, over a ferrite edge that was already tumbled or chamfered. Toroids only.
     double get_toroid_edge_radius() const;
     double get_initial_permeability(double temperature = Defaults().ambientTemperature);
-    static double get_initial_permeability(CoreMaterial coreMaterial, double temperature = Defaults().ambientTemperature);
+    static double get_initial_permeability(const CoreMaterial& coreMaterial, double temperature = Defaults().ambientTemperature);
     double get_effective_permeability(double temperature);
     double get_reluctance(double temperature);
     double get_density();
-    static double get_density(CoreMaterial coreMaterial);
+    static double get_density(const CoreMaterial& coreMaterial);
     double get_resistivity(double temperature);
     static double get_resistivity(CoreMaterial coreMaterial, double temperature);
     double get_curie_temperature();
-    static double get_curie_temperature(CoreMaterial coreMaterial);
+    static double get_curie_temperature(const CoreMaterial& coreMaterial);
     double get_remanence(double temperature);
-    static double get_remanence(CoreMaterial coreMaterial, double temperature, bool returnZeroIfMissing = false);
+    static double get_remanence(const CoreMaterial& coreMaterial, double temperature, bool returnZeroIfMissing = false);
     double get_coercive_force(double temperature);
-    static double get_coercive_force(CoreMaterial coreMaterial, double temperature, bool returnZeroIfMissing = false);
+    static double get_coercive_force(const CoreMaterial& coreMaterial, double temperature, bool returnZeroIfMissing = false);
     double get_magnetic_flux_density_saturation(bool proportion = true);
-    static double get_magnetic_flux_density_saturation(CoreMaterial coreMaterial, bool proportion = true);
+    static double get_magnetic_flux_density_saturation(const CoreMaterial& coreMaterial, bool proportion = true);
     double get_magnetic_flux_density_saturation(double temperature, bool proportion = true);
-    static double get_magnetic_flux_density_saturation(CoreMaterial coreMaterial, double temperature, bool proportion = true);
+    static double get_magnetic_flux_density_saturation(const CoreMaterial& coreMaterial, double temperature, bool proportion = true);
     double get_magnetic_field_strength_saturation(double temperature);
-    static double get_magnetic_field_strength_saturation(CoreMaterial coreMaterial, double temperature);
+    static double get_magnetic_field_strength_saturation(const CoreMaterial& coreMaterial, double temperature);
     CoreShapeFamily get_shape_family() const;
     std::string get_material_family() const;
     std::string get_shape_name() const;
@@ -236,6 +241,26 @@ class Core : public MAS::MagneticCore {
 // base-class one, so every json -> Core path migrates first. It also rejects a family string that
 // survives migration without matching the enum, rather than letting it become value 0.
 void from_json(const json& j, Core& x);
+
+// ABT #1218: the generated MAS serialiser cannot write a schema-valid core. quicktype merges the
+// geometricalDescription oneOf(core/piece.json, core/spacer.json) into ONE struct,
+// CoreGeometricalDescriptionElement, and its to_json writes every member of the union, an unset
+// optional as `null`. Both variant schemas are `additionalProperties: false` and type their
+// optional members without `null`, so every element failed its own schema: a spacer on the piece
+// keys (machining, material, rotation, shape), a piece on the spacer keys (dimensions,
+// insulationMaterial). The same `null`s sink the rest of the core (shape aliases, gap area, ...).
+//
+// MAS.hpp is generated and is not edited, so the variant-aware step lives here: every json <- Core
+// conversion (`json j = core`, a Magnetic's "core", std::vector<Core>) goes through this overload,
+// which wins over the base-class one for the same reason from_json above does. It writes what the
+// generated serialiser writes, keeps on each geometricalDescription element only the keys of the
+// variant its `type` names, and drops every key whose value is unset (`null`) anywhere in the core.
+void to_json(json& j, const Core& x);
+
+// One geometricalDescription element, written as the variant its `type` names (core/spacer.json
+// for "spacer", core/piece.json otherwise), with its unset keys dropped. For callers that write an
+// element on its own (e.g. Core::get_spacers()).
+json geometrical_description_element_to_json(const CoreGeometricalDescriptionElement& element);
 
 void from_json(const json& j, std::vector<BhCycleElement>& v);
 void to_json(json& j, const std::vector<BhCycleElement>& v);

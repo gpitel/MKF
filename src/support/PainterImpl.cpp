@@ -38,6 +38,7 @@ std::vector<double> Painter::get_image_size(Magnetic magnetic) {
         case CoreShapeFamily::C:
         case CoreShapeFamily::U:
         case CoreShapeFamily::UR:
+        case CoreShapeFamily::UT:
             _extraDimension = 1;
             showingCoreWidth = (processedDescription.get_width() - mainColumn.get_width() / 2);
             break;
@@ -1124,7 +1125,8 @@ void Painter::paint_two_piece_set_bobbin(Magnetic magnetic) {
     // the other half too (its reflection across the leg axis at x=0).
     auto coreShapeFamily = magnetic.get_mutable_core().get_shape_family();
     bool fullMainLegDrawn = perColumnWindows || coreShapeFamily == MAS::CoreShapeFamily::C ||
-                            coreShapeFamily == MAS::CoreShapeFamily::U || coreShapeFamily == MAS::CoreShapeFamily::UR;
+                            coreShapeFamily == MAS::CoreShapeFamily::U || coreShapeFamily == MAS::CoreShapeFamily::UR ||
+                            coreShapeFamily == MAS::CoreShapeFamily::UT;
     if (mainColumnWound) {
         addBobbinPolygon(bobbinPoints);
         if (fullMainLegDrawn) {
@@ -1182,6 +1184,7 @@ void Painter::paint_two_piece_set_core(Core core) {
         case MAS::CoreShapeFamily::C:
         case MAS::CoreShapeFamily::U:
         case MAS::CoreShapeFamily::UR:
+        case MAS::CoreShapeFamily::UT:
             showingMainColumnWidth = mainColumn.get_width() / 2;
             showingCoreWidth = processedDescription.get_width() - mainColumn.get_width() / 2;
             break;
@@ -1241,7 +1244,9 @@ void Painter::paint_two_piece_set_core(Core core) {
     // full: its left face sits at -width/2 of the main column, not at the leg's
     // axis. Symmetric families keep x=0 (the left half is drawn as a mirror).
     double mainLegLeftEdge = 0;
-    if (family == MAS::CoreShapeFamily::C || family == MAS::CoreShapeFamily::U || family == MAS::CoreShapeFamily::UR) {
+    // UT is the same asymmetric U piece (closed by a plate), with unequal legs.
+    if (family == MAS::CoreShapeFamily::C || family == MAS::CoreShapeFamily::U || family == MAS::CoreShapeFamily::UR ||
+        family == MAS::CoreShapeFamily::UT) {
         mainLegLeftEdge = -showingMainColumnWidth;
     }
 
@@ -1288,7 +1293,7 @@ void Painter::paint_two_piece_set_core(Core core) {
     // single-window cores keep the historical half view untouched.
     bool mirrorLeftHalf = processedDescription.get_winding_windows().size() > 1 &&
                           family != MAS::CoreShapeFamily::C && family != MAS::CoreShapeFamily::U &&
-                          family != MAS::CoreShapeFamily::UR;
+                          family != MAS::CoreShapeFamily::UR && family != MAS::CoreShapeFamily::UT;
     auto mirrorPoints = [](const std::vector<SVG::Point>& points) {
         std::vector<SVG::Point> mirroredPoints;
         for (auto& point : points) {
@@ -1438,62 +1443,34 @@ void Painter::paint_toroidal_margin(Magnetic magnetic) {
             auto margins = Coil::resolve_margin(sections[i]);
 
             if (sectionOrientation == WindingOrientation::CONTIGUOUS) {
-
-                if (drawSpacer) {
-                    size_t nextSectionIndex = 0;
-                    if (i < sections.size() - 2) {
-                        nextSectionIndex = i + 2;
-                    }
-                    double leftMargin = Coil::resolve_margin(sections[i])[1];
-                    double rightMargin = Coil::resolve_margin(sections[nextSectionIndex])[0];
-                    double rectangleThickness = leftMargin + rightMargin;
-                    if (rectangleThickness == 0) {
+                // FLAT-BAR MARGINS (user ruling 2026-10-03): the sections of a toroid are separated
+                // by a bar through the window, a slab about the radial line at each section
+                // boundary, and a section's margin on one side is the half of that slab on its
+                // side. Each half is drawn as a rectangle, margin thick, from the ring axis to the
+                // window wall along the boundary line the winder placed it on (the section's edge
+                // minus the bar's angle, Coil::toroidal_section_margin_angles). The two halves
+                // either side of a boundary make up the whole bar.
+                if (sections[i].get_type() != ElectricalType::CONDUCTION) {
+                    continue;
+                }
+                const auto barAngles = magnetic.get_mutable_coil().toroidal_section_margin_angles(sections[i]);
+                const double sectionStart = sections[i].get_coordinates()[1] - sections[i].get_dimensions()[1] / 2;
+                const double sectionEnd = sections[i].get_coordinates()[1] + sections[i].get_dimensions()[1] / 2;
+                std::string cssClassName = "spacer";
+                if (!drawSpacer) {
+                    cssClassName = generate_random_string();
+                    _root.style("." + cssClassName).set_attr("fill", std::regex_replace(std::string(settings.get_painter_color_margin()), std::regex("0x"), "#")).set_attr("stroke", "none");
+                }
+                for (size_t side = 0; side < 2; ++side) {
+                    if (margins[side] <= 0) {
                         continue;
                     }
-                    double leftAngle = sections[i].get_coordinates()[1] + sections[i].get_dimensions()[1] / 2;
-                    double rightAngle = sections[nextSectionIndex].get_coordinates()[1] - sections[nextSectionIndex].get_dimensions()[1] / 2;
-
-                    if (i >= sections.size() - 2) {
-                        rightAngle += 360;
-                    }
-                    double rectangleAngleInRadians = (leftAngle + rightAngle) / 2 / 180 * std::numbers::pi;
-                    std::vector<double> centerRadialPoint = {windingWindowRadialHeight * cos(rectangleAngleInRadians), windingWindowRadialHeight * sin(rectangleAngleInRadians)};
-
-                    std::vector<std::vector<double>> marginPoints = {};
-                    double xCoordinate = 0;
-                    double yCoordinate = windingWindowRadialHeight / 2;
-                    double rectangleWidth = rectangleThickness;
-                    double rectangleHeight = windingWindowRadialHeight;
-                    paint_rectangle(xCoordinate, yCoordinate, rectangleWidth, rectangleHeight, "spacer", nullptr, -90 + rectangleAngleInRadians * 180 / std::numbers::pi, {0, 0});
-                }
-                else {
-                    if (margins[0] > 0) {
-                        double strokeWidth = sections[i].get_dimensions()[0];
-                        double circleDiameter = (windingWindowRadialHeight - sections[i].get_coordinates()[0]) * 2;
-
-                        if (strokeWidth >= circleDiameter - 1e-12) continue;
-
-                        double angle = wound_distance_to_angle(margins[0], circleDiameter / 2 - strokeWidth / 2);
-                        if (sections[i].get_type() == ElectricalType::CONDUCTION) {
-                            std::string cssClassName = generate_random_string();
-                            _root.style("." + cssClassName).set_attr("stroke-width", strokeWidth * _scale).set_attr("fill", "none").set_attr("stroke", std::regex_replace(std::string(settings.get_painter_color_margin()), std::regex("0x"), "#"));
-                            paint_circle(0, 0, circleDiameter / 2, cssClassName, nullptr, angle, -(sections[i].get_coordinates()[1] - sections[i].get_dimensions()[1] / 2), {0, 0});
-                        }
-                    }
-
-                    if (margins[1] > 0) {
-                        double strokeWidth = sections[i].get_dimensions()[0];
-                        double circleDiameter = (windingWindowRadialHeight - sections[i].get_coordinates()[0]) * 2;
-
-                        if (strokeWidth >= circleDiameter - 1e-12) continue;
-
-                        double angle = wound_distance_to_angle(margins[1], circleDiameter / 2 - strokeWidth / 2);
-                        if (sections[i].get_type() == ElectricalType::CONDUCTION) {
-                            std::string cssClassName = generate_random_string();
-                            _root.style("." + cssClassName).set_attr("stroke-width", strokeWidth * _scale).set_attr("fill", "none").set_attr("stroke", std::regex_replace(std::string(settings.get_painter_color_margin()), std::regex("0x"), "#"));
-                            paint_circle(0, 0, circleDiameter / 2, cssClassName, nullptr, angle, -(sections[i].get_coordinates()[1] + sections[i].get_dimensions()[1] / 2 + angle), {0, 0});
-                        }
-                    }
+                    const double boundaryAngle = side == 0 ? sectionStart - barAngles.first : sectionEnd + barAngles.second;
+                    // In the rectangle's own frame the boundary line is the +y axis; after the
+                    // rotation onto boundaryAngle, -x points toward higher angles (side 0's section)
+                    // and +x toward lower ones (side 1's).
+                    const double xCoordinate = side == 0 ? -margins[side] / 2 : margins[side] / 2;
+                    paint_rectangle(xCoordinate, windingWindowRadialHeight / 2, margins[side], windingWindowRadialHeight, cssClassName, nullptr, -90 + boundaryAngle, {0, 0});
                 }
             }
             else {
@@ -1772,11 +1749,19 @@ void Painter::paint_coil_turns(Magnetic magnetic, bool skipMarginAndLayers) {
 }
 
 std::string Painter::get_color(double minimumValue, double maximumValue, std::string minimumColor, std::string maximumColor, double value) {
-    // Handle NaN or invalid values - return minimum color as fallback
-    if (!std::isfinite(value)) {
-        return minimumColor;
+    // A NaN field value is a defect upstream; it has no colour. +-inf is an ordinary value at the end
+    // of the scale (log10 of a zero field is -inf) and clamps to the end colour like any other value
+    // beyond the colour bar. Every colour leaves through the same interpolation below, so the result
+    // is always "#rrggbb": the settings store colours as "0x..." and returning one of them unchanged
+    // put "0x2b35f5", which is not an SVG colour, into the image.
+    if (std::isnan(value)) {
+        throw InvalidInputException(ErrorCode::CALCULATION_INVALID_RESULT, "Painter colour scale was given a NaN value");
     }
-    
+    if (!std::isfinite(minimumValue) || !std::isfinite(maximumValue) || !(maximumValue > minimumValue)) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Painter colour scale needs finite limits with maximum > minimum, got [" +
+                                    std::to_string(minimumValue) + ", " + std::to_string(maximumValue) + "]");
+    }
+
     // Clamp the value
     value = clamp(value, minimumValue, maximumValue);
     
@@ -1823,181 +1808,56 @@ void Painter::paint_field_point(double xCoordinate, double yCoordinate, double x
 
 void Painter::paint_magnetic_field(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex, std::optional<ComplexField> inputField) {
     set_image_size(magnetic);
-    double minimumModule = DBL_MAX;
-    double maximumModule = 0;
     _fieldPainted = true;
-    std::vector<double> modules;
-    // settings.set_painter_number_points_x(4);
-    // settings.set_painter_number_points_y(4);
     bool logarithmicScale = settings.get_painter_logarithmic_scale();
 
-    auto core = magnetic.get_core();
-    auto family = core.get_shape_family();
-    bool isToroidal = (family == MAS::CoreShapeFamily::T);
-    
-    ComplexField field;
-    ComplexField internalField;
-    ComplexField externalField;
-    
-    if (inputField) {
-        field = inputField.value();
-    }
-    else if (isToroidal) {
-        // For toroidal cores, calculate internal and external fields separately
-        internalField = calculate_magnetic_field_internal_only(operatingPoint, magnetic, harmonicIndex);
-        externalField = calculate_magnetic_field_external_only(operatingPoint, magnetic, harmonicIndex);
-    }
-    else {
-        field = calculate_magnetic_field(operatingPoint, magnetic, harmonicIndex);
-    }
+    // One field, painted the same way for every core. A toroid's field comes from
+    // calculate_magnetic_field as well: it dispatches to the ring-plane field of the toroidal
+    // leakage model (calculate_toroidal_magnetic_field), which covers the bore, the ferrite and the
+    // outside. An inputField is painted as given, toroid or not.
+    ComplexField field = inputField ? inputField.value() : calculate_magnetic_field(operatingPoint, magnetic, harmonicIndex);
 
-    auto [pixelXDimension, pixelYDimension] = Painter::get_pixel_dimensions(magnetic);
-
-    // Collect all values for color scale
-    if (isToroidal) {
-        // Collect values from both internal and external fields
-        for (size_t i = 0; i < internalField.get_data().size(); ++i) {
-            auto datum = internalField.get_data()[i];
-            double value;
-            if (logarithmicScale) {
-                value = hypot(log10(fabs(datum.get_real())), log10(fabs(datum.get_imaginary())));
-            }
-            else {
-                value = hypot(datum.get_real(), datum.get_imaginary());
-            }
-            if (std::isfinite(value)) modules.push_back(value);
+    // |H| (peak of the harmonic), or log10 |H|. A zero field has log10 = -inf, which is the bottom
+    // of the scale (get_color clamps it); it is left out of the percentiles only.
+    auto module_of = [&](const ComplexFieldPoint& datum) {
+        double module = hypot(datum.get_real(), datum.get_imaginary());
+        return logarithmicScale ? log10(module) : module;
+    };
+    std::vector<double> modules;
+    for (const auto& datum : field.get_data()) {
+        double value = module_of(datum);
+        if (std::isnan(value)) {
+            throw InvalidInputException(ErrorCode::CALCULATION_INVALID_RESULT, "Magnetic field to paint has a NaN value");
         }
-        for (size_t i = 0; i < externalField.get_data().size(); ++i) {
-            auto datum = externalField.get_data()[i];
-            double value;
-            if (logarithmicScale) {
-                value = hypot(log10(fabs(datum.get_real())), log10(fabs(datum.get_imaginary())));
-            }
-            else {
-                value = hypot(datum.get_real(), datum.get_imaginary());
-            }
-            if (std::isfinite(value)) modules.push_back(value);
-        }
-    }
-    else {
-        for (size_t i = 0; i < field.get_data().size(); ++i) {
-            auto datum = field.get_data()[i];
-            double value;
-            if (logarithmicScale) {
-                value = hypot(log10(fabs(datum.get_real())), log10(fabs(datum.get_imaginary())));
-            }
-            else {
-                value = hypot(datum.get_real(), datum.get_imaginary());
-            }
+        if (std::isfinite(value)) {
             modules.push_back(value);
         }
     }
-    
     if (modules.empty()) {
         modules.push_back(0.0);
     }
-    
+
     std::sort(modules.begin(), modules.end());
     size_t index05 = static_cast<size_t>(0.02 * (modules.size() - 1));
     size_t index95 = static_cast<size_t>(0.98 * (modules.size() - 1));
-    double percentile05Value = modules[index05];
-    double percentile95Value = modules[index95];
-
-    if (!settings.get_painter_maximum_value_colorbar().has_value()) {
-        maximumModule = percentile95Value;
-    }
-    if (!settings.get_painter_minimum_value_colorbar().has_value()) {
-        minimumModule = percentile05Value;
-    }
-
-    if (settings.get_painter_maximum_value_colorbar().has_value()) {
-        maximumModule = settings.get_painter_maximum_value_colorbar().value();
-    }
-    if (settings.get_painter_minimum_value_colorbar().has_value()) {
-        minimumModule = settings.get_painter_minimum_value_colorbar().value();
-    }
+    double minimumModule = settings.get_painter_minimum_value_colorbar().value_or(modules[index05]);
+    double maximumModule = settings.get_painter_maximum_value_colorbar().value_or(modules[index95]);
     if (minimumModule == maximumModule) {
         minimumModule = maximumModule - 1;
     }
 
     auto magneticFieldMinimumColor = settings.get_painter_color_magnetic_field_minimum();
     auto magneticFieldMaximumColor = settings.get_painter_color_magnetic_field_maximum();
-    
-    if (isToroidal) {
-        // For toroidal cores: plot internal field inside, external field outside
-        auto processedDesc = core.get_processed_description();
-        double coreRadius = processedDesc->get_width() / 2.0;
-        
-        // Plot internal field only for points inside the core
-        for (size_t i = 0; i < internalField.get_data().size(); ++i) {
-            auto datum = internalField.get_data()[i];
-            auto& point = datum.get_point();
-            double px = point[0];
-            double py = point[1];
-            double distFromCenter = sqrt(px*px + py*py);
-            
-            // Only plot if inside the core
-            if (distFromCenter <= coreRadius) {
-                double value;
-                if (logarithmicScale) {
-                    value = hypot(log10(fabs(datum.get_real())), log10(fabs(datum.get_imaginary())));
-                }
-                else {
-                    value = hypot(datum.get_real(), datum.get_imaginary());
-                }
-                auto color = get_color(minimumModule, maximumModule, magneticFieldMinimumColor, magneticFieldMaximumColor, value);
+    auto [pixelXDimension, pixelYDimension] = Painter::get_pixel_dimensions(magnetic);
 
-                std::stringstream stream;
-                stream << std::scientific << std::setprecision(1) << value;
-                std::string label = stream.str() + " A/m (int)";
-                paint_field_point(px, py, pixelXDimension, pixelYDimension, color, label);
-            }
-        }
-        
-        // Plot external field only for points outside the core
-        for (size_t i = 0; i < externalField.get_data().size(); ++i) {
-            auto datum = externalField.get_data()[i];
-            auto& point = datum.get_point();
-            double px = point[0];
-            double py = point[1];
-            double distFromCenter = sqrt(px*px + py*py);
-            
-            // Only plot if outside the core
-            if (distFromCenter > coreRadius) {
-                double value;
-                if (logarithmicScale) {
-                    value = hypot(log10(fabs(datum.get_real())), log10(fabs(datum.get_imaginary())));
-                }
-                else {
-                    value = hypot(datum.get_real(), datum.get_imaginary());
-                }
-                auto color = get_color(minimumModule, maximumModule, magneticFieldMinimumColor, magneticFieldMaximumColor, value);
-
-                std::stringstream stream;
-                stream << std::scientific << std::setprecision(1) << value;
-                std::string label = stream.str() + " A/m (ext)";
-                paint_field_point(px, py, pixelXDimension, pixelYDimension, color, label);
-            }
-        }
-    }
-    else {
-        // Original behavior for non-toroidal cores
-        for (auto datum : field.get_data()) {
-            double value;
-            if (logarithmicScale) {
-                value = hypot(log10(fabs(datum.get_real())), log10(fabs(datum.get_imaginary())));
-            }
-            else {
-                value = hypot(datum.get_real(), datum.get_imaginary());
-            }
-            auto color = get_color(minimumModule, maximumModule, magneticFieldMinimumColor, magneticFieldMaximumColor, value);
-
-            std::stringstream stream;
-            stream << std::scientific << std::setprecision(1) << value;
-            std::string label = stream.str() + " A/m";
-            auto& point = datum.get_point();
-            paint_field_point(point[0], point[1], pixelXDimension, pixelYDimension, color, label);
-        }
+    for (const auto& datum : field.get_data()) {
+        double value = module_of(datum);
+        auto color = get_color(minimumModule, maximumModule, magneticFieldMinimumColor, magneticFieldMaximumColor, value);
+        std::stringstream stream;
+        stream << std::scientific << std::setprecision(1) << value;
+        std::string label = stream.str() + (logarithmicScale ? " log10(A/m)" : " A/m");
+        auto& point = datum.get_point();
+        paint_field_point(point[0], point[1], pixelXDimension, pixelYDimension, color, label);
     }
 }
 
@@ -2408,6 +2268,7 @@ void Painter::paint_temperature_field(Magnetic magnetic, const std::map<std::str
         case MAS::CoreShapeFamily::C:
         case MAS::CoreShapeFamily::U:
         case MAS::CoreShapeFamily::UR:
+        case MAS::CoreShapeFamily::UT:
             showingMainColumnWidth = mainColumn.get_width() / 2;
             showingCoreWidth = processedElements.get_width() - mainColumn.get_width() / 2;
             break;
@@ -4769,8 +4630,18 @@ void Painter::paint_waveform(std::vector<double> data, std::optional<std::vector
 }
 
 void Painter::paint_curve(Curve2D curve2D, bool logScale) {
-    // For basic painter, ignore logScale and just plot
-    paint_waveform(curve2D.get_y_points(), std::make_optional(curve2D.get_x_points()));
+    // For basic painter, ignore logScale and just plot.
+    // A point without a value (NaN: e.g. the core loss of a point where the core saturates, which
+    // Sweeper flags and does not compute, ABT #1790) has nothing to draw; the line joins the others.
+    std::vector<double> xPoints;
+    std::vector<double> yPoints;
+    for (size_t index = 0; index < curve2D.get_y_points().size(); ++index) {
+        if (std::isfinite(curve2D.get_y_points()[index])) {
+            xPoints.push_back(curve2D.get_x_points().at(index));
+            yPoints.push_back(curve2D.get_y_points()[index]);
+        }
+    }
+    paint_waveform(yPoints, std::make_optional(xPoints));
 }
 
 

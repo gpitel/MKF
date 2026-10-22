@@ -85,7 +85,8 @@ MagnetizingInductanceOutput ReluctanceModel::get_core_reluctance(Core core, std:
     if (std::isnan(ungappedCoreReluctance)) {
         throw NaNResultException("Core Reluctance must be a number, not NaN");
     }
-    double calculatedReluctance = ungappedCoreReluctance + magnetizingInductanceOutput.get_gapping_reluctance().value();
+    // ABT #1714: a core without gaps has no gapping reluctance in series with its material.
+    double calculatedReluctance = ungappedCoreReluctance + gapping_reluctance_in_series(core, magnetizingInductanceOutput);
     if (std::isnan(calculatedReluctance)) {
         throw NaNResultException("Reluctance must be a number, not NaN");
     }
@@ -103,7 +104,7 @@ MagnetizingInductanceOutput ReluctanceModel::get_core_reluctance(Core core, doub
     auto ungappedCoreReluctance = get_ungapped_core_reluctance(core, initialPermeability);
 
     auto magnetizingInductanceOutput = get_gapping_reluctance(core);
-    double calculatedReluctance = ungappedCoreReluctance + magnetizingInductanceOutput.get_gapping_reluctance().value();
+    double calculatedReluctance = ungappedCoreReluctance + gapping_reluctance_in_series(core, magnetizingInductanceOutput);
 
     magnetizingInductanceOutput.set_core_reluctance(calculatedReluctance);
     magnetizingInductanceOutput.set_ungapped_core_reluctance(ungappedCoreReluctance);
@@ -171,6 +172,18 @@ AirGapReluctanceOutput ReluctanceModel::get_annular_clearance_gap_reluctance(Cor
     return airGapReluctanceOutput;
 }
 
+double ReluctanceModel::gapping_reluctance_in_series(Core& core, const MagnetizingInductanceOutput& output) {
+    if (core.get_functional_description().get_gapping().empty()) {
+        return 0;  // no gap: nothing in series with the core material
+    }
+    if (!output.get_gapping_reluctance()) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "The core has " + std::to_string(core.get_functional_description().get_gapping().size()) +
+            " gaps but its reluctance output carries no gapping reluctance");
+    }
+    return output.get_gapping_reluctance().value();
+}
+
 MagnetizingInductanceOutput ReluctanceModel::get_gapping_reluctance(Core core) {
     double calculatedReluctance = 0;
     double calculatedCentralReluctance = 0;
@@ -224,11 +237,20 @@ MagnetizingInductanceOutput ReluctanceModel::get_gapping_reluctance(Core core) {
 
     MagnetizingInductanceOutput magnetizingInductanceOutput;
 
-    magnetizingInductanceOutput.set_maximum_fringing_factor(maximumFringingFactor);
-    magnetizingInductanceOutput.set_maximum_storable_magnetic_energy_gapping(maximumStorableMagneticEnergyGapping);
-
-    magnetizingInductanceOutput.set_gapping_reluctance(calculatedReluctance);
-    magnetizingInductanceOutput.set_reluctance_per_gap(reluctancePerGap);
+    // ABT #1714: the gap-only fields describe gaps. A core with none (a toroid, a gapless
+    // single-piece core) has no gapping reluctance, no fringing and no energy stored in gaps,
+    // so they are left unset. Writing 0 / 1 / [] made every gapless output schema-invalid
+    // (MAS gappingReluctance has exclusiveMinimum 0) and read as an infinitely permeable path.
+    if (gapping.size() != 0) {
+        if (!(calculatedReluctance > 0)) {
+            throw NaNResultException("Gapping reluctance of a core with " + std::to_string(gapping.size()) +
+                                     " gaps must be a positive number, got " + std::to_string(calculatedReluctance));
+        }
+        magnetizingInductanceOutput.set_maximum_fringing_factor(maximumFringingFactor);
+        magnetizingInductanceOutput.set_maximum_storable_magnetic_energy_gapping(maximumStorableMagneticEnergyGapping);
+        magnetizingInductanceOutput.set_gapping_reluctance(calculatedReluctance);
+        magnetizingInductanceOutput.set_reluctance_per_gap(reluctancePerGap);
+    }
     magnetizingInductanceOutput.set_method_used(methodName);
     magnetizingInductanceOutput.set_origin(ResultOrigin::SIMULATION);
 
@@ -937,14 +959,27 @@ double ReluctanceModel::get_gapping_by_fringing_factor(Core core, double fringin
     // against the limb (the fringing field spans a core segment), so the large root lives outside
     // the model's validity domain and no caller wants a gap that fills the limb.
     double columnHeight = centralColumns[0].get_height();
+    // The scan runs from the residual gap (the smallest gap a ground mating plane has, see
+    // Constants.h) to the full column height. A central column no taller than that residual gap
+    // is not a core geometry: it used to return the residual gap as the "maximum gap", which
+    // silently rejected every gapped design on the core instead of naming the broken data.
     double minimumGapLength = constants.residualGap;
     if (columnHeight <= minimumGapLength) {
-        return minimumGapLength;
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "get_gapping_by_fringing_factor: the central column height (" + std::to_string(columnHeight) +
+            " m) is not longer than the residual gap (" + std::to_string(minimumGapLength) +
+            " m); the core's processed columns are not a valid geometry");
     }
 
     auto factorAt = [&](double candidateGapLength) {
         core.set_gap_length(candidateGapLength);
-        return get_core_reluctance(core).get_maximum_fringing_factor().value();
+        auto output = get_core_reluctance(core);
+        if (!output.get_maximum_fringing_factor()) {
+            throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS,
+                               "get_gapping_by_fringing_factor: the core has no gaps after setting a gap length of " +
+                               std::to_string(candidateGapLength) + " m, so it has no fringing factor");
+        }
+        return output.get_maximum_fringing_factor().value();
     };
 
     // Log-spaced scan: gap lengths of interest span microns to millimetres.

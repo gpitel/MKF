@@ -1,4 +1,5 @@
 #include "processors/Sweeper.h"
+#include "processors/ResultsAnalyzer.h"
 #include "physical_models/ComplexPermeability.h"
 #include "Constants.h"
 #include "physical_models/WindingLosses.h"
@@ -10,12 +11,107 @@
 #include "physical_models/LeakageInductance.h"
 #include "support/Settings.h"
 #include <cmath>
+#include <algorithm>
+#include <limits>
+#include <optional>
+#include <sstream>
 #include <numbers>
 #include <complex>
+#include <exception>
 #include "support/Exceptions.h"
 
 
 namespace OpenMagnetics {
+
+namespace {
+
+// ABT #1861 (Alf, 2026-10-14): complex permeability always extrapolates, and the impedance sweeps
+// say where. Flags every swept frequency at which the core's complex permeability is ESTIMATED
+// (outside the material's tabulated range; ComplexPermeabilityEstimator) and groups the flagged
+// points into labelled stretches: which part is estimated, how, and the material's tabulated range.
+// The impedance itself is computed unchanged (Impedance::impedance_from_model).
+void mark_estimated_complex_permeability(Curve2D& curve, const std::optional<CoreMaterial>& coreMaterial) {
+    const auto& frequencies = curve.get_x_points();
+    std::vector<bool> extrapolatedPoints(frequencies.size(), false);
+    std::vector<Curve2DRange> extrapolatedRanges;
+    if (coreMaterial) {
+        ComplexPermeability complexPermeabilityModel;
+        auto [tabulatedMinimum, tabulatedMaximum] = complexPermeabilityModel.get_frequency_range(coreMaterial.value());
+        std::string currentKey;
+        for (size_t index = 0; index < frequencies.size(); ++index) {
+            auto value = complexPermeabilityModel.get_complex_permeability_with_source(coreMaterial.value(), frequencies[index]);
+            if (!value.is_estimated()) {
+                currentKey.clear();
+                continue;
+            }
+            extrapolatedPoints[index] = true;
+            std::vector<std::string> parts;
+            std::string source;
+            if (value.realSource != ComplexPermeabilitySource::TABULATED) {
+                parts.push_back("real");
+                source = value.realMethod;
+            }
+            if (value.imaginarySource != ComplexPermeabilitySource::TABULATED) {
+                parts.push_back("imaginary");
+                source += (source.empty() ? "" : "; ") + value.imaginaryMethod;
+            }
+            if (source == currentKey && !extrapolatedRanges.empty()) {
+                extrapolatedRanges.back().to = frequencies[index];
+                continue;
+            }
+            currentKey = source;
+            extrapolatedRanges.push_back({frequencies[index], frequencies[index], parts, source, coreMaterial->get_name(),
+                                          tabulatedMinimum, tabulatedMaximum});
+        }
+    }
+    curve.set_extrapolated_points(extrapolatedPoints);
+    curve.set_extrapolated_ranges(extrapolatedRanges);
+}
+
+// ABT #1861 (Alf, 2026-10-14): where the core's complex permeability cannot be estimated (e.g. A072's
+// mu' above 97.2 MHz: the donors' median there is 0), the impedance sweep stops there instead of
+// throwing for the whole sweep: those points are left out and marked, with the specific "cannot be
+// estimated" error, in unavailableRanges. Only ComplexPermeabilityEstimateUnavailableException is
+// caught; any other error propagates. When no point at all can be computed, it throws.
+template <typename Evaluate>
+Curve2D sweep_up_to_unavailable_complex_permeability(const std::vector<double>& frequencies, const std::string& title, Evaluate evaluate) {
+    std::vector<double> keptFrequencies;
+    std::vector<double> values;
+    std::vector<Curve2DUnavailableRange> unavailableRanges;
+    std::exception_ptr firstUnavailable;
+    bool previousUnavailable = false;
+    std::string previousReason;
+    for (auto frequency : frequencies) {
+        try {
+            values.push_back(evaluate(frequency));
+            keptFrequencies.push_back(frequency);
+            previousUnavailable = false;
+        }
+        catch (const ComplexPermeabilityEstimateUnavailableException& exception) {
+            if (!firstUnavailable) {
+                firstUnavailable = std::current_exception();
+            }
+            // One range per run of consecutive points refused for the same reason; its message is the
+            // first point's.
+            if (previousUnavailable && previousReason == exception.reason()) {
+                unavailableRanges.back().to = frequency;
+            }
+            else {
+                unavailableRanges.push_back({frequency, frequency, exception.material_name(), exception.what()});
+            }
+            previousUnavailable = true;
+            previousReason = exception.reason();
+        }
+    }
+    if (keptFrequencies.empty()) {
+        std::rethrow_exception(firstUnavailable);
+    }
+    Curve2D curve(keptFrequencies, values, title);
+    curve.set_unavailable_ranges(unavailableRanges);
+    return curve;
+}
+
+}  // namespace
 
 
 Curve2D Sweeper::sweep_impedance_over_frequency(Magnetic magnetic, double start, double stop, size_t numberElements, std::string mode, std::string title, bool fast, bool fastCapacitance) {
@@ -50,13 +146,11 @@ Curve2D Sweeper::sweep_impedance_over_frequency(Magnetic magnetic, double start,
     auto impedanceModel = OpenMagnetics::Impedance(fastCapacitance);
     auto model = impedanceModel.build_wideband_impedance_model(magnetic, referenceFrequency, temperature, fast);
 
-    std::vector<double> impedances;
-    impedances.reserve(frequencies.size());
-    for (auto frequency : frequencies) {
-        impedances.push_back(abs(impedanceModel.impedance_from_model(model, frequency)));
-    }
-
-    return Curve2D(frequencies, impedances, title);
+    auto curve = sweep_up_to_unavailable_complex_permeability(frequencies, title, [&](double frequency) {
+        return abs(impedanceModel.impedance_from_model(model, frequency));
+    });
+    mark_estimated_complex_permeability(curve, model.coreMaterial);
+    return curve;
 }
 
 Curve2D Sweeper::sweep_common_mode_impedance_over_frequency(Magnetic magnetic, double start, double stop, size_t numberElements, std::string mode, std::string title, bool fastCapacitance) {
@@ -80,13 +174,11 @@ Curve2D Sweeper::sweep_common_mode_impedance_over_frequency(Magnetic magnetic, d
     auto impedanceModel = OpenMagnetics::Impedance(fastCapacitance);
     auto model = impedanceModel.build_common_mode_impedance_model(magnetic);
 
-    std::vector<double> impedances;
-    impedances.reserve(frequencies.size());
-    for (auto frequency : frequencies) {
-        impedances.push_back(abs(impedanceModel.impedance_from_model(model, frequency)));
-    }
-
-    return Curve2D(frequencies, impedances, title);
+    auto curve = sweep_up_to_unavailable_complex_permeability(frequencies, title, [&](double frequency) {
+        return abs(impedanceModel.impedance_from_model(model, frequency));
+    });
+    mark_estimated_complex_permeability(curve, model.coreMaterial);
+    return curve;
 }
 
 Curve2D Sweeper::sweep_differential_mode_impedance_over_frequency(Magnetic magnetic, double start, double stop, size_t numberElements, std::string mode, std::string title) {
@@ -108,7 +200,7 @@ Curve2D Sweeper::sweep_differential_mode_impedance_over_frequency(Magnetic magne
     // the whole capacitance model would run per frequency (~100x slower).
     double referenceFrequency = std::sqrt(frequencies.front() * frequencies.back());
     auto impedance = OpenMagnetics::Impedance();
-    auto parameters = impedance.calculate_differential_mode_parameters(magnetic.get_core(), magnetic.get_coil(), referenceFrequency);
+    auto parameters = impedance.calculate_differential_mode_parameters(magnetic, referenceFrequency);
 
     std::vector<double> impedances;
     for (auto frequency : frequencies) {
@@ -130,15 +222,11 @@ Curve2D Sweeper::sweep_q_factor_over_frequency(Magnetic magnetic, double start, 
         throw ModelNotAvailableException("Unknown spaced array mode");
     }
 
-    std::vector<double> qFactors;
-    for (auto frequency : frequencies) {
-        auto qFactor = abs(OpenMagnetics::Impedance().calculate_q_factor(magnetic, frequency));
-        qFactors.push_back(qFactor);
-    }
-
-    auto core = magnetic.get_core();
-    auto coil = magnetic.get_coil();
-    return Curve2D(frequencies, qFactors, title);
+    auto curve = sweep_up_to_unavailable_complex_permeability(frequencies, title, [&](double frequency) {
+        return abs(OpenMagnetics::Impedance().calculate_q_factor(magnetic, frequency));
+    });
+    mark_estimated_complex_permeability(curve, magnetic.get_core().resolve_material());
+    return curve;
 }
 
 Curve2D Sweeper::sweep_magnetizing_inductance_over_frequency(Magnetic magnetic, double start, double stop, size_t numberElements, double temperature, std::string mode, std::string title) {
@@ -227,14 +315,40 @@ Curve2D Sweeper::sweep_magnetizing_inductance_over_dc_bias(Magnetic magnetic, do
         currentMask.push_back(virtualCurrentRms * sqrt(2) * turnsRatio);
     }
 
+    // Saturated points of this sweep (ABT #1790, Alf 2026-10-12). A DC-bias sweep is drawn to see where the
+    // inductance collapses. Since ABT #1855 MagnetizingInductance gives its numbers for a saturated core
+    // too (past the knee the material takes the vacuum's permeability, mu_r = 1, in the same reluctance
+    // model, so the curve runs on to the air-core inductance); a saturated point by the saturation check
+    // analyze_results makes (ResultsAnalyzer::check_saturation: B peak above the material's B_sat at the
+    // sweep's temperature, or the bias collapsed the permeability to mu_r = 1, Alf 2026-10-14) is flagged
+    // in the curve and named in its title.
+    const auto coreMaterial = magnetic.get_core().resolve_material();
     std::vector<double> magnetizingInductances;
+    std::vector<bool> saturatedPoints;
+    std::optional<double> firstSaturatedCurrentOffset;
     for (auto currentOffset : currentOffsets) {
         auto operatingPoint = Inputs::create_operating_point_with_sinusoidal_current_mask(defaults.measurementFrequency, staticMagnetizingInductance, temperature, turnsRatios, currentMask, currentOffset);
-        double magnetizingInductance = resolve_dimensional_values(magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(magnetic.get_core(), inductorCoil, &operatingPoint).get_magnetizing_inductance());
+        auto [magnetizingInductanceOutput, magneticFluxDensity] = magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(magnetic.get_core(), inductorCoil, &operatingPoint);
+        double magnetizingInductance = resolve_dimensional_values(magnetizingInductanceOutput.get_magnetizing_inductance());
+        bool saturated = ResultsAnalyzer::check_saturation(coreMaterial, ResultsAnalyzer::get_peak_flux_density(magneticFluxDensity), temperature,
+                                                           1.0, magnetizingInductanceModel.get_last_dc_bias_point()).saturates;
+        if (saturated && !firstSaturatedCurrentOffset) {
+            firstSaturatedCurrentOffset = currentOffset;
+        }
         magnetizingInductances.push_back(magnetizingInductance);
+        saturatedPoints.push_back(saturated);
     }
 
-    return Curve2D(currentOffsets, magnetizingInductances, title);
+    if (firstSaturatedCurrentOffset) {
+        std::ostringstream note;
+        note << " (core saturated from " << firstSaturatedCurrentOffset.value()
+             << " A: B peak above B_sat or the permeability collapsed; past the knee the model takes the air-core inductance, mu_r = 1)";
+        title += note.str();
+    }
+
+    Curve2D curve(currentOffsets, magnetizingInductances, title);
+    curve.set_saturated_points(saturatedPoints);
+    return curve;
 }
 
 Curve2D Sweeper::sweep_winding_resistance_over_frequency(Magnetic magnetic, double start, double stop, size_t numberElements, size_t windingIndex, double temperature, std::string mode, std::string title) {
@@ -320,6 +434,11 @@ std::pair<double, double> Sweeper::core_resistance_frequency_window(Magnetic mag
         return {start, stop};
     }
     auto [spanMinimum, spanMaximum] = CoreLossesModel::get_steinmetz_fitted_span(material);
+    // Settings::allowMaterialDataExtrapolation (explicit opt-in): sweep the whole requested window; the
+    // points outside the span are extrapolated and warned about by get_steinmetz_coefficients.
+    if (Settings::GetInstance().get_allow_material_data_extrapolation()) {
+        return {start, stop};
+    }
     double clippedStart = std::max(start, spanMinimum);
     double clippedStop = std::min(stop, spanMaximum);
     if (!(clippedStop > clippedStart)) {
@@ -377,7 +496,7 @@ Curve2D Sweeper::sweep_core_resistance_over_frequency(Magnetic magnetic, double 
     return Curve2D(frequencies, coreResistances, title);
 }
 
-Curve2D Sweeper::sweep_core_losses_over_frequency(Magnetic magnetic, OperatingPoint operatingPoint, double start, double stop, size_t numberElements, double temperature, std::string mode, std::string title) {
+Curve2D Sweeper::sweep_core_losses_over_frequency(Magnetic magnetic, OperatingPoint operatingPoint, std::optional<Topology> topology, double start, double stop, size_t numberElements, double temperature, std::string mode, std::string title) {
     // ABT #1456: this sweep evaluates the Steinmetz model, whose coefficients exist only inside the material's
     // fitted span. Sweep the part of [start, stop] the fit covers and say so in the title, as the core
     // resistance sweep does; a request entirely outside the span throws.
@@ -408,27 +527,31 @@ Curve2D Sweeper::sweep_core_losses_over_frequency(Magnetic magnetic, OperatingPo
         frequencies.back() = stop;
     }
     auto core = magnetic.get_core();
-    auto coil = magnetic.get_coil();
 
-    auto magnetizingInductanceModel = MagnetizingInductance();
-    auto magnetizingInductance = resolve_dimensional_values(magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(core, coil).get_magnetizing_inductance());
-
-    double numberWindings = coil.get_functional_description().size();
-    double numberTurnsPrimary = coil.get_functional_description()[0].get_number_turns();
-    double effectiveArea = core.get_processed_description()->get_effective_parameters().get_effective_area();
-
-    OpenMagnetics::InitialPermeability initialPermeabilityModel;
-    auto reluctanceModel = OpenMagnetics::ReluctanceModel::factory();
-    auto initialPermeability = initialPermeabilityModel.get_initial_permeability(core.resolve_material(), temperature);
-    auto magnetizingInductanceOutput = reluctanceModel->get_core_reluctance(core, initialPermeability);
-    auto totalReluctance = magnetizingInductanceOutput.get_core_reluctance();
+    // Each point's magnetizing current and flux density come from MagnetizingInductance, the model
+    // the simulator and the advisers use, given the design's topology. This sweep kept its own copy
+    // of that model's branches, which drifted from it: once the model told a multi-winding DMC from
+    // a CMC, the copy still drove a DMC with the CMC triangle of its line current's whole swing at
+    // the ripple frequency (ABT #1754).
+    MagnetizingInductance magnetizingInductanceModel;
+    magnetizingInductanceModel.set_topology(topology);
+    operatingPoint.get_mutable_conditions().set_ambient_temperature(temperature);
 
     std::vector<double> coreLossesPerFrequency;
+    // Saturated points of this sweep (ABT #1790, Alf 2026-10-12). The sweep holds the applied voltage, so
+    // the flux swing grows as the frequency falls and the low end of a sweep can ask for volt-seconds the
+    // core cannot take. Since ABT #1855 MagnetizingInductance gives its numbers for those too; a point
+    // the saturation check analyze_results makes calls saturated (ResultsAnalyzer::check_saturation: B peak
+    // above the material's B_sat at the sweep's temperature, or the bias collapsed the permeability to
+    // mu_r = 1) is a saturated core, for which no loss
+    // model holds: it stays in the curve at its frequency, flagged, with no value (NaN), and the title
+    // names the saturated points.
+    std::vector<bool> saturatedPoints;
+    std::vector<double> saturatedFrequencies;
     CoreLosses coreLossesModel;
     coreLossesModel.set_core_losses_model_name(CoreLossesModels::STEINMETZ);
 
     for (auto frequency : frequencies) {
-
         // Keep BOTH signals through the rescale. The third argument used to be `true`
         // (cleanFrequencyDependentFields), which with the default useCurrentAsBase=true
         // DELETES the voltage and keeps the current — so every point on the curve was
@@ -438,54 +561,46 @@ Curve2D Sweeper::sweep_core_losses_over_frequency(Magnetic magnetic, OperatingPo
         // core losses go DOWN, not up. The two only ever agreed at the operating
         // point's own frequency, which is why the graph read tens of watts where the
         // Core Info panel and the datasheet read a fraction of one (ABT: user report).
-        Inputs::scale_time_to_frequency(operatingPoint, frequency, false);
-
-        OperatingPointExcitation excitation = Inputs::get_primary_excitation(operatingPoint);
-
-        if (numberWindings == 1 && excitation.get_current()) {
-            Inputs::set_current_as_magnetizing_current(&operatingPoint);
-        }
-        else if (Inputs::is_multiport_inductor(operatingPoint, coil.get_isolation_sides())) {
-            auto magnetizingCurrent = Inputs::get_multiport_inductor_magnetizing_current(operatingPoint);
-            excitation.set_magnetizing_current(magnetizingCurrent);
-            operatingPoint.get_mutable_excitations_per_winding()[0] = excitation;
-        }
-        else if (Inputs::can_be_common_mode_choke(operatingPoint) && core.get_type() == CoreType::TOROIDAL) {
-            // CMC: drive the core from the common-mode current alone, so the
-            // DM (line) current which cancels in the toroid doesn't inflate B.
-            // Same pattern MagnetizingInductance.cpp:149 uses.
-            auto magnetizingCurrent = Inputs::get_common_mode_choke_magnetizing_current(operatingPoint);
-            excitation.set_magnetizing_current(magnetizingCurrent);
-            operatingPoint.get_mutable_excitations_per_winding()[0] = excitation;
-        }
-        else if (excitation.get_voltage()) {
-            auto voltage = excitation.get_voltage().value();
-            auto sampledVoltageWaveform = Inputs::calculate_sampled_waveform(voltage.get_waveform().value(), frequency);
-
-            auto magnetizingCurrent = Inputs::calculate_magnetizing_current(excitation,
-                                                                                   sampledVoltageWaveform,
-                                                                                   magnetizingInductance,
-                                                                                   false);
-
-            auto sampledMagnetizingCurrentWaveform = Inputs::calculate_sampled_waveform(magnetizingCurrent.get_waveform().value(), excitation.get_frequency());
-            // calculate_magnetizing_current already set the harmonics, from the current's knots
-            // where it had them (ABT #1460); recomputing them from this resample would lose that.
-            magnetizingCurrent.set_processed(Inputs::calculate_processed_data(magnetizingCurrent, sampledMagnetizingCurrentWaveform, false));
-
-            excitation.set_magnetizing_current(magnetizingCurrent);
-            operatingPoint.get_mutable_excitations_per_winding()[0] = excitation;
+        auto sweptOperatingPoint = operatingPoint;
+        // Recompute the signals' harmonics and processed data on the rescaled time axis: the stored
+        // ones describe the operating point's own frequency (ABT #1764).
+        Inputs::scale_time_to_frequency(sweptOperatingPoint, frequency, false, true);
+        // The model derives the magnetizing current and flux density at each frequency, as this
+        // sweep always did: one the operating point carries may come from a model that did not
+        // know the topology (the CMC triangle a DMC used to get).
+        for (auto& excitation : sweptOperatingPoint.get_mutable_excitations_per_winding()) {
+            excitation.set_magnetizing_current(std::nullopt);
+            excitation.set_magnetic_flux_density(std::nullopt);
         }
 
-        auto magneticFlux = OpenMagnetics::MagneticField::calculate_magnetic_flux(operatingPoint.get_mutable_excitations_per_winding()[0].get_magnetizing_current().value(), totalReluctance, numberTurnsPrimary);
-        auto magneticFluxDensity = OpenMagnetics::MagneticField::calculate_magnetic_flux_density(magneticFlux, effectiveArea);
-    
+        auto magneticFluxDensity = magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(magnetic, &sweptOperatingPoint).second;
+        if (ResultsAnalyzer::check_saturation(core.resolve_material(), ResultsAnalyzer::get_peak_flux_density(magneticFluxDensity), temperature,
+                                              1.0, magnetizingInductanceModel.get_last_dc_bias_point()).saturates) {
+            coreLossesPerFrequency.push_back(std::numeric_limits<double>::quiet_NaN());
+            saturatedPoints.push_back(true);
+            saturatedFrequencies.push_back(frequency);
+            continue;
+        }
+        auto excitation = sweptOperatingPoint.get_excitations_per_winding()[0];
         excitation.set_magnetic_flux_density(magneticFluxDensity);
 
-        auto coreLosses =  coreLossesModel.calculate_core_losses(core, excitation, temperature).get_core_losses();
+        auto coreLosses = coreLossesModel.calculate_core_losses(core, excitation, temperature).get_core_losses();
         coreLossesPerFrequency.push_back(coreLosses);
+        saturatedPoints.push_back(false);
     }
 
-    return Curve2D(frequencies, coreLossesPerFrequency, title);
+    if (!saturatedFrequencies.empty()) {
+        std::ostringstream note;
+        note << " (core saturated at " << saturatedFrequencies.size() << " of " << frequencies.size() << " points, "
+             << *std::min_element(saturatedFrequencies.begin(), saturatedFrequencies.end()) << " Hz to "
+             << *std::max_element(saturatedFrequencies.begin(), saturatedFrequencies.end())
+             << " Hz: B peak above B_sat, no core loss is computed)";
+        title += note.str();
+    }
+
+    Curve2D curve(frequencies, coreLossesPerFrequency, title);
+    curve.set_saturated_points(saturatedPoints);
+    return curve;
 }
 
 Curve2D Sweeper::sweep_winding_losses_over_frequency(Magnetic magnetic, OperatingPoint operatingPoint, double start, double stop, size_t numberElements, double temperature, std::string mode, std::string title) {

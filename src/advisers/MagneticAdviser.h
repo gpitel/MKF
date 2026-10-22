@@ -1,4 +1,5 @@
 #pragma once
+#include "support/Settings.h"
 #include "support/Utils.h"
 #include "advisers/MagneticFilter.h"
 #include "advisers/CoreAdviser.h"
@@ -129,6 +130,10 @@ namespace OpenMagnetics {
  * @see MagneticFilter For available filter types
  */
 class MagneticAdviser{
+    private:
+        // ABT #1652: first member, so no adviser code runs without it: while this adviser exists,
+        // material data is never extrapolated (see MaterialDataExtrapolationBarrier in Settings.h).
+        MaterialDataExtrapolationBarrier _materialDataExtrapolationBarrier;
     public:
 
         std::map<MagneticFilters, std::shared_ptr<MagneticFilter>> _filters;
@@ -145,31 +150,62 @@ class MagneticAdviser{
         /// rejections here lets get_scorings() force them to the worst normalized
         /// value instead, which works for any invert/log configuration (ABT #801).
         std::map<MagneticFilters, std::set<std::string>> _failedScorings;
+        /// @brief Catalogue parts whose core losses cannot be evaluated, reference -> reason.
+        ///
+        /// A part whose core material has no core-loss model is not dropped and does not abort the
+        /// search: the loss filters do not apply to it (MagneticFilterCoreLossesBased), it is ranked
+        /// on the filters that do, and it is listed here with the reason
+        /// (MagneticFilter::core_losses_not_evaluable_reason) so callers can show that its losses
+        /// were not judged. Filled by the catalogue get_advised_magnetic, cleared at its start.
+        std::map<std::string, std::string> _lossesNotEvaluable;
+        /// @brief Catalogue candidates excluded because evaluating them raised, (reference, error).
+        ///
+        /// A filter or the final simulation that throws on a candidate keeps it out of the
+        /// ranking, as before; it is recorded here with the error instead of vanishing from the
+        /// result without a word. Filled by the catalogue get_advised_magnetic, cleared at its
+        /// start. A vector, not a map: two catalogue parts may share a reference.
+        std::vector<std::pair<std::string, std::string>> _failedCandidates;
+        /// @brief Requirement frequencies each ranked candidate was judged on, reference -> filter -> Hz.
+        ///
+        /// Filled for filters with a frequency-wise requirement (MagneticFilter::get_judged_frequencies):
+        /// IMPEDANCE judges a minimumImpedance point only inside the core material's mu(f) range, so a
+        /// candidate whose data stops below the top requirement frequency is ranked on the points it
+        /// covers, and this says which. Filled by the catalogue get_advised_magnetic, cleared at its start.
+        std::map<std::string, std::map<MagneticFilters, std::vector<double>>> _judgedFrequencies;
+        /// @brief The subset of _judgedFrequencies judged on the part's own measured data, reference -> filter -> Hz.
+        ///
+        /// IMPEDANCE judges a minimumImpedance point outside the core material's mu(f) range on the
+        /// part's measured common-mode |Z| (datasheet impedancePoints) when it has one
+        /// (MagneticFilter::get_measured_frequencies). Filled and cleared with _judgedFrequencies.
+        std::map<std::string, std::map<MagneticFilters, std::vector<double>>> _measuredFrequencies;
         /// @brief Default filter flow for custom magnetic design.
         /// COST and LOSSES use log normalization (spans orders of magnitude).
         /// DIMENSIONS uses linear normalization (intuitive volume comparison).
         std::vector<MagneticFilterOperation> _defaultCustomMagneticFilterFlow{
-            MagneticFilterOperation(MagneticFilters::COST, true, true, 1.0),
-            MagneticFilterOperation(MagneticFilters::LOSSES, true, true, 1.0),
-            MagneticFilterOperation(MagneticFilters::DIMENSIONS, true, false, 1.0),  // Linear for DIMENSIONS
+            MagneticFilterOperation(MagneticFilters::COST, true, true, false, 1.0),
+            MagneticFilterOperation(MagneticFilters::LOSSES, true, true, false, 1.0),
+            MagneticFilterOperation(MagneticFilters::DIMENSIONS, true, false, false, 1.0),  // Linear for DIMENSIONS
         };
 
         /// @brief Default filter flow for catalogue magnetic selection.
-        /// These filters are strictly required to ensure compatibility with design requirements.
+        /// Strictness is stated per filter (ABT #1231). The strict ones REJECT a part: a catalogue
+        /// part that saturates at the operating point (SATURATION), or exceeds its own published
+        /// rated/saturation currents (DATASHEET_LIMITS), or cannot give the turns ratios is not
+        /// recommended. The others only rank the parts that pass.
         /// DATASHEET_LIMITS goes first: it gates a catalogue part against its OWN published
         /// electrical limits (rated/saturation currents, etc.) from manufacturerInfo.datasheetInfo
         /// — the cheapest reject available, and a pure pass-through for parts without a datasheet
         /// block (every designed/custom magnetic). It existed since ABT #19 but was never wired
         /// into this flow, so catalogue parts were only ever gated by MKF-simulated quantities.
         std::vector<MagneticFilterOperation> _defaultCatalogueMagneticFilterFlow{
-            MagneticFilterOperation(MagneticFilters::DATASHEET_LIMITS, true, false, 1.0),
+            MagneticFilterOperation(MagneticFilters::DATASHEET_LIMITS, true, false, true, 1.0),
             MagneticFilterOperation(MagneticFilters::TURNS_RATIOS, true, false, true, 1.0),
-            MagneticFilterOperation(MagneticFilters::MAXIMUM_DIMENSIONS, true, false, 1.0),
-            MagneticFilterOperation(MagneticFilters::SATURATION, true, false, 1.0),
-            MagneticFilterOperation(MagneticFilters::DC_CURRENT_DENSITY, true, false, 1.0),
-            MagneticFilterOperation(MagneticFilters::EFFECTIVE_CURRENT_DENSITY, true, false, 1.0),
-            MagneticFilterOperation(MagneticFilters::IMPEDANCE, true, false, 1.0),
-            MagneticFilterOperation(MagneticFilters::MAGNETIZING_INDUCTANCE, true, false, 1.0),
+            MagneticFilterOperation(MagneticFilters::MAXIMUM_DIMENSIONS, true, false, false, 1.0),
+            MagneticFilterOperation(MagneticFilters::SATURATION, true, false, true, 1.0),
+            MagneticFilterOperation(MagneticFilters::DC_CURRENT_DENSITY, true, false, false, 1.0),
+            MagneticFilterOperation(MagneticFilters::EFFECTIVE_CURRENT_DENSITY, true, false, false, 1.0),
+            MagneticFilterOperation(MagneticFilters::IMPEDANCE, true, false, false, 1.0),
+            MagneticFilterOperation(MagneticFilters::MAGNETIZING_INDUCTANCE, true, false, false, 1.0),
         };
         bool _simulateResults = true;
         bool _uniqueCoreShapes = false;
@@ -290,6 +326,39 @@ class MagneticAdviser{
          * @return Map of reference -> (filter -> normalized_score).
          */
         std::map<std::string, std::map<MagneticFilters, double>> get_scorings();
+
+        /**
+         * @brief Catalogue parts of the last catalogue run whose core losses could not be evaluated.
+         * @return Map of reference -> reason ("core material 'X' carries no core-loss data ...").
+         *         A listed part was ranked without any loss-based filter and returned without
+         *         simulated outputs.
+         */
+        const std::map<std::string, std::string>& get_losses_not_evaluable() const { return _lossesNotEvaluable; }
+
+        /**
+         * @brief Catalogue candidates of the last catalogue run that were excluded because
+         *        evaluating them raised.
+         * @return (reference, error) pairs; the error names the filter (or "final simulation")
+         *         and carries the exception's message. A listed candidate is not in the ranking.
+         */
+        const std::vector<std::pair<std::string, std::string>>& get_failed_candidates() const { return _failedCandidates; }
+
+        /**
+         * @brief Requirement frequencies each candidate of the last catalogue run was judged on.
+         * @return Map of reference -> (filter -> judged frequencies in Hz). Only filters with a
+         *         frequency-wise requirement appear (IMPEDANCE: the minimumImpedance points inside the
+         *         core material's tabulated mu(f) range). Points not listed were not judged.
+         */
+        const std::map<std::string, std::map<MagneticFilters, std::vector<double>>>& get_judged_frequencies() const { return _judgedFrequencies; }
+
+        /**
+         * @brief The judged frequencies of the last catalogue run that were judged on the part's own
+         *        measured data rather than the model.
+         * @return Map of reference -> (filter -> frequencies in Hz), a subset of get_judged_frequencies().
+         *         IMPEDANCE: the minimumImpedance points outside the core material's mu(f) range judged
+         *         on the datasheet's measured common-mode |Z|. Empty list: every judged point used the model.
+         */
+        const std::map<std::string, std::map<MagneticFilters, std::vector<double>>>& get_measured_frequencies() const { return _measuredFrequencies; }
 
         /**
          * @brief Design magnetics from a converter topology using ngspice simulation.

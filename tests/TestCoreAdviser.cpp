@@ -2,14 +2,19 @@
 #include <source_location>
 #include "support/Settings.h"
 #include "advisers/CoreAdviser.h"
+#include "advisers/MagneticAdviser.h"
 #include "support/Painter.h"
 #include "support/Utils.h"
+#include "support/Logger.h"
 #include "processors/Inputs.h"
 #include "TestingUtils.h"
 #include "Fixtures.h"
 #include "processors/Sweeper.h"
+#include "processors/MagneticSimulator.h"
 #include "physical_models/Impedance.h"
+#include "physical_models/ComplexPermeability.h"
 #include "physical_models/Reluctance.h"
+#include "physical_models/MagnetizingInductance.h"
 
 #include <catch2/catch_test_macros.hpp>
 #include <cmath>
@@ -23,6 +28,8 @@
 #include <magic_enum.hpp>
 #include <vector>
 #include <typeinfo>
+#include <numbers>
+#include "constructive_models/Bobbin.h"
 
 using namespace MAS;
 using namespace OpenMagnetics;
@@ -38,6 +45,22 @@ void prepare_test_parameters(double dcCurrent, double ambientTemperature, double
     if (designRequirements.get_insulation()) {
         inputs.get_mutable_design_requirements().set_insulation(designRequirements.get_insulation().value());
     }
+}
+
+// ABT #838: a common-mode choke's operating point. Both windings carry the same line current (a DC
+// offset, whose flux cancels between the windings) plus the same common-mode ripple, which is what
+// magnetises the core: milliamps to tens of milliamps of noise current, not amperes. The CMC tests
+// used to describe the choke as a single winding driven by 600 Vpp at 100 kHz through the 100 uH
+// specification, i.e. 4.8 A peak of magnetising current imposed on high-permeability toroids
+// (0.8-1.4 T, 55-147 W of core loss at 25 C) that no operating temperature could carry.
+OpenMagnetics::Inputs prepare_common_mode_choke_inputs(double frequency, double minimumMagnetizingInductance,
+                                                       double commonModeCurrentPeakToPeak, double lineCurrent) {
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+        frequency, minimumMagnetizingInductance, 25, WaveformLabel::SINUSOIDAL,
+        std::vector<double>{commonModeCurrentPeakToPeak, commonModeCurrentPeakToPeak}, 0.5, lineCurrent, {1.0});
+    inputs.get_mutable_design_requirements().set_isolation_sides(std::vector<IsolationSide>{IsolationSide::PRIMARY, IsolationSide::PRIMARY});
+    REQUIRE(OpenMagnetics::Inputs::can_be_common_mode_choke(inputs.get_operating_points()[0]));
+    return inputs;
 }
 
 std::vector<Core> load_test_data() {
@@ -161,7 +184,11 @@ TEST_CASE("Test_CoreAdviserAvailableCores_All_Cores_With_Margin", "[adviser][cor
             found = true;
         }
     }
-    REQUIRE(found);
+    // Re-pinned 2026-10-04 (temperature gate, ABT #1412): the core-stage temperature gate
+    // (130 C) now scores the copper as the coil stage would wind it, and E 35/18/10 - 3C95 -
+    // Gapped 0.2 mm reaches 255.4 C at this 600 Vpp / 100 kHz excitation (its 0.5 mm-gap
+    // sibling 140.4 C): it is rejected, the plumbing still returns 50 cooler cores.
+    REQUIRE_FALSE(found);
     settings.reset();
 }
 
@@ -170,32 +197,25 @@ TEST_CASE("Test_CoreAdviserAvailableCores_Toroidal_Cores_With_Impedance", "[advi
     settings.set_use_concentric_cores(false);
     settings.set_use_toroidal_cores(true);
     settings.set_use_only_cores_in_stock(false);
-    // Original test used 600 Vpp + 30 A DC to force a high-flux scenario.
-    // With strict material-application filtering (only N30 toroids remain
-    // in the test catalog for Interference Suppression), that flux level
-    // saturates every candidate. Shrink both numbers to values that let
-    // the smoke test exercise the impedance filter end-to-end on N30.
-    double voltagePeakToPeak = 60;
-    // dcCurrent was 30 A in the original test. The test is really a
-    // single-winding inductor smoke test with an impedance constraint rather
-    // than a CMC design — `can_be_common_mode_choke` cannot fire with only
-    // one excitation, so the saturation filter sees the full DC bias. With
-    // the strict material-application filter, the only Interference-
-    // Suppression toroids in the test catalog (N30) legitimately saturate
-    // under meaningful DC bias. Dropping to 0 A keeps the smoke test
-    // achievable: we're exercising the filter chain end-to-end, not
-    // modelling a real-world inductor with 30 A of DC.
+    // Fixture changed 2026-10-12 (ABT #838, Alf's decision): a realistic common-mode-choke drive, as
+    // the other CMC fixtures got (prepare_common_mode_choke_inputs): two windings carrying the same
+    // 20 mApp of common-mode current at 100 kHz, no line current. The test used to describe the choke
+    // as ONE winding driven by 60 Vpp at 100 kHz through its 1 uH minimum-inductance specification:
+    // 47.7 A peak of magnetising current on 132-200 turns of the powder toroids that survive the
+    // impedance filter (0.38-0.95 T, 6.9-41.7 kW of core loss, 77-123 W of copper). The adviser
+    // returned five of them at 1175-1533 C while losses were computed at 25 C, and returns none now
+    // that they are solved at the temperature they produce (no operating point below the 460 / 500 C
+    // Curie temperatures). Before that it was 600 Vpp + 30 A DC, shrunk when the strict
+    // material-application filter left only N30 toroids for Interference Suppression.
+    double commonModeCurrentPeakToPeak = 0.02;
     double dcCurrent = 0;
-    double ambientTemperature = 25;
     double frequency = 100000;
     // For interference suppression, impedance (not inductance) is the primary requirement.
     // Complex permeability provides high impedance through resistive losses.
     // Set a low minimum inductance that doesn't conflict with impedance-optimized turn counts.
     double desiredMagnetizingInductance = 1e-6;
-    std::vector<double> turnsRatios = {};
-    OpenMagnetics::Inputs inputs;
 
-    prepare_test_parameters(dcCurrent, ambientTemperature, frequency, turnsRatios, desiredMagnetizingInductance, inputs, voltagePeakToPeak);
+    auto inputs = prepare_common_mode_choke_inputs(frequency, desiredMagnetizingInductance, commonModeCurrentPeakToPeak, dcCurrent);
 
     std::map<CoreAdviser::CoreAdviserFilters, double> weights;
     weights[CoreAdviser::CoreAdviserFilters::COST] = 0;
@@ -283,7 +303,15 @@ TEST_CASE("Test_CoreAdviserAvailableCores_Toroidal_Cores_With_Impedance", "[advi
     REQUIRE(foundCoreMeetingImpedance);
 
     {
-        auto impedanceSweep = Sweeper().sweep_impedance_over_frequency(masMagnetics[0].first.get_magnetic(), 1000, 4000000, 1000);
+        // The plotted band is limited to the complex-permeability data of whichever material the
+        // adviser ranked first: a ferrite whose table starts above 1 kHz (e.g. material 80's table
+        // starts at 10 kHz, or a derived table starting at its lowest mu_i(f) point) has no data below it.
+        auto bestMagnetic = masMagnetics[0].first.get_magnetic();
+        auto [minimumMaterialFrequency, maximumMaterialFrequency] = OpenMagnetics::ComplexPermeability().get_frequency_range(bestMagnetic.get_core().resolve_material());
+        double startFrequency = std::max(1000.0, minimumMaterialFrequency);
+        double stopFrequency = std::min(4000000.0, maximumMaterialFrequency);
+        REQUIRE(startFrequency < stopFrequency);
+        auto impedanceSweep = Sweeper().sweep_impedance_over_frequency(bestMagnetic, startFrequency, stopFrequency, 1000);
 
         auto outputFilePath = std::filesystem::path {std::source_location::current().file_name()}.parent_path().append("..").append("output");
         auto outFile = outputFilePath;
@@ -337,10 +365,40 @@ TEST_CASE("Test_CoreAdviser_CMC_Default_Web_Design_Returns_Cores", "[adviser][co
     REQUIRE(inputsFile.good());
     json inputsJson;
     inputsFile >> inputsJson;
+    // ABT #838: the captured wizard inputs put a 1 App, 150 kHz ripple on both windings over their 10 A
+    // line current. Identical on both windings, that ripple is common-mode current, the current that
+    // magnetises a CMC's core: 1 App of it drove the advised R12KZ toroids to 0.8-1.4 T and 16-22 W at
+    // 25 C, past their 130 C Curie temperature. A CMC's common-mode current is milliamps to tens of
+    // milliamps: the ripple is scaled to 20 mApp around the same 10 A line current, and the stale
+    // processed/harmonics data are dropped so the inputs process the scaled waveform. The captured
+    // winding voltage (500 Vpp at 150 kHz) is the voltage that 1 App ripple induces, so it is scaled
+    // by the same factor: current and voltage describe the same ripple (approved by Alf 2026-10-13).
+    // Left at 500 Vpp it states 50 times the volt-seconds of the 20 mApp ripple, and the saturation
+    // filter refuses every candidate on them.
+    const double commonModeRippleScale = 0.02;
+    for (auto& excitationJson : inputsJson.at("operatingPoints").at(0).at("excitationsPerWinding")) {
+        auto& currentJson = excitationJson.at("current");
+        const double lineCurrent = currentJson.at("processed").at("offset").get<double>();
+        for (auto& sample : currentJson.at("waveform").at("data")) {
+            sample = lineCurrent + (sample.get<double>() - lineCurrent) * commonModeRippleScale;
+        }
+        currentJson.erase("processed");
+        currentJson.erase("harmonics");
+        auto& voltageJson = excitationJson.at("voltage");
+        for (auto& sample : voltageJson.at("waveform").at("data")) {
+            sample = sample.get<double>() * commonModeRippleScale;
+        }
+        voltageJson.erase("processed");
+        voltageJson.erase("harmonics");
+    }
 
     OpenMagnetics::Inputs inputs(inputsJson);
     // Sanity: this is a 2-winding common-mode choke carrying real DC line current.
     REQUIRE(OpenMagnetics::Inputs::can_be_common_mode_choke(inputs.get_operating_points()[0]));
+    for (const auto& excitation : inputs.get_operating_points()[0].get_excitations_per_winding()) {
+        REQUIRE_THAT(excitation.get_current()->get_processed()->get_peak_to_peak().value(), Catch::Matchers::WithinRel(0.02, 0.01));
+        REQUIRE_THAT(excitation.get_current()->get_processed()->get_offset(), Catch::Matchers::WithinRel(10.0, 0.01));
+    }
 
     std::map<CoreAdviser::CoreAdviserFilters, double> weights;
     weights[CoreAdviser::CoreAdviserFilters::COST] = 1.0 / 3;
@@ -362,7 +420,11 @@ TEST_CASE("Test_CoreAdviser_CMC_Default_Web_Design_Returns_Cores", "[adviser][co
 
 TEST_CASE("Test_CoreAdviserAvailableCores_All_Cores_Load_Internally_Only_Stock", "[adviser][core-adviser][available-cores][smoke-test]") {
     clear_databases();
-    double voltagePeakToPeak = 600;
+    // ABT #838: 200 Vpp (was 600). 600 Vpp at 100 kHz across the 100 uH specification is 4.8 A peak,
+    // 720 VA reactive: every stock candidate near 100 uH (RM 10 N41 gapped 0.44 mm: Bpk 0.28 T, 4.3 W
+    // at 25 C) runs away to its Curie temperature once its core loss is solved at the temperature it
+    // heats itself to, so no core survived. At 200 Vpp (1.6 A peak) a PQ 20/20 N49 lands at 50 C.
+    double voltagePeakToPeak = 200;
     double dcCurrent = 0;
     double ambientTemperature = 25;
     double frequency = 100000;
@@ -483,7 +545,28 @@ TEST_CASE("Test_CoreAdviserAvailableCores_All_Cores_Two_Chosen_Ones", "[adviser]
     auto cores = load_test_data();
     auto masMagnetics = coreAdviser.get_advised_core(inputs, weights, &cores, 50);
 
-    REQUIRE(masMagnetics.size() == 50);
+    // Re-pinned 2026-10-04 (temperature gate, ABT #1412): 600 Vpp sinusoidal at 100 kHz on
+    // 100 uH is 3.4 A rms. With the copper scored as the coil stage would wind it, 14 of the
+    // catalogue cores stay under the 130 C limit; the coolest rejected are EP 20 - 3C96 -
+    // Gapped 0.375 mm (134.9 C), PQ 26/20 - 3C96 - Gapped 0.358 mm (135.6 C) and EQ 25 -
+    // Edge 40 - Ungapped (139.6 C), so the adviser returns 14, not the 50 asked for.
+    // Re-pinned 2026-10-06, 14 -> 19: get_advised_core now merges the first search with the
+    // stacked one instead of returning only the stacked one, whose cost/size pre-loss cap had
+    // culled five designs the first search returned under the limit: P 26/16 - 3C95 - Gapped
+    // 0.725 mm, RM 10 - 3C90 - Gapped 0.74 mm and RM 10 - 3C91 / 3C95 / 3C97 - Gapped 0.47 mm.
+    // Re-pinned 2026-10-11, 19 -> 16 (ABT #838, approved by Alf): the core loss is now solved at the
+    // temperature the core and winding losses heat it to, not at 25 C. RM 10 - 3C91 - Gapped 0.47 /
+    // 0.29 / 0.3 mm run away: 3.9-4.9 W at 25 C heat the RM 10 past 100 C, above 3C91's loss minimum,
+    // where its loss rises with temperature faster than the core sheds it (0.47 mm: 4.1 W at 110 C,
+    // 5.0 W at 121 C, 8.3 W at 152 C, 17 W at 208 C), up to the 220 C Curie temperature with the losses
+    // still asking for 225-248 C. No operating temperature exists, so the adviser rejects them.
+    // Re-pinned 2026-10-12, 16 -> 14 (ABT #838 / #1802, approved by Alf on 2026-10-12): the 130 C
+    // limit is now also applied to the temperature the loss-temperature solve converges to, not only
+    // to the one-pass estimate from the 25 C losses. That drops four parts whose solved hot spot is
+    // above the limit: ETD 29 - 3C97 - Gapped 0.5 mm (132.49 C), RM 10 - 3C91 - Gapped 0.29 mm and
+    // 0.3 mm (218.36 C each, a fixed point inside 3C91's permeability collapse below Curie) and
+    // RM 10 - 3C97 - Gapped 0.3 mm (135.45 C).
+    REQUIRE(masMagnetics.size() == 14);
     
     // Verify results have valid scores and contain suitable cores
     bool hasToroidal = false;
@@ -500,6 +583,206 @@ TEST_CASE("Test_CoreAdviserAvailableCores_All_Cores_Two_Chosen_Ones", "[adviser]
     }
     // With balanced weights, we expect various core types to appear in results
     REQUIRE((hasToroidal || hasTwoPieceSet));
+    settings.reset();
+}
+
+// ABT #1802: the temperature gate holds a returned core to its limit on the temperature the
+// loss-temperature solve found for it, which is the one the adviser publishes. The gate's filter
+// stage judges a single pass (losses at 25 C, the network solved once): RM 10 - 3C91 - Gapped
+// 0.29 mm and 0.3 mm passed it at 124 C and were returned with their cores solved at 218.4 C
+// (12.4 W, inside 3C91's mu_i collapse below Curie) under the 130 C limit.
+TEST_CASE("Core adviser returns no core whose loss-temperature solve is above the temperature limit", "[adviser][core-adviser][available-cores][abt-1802]") {
+    settings.reset();
+    clear_databases();
+    OpenMagnetics::Inputs inputs;
+    prepare_test_parameters(0, 25, 100000, {}, 10e-5, inputs, 600);
+
+    std::map<CoreAdviser::CoreAdviserFilters, double> weights;
+    weights[CoreAdviser::CoreAdviserFilters::COST] = 1;
+    weights[CoreAdviser::CoreAdviserFilters::EFFICIENCY] = 1;
+    weights[CoreAdviser::CoreAdviserFilters::DIMENSIONS] = 1;
+
+    settings.set_use_toroidal_cores(true);
+    CoreAdviser coreAdviser;
+    coreAdviser.set_mode(CoreAdviser::CoreAdviserModes::AVAILABLE_CORES);
+    auto cores = load_test_data();
+    auto masMagnetics = coreAdviser.get_advised_core(inputs, weights, &cores, 50);
+
+    const double maximumTemperature = resolve_maximum_design_temperature(inputs);
+    REQUIRE(maximumTemperature == 130);
+    REQUIRE(masMagnetics.size() > 0);
+    for (auto& [mas, scoring] : masMagnetics) {
+        auto coreName = mas.get_magnetic().get_core().get_name().value_or("unnamed");
+        INFO(coreName);
+        REQUIRE(mas.get_outputs().size() == 1);
+        for (auto& output : mas.get_outputs()) {
+            REQUIRE(output.get_temperature());
+            REQUIRE(output.get_core_losses());
+            CHECK(output.get_temperature()->get_maximum_temperature() <= maximumTemperature);
+            // The hot spot is at least as hot as the core the losses were solved at.
+            CHECK(output.get_core_losses()->get_temperature() <= output.get_temperature()->get_maximum_temperature() + MagneticSimulator::kOperatingTemperatureTolerance);
+        }
+        CHECK(coreName.find("RM 10 - 3C91 - Gapped 0.29 mm") == std::string::npos);
+        CHECK(coreName.find("RM 10 - 3C91 - Gapped 0.3 mm") == std::string::npos);
+    }
+    settings.reset();
+}
+
+// ABT #1822: the stand-in coil's parallels are sized to each winding's current unless the adviser's
+// application is interference suppression (ABT #126). The exemption used to follow the SHAPE of the
+// excitation (Inputs::can_be_common_mode_choke), which is also true for a 1:1 transformer with equal
+// currents: on a power design every winding kept ONE skin-depth strand (0.416 mm at 100 kHz,
+// 24.8 A/mm2 for 3.376 A rms), and the loss-temperature solve of the returned part ran on it.
+TEST_CASE("Core adviser sizes its stand-in's parallels to the current unless the application is interference suppression",
+          "[adviser][core-adviser][available-cores][abt-1822]") {
+    settings.reset();
+    clear_databases();
+    OpenMagnetics::Inputs inputs;
+    prepare_test_parameters(0, 25, 100000, {1}, 10e-5, inputs, 600);
+    inputs.get_mutable_design_requirements().get_mutable_magnetizing_inductance().set_minimum(10e-5);
+    inputs.get_mutable_design_requirements().get_mutable_magnetizing_inductance().set_nominal(std::nullopt);
+    inputs.get_mutable_design_requirements().get_mutable_magnetizing_inductance().set_maximum(std::nullopt);
+    const auto operatingPoint = inputs.get_operating_points()[0];
+    const auto excitations = operatingPoint.get_excitations_per_winding();
+    REQUIRE(excitations.size() == 2);
+    // The premise: this power transformer's excitation is common-mode-choke shaped.
+    REQUIRE(OpenMagnetics::Inputs::can_be_common_mode_choke(operatingPoint));
+
+    auto dcCurrentDensity = [&](const OpenMagnetics::Winding& winding, size_t windingIndex) {
+        auto wire = OpenMagnetics::Coil::resolve_wire(winding);
+        return wire.calculate_dc_current_density(excitations[windingIndex].get_current().value()) / winding.get_number_parallels();
+    };
+    auto parallelsForEffectiveDensity = [&](const OpenMagnetics::Winding& winding, size_t windingIndex) {
+        auto wire = OpenMagnetics::Coil::resolve_wire(winding);
+        return OpenMagnetics::Wire::calculate_number_parallels_needed(excitations[windingIndex].get_current().value(), inputs.get_maximum_temperature(), wire, defaults.maximumEffectiveCurrentDensity);
+    };
+    // dcLimit: a returned part's strand may have been thinned to fit the winding window after the
+    // parallels were sized (post_process_core), so only the stand-in before it is held to the DC limit.
+    auto check_sized = [&](const std::vector<OpenMagnetics::Winding>& windings, bool dcLimit) {
+        REQUIRE(windings.size() == 2);
+        for (size_t windingIndex = 0; windingIndex < windings.size(); ++windingIndex) {
+            INFO("winding " << windingIndex << ", " << windings[windingIndex].get_number_parallels() << " parallels");
+            CHECK(windings[windingIndex].get_number_parallels() > 1);
+            if (dcLimit) {
+                CHECK(dcCurrentDensity(windings[windingIndex], windingIndex) <= defaults.maximumCurrentDensity);
+            }
+            CHECK(windings[windingIndex].get_number_parallels() >= parallelsForEffectiveDensity(windings[windingIndex], windingIndex));
+        }
+    };
+    auto cores = load_test_data();
+    REQUIRE(cores.size() > 0);
+    std::vector<OpenMagnetics::Core> oneCore = {cores[0]};
+
+    SECTION("Power: the dataset's stand-in and the completed windings carry their current") {
+        CoreAdviser coreAdviser;
+        coreAdviser.set_mode(CoreAdviser::CoreAdviserModes::AVAILABLE_CORES);
+        auto magnetics = coreAdviser.create_magnetic_dataset(inputs, &oneCore, false);
+        REQUIRE(magnetics.size() == 1);
+        check_sized(magnetics[0].first.get_coil().get_functional_description(), true);
+        correct_windings(&magnetics, inputs, true);
+        check_sized(magnetics[0].first.get_coil().get_functional_description(), true);
+    }
+    SECTION("Power: a returned core's coil carries its current") {
+        std::map<CoreAdviser::CoreAdviserFilters, double> weights;
+        weights[CoreAdviser::CoreAdviserFilters::COST] = 1;
+        weights[CoreAdviser::CoreAdviserFilters::EFFICIENCY] = 1;
+        weights[CoreAdviser::CoreAdviserFilters::DIMENSIONS] = 1;
+        CoreAdviser coreAdviser;
+        coreAdviser.set_mode(CoreAdviser::CoreAdviserModes::AVAILABLE_CORES);
+        auto masMagnetics = coreAdviser.get_advised_core(inputs, weights, &cores, 3);
+        REQUIRE(masMagnetics.size() > 0);
+        for (auto& [mas, scoring] : masMagnetics) {
+            INFO(mas.get_magnetic().get_core().get_name().value_or("unnamed"));
+            check_sized(mas.get_magnetic().get_coil().get_functional_description(), false);
+        }
+    }
+    SECTION("Interference suppression: one parallel per winding") {
+        CoreAdviser coreAdviser;
+        coreAdviser.set_mode(CoreAdviser::CoreAdviserModes::AVAILABLE_CORES);
+        coreAdviser.set_application(MAS::MagneticApplication::INTERFERENCE_SUPPRESSION);
+        // The suppression dataset keeps toroids only for a common-mode-choke shaped excitation.
+        settings.set_use_toroidal_cores(true);
+        std::vector<OpenMagnetics::Core> oneToroid;
+        for (auto& core : cores) {
+            if (core.get_shape_family() == MAS::CoreShapeFamily::T) {
+                oneToroid.push_back(core);
+                break;
+            }
+        }
+        REQUIRE(oneToroid.size() == 1);
+        auto magnetics = coreAdviser.create_magnetic_dataset(inputs, &oneToroid, false);
+        REQUIRE(magnetics.size() == 1);
+        for (auto& winding : magnetics[0].first.get_coil().get_functional_description()) {
+            CHECK(winding.get_number_parallels() == 1);
+        }
+        correct_windings(&magnetics, inputs, false);
+        auto windings = magnetics[0].first.get_coil().get_functional_description();
+        REQUIRE(windings.size() == 2);
+        for (auto& winding : windings) {
+            CHECK(winding.get_number_parallels() == 1);
+        }
+    }
+    SECTION("A filter completing a stand-in decides by the application it is handed, as the advisers do") {
+        // MagneticFilter::with_every_winding is correct_windings' third caller. It used to keep the
+        // excitation-shape test, so the loss and temperature filters scored a power design's
+        // stand-in on one strand per winding while the advisers sized the returned part's copper.
+        CoreAdviser coreAdviser;
+        coreAdviser.set_mode(CoreAdviser::CoreAdviserModes::AVAILABLE_CORES);
+        coreAdviser.set_application(MAS::MagneticApplication::INTERFERENCE_SUPPRESSION);
+        settings.set_use_toroidal_cores(true);
+        std::vector<OpenMagnetics::Core> oneToroid;
+        for (auto& core : cores) {
+            if (core.get_shape_family() == MAS::CoreShapeFamily::T) {
+                oneToroid.push_back(core);
+                break;
+            }
+        }
+        REQUIRE(oneToroid.size() == 1);
+        // A stand-in with one parallel per winding (the suppression dataset's).
+        auto magnetics = coreAdviser.create_magnetic_dataset(inputs, &oneToroid, false);
+        REQUIRE(magnetics.size() == 1);
+        const auto standIn = magnetics[0].first;
+        for (auto& winding : standIn.get_coil().get_functional_description()) {
+            REQUIRE(winding.get_number_parallels() == 1);
+        }
+        REQUIRE(OpenMagnetics::MagneticFilter::lacks_windings(standIn, inputs));
+
+        // The helper re-derives the windings after the first from the turns ratios; the first keeps
+        // the parallels it came with. So the added winding is the one that shows the decision.
+        auto power = OpenMagnetics::MagneticFilter::with_every_winding(standIn, inputs, MAS::MagneticApplication::POWER);
+        auto powerWindings = power.get_coil().get_functional_description();
+        REQUIRE(powerWindings.size() == 2);
+        INFO("added winding, " << powerWindings[1].get_number_parallels() << " parallels");
+        CHECK(powerWindings[1].get_number_parallels() > 1);
+        CHECK(dcCurrentDensity(powerWindings[1], 1) <= defaults.maximumCurrentDensity);
+        CHECK(powerWindings[1].get_number_parallels() >= parallelsForEffectiveDensity(powerWindings[1], 1));
+
+        auto suppression = OpenMagnetics::MagneticFilter::with_every_winding(standIn, inputs, MAS::MagneticApplication::INTERFERENCE_SUPPRESSION);
+        auto suppressionWindings = suppression.get_coil().get_functional_description();
+        REQUIRE(suppressionWindings.size() == 2);
+        for (auto& winding : suppressionWindings) {
+            CHECK(winding.get_number_parallels() == 1);
+        }
+
+        // A filter that was not told the application refuses to complete a stand-in; told, it
+        // evaluates it. The candidate is a core the power adviser returns for these inputs, cut
+        // back to its first winding (this section's toroid saturates at 600 Vpp).
+        std::map<CoreAdviser::CoreAdviserFilters, double> weights;
+        weights[CoreAdviser::CoreAdviserFilters::COST] = 1;
+        weights[CoreAdviser::CoreAdviserFilters::EFFICIENCY] = 1;
+        weights[CoreAdviser::CoreAdviserFilters::DIMENSIONS] = 1;
+        CoreAdviser powerAdviser;
+        powerAdviser.set_mode(CoreAdviser::CoreAdviserModes::AVAILABLE_CORES);
+        auto masMagnetics = powerAdviser.get_advised_core(inputs, weights, &cores, 1);
+        REQUIRE(masMagnetics.size() > 0);
+        auto untold = masMagnetics[0].first.get_magnetic();
+        untold.get_mutable_coil().get_mutable_functional_description().resize(1);
+        REQUIRE(OpenMagnetics::MagneticFilter::lacks_windings(untold, inputs));
+        OpenMagnetics::MagneticFilterCoreDcAndSkinLosses lossesFilter(inputs);
+        REQUIRE_THROWS_AS(lossesFilter.evaluate_magnetic(&untold, &inputs), OpenMagnetics::InvalidInputException);
+        lossesFilter.set_application(MAS::MagneticApplication::POWER);
+        REQUIRE_NOTHROW(lossesFilter.evaluate_magnetic(&untold, &inputs));
+    }
     settings.reset();
 }
 
@@ -527,7 +810,11 @@ TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_High_Power", "[adviser][cor
     auto cores = load_test_data();
     auto masMagnetics = coreAdviser.get_advised_core(inputs, weights, &cores, 5);
 
-    REQUIRE(masMagnetics.size() > 0);
+    // Re-pinned 2026-10-04 (temperature gate, ABT #1412): 6000 Vpp sinusoidal at 100 kHz on
+    // 100 uH is 34 A rms. With the copper scored as the coil stage would wind it, none of the
+    // 392 non-toroidal candidates stays under the 130 C limit (coolest: E 70/33/32 - 95 -
+    // Distributed gapped 1.36 mm, 4 stacks, 175.4 C), so the adviser returns none.
+    REQUIRE(masMagnetics.empty());
     // Verify results are valid cores (saturation filter may exclude some)
     for (auto [mas, scoring] : masMagnetics) {
         REQUIRE(mas.get_magnetic().get_core().get_name().has_value());
@@ -591,7 +878,12 @@ TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_High_Power_High_Frequency",
     auto cores = load_test_data();
     auto masMagnetics = coreAdviser.get_advised_core(inputs, weights, &cores, 5);
 
-    REQUIRE(masMagnetics.size() > 0);
+    // Re-pinned 2026-10-04 (temperature gate, ABT #1412): 600 kVpp sinusoidal at 500 kHz on
+    // 10 mH (6.8 A rms). No non-toroidal candidate stays under the 130 C limit once the
+    // copper is scored as the coil stage would wind it (coolest: E 160/38/40 - Kool Mu MAX 26 -
+    // Ungapped, 4 stacks, 1472.8 C), so the adviser returns none. Any core returned must still
+    // be large enough to handle the power without saturating.
+    REQUIRE(masMagnetics.empty());
 
     // Verify all returned cores are large enough to handle high power without saturation
     for (auto [mas, scoring] : masMagnetics) {
@@ -771,7 +1063,163 @@ TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_Redo_Culling", "[adviser][c
     settings.reset();
 }
 
-TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_Two_Windings", "[adviser][core-adviser][available-cores][smoke-test]") {
+// ABT #838: the core stage's stand-in coil gets a strand of two skin depths. 206 turns of the
+// 100 kHz strand (0.42 mm) overflow a PQ 20/20's quick bobbin (the Redo_Culling candidate above),
+// and the loss <-> temperature solve heats the wound stand-in on a thermal network that refuses
+// copper outside the window, so the candidate was dropped. post_process_core thins the stand-in
+// strand to the thickest one whose layout keeps every turn in the window; a stand-in that fits
+// keeps its skin-depth strand.
+TEST_CASE("Core adviser post-processing fits its stand-in strand to the winding window",
+          "[adviser][core-adviser][smoke-test]") {
+    clear_databases();
+    settings.reset();
+    const double frequency = 100000;
+    const double ambientTemperature = 25;
+    OpenMagnetics::Inputs inputs;
+    // 600 Vpp keeps the PQ 20/20 cool: the guard is about the layout, not the losses.
+    prepare_test_parameters(0, ambientTemperature, frequency, {}, 10e-3, inputs, 600);
+
+    auto skinDepthStrand = OpenMagnetics::Wire::get_wire_for_frequency(frequency, inputs.get_maximum_temperature(), true);
+    const double skinDepthDiameter = resolve_dimensional_values(skinDepthStrand.get_conducting_diameter().value());
+
+    auto standIn = [&](int64_t numberTurns) {
+        auto core = OpenMagneticsTesting::get_quick_core("PQ 20/20", OpenMagneticsTesting::get_ground_gap(0.000477), 1, "3C97");
+        OpenMagnetics::Winding winding;
+        winding.set_name("primary");
+        winding.set_isolation_side(IsolationSide::PRIMARY);
+        winding.set_number_turns(numberTurns);
+        winding.set_number_parallels(1);
+        winding.set_wire(skinDepthStrand);
+        OpenMagnetics::Coil coil;
+        coil.set_bobbin(OpenMagnetics::Bobbin::create_quick_bobbin(core));
+        coil.set_functional_description({winding});
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(coil);
+        return magnetic;
+    };
+    auto strandDiameter = [](OpenMagnetics::Magnetic magnetic) {
+        return resolve_dimensional_values(magnetic.get_mutable_coil().resolve_wire(0).get_conducting_diameter().value());
+    };
+
+    SECTION("206 turns of the skin-depth strand overflow the window: the strand is thinned until they fit") {
+        auto overflowing = standIn(206);
+        {
+            auto probe = overflowing;
+            settings.set_coil_delimit_and_compact(false);
+            REQUIRE(probe.get_mutable_coil().fast_wind());
+            settings.reset();
+            REQUIRE_FALSE(probe.get_mutable_coil().are_turns_inside_winding_window());
+        }
+        auto mas = CoreAdviser().post_process_core(overflowing, inputs);
+        auto magnetic = mas.get_magnetic();
+        REQUIRE(magnetic.get_coil().get_turns_description());
+        CHECK(magnetic.get_mutable_coil().are_turns_inside_winding_window());
+        const double fitted = strandDiameter(magnetic);
+        CAPTURE(skinDepthDiameter, fitted);
+        CHECK(fitted < skinDepthDiameter);
+        REQUIRE(mas.get_outputs().size() == 1);
+        REQUIRE(mas.get_outputs()[0].get_winding_losses());
+        CHECK(mas.get_outputs()[0].get_winding_losses()->get_winding_losses() > 0);
+
+        // The thickest strand that fits: 0.5 % thicker no longer does.
+        auto thicker = standIn(206);
+        auto thickerStrand = OpenMagnetics::Wire::get_wire_for_conducting_area(std::numbers::pi * std::pow(fitted * 1.005, 2) / 4,
+                                                                              ambientTemperature, true);
+        thicker.get_mutable_coil().set_wires({thickerStrand});
+        settings.set_coil_delimit_and_compact(false);
+        REQUIRE(thicker.get_mutable_coil().fast_wind());
+        settings.reset();
+        CHECK_FALSE(thicker.get_mutable_coil().are_turns_inside_winding_window());
+    }
+    SECTION("A stand-in that fits keeps its skin-depth strand") {
+        auto mas = CoreAdviser().post_process_core(standIn(40), inputs);
+        auto magnetic = mas.get_magnetic();
+        CHECK(magnetic.get_mutable_coil().are_turns_inside_winding_window());
+        CHECK(strandDiameter(mas.get_magnetic()) == skinDepthDiameter);
+    }
+    settings.reset();
+}
+
+// ABT #838: the core stage winds its stand-in coil with the layout the coil stage will use. On a
+// toroid that is CONTIGUOUS sectors spread around the ring; the quick bobbin's default OVERLAPPING
+// rings stacked a CMC's two windings radially, so fast_wind returned false, post_process_core
+// ignored it, and an unwound stand-in reached the loss and temperature solve. Two 4-turn windings of
+// a 1.47 mm wire fill a 2.75 mm radial window side by side but not stacked (2.94 mm). A coil that the
+// coil-stage layout cannot wind either (two 9-turn windings need 3 rings, 4.4 mm, of a 3.5 mm window)
+// is not a candidate: post_process_core throws with the winder's reason.
+// Alf approved 2026-10-16/17, ABT #1898: the old 3-ring premise came from the truncation. On T 13/7/5
+// each winding's 180 deg sector takes exactly 3 turns on the inner ring (180 / 60.000000000000007 =
+// 2.9999999999999996, truncated to 2), so two 8-turn windings DO fit in 2 rings (5 + 3) per winding,
+// 2.94 mm of the 3.5 mm window; 9 turns per winding is the case that genuinely needs a third ring.
+TEST_CASE("Core adviser post-processing winds a toroid's stand-in coil with the coil stage's layout",
+          "[adviser][core-adviser][smoke-test]") {
+    clear_databases();
+    settings.reset();
+    auto inputs = prepare_common_mode_choke_inputs(100000, 100e-6, 0.02, 0);
+    auto standIn = [](std::string shapeName, int64_t numberTurns) {
+        auto core = OpenMagneticsTesting::get_quick_core(shapeName, json::parse("[]"), 1, "R12KZ");
+        auto wire = find_wire_by_name("Round 1.40 - Grade 1");
+        std::vector<OpenMagnetics::Winding> windings;
+        for (auto name : {"Line", "Neutral"}) {
+            OpenMagnetics::Winding winding;
+            winding.set_name(name);
+            winding.set_isolation_side(IsolationSide::PRIMARY);
+            winding.set_number_turns(numberTurns);
+            winding.set_number_parallels(1);
+            winding.set_wire(wire);
+            windings.push_back(winding);
+        }
+        OpenMagnetics::Coil coil;
+        coil.set_bobbin(OpenMagnetics::Bobbin::create_quick_bobbin(core));
+        coil.set_functional_description(windings);
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(coil);
+        return magnetic;
+    };
+
+    SECTION("T 10.5/5.5/20, 2 x 4 turns: wound side by side, every turn inside the window") {
+        auto mas = CoreAdviser().post_process_core(standIn("T 10.5/5.5/20", 4), inputs);
+        auto magnetic = mas.get_magnetic();
+        auto turns = magnetic.get_coil().get_turns_description();
+        REQUIRE(turns);
+        CHECK(turns->size() == 8);
+        CHECK(magnetic.get_mutable_coil().are_turns_inside_winding_window());
+    }
+    SECTION("T 13/7/5, 2 x 8 turns: an exact fit, 2 rings per winding, every turn inside the window") {
+        auto mas = CoreAdviser().post_process_core(standIn("T 13/7/5", 8), inputs);
+        auto magnetic = mas.get_magnetic();
+        auto turns = magnetic.get_coil().get_turns_description();
+        REQUIRE(turns);
+        CHECK(turns->size() == 16);
+        CHECK(magnetic.get_mutable_coil().are_turns_inside_winding_window());
+        auto layers = magnetic.get_coil().get_layers_description();
+        REQUIRE(layers);
+        std::map<std::string, size_t> ringsPerWinding;
+        for (const auto& layer : layers.value()) {
+            if (layer.get_type() == ElectricalType::CONDUCTION) {
+                ringsPerWinding[layer.get_partial_windings()[0].get_winding()]++;
+            }
+        }
+        CHECK(ringsPerWinding == std::map<std::string, size_t>{{"Line", 2}, {"Neutral", 2}});
+    }
+    SECTION("T 13/7/5, 2 x 9 turns: cannot be wound, and post-processing says why") {
+        std::optional<std::string> refusal;
+        try {
+            CoreAdviser().post_process_core(standIn("T 13/7/5", 9), inputs);
+        }
+        catch (const OpenMagnetics::CoilException& e) {
+            refusal = e.what();
+        }
+        REQUIRE(refusal);
+        CHECK_THAT(refusal.value(), Catch::Matchers::ContainsSubstring("cannot be wound") &&
+                                    Catch::Matchers::ContainsSubstring("does not fit its round winding window"));
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_Two_Windings","[adviser][core-adviser][available-cores][smoke-test]") {
     clear_databases();
     double voltagePeakToPeak = 600;
     double dcCurrent = 0;
@@ -782,6 +1230,12 @@ TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_Two_Windings", "[adviser][c
     OpenMagnetics::Inputs inputs;
 
     prepare_test_parameters(dcCurrent, ambientTemperature, frequency, turnsRatios, desiredMagnetizingInductance, inputs, voltagePeakToPeak);
+    // Fixture correction (ABT #1680): create_quick_operating_point reflects the secondary as if
+    // the ratio were Ns/Np, so ratio 0.1 builds a 10:1 step-down secondary (60 Vpp at ten times
+    // the primary current). MKF's turns ratio is Np/Ns: the requirement must say 10, or the
+    // window copper capacity screen sizes ten times the turns at ten times the current and
+    // rejects every core.
+    inputs.get_mutable_design_requirements().get_mutable_turns_ratios()[0].set_nominal(10);
 
     std::map<CoreAdviser::CoreAdviserFilters, double> weights;
     weights[CoreAdviser::CoreAdviserFilters::COST] = 1;
@@ -795,7 +1249,16 @@ TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_Two_Windings", "[adviser][c
     auto cores = load_test_data();
     auto masMagnetics = coreAdviser.get_advised_core(inputs, weights, &cores, 20);
 
-    REQUIRE(masMagnetics.size() == 20);
+    // Re-pinned 2026-10-04 (temperature gate, ABT #1412): with the copper of both windings
+    // scored as the coil stage would wind it, three cores stayed under the 130 C limit; the
+    // coolest rejected were E 32/16/11 - N87 - Distributed gapped 0.48 mm (133.7 C), EC 41 -
+    // 3C94 - Gapped 0.5 mm (136.3 C) and EQ 30 - 3F3 - Gapped 0.508 mm (139.4 C).
+    // Re-pinned 2026-10-06, 3 -> 10: after main's re-gap on the turns-ratio snap (0e0d9369) the
+    // first search finds 9 cores under the limit (EQ 30 and PQ 32/20 in 3C9x/3F3), fewer than
+    // the 20 asked for, so the stacked search runs too and adds ETD 34 - 3C97 - Gapped 0.2 mm.
+    // get_advised_core now MERGES both searches instead of returning only the stacked one,
+    // which had culled the first search's 9 by its cost/size pre-loss cap and returned 1.
+    REQUIRE(masMagnetics.size() == 10);
 
     // Verify all results are non-toroidal (by name pattern) and have valid scores
     for (auto& [mas, scoring] : masMagnetics) {
@@ -852,20 +1315,12 @@ TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_Two_Points_High_Power_Low_P
     auto cores = load_test_data();
     auto masMagnetics = coreAdviser.get_advised_core(inputs, weights, &cores, 5);
 
-    REQUIRE(masMagnetics.size() > 0);
-
-    bool found = false;
-    for (auto [mas, scoring] : masMagnetics) {
-        if (mas.get_magnetic().get_core().get_name().value_or("unnamed") == "U 66/33/27 - Kool M\xC2\xB5 60 - Ungapped") {
-            if (mas.get_magnetic().get_core().get_functional_description().get_number_stacks() == 1) {
-                found = true;
-            }
-        }
-    }
-    REQUIRE(found);
-
-    REQUIRE(masMagnetics[0].first.get_outputs().size() == 2);
-    REQUIRE(masMagnetics[0].first.get_magnetic().get_coil().get_functional_description().size() == 2);
+    // Re-pinned 2026-10-04 (temperature gate, ABT #1412): at the 6000 Vpp operating point
+    // (34 A rms at 100 kHz) the expected U 66/33/27 - Kool Mu 60 - Ungapped reaches 1133.6 C
+    // with the copper scored as the coil stage would wind it, and no candidate stays under the
+    // 130 C limit (coolest of 333: E 70/33/32 - 95 - Distributed gapped 1.36 mm, 4 stacks,
+    // 279.2 C), so the adviser returns none.
+    REQUIRE(masMagnetics.empty());
 
     settings.reset();
 }
@@ -897,7 +1352,11 @@ TEST_CASE("Test_CoreAdviserAvailableCores_Two_Points_Equal", "[adviser][core-adv
     auto cores = load_test_data();
     auto masMagnetics = coreAdviser.get_advised_core(inputs, weights, &cores, 20);
 
-    REQUIRE(masMagnetics.size() > 0);
+    // Re-pinned 2026-10-04 (temperature gate, ABT #1412): two copies of the 6000 Vpp / 100 kHz
+    // point (34 A rms on 100 uH). With the copper scored as the coil stage would wind it no
+    // candidate stays under the 130 C limit (coolest: E 70/33/32 - 95 - Distributed gapped
+    // 1.36 mm, 3 stacks, 200.5 C), so the adviser returns none.
+    REQUIRE(masMagnetics.empty());
 
     // Verify results are valid cores that don't saturate
     for (auto [mas, scoring] : masMagnetics) {
@@ -920,6 +1379,42 @@ TEST_CASE("Test_CoreAdviser_Web_0", "[adviser][core-adviser][available-cores][bu
     // Repro point: the adviser must return a core for these frontend inputs.
     REQUIRE(masMagnetics.size() > 0);
 
+    settings.reset();
+}
+
+TEST_CASE("Test_CoreAdviser_Scorings_Describe_The_Last_Advise_Only", "[adviser][core-adviser][available-cores][abt-1620]") {
+    // ABT #1620: get_scorings() accumulated across advises (and summed a candidate scored twice),
+    // so after a second advise it still listed the first advise's cores.
+    clear_databases();
+    OpenMagnetics::Inputs inputs = OpenMagneticsTesting::fixtures::get_json("core-adviser-web-inductor-inputs");
+    settings.set_use_toroidal_cores(false);
+    auto allCores = load_test_data();
+    REQUIRE(allCores.size() >= 400);
+    std::vector<Core> firstCores(allCores.begin(), allCores.begin() + 200);
+    std::vector<Core> secondCores(allCores.begin() + 200, allCores.begin() + 400);
+
+    CoreAdviser freshCoreAdviser;
+    freshCoreAdviser.set_mode(CoreAdviser::CoreAdviserModes::AVAILABLE_CORES);
+    freshCoreAdviser.get_advised_core(inputs, &secondCores, 3);
+    auto alone = freshCoreAdviser.get_scorings();
+    REQUIRE(!alone.empty());
+
+    CoreAdviser sharedCoreAdviser;
+    sharedCoreAdviser.set_mode(CoreAdviser::CoreAdviserModes::AVAILABLE_CORES);
+    sharedCoreAdviser.get_advised_core(inputs, &firstCores, 3);
+    REQUIRE(!sharedCoreAdviser.get_scorings().empty());
+    sharedCoreAdviser.get_advised_core(inputs, &secondCores, 3);
+    auto afterFirst = sharedCoreAdviser.get_scorings();
+
+    CHECK(afterFirst.size() == alone.size());
+    for (const auto& [reference, scoringPerFilter] : afterFirst) {
+        INFO(reference);
+        REQUIRE(alone.contains(reference));
+        for (const auto& [filter, scoring] : scoringPerFilter) {
+            REQUIRE(alone.at(reference).contains(filter));
+            CHECK_THAT(scoring, Catch::Matchers::WithinRel(alone.at(reference).at(filter), 1e-12));
+        }
+    }
     settings.reset();
 }
 
@@ -1169,6 +1664,15 @@ TEST_CASE("Test_CoreAdviser_Web_6", "[adviser][core-adviser][available-cores][bu
 
 TEST_CASE("Test_CoreAdviser_Web_7", "[adviser][core-adviser][available-cores][bug]") {
     clear_databases();
+    // Fixture correction: the captured web inputs carry four windings (two 200 kHz windings at
+    // 36 V and 27 V, and two "Primary winding excitation" defaults at +-45.5 V) but only one
+    // turns ratio, 1.33 (= 36 V / 27 V). A turns ratio per winding after the first is required
+    // (the window copper capacity screen throws without them: the turns of the windings the
+    // stand-in coil lacks cannot be derived). The two added ratios follow from the fixture's own
+    // voltages the same way the first does: 36 V / 45.5 V = 0.79.
+    // The two default windings were also left at the form's 100 kHz while the operating point runs at
+    // 200 kHz: the windings of one magnetic share one flux and one frequency, so they are put at 200 kHz
+    // (time axes halved, same shapes and amplitudes) (ABT #1467).
     auto json_path_1006 = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "test_coreadviser_web_7_1006.json");
     std::ifstream json_file_1006(json_path_1006);
     std::string inputsString((std::istreambuf_iterator<char>(json_file_1006)), std::istreambuf_iterator<char>());
@@ -1468,6 +1972,12 @@ TEST_CASE("Test_CoreAdviserStandardCores_All_Shapes_Two_Windings", "[adviser][co
     inputs.get_mutable_design_requirements().get_mutable_magnetizing_inductance().set_minimum(desiredMagnetizingInductance);
     inputs.get_mutable_design_requirements().get_mutable_magnetizing_inductance().set_nominal(std::nullopt);
     inputs.get_mutable_design_requirements().get_mutable_magnetizing_inductance().set_maximum(std::nullopt);
+    // Fixture correction (ABT #1680): create_quick_operating_point reflects the secondary as if
+    // the ratio were Ns/Np, so ratio 0.1 builds a 10:1 step-down secondary (21 V, 33.8 A rms
+    // against 211 V, 3.4 A). MKF's turns ratio is Np/Ns: the requirement must say 10, or the
+    // window copper capacity screen sizes ten times the turns at ten times the current and
+    // rejects every core.
+    inputs.get_mutable_design_requirements().get_mutable_turns_ratios()[0].set_nominal(10);
 
     OperatingPoint operatingPoint;
     CoreAdviser coreAdviser;
@@ -1817,18 +2327,15 @@ TEST_CASE("Test_CoreAdviserStandardCores_Common_Mode_Choke_Low_Frequency", "[adv
     settings.reset();
     clear_databases();
     load_core_shapes();
-    double voltagePeakToPeak = 600;
+    double commonModeCurrentPeakToPeak = 0.02;
     double dcCurrent = 0;
-    double ambientTemperature = 25;
     double frequency = 100000;
     double desiredMagnetizingInductance = 10e-5;
-    std::vector<double> turnsRatios = {};
-    OpenMagnetics::Inputs inputs;
 
     settings.set_use_toroidal_cores(false);
     settings.set_use_concentric_cores(true);
 
-    prepare_test_parameters(dcCurrent, ambientTemperature, frequency, turnsRatios, desiredMagnetizingInductance, inputs, voltagePeakToPeak);
+    auto inputs = prepare_common_mode_choke_inputs(frequency, desiredMagnetizingInductance, commonModeCurrentPeakToPeak, dcCurrent);
 
     std::vector<std::pair<double, double>> impedancePoints = {
         {1e5, 1000},
@@ -1878,18 +2385,15 @@ TEST_CASE("Test_CoreAdviserStandardCores_Common_Mode_Choke_Low_Frequency_With_Dc
     settings.reset();
     clear_databases();
     load_core_shapes();
-    double voltagePeakToPeak = 600;
+    double commonModeCurrentPeakToPeak = 0.02;
     double dcCurrent = 50;
-    double ambientTemperature = 25;
     double frequency = 100000;
     double desiredMagnetizingInductance = 10e-5;
-    std::vector<double> turnsRatios = {};
-    OpenMagnetics::Inputs inputs;
 
     settings.set_use_toroidal_cores(false);
     settings.set_use_concentric_cores(true);
 
-    prepare_test_parameters(dcCurrent, ambientTemperature, frequency, turnsRatios, desiredMagnetizingInductance, inputs, voltagePeakToPeak);
+    auto inputs = prepare_common_mode_choke_inputs(frequency, desiredMagnetizingInductance, commonModeCurrentPeakToPeak, dcCurrent);
 
     std::vector<std::pair<double, double>> impedancePoints = {
         {1e5, 1000},
@@ -1938,18 +2442,15 @@ TEST_CASE("Test_CoreAdviserStandardCores_Common_Mode_Choke_High_Frequency", "[ad
     settings.reset();
     clear_databases();
     load_core_shapes();
-    double voltagePeakToPeak = 600;
+    double commonModeCurrentPeakToPeak = 0.02;
     double dcCurrent = 0;
-    double ambientTemperature = 25;
     double frequency = 100000;
     double desiredMagnetizingInductance = 10e-5;
-    std::vector<double> turnsRatios = {};
-    OpenMagnetics::Inputs inputs;
 
     settings.set_use_toroidal_cores(false);
     settings.set_use_concentric_cores(true);
 
-    prepare_test_parameters(dcCurrent, ambientTemperature, frequency, turnsRatios, desiredMagnetizingInductance, inputs, voltagePeakToPeak);
+    auto inputs = prepare_common_mode_choke_inputs(frequency, desiredMagnetizingInductance, commonModeCurrentPeakToPeak, dcCurrent);
 
     std::vector<std::pair<double, double>> impedancePoints = {
         {1e6, 1000},
@@ -2385,10 +2886,17 @@ TEST_CASE("Test_CoreAdviser_Flyback_From_Frontend_Inputs", "[adviser][core-advis
     // Primary current: triangular ramp during on-time, zero during off-time
     SignalDescriptor primaryCurrent;
     Waveform currentWaveform;
-    currentWaveform.set_data(std::vector<double>{0, 0, 2.35, 0});  // Simplified flyback primary current
-    currentWaveform.set_time(std::vector<double>{0, 0, 5e-6, 5e-6});  // 50% duty cycle at 100kHz = 5µs on
+    // Given over the whole 10 us period, zero in the off-time: a waveform covering only the 5 us
+    // on-time is rejected by the sampler, which would otherwise stretch it over the period (ABT #1467).
+    currentWaveform.set_data(std::vector<double>{0, 0, 2.35, 0, 0});  // Simplified flyback primary current
+    currentWaveform.set_time(std::vector<double>{0, 0, 5e-6, 5e-6, 10e-6});  // 50% duty cycle at 100kHz = 5µs on
     primaryCurrent.set_waveform(currentWaveform);
     
+    // offset is a required field, a plain double the generated class leaves uninitialised: a
+    // processed block built by hand must set it, or the flyback magnetizing current is built on
+    // whatever the heap held (ABT #1755: 54 A instead of 2.3 A, 0 cores, only after some other
+    // tests had run). 0 is what Inputs' calculate_offset gives these labels and waveforms: the
+    // first sample for FLYBACK_PRIMARY, the last for FLYBACK_SECONDARY, 0 for RECTANGULAR.
     ProcessedWaveform currentProcessed;
     currentProcessed.set_label(WaveformLabel::FLYBACK_PRIMARY);
     currentProcessed.set_average(0.588);
@@ -2396,6 +2904,7 @@ TEST_CASE("Test_CoreAdviser_Flyback_From_Frontend_Inputs", "[adviser][core-advis
     currentProcessed.set_peak(2.32);
     currentProcessed.set_peak_to_peak(2.32);
     currentProcessed.set_duty_cycle(0.5);
+    currentProcessed.set_offset(0);
     primaryCurrent.set_processed(currentProcessed);
     primaryExcitation.set_current(primaryCurrent);
     
@@ -2411,6 +2920,7 @@ TEST_CASE("Test_CoreAdviser_Flyback_From_Frontend_Inputs", "[adviser][core-advis
     voltageProcessed.set_peak(114);
     voltageProcessed.set_peak_to_peak(228);
     voltageProcessed.set_duty_cycle(0.5);
+    voltageProcessed.set_offset(0);
     primaryVoltage.set_processed(voltageProcessed);
     primaryExcitation.set_voltage(primaryVoltage);
     
@@ -2433,6 +2943,7 @@ TEST_CASE("Test_CoreAdviser_Flyback_From_Frontend_Inputs", "[adviser][core-advis
     secCurrentProcessed.set_rms(3.5);
     secCurrentProcessed.set_peak(5.0);
     secCurrentProcessed.set_duty_cycle(0.5);
+    secCurrentProcessed.set_offset(0);
     secondaryCurrent.set_processed(secCurrentProcessed);
     secondaryExcitation.set_current(secondaryCurrent);
     
@@ -2441,6 +2952,8 @@ TEST_CASE("Test_CoreAdviser_Flyback_From_Frontend_Inputs", "[adviser][core-advis
     inputs.get_mutable_operating_points().push_back(operatingPoint);
     
     // Add second operating point (like the frontend does for min/max input voltages)
+    // Its duty is 0.4, so +150 V x 4 us balances -100 V x 6 us: the frontend capture had D = 0.5,
+    // a 25 V mean that no steady-state winding can carry (check_volt_second_balance, ABT #1467).
     OperatingPoint operatingPoint2;
     OperatingConditions conditions2;
     conditions2.set_ambient_temperature(25);
@@ -2453,8 +2966,8 @@ TEST_CASE("Test_CoreAdviser_Flyback_From_Frontend_Inputs", "[adviser][core-advis
     
     SignalDescriptor primaryCurrent2;
     Waveform currentWaveform2;
-    currentWaveform2.set_data(std::vector<double>{0, 0, 1.5, 0});
-    currentWaveform2.set_time(std::vector<double>{0, 0, 5e-6, 5e-6});
+    currentWaveform2.set_data(std::vector<double>{0, 0, 1.5, 0, 0});
+    currentWaveform2.set_time(std::vector<double>{0, 0, 4e-6, 4e-6, 10e-6});
     primaryCurrent2.set_waveform(currentWaveform2);
     
     ProcessedWaveform currentProcessed2;
@@ -2463,21 +2976,23 @@ TEST_CASE("Test_CoreAdviser_Flyback_From_Frontend_Inputs", "[adviser][core-advis
     currentProcessed2.set_rms(0.7);
     currentProcessed2.set_peak(1.5);
     currentProcessed2.set_peak_to_peak(1.5);
-    currentProcessed2.set_duty_cycle(0.5);
+    currentProcessed2.set_duty_cycle(0.4);
+    currentProcessed2.set_offset(0);
     primaryCurrent2.set_processed(currentProcessed2);
     primaryExcitation2.set_current(primaryCurrent2);
     
     SignalDescriptor primaryVoltage2;
     Waveform voltageWaveform2;
     voltageWaveform2.set_data(std::vector<double>{150, 150, -100, -100});
-    voltageWaveform2.set_time(std::vector<double>{0, 5e-6, 5e-6, 10e-6});
+    voltageWaveform2.set_time(std::vector<double>{0, 4e-6, 4e-6, 10e-6});
     primaryVoltage2.set_waveform(voltageWaveform2);
     
     ProcessedWaveform voltageProcessed2;
     voltageProcessed2.set_label(WaveformLabel::RECTANGULAR);
     voltageProcessed2.set_peak(150);
     voltageProcessed2.set_peak_to_peak(250);
-    voltageProcessed2.set_duty_cycle(0.5);
+    voltageProcessed2.set_duty_cycle(0.4);
+    voltageProcessed2.set_offset(0);
     primaryVoltage2.set_processed(voltageProcessed2);
     primaryExcitation2.set_voltage(primaryVoltage2);
     
@@ -2491,7 +3006,7 @@ TEST_CASE("Test_CoreAdviser_Flyback_From_Frontend_Inputs", "[adviser][core-advis
     SignalDescriptor secondaryCurrent2;
     Waveform secCurrentWaveform2;
     secCurrentWaveform2.set_data(std::vector<double>{0, 0, 4.0, 0});
-    secCurrentWaveform2.set_time(std::vector<double>{0, 5e-6, 5e-6, 10e-6});
+    secCurrentWaveform2.set_time(std::vector<double>{0, 4e-6, 4e-6, 10e-6});
     secondaryCurrent2.set_waveform(secCurrentWaveform2);
     
     ProcessedWaveform secCurrentProcessed2;
@@ -2499,7 +3014,8 @@ TEST_CASE("Test_CoreAdviser_Flyback_From_Frontend_Inputs", "[adviser][core-advis
     secCurrentProcessed2.set_average(2.0);
     secCurrentProcessed2.set_rms(2.8);
     secCurrentProcessed2.set_peak(4.0);
-    secCurrentProcessed2.set_duty_cycle(0.5);
+    secCurrentProcessed2.set_duty_cycle(0.4);
+    secCurrentProcessed2.set_offset(0);
     secondaryCurrent2.set_processed(secCurrentProcessed2);
     secondaryExcitation2.set_current(secondaryCurrent2);
     
@@ -2578,12 +3094,17 @@ TEST_CASE("Test_CoreAdviser_LLC_From_Frontend_Inputs", "[adviser][core-adviser][
     
     designRequirements.set_topology(MAS::Topology::LLC_RESONANT_CONVERTER);
     
-    // Two turns ratios (for two secondaries or center-tapped)
-    DimensionWithTolerance turnsRatioReq1, turnsRatioReq2;
-    turnsRatioReq1.set_nominal(8.33);
-    turnsRatioReq2.set_nominal(8.33);
+    // Fixture correction: the frontend log had two turns ratios (8.33, 8.33: a centre-tapped
+    // secondary), but this test builds only two excitations, Primary and one Secondary, so it
+    // needs exactly one ratio (one per winding after the first; the window copper capacity
+    // screen throws on a mismatch, the turns of a winding cannot be derived otherwise). The
+    // ratio follows from the fixture's own currents: 10 A rms secondary over 2.147 A rms
+    // primary = 4.66 (the magnetizing current, 200 V x 5 us / 825.6 uH = 1.2 A peak-to-peak,
+    // is a small part of the primary rms). 8.33 with one 10 A secondary would not balance the
+    // ampere-turns of a 2.147 A primary.
+    DimensionWithTolerance turnsRatioReq1;
+    turnsRatioReq1.set_nominal(4.66);
     designRequirements.get_mutable_turns_ratios().push_back(turnsRatioReq1);
-    designRequirements.get_mutable_turns_ratios().push_back(turnsRatioReq2);
     
     // Leakage inductance requirement
     DimensionWithTolerance leakageReq;
@@ -2646,6 +3167,8 @@ TEST_CASE("Test_CoreAdviser_LLC_From_Frontend_Inputs", "[adviser][core-adviser][
     voltageProcessed.set_peak(200);
     voltageProcessed.set_peak_to_peak(400);
     voltageProcessed.set_duty_cycle(0.5);
+    // offset is required and uninitialised unless set (ABT #1755); 0 for a symmetric square wave.
+    voltageProcessed.set_offset(0);
     primaryVoltage.set_processed(voltageProcessed);
     primaryExcitation.set_voltage(primaryVoltage);
     
@@ -2667,6 +3190,7 @@ TEST_CASE("Test_CoreAdviser_LLC_From_Frontend_Inputs", "[adviser][core-adviser][
     // sinusoidal peak, matching how the primary above states 6.21 for its 3.105 peak.
     secCurrentProcessed.set_peak_to_peak(28.0);
     secCurrentProcessed.set_duty_cycle(0.5);
+    secCurrentProcessed.set_offset(0.0);
     secondaryCurrent.set_processed(secCurrentProcessed);
     secondaryExcitation.set_current(secondaryCurrent);
     
@@ -2922,6 +3446,69 @@ TEST_CASE("Test_CoreAdviser_Temperature_Filter", "[adviser][core-adviser][availa
 }
 
 
+TEST_CASE("Test_MagneticAdviser_Temperature_Filter_Finds_Larger_Ferrite_For_Resonant_Inductor", "[adviser][core-adviser][standard-cores][temperature-filter][abt1412]") {
+    // ABT #1412: an LLC/CLLC resonant inductor carries pure AC, so it swings the full flux
+    // every cycle and core LOSS, not saturation, sizes the core. The ranking favours small
+    // cores; with the temperature gate on it rejected every one of them and nothing ever
+    // tried the next larger core, so no ferrite design came back at all. The same spec
+    // class as the field report (33.5 uH +/-15 %, ~28 A peak at 143 kHz, no DC), built
+    // synthetically here. The gate is on by default in design mode.
+    settings.reset();
+    clear_databases();
+    REQUIRE(settings.get_core_adviser_enable_temperature_filter());
+    const double maximumTemperature = settings.get_core_adviser_maximum_temperature();
+
+    const double frequency = 143000;
+    const double inductance = 33.5e-6;
+    const double currentPeak = 28.0;
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+        frequency, inductance, 40, WaveformLabel::SINUSOIDAL, 2 * currentPeak, 0.5, 0);
+    DimensionWithTolerance inductanceRequirement;
+    inductanceRequirement.set_nominal(inductance);
+    inductanceRequirement.set_minimum(inductance * 0.85);
+    inductanceRequirement.set_maximum(inductance * 1.15);
+    inputs.get_mutable_design_requirements().set_magnetizing_inductance(inductanceRequirement);
+
+    MagneticAdviser magneticAdviser;
+    magneticAdviser.set_core_mode(CoreAdviser::CoreAdviserModes::STANDARD_CORES);
+    auto results = magneticAdviser.get_advised_magnetic(inputs, 5);
+    REQUIRE(!results.empty());
+
+    MagneticSimulator magneticSimulator;
+    bool ferriteFound = false;
+    for (auto& [mas, scoring] : results) {
+        auto material = mas.get_mutable_magnetic().get_mutable_core().resolve_material();
+        if (material.get_material() == MAS::MaterialType::FERRITE) {
+            ferriteFound = true;
+        }
+        // The adviser's own final simulate is fast mode (no thermal solve): re-simulate
+        // in full, which is what a user sees, and hold every result to the limit.
+        auto simulated = magneticSimulator.simulate(mas);
+        for (const auto& output : simulated.get_outputs()) {
+            REQUIRE(output.get_temperature());
+            INFO(mas.get_mutable_magnetic().get_reference());
+            CHECK(output.get_temperature()->get_maximum_temperature() <= maximumTemperature);
+        }
+    }
+    CHECK(ferriteFound);
+
+    settings.reset();
+}
+
+TEST_CASE("Test_Maximum_Design_Temperature_Comes_From_The_Design_Requirements", "[adviser][core-adviser][temperature-filter]") {
+    // The temperature gates hold a design to the maximum of designRequirements.operatingTemperature
+    // when the inputs state one, and to the configured setting only when they do not.
+    settings.reset();
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+        100000, 100e-6, 40, WaveformLabel::TRIANGULAR, 10, 0.5, 5);
+    REQUIRE_THAT(resolve_maximum_design_temperature(inputs), Catch::Matchers::WithinAbs(settings.get_core_adviser_maximum_temperature(), 1e-12));
+    DimensionWithTolerance operatingTemperature;
+    operatingTemperature.set_nominal(85);
+    operatingTemperature.set_maximum(105);
+    inputs.get_mutable_design_requirements().set_operating_temperature(operatingTemperature);
+    REQUIRE_THAT(resolve_maximum_design_temperature(inputs), Catch::Matchers::WithinAbs(105, 1e-12));
+}
+
 // =============================================================================
 // CMC core adviser smoke test (merged from TestCoreAdviserCmcBug.cpp)
 // =============================================================================
@@ -3124,7 +3711,12 @@ TEST_CASE("Test_CoreAdviser_PFC_Boost_Inductor_StandardCores", "[core-adviser][a
     // boost inductor; when its synthetic catalogue cannot serve the design it
     // falls through to the AVAILABLE_CORES manufacturer catalogue and TAGS every
     // result so the mode substitution is explicit (no silent fallback).
-    REQUIRE(standardResults.size() > 0);
+    // Re-pinned 2026-10-04 (temperature gate, ABT #1412): neither catalogue now holds a core
+    // that carries this inductor under the 130 C limit. The core the base returned, E 114/46/35
+    // - Kool Mu 26, 4 stacks, needs a ~94 W DC copper floor plus 71 W of core loss (0.47 T)
+    // and reads 237.8 C with its window filled (157.8 W winding with 32 x 0.5 mm strands), so
+    // the adviser returns none. Any result returned must still carry the substitution tag.
+    REQUIRE(standardResults.empty());
     for (auto& [mas, scoring] : standardResults) {
         auto reference = mas.get_magnetic().get_manufacturer_info().value().get_reference().value();
         WARN("  standard: " << reference);
@@ -3188,7 +3780,12 @@ TEST_CASE("Test_CoreAdviser_Standard_Cores_Respect_Every_Axis_Of_Maximum_Dimensi
     coreAdviser.set_mode(CoreAdviser::CoreAdviserModes::STANDARD_CORES);
     auto results = coreAdviser.get_advised_core(inputs, weights, 20);
 
-    REQUIRE(!results.empty());
+    // Re-pinned 2026-10-04 (temperature gate, ABT #1412): no standard core inside the
+    // 41 x 43 x 44 mm envelope carries this 30 kW CLLC's resonant current under the 130 C limit
+    // once its copper is scored as the coil stage would wind it (coolest: 95 E 41/16.5/12.5,
+    // 3 stacks, 136.7 C; E 41/17/13 x3 136.9 C; E 42/21/20 x2 137.0 C), so none is returned.
+    // Any core returned must still respect every axis of the envelope.
+    REQUIRE(results.empty());
     for (auto& [mas, scoring] : results) {
         auto core = mas.get_magnetic().get_core();
         auto dimensions = core.get_maximum_dimensions();
@@ -3214,6 +3811,56 @@ TEST_CASE("Test_Loss_Model_Frequency_Span_Judges_The_Model_That_Runs", "[adviser
     CHECK_FALSE(MagneticFilterLossModelFrequencySpan::is_material_evaluable(Core::resolve_material("TP5H"), inputs, CoreLossesModels::IGSE));
     CHECK_FALSE(MagneticFilterLossModelFrequencySpan::is_material_evaluable(Core::resolve_material("NP7"), inputs));
     CHECK_FALSE(MagneticFilterLossModelFrequencySpan::is_material_evaluable(Core::resolve_material("NP7"), inputs, CoreLossesModels::IGSE));
+}
+
+// ABT #1497: with an explicitly requested core-loss model CoreLosses runs only that model and throws for a
+// material that cannot run it, so the span filter must call such a material not evaluable instead of
+// judging the model the default cascade would have substituted. Its verdict must match CoreLosses'
+// own, material by material; without a request the cascade verdicts stand.
+TEST_CASE("Test_Loss_Model_Frequency_Span_Honours_An_Explicit_Model_Request", "[adviser][core-adviser][abt-1497]") {
+    settings.reset();
+    auto inputs = OpenMagneticsTesting::create_quick_test_inputs();  // 100 kHz
+    auto operatingPoint = inputs.get_operating_points()[0];
+    // Default: DMR40B (Roshen only in MAS) is evaluable, its Roshen model runs. It replaces PC95, which
+    // gained a Steinmetz fit in MAS 0ceffb3 (ABT #1512).
+    REQUIRE(MagneticFilterLossModelFrequencySpan::is_material_evaluable(Core::resolve_material("DMR40B"), inputs));
+
+    settings.set_core_losses_requested_model(CoreLossesModels::IGSE);
+    CHECK_FALSE(MagneticFilterLossModelFrequencySpan::is_material_evaluable(Core::resolve_material("DMR40B"), inputs));
+    CHECK_FALSE(MagneticFilterLossModelFrequencySpan::is_material_evaluable(Core::resolve_material("DMR40B"), inputs, CoreLossesModels::ROSHEN));
+    CHECK(MagneticFilterLossModelFrequencySpan::is_material_evaluable(Core::resolve_material("N87"), inputs));
+    // A simulator built now carries the request, as the adviser's own simulators do.
+    REQUIRE(CoreLosses().get_core_losses_requested_model_name() == CoreLossesModels::IGSE);
+
+    std::vector<int64_t> numberTurns = {20};
+    MagneticFilterLossModelFrequencySpan filter;
+    size_t evaluable = 0;
+    size_t notEvaluable = 0;
+    for (std::string grade : {"DMR40B", "N87", "3C95", "2HM4", "75-Series 26", "TP5H", "NP7"}) {
+        INFO(grade);
+        auto magnetic = OpenMagneticsTesting::get_quick_magnetic("E 42/21/15", OpenMagneticsTesting::get_ground_gap(0.001), numberTurns, 1, grade);
+        bool filterVerdict = MagneticFilterLossModelFrequencySpan::is_material_evaluable(Core::resolve_material(grade), inputs);
+        CHECK(filter.evaluate_magnetic(&magnetic, &inputs).first == filterVerdict);
+        bool coreLossesRuns = true;
+        std::string failure;
+        try {
+            MagneticSimulator magneticSimulator;
+            magneticSimulator.calculate_core_losses(operatingPoint, magnetic);
+        }
+        catch (const std::exception& exception) {
+            coreLossesRuns = false;
+            failure = exception.what();
+        }
+        INFO(failure);
+        CHECK(filterVerdict == coreLossesRuns);
+        (filterVerdict ? evaluable : notEvaluable)++;
+    }
+    // Both verdicts are exercised.
+    CHECK(evaluable >= 2);
+    CHECK(notEvaluable >= 3);
+
+    settings.reset();
+    CHECK(MagneticFilterLossModelFrequencySpan::is_material_evaluable(Core::resolve_material("DMR40B"), inputs));
 }
 
 // ABT #1456: at 100 kHz MKF used to rank nine 0.5-5 MHz MnZn grades best by far (TP5H read 2 % of 3C95's
@@ -3261,4 +3908,469 @@ TEST_CASE("Test_CoreAdviser_Ferrite_Pool_Drops_MHz_Grades_Out_Of_Span_At_100kHz"
     settings.reset();
 }
 
+// ABT #1652 (Alf): advisers NEVER extrapolate, even with Settings::allowMaterialDataExtrapolation on. The same
+// ferrite pool at 100 kHz with the flag ON must still drop the nine MHz grades by the span verdict and compute
+// no extrapolated loss; outside the adviser the flag lets TP5H through, so the setup really had it on.
+TEST_CASE("Test_CoreAdviser_Ferrite_Pool_Never_Extrapolates_With_Extrapolation_Allowed", "[adviser][core-adviser][abt-1652]") {
+    settings.reset();
+    clear_databases();
+    settings.set_preferred_core_material_ferrite_manufacturer("No such manufacturer (ABT #1456)");
+    Logger::getInstance().disableCollector();
+    Logger::getInstance().enableCollector(LogLevel::WARNING);
+
+    const std::vector<std::string> mhzGrades = {"TP5H", "KL9F", "DMR52W", "DMR51W", "KL7F", "KL11F", "DMR52", "P61", "P63"};
+    auto inputs = OpenMagneticsTesting::create_quick_test_inputs();  // 100 kHz
+    settings.set_allow_material_data_extrapolation(true);
+    REQUIRE(MagneticFilterLossModelFrequencySpan::is_material_evaluable(Core::resolve_material("TP5H"), inputs));
+
+    std::vector<int64_t> numberTurns = {20};
+    auto magnetic = OpenMagneticsTesting::get_quick_magnetic("E 42/21/15", OpenMagneticsTesting::get_ground_gap(0.001), numberTurns, 1, "N87");
+    magnetic.get_mutable_core().get_mutable_functional_description().set_material(std::string(DUMMY_SENTINEL_NAME));
+    std::vector<std::pair<OpenMagnetics::Magnetic, double>> candidates = {{magnetic, 1.0}};
+
+    Logger::getInstance().drainCollected();
+    std::vector<std::pair<OpenMagnetics::Magnetic, double>> withMaterials;
+    std::string log;
+    {
+        CoreAdviser coreAdviser;
+        OpenMagnetics::read_log();
+        withMaterials = coreAdviser.add_ferrite_materials_by_losses(&candidates, inputs);
+        log = OpenMagnetics::read_log();
+    }
+    REQUIRE(!withMaterials.empty());
+    CHECK(log.find("Dropping core material 'TP5H'") != std::string::npos);
+    for (auto& [candidate, scoring] : withMaterials) {
+        auto materialName = candidate.get_core().get_material_name();
+        INFO(materialName);
+        CHECK(std::find(mhzGrades.begin(), mhzGrades.end(), materialName) == mhzGrades.end());
+    }
+    size_t extrapolationRecords = 0;
+    for (auto& record : Logger::getInstance().drainCollected()) {
+        if (record.moduleOfOrigin == kMaterialDataExtrapolationModule) {
+            UNSCOPED_INFO("extrapolated under the adviser: " << record.message);
+            extrapolationRecords++;
+        }
+    }
+    CHECK(extrapolationRecords == 0);
+    CHECK(settings.get_allow_material_data_extrapolation());
+
+    Logger::getInstance().disableCollector();
+    settings.reset();
+}
+
 }  // namespace
+
+static OpenMagnetics::Inputs load_test_inputs(const std::string& fileName, std::source_location location = std::source_location::current()) {
+    auto inputsPath = OpenMagneticsTesting::get_test_data_path(location, fileName);
+    std::ifstream inputsFile(inputsPath);
+    REQUIRE(inputsFile.good());
+    json inputsJson;
+    inputsFile >> inputsJson;
+    return OpenMagnetics::Inputs(inputsJson);
+}
+
+TEST_CASE("Test_MagnetizingInductance_Transformer_Stand_In_Coil_Flux_Equals_Full_Coil_Flux", "[physical-model][magnetizing-inductance][core-adviser][temperature-filter]") {
+    // The core adviser judges cores with a one-winding stand-in coil; the secondaries come once
+    // a core is chosen. The magnetizing current must not depend on that: a 228 W forward
+    // transformer's core flux on the stand-in is the flux on the full primary + secondary coil
+    // (its volt-seconds), not the flux of its 2.55 A primary current taken as magnetizing
+    // current, which put 0.4-1.7 T and core temperatures of thousands of degrees on every
+    // standard core and culled them all at the temperature gate.
+    settings.reset();
+    clear_databases();
+    auto inputs = load_test_inputs("forward-228w-19v-transformer.json");
+    REQUIRE(inputs.get_operating_points()[0].get_excitations_per_winding().size() == 2);
+
+    auto core = OpenMagneticsTesting::get_quick_core("ETD 34/17/11", OpenMagneticsTesting::get_residual_gap(), 1, "3C95");
+    auto standInCoil = OpenMagneticsTesting::get_quick_coil({28}, {1}, "ETD 34/17/11");
+    auto fullCoil = OpenMagneticsTesting::get_quick_coil({28, 4}, {1, 1}, "ETD 34/17/11");
+
+    OpenMagnetics::MagnetizingInductance magnetizingInductance("ZHANG");
+    auto standInOperatingPoint = inputs.get_operating_point(0);
+    auto fullOperatingPoint = inputs.get_operating_point(0);
+    auto standIn = magnetizingInductance.calculate_inductance_and_magnetic_flux_density(core, standInCoil, &standInOperatingPoint);
+    auto full = magnetizingInductance.calculate_inductance_and_magnetic_flux_density(core, fullCoil, &fullOperatingPoint);
+
+    double standInPeak = standIn.second.get_processed()->get_peak().value();
+    double fullPeak = full.second.get_processed()->get_peak().value();
+    INFO("stand-in B peak " << standInPeak << " T, full coil B peak " << fullPeak << " T");
+    CHECK_THAT(standInPeak, Catch::Matchers::WithinRel(fullPeak, 1e-9));
+    CHECK(fullPeak < 0.3);
+    settings.reset();
+}
+
+TEST_CASE("Test_CoreAdviser_Forward_Transformer_Advised_With_Its_Volt_Second_Flux_Passes_Temperature", "[adviser][core-adviser][standard-cores][temperature-filter]") {
+    // Henry corpus case forward-228w-19v-transformer: with the stand-in coil's primary current
+    // taken as magnetizing current every core was too hot and the adviser returned nothing.
+    // Judged by its volt-second flux, it returns designs, and every one of them passes the same
+    // temperature filter the gate runs.
+    settings.reset();
+    clear_databases();
+    auto inputs = load_test_inputs("forward-228w-19v-transformer.json");
+    REQUIRE(settings.get_core_adviser_enable_temperature_filter());
+
+    CoreAdviser coreAdviser;
+    coreAdviser.set_mode(CoreAdviser::CoreAdviserModes::STANDARD_CORES);
+    auto masMagnetics = coreAdviser.get_advised_core(inputs, 5);
+
+    REQUIRE(masMagnetics.size() > 0);
+    const double maximumTemperature = resolve_maximum_design_temperature(inputs);
+    MagneticFilterTemperature temperatureFilter(inputs, maximumTemperature);
+    for (auto& [mas, scoring] : masMagnetics) {
+        auto magnetic = mas.get_magnetic();
+        INFO(magnetic.get_core().get_name().value_or("unnamed core") << " at "
+             << magnetic.get_coil().get_functional_description()[0].get_number_turns() << " turns");
+        CHECK(temperatureFilter.evaluate_magnetic(&magnetic, &inputs).first);
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_CoreAdviser_Window_Copper_Capacity_Rejects_A_Core_That_Cannot_Hold_50_A", "[adviser][core-adviser][magnetic-filter][standard-cores]") {
+    // Henry corpus case forward-200k-5v-50a-transformer: 15 primary turns at 5.5 A and 2
+    // secondary turns at 33 A rms, 200 kHz. Small cores (PQ 27/15, RM 10, E 25) passed every
+    // core-stage filter, then no wire within 12 A/mm2 and 5 parallels fitted their windows and
+    // every design came back INVALID. The window copper capacity filter rejects such a core
+    // before the coil stage, with its numbers; a core with room passes.
+    settings.reset();
+    clear_databases();
+    auto inputs = load_test_inputs("forward-200k-5v-50a-transformer.json");
+
+    auto strand = OpenMagnetics::Wire::get_wire_for_frequency(200000, inputs.get_maximum_temperature(), true);
+    MagneticFilterWindowCopperCapacity filter(inputs, defaults.maximumEffectiveCurrentDensity);
+    auto stand_in = [&](const std::string& shapeName, int64_t primaryNumberTurns = 15) {
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(OpenMagneticsTesting::get_quick_core(shapeName, OpenMagneticsTesting::get_residual_gap(), 1, "3C95"));
+        magnetic.set_coil(OpenMagneticsTesting::get_quick_coil({primaryNumberTurns}, {1}, shapeName, 1, MAS::WindingOrientation::OVERLAPPING,
+                                                              MAS::WindingOrientation::OVERLAPPING, MAS::CoilAlignment::CENTERED,
+                                                              MAS::CoilAlignment::CENTERED, {strand}));
+        return magnetic;
+    };
+
+    auto small = stand_in("PQ 27/15");
+    auto [smallFits, smallProportion] = filter.evaluate_magnetic(&small, &inputs);
+    INFO(filter.get_last_reason());
+    CHECK_FALSE(smallFits);
+    CHECK(smallProportion > 1);
+    CHECK_THAT(filter.get_last_reason(), Catch::Matchers::ContainsSubstring("PQ 27/15"));
+
+    auto large = stand_in("PQ 50/50");
+    auto [largeFits, largeProportion] = filter.evaluate_magnetic(&large, &inputs);
+    CHECK(largeFits);
+    CHECK(filter.get_last_reason().empty());
+
+    // The wire check must agree with the coil stage it screens for. It once searched every wire
+    // standard and ignored the insulation the margin-tape combinations ask of the wires (a
+    // single-layer coating): E 26/9.5/14.1 and 39 more small cores passed it, then the coil
+    // stage, advising from the preferred standard, found no secondary wire for any of them and
+    // returned every design INVALID (EFFECTIVE_CURRENT_DENSITY).
+    MagneticFilterWireWithinLimits wireWithinLimits(defaults.maximumEffectiveCurrentDensity, defaults.maximumNumberParallels);
+    auto transformer = [&](const std::string& shapeName) {
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(OpenMagneticsTesting::get_quick_core(shapeName, OpenMagneticsTesting::get_residual_gap(), 1, "3C95"));
+        magnetic.set_coil(OpenMagneticsTesting::get_quick_coil({15, 2}, {1, 1}, shapeName, 1, MAS::WindingOrientation::OVERLAPPING,
+                                                              MAS::WindingOrientation::OVERLAPPING, MAS::CoilAlignment::CENTERED,
+                                                              MAS::CoilAlignment::CENTERED, {strand, strand}));
+        return magnetic;
+    };
+    for (const std::string shapeName : {"E 26/9.5/14.1", "ETD 49/25/16"}) {
+        INFO(shapeName);
+        auto magnetic = transformer(shapeName);
+        auto [withinLimits, unused] = wireWithinLimits.evaluate_magnetic(&magnetic, &inputs);
+        INFO(wireWithinLimits.get_last_reason());
+        OpenMagnetics::Mas mas;
+        mas.set_inputs(inputs);
+        mas.set_magnetic(magnetic);
+        CoilAdviser coilAdviser;
+        auto coils = coilAdviser.get_advised_coil(mas, 1);
+        REQUIRE(coils.size() > 0);
+        CHECK(withinLimits == !coil_failed_validity_filters(coils[0]));
+        if (shapeName == "ETD 49/25/16") {
+            CHECK(withinLimits);
+        }
+        else {
+            CHECK_FALSE(withinLimits);
+        }
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_CoreAdviser_Window_Copper_Capacity_Counts_Line_Frequency_Copper_By_Its_Current", "[adviser][core-adviser][magnetic-filter]") {
+    // PFC boost choke at line frequency (PFC_Inputs.mas.json: 50 Hz, 32.3 A rms). Two skin
+    // depths at 50 Hz are 18.6 mm, so the stand-in strand alone holds 272 mm2 of copper while
+    // the current needs 2.7 mm2 at 12 A/mm2. The capacity screen counted the whole strand per
+    // turn, asked 17,700 mm2 of copper of a 4-stack E 114/46/35 and rejected every core in the
+    // catalogue, so the PFC choke tests returned no core at all. Copper below one strand is
+    // sized by the current: 65 turns fit that window comfortably, 6000 turns do not.
+    settings.reset();
+    clear_databases();
+    auto inputs = load_test_inputs("PFC_Inputs.mas.json");
+
+    auto strand = OpenMagnetics::Wire::get_wire_for_frequency(50, inputs.get_maximum_temperature(), true);
+    REQUIRE(resolve_dimensional_values(strand.get_conducting_diameter().value()) > 0.01);
+    MagneticFilterWindowCopperCapacity filter(inputs, defaults.maximumEffectiveCurrentDensity);
+    auto stand_in = [&](int64_t numberTurns) {
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(OpenMagneticsTesting::get_quick_core("E 114/46/35", OpenMagneticsTesting::get_residual_gap(), 4, "3C95"));
+        magnetic.set_coil(OpenMagneticsTesting::get_quick_coil({numberTurns}, {1}, "E 114/46/35", 1, MAS::WindingOrientation::OVERLAPPING,
+                                                              MAS::WindingOrientation::OVERLAPPING, MAS::CoilAlignment::CENTERED,
+                                                              MAS::CoilAlignment::CENTERED, {strand}));
+        return magnetic;
+    };
+
+    auto choke = stand_in(65);
+    auto [fits, proportion] = filter.evaluate_magnetic(&choke, &inputs);
+    INFO(filter.get_last_reason());
+    CHECK(fits);
+    CHECK(proportion < 0.5);
+
+    auto overfull = stand_in(6000);
+    auto [overfullFits, overfullProportion] = filter.evaluate_magnetic(&overfull, &inputs);
+    CHECK_FALSE(overfullFits);
+    CHECK(overfullProportion > 1);
+    settings.reset();
+}
+
+TEST_CASE("Test_CoreAdviser_Temperature_Lays_Out_Line_Frequency_Stand_In_Copper_Sized_To_Its_Current", "[adviser][core-adviser][magnetic-filter][temperature-filter]") {
+    // Same PFC boost choke stand-in as above (PFC_Inputs.mas.json, 50 Hz, 32.3 A rms, 65 turns on
+    // a 4-stack E 114/46/35). The 18.6 mm line-frequency strand lays out three turns per layer,
+    // so the temperature filter rejected every core with "whole layers do not fit" and the PFC
+    // choke tests got no core. The core adviser's temperature filter now lays out the copper the
+    // coil stage could wind (MagneticFilter::with_copper_sized_to_current): thinner than the
+    // strand, at least the copper the current needs, and it must fit the window as whole layers.
+    settings.reset();
+    clear_databases();
+    auto inputs = load_test_inputs("PFC_Inputs.mas.json");
+
+    auto strand = OpenMagnetics::Wire::get_wire_for_frequency(50, inputs.get_maximum_temperature(), true);
+    const double strandDiameter = resolve_dimensional_values(strand.get_conducting_diameter().value());
+    OpenMagnetics::Magnetic choke;
+    choke.set_core(OpenMagneticsTesting::get_quick_core("E 114/46/35", OpenMagneticsTesting::get_residual_gap(), 4, "3C95"));
+    choke.set_coil(OpenMagneticsTesting::get_quick_coil({65}, {1}, "E 114/46/35", 1, MAS::WindingOrientation::OVERLAPPING,
+                                                       MAS::WindingOrientation::OVERLAPPING, MAS::CoilAlignment::CENTERED,
+                                                       MAS::CoilAlignment::CENTERED, {strand}));
+
+    auto sized = MagneticFilter::with_copper_sized_to_current(choke, inputs, defaults.maximumEffectiveCurrentDensity);
+    auto sizedWinding = sized.get_coil().get_functional_description()[0];
+    auto sizedCoil = sized.get_coil();
+    auto sizedWire = sizedCoil.resolve_wire(0);
+    const double sizedDiameter = resolve_dimensional_values(sizedWire.get_conducting_diameter().value());
+    const double rms = inputs.get_operating_points()[0].get_excitations_per_winding()[0].get_current()->get_processed()->get_rms().value();
+    const double minimumDiameter = 2 * sqrt(rms / defaults.maximumEffectiveCurrentDensity / M_PI);
+    INFO("strand " << strandDiameter * 1000 << " mm, sized " << sizedDiameter * 1000 << " mm x" << sizedWinding.get_number_parallels()
+         << ", DC minimum " << minimumDiameter * 1000 << " mm");
+    CHECK(sizedWinding.get_number_turns() == 65);
+    CHECK(sizedDiameter < strandDiameter);
+    CHECK(sizedDiameter * sqrt(sizedWinding.get_number_parallels()) >= minimumDiameter);
+    // The candidate keeps its stand-in coil.
+    auto chokeCoil = choke.get_coil();
+    CHECK(resolve_dimensional_values(chokeCoil.resolve_wire(0).get_conducting_diameter().value()) == strandDiameter);
+
+    const double maximumTemperature = resolve_maximum_design_temperature(inputs);
+    MagneticFilterTemperature standInTemperature(inputs, maximumTemperature);
+    standInTemperature.set_size_stand_in_copper(true);  // as the core adviser runs it
+    auto [unusedSized, sizedHottest] = standInTemperature.evaluate_magnetic(&choke, &inputs);
+    INFO("hottest with sized copper " << sizedHottest << " C");
+    CHECK(sizedHottest < std::numeric_limits<double>::max());
+
+    // With the strand itself (a real coil's own wires, the flag off) the window holds no whole layers.
+    MagneticFilterTemperature ownWiresTemperature(inputs, maximumTemperature);
+    auto [ownWiresValid, ownWiresHottest] = ownWiresTemperature.evaluate_magnetic(&choke, &inputs);
+    CHECK_FALSE(ownWiresValid);
+    CHECK(ownWiresHottest == std::numeric_limits<double>::max());
+    settings.reset();
+}
+
+TEST_CASE("Test_CoreAdviser_Stand_In_Transformer_Losses_And_Temperature_Count_The_Copper_Of_Every_Winding", "[adviser][core-adviser][magnetic-filter][temperature-filter]") {
+    // The core stage judges a transformer core with a one-winding stand-in coil. Its loss filter
+    // used to reject such a candidate outright (winding count != excitation count) and the core
+    // adviser passed every multi-winding candidate through unscored, while the temperature filter
+    // solved a core-only network: the copper of the windings never counted before the coil stage,
+    // and a 10 kW phase-shifted full bridge sent 40 cores to coil design and simulation that were
+    // all too hot (~500 s, no design). Both filters now complete the stand-in from the turns
+    // ratios and count the DC and skin-effect losses of every winding. Henry corpus case
+    // forward-200k-5v-50a-transformer (15 primary turns at 5.5 A, 2 secondary turns at 33 A rms,
+    // 200 kHz): with the currents cut to a tenth (same voltages, so the same volt-second flux and
+    // core losses) the losses and the temperature must both drop.
+    settings.reset();
+    clear_databases();
+    auto inputs = load_test_inputs("forward-200k-5v-50a-transformer.json");
+    REQUIRE(inputs.get_operating_points()[0].get_excitations_per_winding().size() == 2);
+    auto lightInputs = inputs;
+    for (auto& operatingPoint : lightInputs.get_mutable_operating_points()) {
+        for (auto& excitation : operatingPoint.get_mutable_excitations_per_winding()) {
+            excitation = OpenMagnetics::Inputs::get_excitation_with_proportional_current(excitation, 0.1);
+        }
+    }
+
+    const std::string shapeName = "ETD 49/25/16";
+    auto strand = OpenMagnetics::Wire::get_wire_for_frequency(200000, inputs.get_maximum_temperature(), true);
+    auto primaryCurrent = inputs.get_operating_points()[0].get_excitations_per_winding()[0].get_current().value();
+    int64_t primaryParallels = OpenMagnetics::Wire::calculate_number_parallels_needed(primaryCurrent, inputs.get_maximum_temperature(), strand,
+                                                                                     defaults.maximumEffectiveCurrentDensity);
+    OpenMagnetics::Magnetic standIn;
+    standIn.set_core(OpenMagneticsTesting::get_quick_core(shapeName, OpenMagneticsTesting::get_residual_gap(), 1, "3C95"));
+    standIn.set_coil(OpenMagneticsTesting::get_quick_coil({15}, {primaryParallels}, shapeName, 1, MAS::WindingOrientation::OVERLAPPING,
+                                                         MAS::WindingOrientation::OVERLAPPING, MAS::CoilAlignment::CENTERED,
+                                                         MAS::CoilAlignment::CENTERED, {strand}));
+    REQUIRE(standIn.get_coil().get_functional_description().size() == 1);
+
+    MagneticFilterCoreDcAndSkinLosses losses(inputs);
+    losses.set_application(MAS::MagneticApplication::POWER);  // completing a stand-in needs it (ABT #1822)
+    std::vector<OpenMagnetics::Outputs> outputs;
+    auto [lossesValid, totalLosses] = losses.evaluate_magnetic(&standIn, &inputs, &outputs);
+    std::vector<OpenMagnetics::Outputs> lightOutputs;
+    auto [lightLossesValid, lightTotalLosses] = losses.evaluate_magnetic(&standIn, &lightInputs, &lightOutputs);
+    REQUIRE(outputs.size() == 1);
+    REQUIRE(lightOutputs.size() == 1);
+    double windingLosses = outputs[0].get_winding_losses()->get_winding_losses();
+    double coreLosses = outputs[0].get_core_losses()->get_core_losses();
+    double lightCoreLosses = lightOutputs[0].get_core_losses()->get_core_losses();
+    INFO("total " << totalLosses << " W (core " << coreLosses << " W, windings " << windingLosses << " W), at a tenth of the current "
+         << lightTotalLosses << " W");
+    CHECK(lossesValid);
+    CHECK(windingLosses > 0);
+    CHECK_THAT(lightCoreLosses, Catch::Matchers::WithinRel(coreLosses, 1e-6));
+    CHECK_THAT(totalLosses, Catch::Matchers::WithinRel(coreLosses + windingLosses, 1e-9));
+    CHECK(totalLosses > lightTotalLosses + 0.5 * windingLosses);
+    // The candidate keeps its stand-in coil: the coil stage designs the real one.
+    CHECK(standIn.get_coil().get_functional_description().size() == 1);
+
+    const double maximumTemperature = resolve_maximum_design_temperature(inputs);
+    MagneticFilterTemperature temperature(inputs, maximumTemperature);
+    temperature.set_size_stand_in_copper(true);  // as the core adviser runs it on its stand-ins
+    temperature.set_application(MAS::MagneticApplication::POWER);
+    auto [unusedFull, hottest] = temperature.evaluate_magnetic(&standIn, &inputs);
+    auto [unusedLight, lightHottest] = temperature.evaluate_magnetic(&standIn, &lightInputs);
+    INFO("hottest " << hottest << " C, at a tenth of the current " << lightHottest << " C");
+    CHECK(hottest > lightHottest + 1);
+    CHECK(standIn.get_coil().get_functional_description().size() == 1);
+    settings.reset();
+}
+
+// ABT #1875 guards. The inputs and adviser settings are the IMPACT.md / TRACE.md ones
+// (.mkf-p1875-runs): CoreAdviser weights E/D/C 40/30/30, standard cores, 10 results.
+static OpenMagnetics::Inputs load_abt1875_inputs(const std::string& fileName) {
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), fileName);
+    std::ifstream file(path);
+    json masJson = json::parse(file);
+    return OpenMagnetics::Inputs(masJson.contains("inputs") ? masJson["inputs"] : masJson);
+}
+
+static std::map<CoreAdviser::CoreAdviserFilters, double> abt1875_weights() {
+    return {{CoreAdviser::CoreAdviserFilters::EFFICIENCY, 0.4},
+            {CoreAdviser::CoreAdviserFilters::DIMENSIONS, 0.3},
+            {CoreAdviser::CoreAdviserFilters::COST, 0.3}};
+}
+
+TEST_CASE("Test_CoreAdviser_Seeding_Regaps_A_Turns_Solve_Refusal", "[adviser][core-adviser][abt-1875]") {
+    // The 225 uH DCM flyback on 95 E 10/5.5/5, 4 stacks, at the 0.087 mm gap the standard-cores
+    // gapping gave it: the turns solve meets saturation at 20 turns (B peak 0.64 T above 0.478 T)
+    // and refuses. The seeder's saturation-aware re-gap raises N and re-solves the gap (IMPACT.md:
+    // 42 turns, 0.6 mm, B peak 0.30 T). Before ABT #1875 the refusal dropped the candidate first.
+    settings.reset();
+    clear_databases();
+    auto inputs = pre_process_inputs(load_abt1875_inputs("Test_Magnetizing_Current_Dcm_Flyback_Balanced.json"));
+    std::vector<OpenMagnetics::Core> cores = {OpenMagneticsTesting::get_quick_core("E 10/5.5/5", OpenMagneticsTesting::get_ground_gap(8.72791e-05), 4, "95")};
+    CoreAdviser coreAdviser;
+    auto magnetics = coreAdviser.create_magnetic_dataset(inputs, &cores, false);
+    REQUIRE(magnetics.size() == 1);
+
+    // The refusal says at how many turns it refused, as a typed field.
+    MagnetizingInductance magnetizingInductance;
+    std::optional<int64_t> refusedTurns;
+    {
+        OpenMagnetics::Inputs solveInputs(inputs);
+        try {
+            magnetizingInductance.calculate_number_turns_from_gapping_and_inductance(
+                magnetics[0].first.get_core(), magnetics[0].first.get_coil(), &solveInputs, DimensionalValues::MINIMUM);
+        }
+        catch (const SaturationException& e) {
+            refusedTurns = e.number_turns();
+        }
+    }
+    REQUIRE(refusedTurns);
+    INFO("refused at " << refusedTurns.value() << " turns");
+
+    add_initial_turns_by_inductance(&magnetics, inputs);
+    REQUIRE(magnetics.size() == 1);
+    auto magnetic = magnetics[0].first;
+    int64_t numberTurns = magnetic.get_coil().get_functional_description()[0].get_number_turns();
+    INFO("kept with " << numberTurns << " turns");
+    CHECK(numberTurns > refusedTurns.value());
+    // The kept design passes the very check the solve refused on.
+    OpenMagnetics::Inputs checkInputs(inputs);
+    auto [saturates, message] = magnetizingInductance.check_sizing_saturation(magnetic.get_core(), magnetic.get_coil(), numberTurns, &checkInputs);
+    INFO(message);
+    CHECK_FALSE(saturates);
+    settings.reset();
+}
+
+TEST_CASE("Test_CoreAdviser_Temperature_Walk_Counts_Parts_Post_Processing_Keeps", "[adviser][core-adviser][abt-1875]") {
+    // simple_inductor, standard cores: with the turns-solve refusals re-gapped, the rescued cores
+    // shift the ABT #1412 walk to smaller cores, and its first batch passes the single-pass
+    // temperature filter 46 times while the ABT #1802 solved-temperature gate keeps 3 of them.
+    // Counting the filter's passes stopped the walk there and returned 3 parts; counting the parts
+    // post-processing keeps walks on to the 10 asked for (main before ABT #1875 also returned 10).
+    settings.reset();
+    clear_databases();
+    settings.set_coil_delimit_and_compact(true);
+    auto inputs = load_abt1875_inputs("simple_inductor.json");
+    CoreAdviser coreAdviser;
+    coreAdviser.set_mode(CoreAdviser::CoreAdviserModes::STANDARD_CORES);
+    auto results = coreAdviser.get_advised_core(inputs, abt1875_weights(), 10);
+    CHECK(results.size() == 10);
+    settings.reset();
+}
+
+// ABT #1785 guard: the first filter of the available-cores pass copies only the survivors its
+// score-cull keeps. filter_magnetics_from(source, ..., keepBest) must give exactly what copying
+// every survivor, sorting and resize(keepBest) gives (same members, order, scores and recorded
+// scorings), while returning only keepBest copies. Before the cut the stacked second search
+// copied all ~60 000 survivors and then dropped all but the cull.
+TEST_CASE("Test_CoreAdviser_AreaProduct_First_Cull_Copies_Only_Kept_Survivors", "[adviser][core-adviser][abt-1785]") {
+    settings.reset();
+    clear_databases();
+    auto inputs = pre_process_inputs(load_abt1875_inputs("Test_Magnetizing_Current_Dcm_Flyback_Balanced.json"));
+    std::vector<OpenMagnetics::Core> cores;
+    for (const std::string shape : {"E 13/7/4", "E 16/8/5", "E 19/8/5", "E 20/10/6", "E 25/13/7", "E 30/15/7",
+                                    "E 32/16/9", "E 42/21/15", "E 55/28/21", "PQ 20/16", "PQ 26/25", "PQ 32/30",
+                                    "PQ 40/40", "PQ 50/50", "ETD 29/16/10", "ETD 34/17/11", "ETD 39/20/13", "ETD 44/22/15"}) {
+        cores.push_back(OpenMagneticsTesting::get_quick_core(shape, OpenMagneticsTesting::get_ground_gap(0.0005), 1, "3C95"));
+    }
+    CoreAdviser coreAdviser;
+    const auto source = coreAdviser.create_magnetic_dataset(inputs, &cores, false);
+    REQUIRE(source.size() == cores.size());
+
+    std::map<CoreAdviser::CoreAdviserFilters, std::map<std::string, bool>> filterConfiguration{
+        {CoreAdviser::CoreAdviserFilters::EFFICIENCY, {{"invert", true}, {"log", true}}}};
+    auto run = [&](std::optional<size_t> keepBest, std::map<CoreAdviser::CoreAdviserFilters, std::map<std::string, double>>& scorings) {
+        CoreAdviser::MagneticCoreFilterAreaProduct filter(inputs);
+        filter.set_scorings(&scorings);
+        filter.set_filter_configuration(&filterConfiguration);
+        return filter.filter_magnetics_from(source, inputs, 1.0, keepBest);
+    };
+
+    std::map<CoreAdviser::CoreAdviserFilters, std::map<std::string, double>> allScorings;
+    auto all = run(std::nullopt, allScorings);
+    const size_t keep = 3;
+    INFO(all.size() << " survivors of " << source.size());
+    REQUIRE(all.size() > keep);  // the cull must actually drop survivors
+    // No tie across the cut, or the kept members would only test std::stable_sort's tie-breaking.
+    for (size_t i = 0; i < keep; ++i) {
+        CHECK(all[i].second > all[i + 1].second);
+    }
+    all.resize(keep);
+
+    std::map<CoreAdviser::CoreAdviserFilters, std::map<std::string, double>> keptScorings;
+    auto kept = run(keep, keptScorings);
+    REQUIRE(kept.size() == keep);
+    REQUIRE(kept.capacity() == keep);  // no copy of a dropped survivor was ever made in the result
+    for (size_t i = 0; i < keep; ++i) {
+        CHECK(kept[i].first.get_reference() == all[i].first.get_reference());
+        CHECK(kept[i].second == all[i].second);
+    }
+    // Every survivor's scoring is still recorded, the dropped ones included.
+    CHECK(keptScorings == allScorings);
+    CHECK(source.size() == cores.size());
+    settings.reset();
+}

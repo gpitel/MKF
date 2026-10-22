@@ -3,6 +3,7 @@
 #include "constructive_models/Core.h"
 #include "constructive_models/Magnetic.h"
 #include "physical_models/Temperature.h"
+#include "physical_models/StrayCapacitance.h"
 #include "support/Utils.h"
 #include <MAS.hpp>
 #include "svg.hpp"
@@ -41,7 +42,7 @@ enum class PainterProjection {
 
 enum class ElectricFieldVisualizationModel {
     LEGACY,       // Original convex-hull area + band-proportion approach
-    SDF_PHYSICS   // SDF Voronoi decomposition + bipolar/plate energy density
+    SDF_PHYSICS   // the stray-capacitance model's energy, element by element (calculate_electric_energy_painting)
 };
 
 
@@ -88,13 +89,13 @@ class PainterInterface {
                      hexStr[2] + hexStr[2];
         }
         
-        // Ensure we have a valid hex string
-        if (hexStr.length() < 6) {
-            return 0x000000; // Return black as default
+        if (hexStr.rfind("0x", 0) == 0 || hexStr.rfind("0X", 0) == 0) {
+            hexStr = hexStr.substr(2);
         }
-        
-        // Convert hex string to RGB
-        uint32_t colorValue = std::stoul(hexStr, nullptr, 16);
+        if (hexStr.length() != 6 || hexStr.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "Painter colour '" + hex + "' is not #rrggbb, 0xrrggbb or #rgb");
+        }
+        uint32_t colorValue = static_cast<uint32_t>(std::stoul(hexStr, nullptr, 16));
 
         return colorValue;
     }
@@ -283,21 +284,30 @@ class PainterInterface {
     ComplexField calculate_magnetic_field(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex = 1);
     Field calculate_electric_field(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex = 1,
                                    ElectricFieldVisualizationModel model = ElectricFieldVisualizationModel::LEGACY);
-    Field calculate_electric_field_sdf(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex = 1);
-
-    // SDF primitives for turn shapes
-    static double sdf_circle(double px, double py, double cx, double cy, double radius);
-    static double sdf_box(double px, double py, double cx, double cy, double halfW, double halfH);
-    static double sdf_oriented_box(double px, double py, double cx, double cy,
-                                   double halfW, double halfH, double angle);
-    static double sdf_turn(double px, double py, const Turn& turn);
-
-    // Energy density models per shape combination
-    static double energy_density_bipolar(double px, double py, const Turn& t1, const Turn& t2, double voltageDrop, double epsilonEff);
-    static double energy_density_parallel_plate(double px, double py, const Turn& t1, const Turn& t2, double voltageDrop, double epsilonEff);
-    static double energy_density_angled_plates(double px, double py, const Turn& t1, const Turn& t2, double voltageDrop, double epsilonEff);
-    static double energy_density_round_rect(double px, double py, const Turn& roundTurn, const Turn& rectTurn, double voltageDrop, double epsilonEff);
-    static double compute_energy_density_at_pixel(double px, double py, const Turn& t1, const Turn& t2, double voltageDrop, double epsilonEff);
+  public:
+    // The electric energy the stray-capacitance model stores, painted where each of its elements' own fields
+    // puts it (ABT painter fix 3). Every capacitance StrayCapacitance reports is 2W/dV^2 of an energy W that is a
+    // sum over elements (turn-to-turn pairs, turn-to-core faces); each element's 1/2 C |dV|^2, per unit of its
+    // length, is distributed by StrayCapacitance::sample_electric_energy_element and binned into the painter's
+    // pixel tiling. Potentials: per winding, the rms phasor of its voltage at the harmonic, times the winding's
+    // linear divider (calculate_voltages_per_turn); the core is held at its coreElectricalReference potential, or
+    // floats (charge balanced, or two bodies for a split gap).
+    struct ElectricEnergyPainting {
+        Field field;                                                  // per pixel cell, J/m^3 (zero cells kept)
+        std::vector<StrayCapacitance::ElectricEnergyElement> elements;
+        std::vector<double> energyPerLength;                          // J/m, per element
+        double totalEnergyPerLengthInPlane = 0;                       // J/m, sum over in-plane elements
+        double placedEnergyPerLength = 0;                             // J/m, binned into the cells
+        double unplacedEnergyPerLength = 0;                           // J/m, in-plane energy the sampler has no place for
+        double outsideGridEnergyPerLength = 0;                        // J/m, placed outside the painted window
+        double outOfPlaneEnergyPerLength = 0;                         // J/m, elements not in the plane (toroid top/bottom runs)
+        double gapEnergy = 0;                                         // J, the split-core gap capacitance
+        double totalEnergy = 0;                                       // J, sum of every element's energy plus gapEnergy
+        double cellWidth = 0;
+        double cellHeight = 0;
+    };
+    static ElectricEnergyPainting calculate_electric_energy_painting(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex = 1);
+  protected:
 
     CoatingInfo process_coating(double insulationThickness, InsulationWireCoating coating) {
         InsulationWireCoatingType insulationWireCoatingType = coating.get_type().value();
@@ -373,8 +383,8 @@ class PainterInterface {
     virtual std::string export_svg() = 0;
     virtual void export_png() = 0;
     virtual void paint_core(Magnetic magnetic) = 0;
-    ComplexField calculate_magnetic_field_internal_only(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex);
-    ComplexField calculate_magnetic_field_external_only(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex);
+    // Toroids: the ring-plane field of the toroidal leakage model on the painter grid (see Painter.cpp).
+    ComplexField calculate_toroidal_magnetic_field(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex = 1);
     virtual void paint_bobbin(Magnetic magnetic) = 0;
     virtual void paint_coil_sections(Magnetic magnetic) = 0;
     virtual void paint_coil_layers(Magnetic magnetic) = 0;
@@ -440,10 +450,13 @@ class Painter : public PainterInterface {
     void paint_rectangular_wire(double xCoordinate, double yCoordinate, Wire wire, double angle, std::vector<double> center, std::optional<std::string> label = std::nullopt);
     void paint_rectangle(double xCoordinate, double yCoordinate, double xDimension, double yDimension, std::string cssClassName, SVG::Group* group = nullptr, double angle = 0, std::vector<double> center = {0, 0}, std::optional<std::string> label = std::nullopt);
     void paint_circle(double xCoordinate, double yCoordinate, double radius, std::string cssClassName, SVG::Group* group = nullptr, double fillAngle=360, double angle = 0, std::vector<double> center = {0, 0}, std::optional<std::string> label = std::nullopt);
-    std::string get_color(double minimumValue, double maximumValue, std::string minimumColor, std::string maximumColor, double value);
     void paint_field_point(double xCoordinate, double yCoordinate, double xDimension, double yDimension, std::string color, std::string label);
 
  public:
+    // Colour of value on the linear scale [minimumValue, maximumValue] between the two end colours
+    // (each "#rrggbb", "0xrrggbb" or "#rgb"), always returned as "#rrggbb". Values beyond the scale,
+    // including +-inf, take the end colour; NaN throws.
+    std::string get_color(double minimumValue, double maximumValue, std::string minimumColor, std::string maximumColor, double value);
     SVG::SVG _root;
     Painter() = default;
     Painter(std::filesystem::path filepath){

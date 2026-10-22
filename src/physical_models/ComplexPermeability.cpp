@@ -3,8 +3,11 @@
 
 #include "support/Utils.h"
 #include <algorithm>
+#include <limits>
 #include <math.h>
 #include "support/Exceptions.h"
+#include "support/Logger.h"
+#include <tuple>
 
 
 namespace OpenMagnetics {
@@ -85,9 +88,9 @@ ComplexPermeabilityData ComplexPermeability::calculate_complex_permeability_from
     double materialPermeabilityScale = F_mu * initialPermeability;
 
     // Normalized span, and why it reaches so far past the anchor: get_complex_permeability
-    // CLAMPS the interpolation to this table's frequency range, so whatever the last
-    // tabulated point holds is what every higher frequency gets — a constant permeability,
-    // not a falling one. At 0.01..100x the anchor, a material anchored at 18.8 kHz
+    // answers only inside this table's frequency range (it throws outside it), and it used to
+    // hold the last tabulated point instead — a constant permeability, not a falling one.
+    // At 0.01..100x the anchor, a material anchored at 18.8 kHz
     // (Nanoperm 80000) tabulated only 188 Hz..1.88 MHz, and every sweep above 1.88 MHz
     // read back the same mu' and mu''. That reported 23,565 at 25.6 MHz where the
     // material's own initial-permeability table says 156 — 151x high — and pushed the
@@ -95,6 +98,47 @@ ComplexPermeabilityData ComplexPermeability::calculate_complex_permeability_from
     // (ABT #843). The closed form is defined for any normalized frequency; only the
     // tabulation was short. Keep the same ~10 points per decade.
     auto normalizedFrequencies = logarithmic_spaced_array(0.01, 1e5, 70);
+    // The table must also reach down to where the material's own initial-permeability data
+    // starts. get_complex_permeability answers only inside this table and throws outside it, and
+    // 0.01x the anchor lies above the data for materials anchored at MHz (Edge 26: 340 kHz), so
+    // a 100 kHz request that the data covers would have no table. Extend the grid downwards at
+    // the same logarithmic step, ending exactly at the data's lowest frequency; the points above
+    // 0.01x the anchor are unchanged.
+    {
+        double lowestDataFrequency = std::numeric_limits<double>::max();
+        for (const auto& point : InitialPermeability::get_only_frequency_dependent_points(coreMaterial)) {
+            if (point.get_frequency()) {
+                lowestDataFrequency = std::min(lowestDataFrequency, point.get_frequency().value());
+            }
+        }
+        // A material whose mu(f) is a FORMULA (Poco/Magnetics/Micrometals frequency factors: no
+        // tabulated points) is defined down to DC, so its table must reach low frequencies too.
+        // Stopping at 0.01x the anchor refused GPC 26 (anchor ~1 MHz) at 1 kHz with "complex
+        // permeability data only from 10 kHz" — data it never had; the limit was this grid's
+        // (user report 2026-10-09). Down there the closed form gives mu' -> mu_i and mu'' -> 0.
+        // A formula material stores ONE initial-permeability point (plus its modifiers);
+        // get_only_frequency_dependent_points samples that formula from the measurement frequency
+        // (10 kHz) up, so those samples are not data and must not set the table's lower end.
+        constexpr double formulaLowestFrequency = 1;  // Hz
+        bool isFormulaMaterial = std::holds_alternative<PermeabilityPoint>(coreMaterial.get_permeability().get_initial());
+        bool hasTabulatedPoints = !isFormulaMaterial && lowestDataFrequency < std::numeric_limits<double>::max();
+        double tableLowestFrequency = hasTabulatedPoints ? lowestDataFrequency : formulaLowestFrequency;
+        if (frequencyFor67Point78Drop > 0) {
+            double lowestNormalizedFrequency = tableLowestFrequency / frequencyFor67Point78Drop;
+            double logarithmicStep = normalizedFrequencies[1] / normalizedFrequencies[0];
+            std::vector<double> lowerNormalizedFrequencies;
+            double normalizedFrequency = normalizedFrequencies.front() / logarithmicStep;
+            while (normalizedFrequency > lowestNormalizedFrequency) {
+                lowerNormalizedFrequencies.push_back(normalizedFrequency);
+                normalizedFrequency /= logarithmicStep;
+            }
+            if (lowestNormalizedFrequency < normalizedFrequencies.front()) {
+                lowerNormalizedFrequencies.push_back(lowestNormalizedFrequency);
+            }
+            std::reverse(lowerNormalizedFrequencies.begin(), lowerNormalizedFrequencies.end());
+            normalizedFrequencies.insert(normalizedFrequencies.begin(), lowerNormalizedFrequencies.begin(), lowerNormalizedFrequencies.end());
+        }
+    }
     // Where the material's own initial-permeability curve actually ends. Past that point
     // the interpolator turns back UP (Nanoperm 80000: 156 at its last point, 25.6 MHz, then
     // 451 at 50 MHz and 1,057 at 100 MHz), and permeability does not recover after roll-off.
@@ -164,14 +208,37 @@ ComplexPermeabilityData ComplexPermeability::calculate_complex_permeability_from
         // mu'(f) to the modelled one, which pins mu' to the data and carries mu'' along at
         // the modelled loss angle (ABT #843). Materials without a frequency-dependent table
         // never reach this function, so there is always a curve to read.
-        double measuredPermeability = InitialPermeability::get_initial_permeability(coreMaterial, std::nullopt, std::nullopt, permeabilityPointFrequency);
+        // The table ENDS where the material's own frequency model stops describing a material.
+        // A formula mu(f) is a fit with a valid range: XFlux 60's Magnetics frequencyFactor quartic
+        // reads 59.9 at 100 kHz, 58.5 at 1 MHz, 30.7 at 20 MHz and 0.83 at 26.6 MHz, and goes
+        // negative after that. A relative permeability below the vacuum's is not a material value
+        // (get_initial_permeability refuses it, ABT #1740), so there is no table point there: the
+        // points before it stand, and get_complex_permeability answers inside them and throws
+        // above them, like any other end of the tabulated range. Asking the checked getter here
+        // instead made that one out-of-range point throw away the whole table, and the material
+        // had no complex permeability at 100 kHz either (ABT #1790). The model value is read as
+        // it stands only to find that end; it is never used below 1, clamped or floored.
+        // A point also needs the model 5 % above it (the local slope of the Kramers-Kronig loss
+        // angle below), so the table ends at the first frequency where either read is below 1.
+        // Past the last TABULATED point the model is not read at all (see below).
+        constexpr double localSlopeRelativeStep = 1.05;
+        bool beyondTheTabulatedData = lastTabulatedFrequency > 0 && permeabilityPointFrequency > lastTabulatedFrequency;
+        double measuredPermeability = 0;
+        double permeabilityAbove = 0;
+        if (!beyondTheTabulatedData) {
+            measuredPermeability = InitialPermeability::get_initial_permeability_model_value(coreMaterial, std::nullopt, std::nullopt, permeabilityPointFrequency);
+            permeabilityAbove = InitialPermeability::get_initial_permeability_model_value(coreMaterial, std::nullopt, std::nullopt, permeabilityPointFrequency * localSlopeRelativeStep);
+            if (measuredPermeability < 1 || permeabilityAbove < 1) {
+                break;
+            }
+        }
 
         // Past its last tabulated point the initial-permeability interpolator turns back UP:
         // Nanoperm 80000 reads 156 at 25.6 MHz (its last point), then 451 at 50 MHz and
         // 1,057 at 100 MHz. Permeability does not recover after roll-off, so a rise means we
         // have run off the end of the data, not that the material got more permeable. Carry
         // on with the last real log-log slope instead of following the rise (ABT #843).
-        if (lastTabulatedFrequency > 0 && permeabilityPointFrequency > lastTabulatedFrequency) {
+        if (beyondTheTabulatedData) {
             measuredPermeability = lastTabulatedPermeability * pow(permeabilityPointFrequency / lastTabulatedFrequency, beyondTheDataLogSlope);
         }
 
@@ -187,15 +254,13 @@ ComplexPermeabilityData ComplexPermeability::calculate_complex_permeability_from
             // (a flat table says nothing about eddy loss, which the closed form does).
             double sheetAngle = std::atan2(std::max(muCoreImag, 0.0), muCoreReal);
             double localSlope = 0;
-            if (lastTabulatedFrequency > 0 && permeabilityPointFrequency > lastTabulatedFrequency) {
+            if (beyondTheTabulatedData) {
                 localSlope = beyondTheDataLogSlope;
             }
             else {
-                constexpr double relativeStep = 1.05;
-                double permeabilityAbove = InitialPermeability::get_initial_permeability(coreMaterial, std::nullopt, std::nullopt, permeabilityPointFrequency * relativeStep);
-                double permeabilityBelow = InitialPermeability::get_initial_permeability(coreMaterial, std::nullopt, std::nullopt, permeabilityPointFrequency / relativeStep);
+                double permeabilityBelow = InitialPermeability::get_initial_permeability(coreMaterial, std::nullopt, std::nullopt, permeabilityPointFrequency / localSlopeRelativeStep);
                 if (permeabilityAbove > 0 && permeabilityBelow > 0) {
-                    localSlope = log(permeabilityAbove / permeabilityBelow) / (2 * log(relativeStep));
+                    localSlope = log(permeabilityAbove / permeabilityBelow) / (2 * log(localSlopeRelativeStep));
                 }
             }
             // n in [0, 0.95]: negative slopes only (a rising read is interpolator artefact),
@@ -225,28 +290,53 @@ ComplexPermeabilityData ComplexPermeability::calculate_complex_permeability_from
 }
 
 
-std::pair<double, double> ComplexPermeability::get_complex_permeability(CoreMaterial coreMaterial, double frequency) {
-    // Fast path: if both interpolators are already cached for this material,
-    // skip the expensive recomputation of the complex permeability data
-    // (calculate_frequency_for_initial_permeability_drop runs O(40) pow() per
-    // call and is invoked 3 times per material). Without this guard, advisers
-    // that scan thousands of cores share only a few materials and end up
-    // rebuilding the same per-material curves thousands of times, which
-    // dominates DMC/CMC core selection wall time.
-    const std::string& materialNameForCache = coreMaterial.get_name();
-    if (complexPermeabilityRealInterps.contains(materialNameForCache) &&
-        complexPermeabilityImaginaryInterps.contains(materialNameForCache)) {
-        auto realSpan = complexPermeabilityRealFrequencySpans[materialNameForCache];
-        double cachedReal = std::max(1., complexPermeabilityRealInterps[materialNameForCache](std::clamp(frequency, realSpan.first, realSpan.second)));
-        if (std::isnan(cachedReal)) {
-            throw NaNResultException("complex Permeability real part must be a number, not NaN");
-        }
-        auto imaginarySpan = complexPermeabilityImaginaryFrequencySpans[materialNameForCache];
-        double cachedImag = complexPermeabilityImaginaryInterps[materialNameForCache](std::clamp(frequency, imaginarySpan.first, imaginarySpan.second));
-        if (std::isnan(cachedImag)) {
-            throw NaNResultException("complex Permeability imaginary part must be a number, not NaN");
-        }
-        return {cachedReal, cachedImag};
+namespace {
+void combine_hash(std::size_t& seed, std::size_t value) {
+    seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+}
+
+// The caches are per thread; a catalogue clear or reload on any thread empties them on this one.
+void drop_complex_permeability_caches_if_the_catalogue_changed() {
+    const uint64_t currentCatalogueGeneration = catalogueGeneration.load(std::memory_order_relaxed);
+    if (complexPermeabilityCachesCatalogueGeneration == currentCatalogueGeneration) {
+        return;
+    }
+    complexPermeabilityRealInterps.clear();
+    complexPermeabilityImaginaryInterps.clear();
+    complexPermeabilityRealFrequencySpans.clear();
+    complexPermeabilityImaginaryFrequencySpans.clear();
+    complexPermeabilityEstimates.clear();
+    complexPermeabilityEstimateRefusals.clear();
+    complexPermeabilityCachesCatalogueGeneration = currentCatalogueGeneration;
+}
+} // namespace
+
+std::string ComplexPermeability::cache_key(const CoreMaterial& coreMaterial) {
+    // Everything the curves are built from: the tabulated complex permeability when there is one,
+    // otherwise the initial permeability they are derived from (the initial permeability is part
+    // of the key either way: the estimates of the untabulated range read it too).
+    std::size_t seed = 0;
+    const auto& permeability = coreMaterial.get_permeability();
+    combine_hash(seed, InitialPermeability::hash_permeability(permeability.get_initial()));
+    const auto complex = permeability.get_complex();
+    if (complex) {
+        combine_hash(seed, 1);
+        combine_hash(seed, InitialPermeability::hash_permeability(complex->get_real()));
+        combine_hash(seed, InitialPermeability::hash_permeability(complex->get_imaginary()));
+    }
+    return coreMaterial.get_name() + "#" + std::to_string(seed);
+}
+
+std::string ComplexPermeability::ensure_interpolators(const CoreMaterial& coreMaterial) {
+    // Cached per material: advisers that scan thousands of cores share only a few materials,
+    // and rebuilding the derived curves (calculate_frequency_for_initial_permeability_drop runs
+    // O(40) pow() per call, three times per material) dominated DMC/CMC core selection.
+    drop_complex_permeability_caches_if_the_catalogue_changed();
+    const std::string& materialName = coreMaterial.get_name();
+    std::string cacheKey = cache_key(coreMaterial);
+    if (complexPermeabilityRealInterps.contains(cacheKey) &&
+        complexPermeabilityImaginaryInterps.contains(cacheKey)) {
+        return cacheKey;
     }
 
     ComplexPermeabilityData complexPermeabilityData;
@@ -255,7 +345,7 @@ std::pair<double, double> ComplexPermeability::get_complex_permeability(CoreMate
             complexPermeabilityData = calculate_complex_permeability_from_frequency_dependent_initial_permeability(coreMaterial);
         }
         else {
-            throw MaterialDataMissingException(coreMaterial.get_name(), "Complex permeability");
+            throw MaterialDataMissingException(materialName, "Complex permeability");
         }
     }
     else {
@@ -267,73 +357,177 @@ std::pair<double, double> ComplexPermeability::get_complex_permeability(CoreMate
 
     if (!std::holds_alternative<std::vector<PermeabilityPoint>>(realPart) ||
         !std::holds_alternative<std::vector<PermeabilityPoint>>(imaginaryPart)) {
-        throw InvalidInputException(ErrorCode::MISSING_DATA, "Complex permeability data is not in expected format for " + coreMaterial.get_name());
-    }
-    auto realPermeabilityPoints = std::get<std::vector<PermeabilityPoint>>(realPart);
-    auto imaginaryPermeabilityPoints = std::get<std::vector<PermeabilityPoint>>(imaginaryPart);
-
-    if (realPermeabilityPoints.size() < 2) {
-        throw InvalidInputException(ErrorCode::MISSING_DATA, "Not enough complex permeability data for  " + coreMaterial.get_name());
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Complex permeability data is not in expected format for " + materialName);
     }
 
-    if (!complexPermeabilityRealInterps.contains(coreMaterial.get_name()))
-    {
-        int n = realPermeabilityPoints.size();
-        std::vector<double> x, y;
-
-
-        std::sort(realPermeabilityPoints.begin(), realPermeabilityPoints.end(), [](const PermeabilityPoint& b1, const PermeabilityPoint& b2) {
-            return b1.get_frequency().value() < b2.get_frequency().value();
-        });
-
-
-        for (int i = 0; i < n; i++) {
-            if (x.empty() || fabs(*realPermeabilityPoints[i].get_frequency() - x.back()) > 1e-9) {
-                x.push_back(*realPermeabilityPoints[i].get_frequency());
-                y.push_back(realPermeabilityPoints[i].get_value());
+    auto buildInterpolator = [&](std::vector<PermeabilityPoint> points, const std::string& part,
+                                 std::map<std::string, tk::spline>& interps,
+                                 std::map<std::string, std::pair<double, double>>& spans) {
+        for (const auto& point : points) {
+            if (!point.get_frequency()) {
+                throw InvalidInputException(ErrorCode::MISSING_DATA, "Complex permeability " + part + " point without frequency in " + materialName);
             }
         }
+        std::sort(points.begin(), points.end(), [](const PermeabilityPoint& b1, const PermeabilityPoint& b2) {
+            return b1.get_frequency().value() < b2.get_frequency().value();
+        });
+        std::vector<double> x, y;
+        for (const auto& point : points) {
+            if (x.empty() || fabs(*point.get_frequency() - x.back()) > 1e-9) {
+                x.push_back(*point.get_frequency());
+                y.push_back(point.get_value());
+            }
+        }
+        if (x.size() < 2) {
+            throw InvalidInputException(ErrorCode::MISSING_DATA, "Not enough complex permeability " + part + " data for " + materialName);
+        }
+        interps[cacheKey] = tk::spline(x, y, tk::spline::cspline_hermite);
+        spans[cacheKey] = {x.front(), x.back()};
+    };
 
-        tk::spline interp(x, y, tk::spline::cspline_hermite);
-        complexPermeabilityRealInterps[coreMaterial.get_name()] = interp;
-        complexPermeabilityRealFrequencySpans[coreMaterial.get_name()] = {x.front(), x.back()};
+    buildInterpolator(std::get<std::vector<PermeabilityPoint>>(realPart), "real", complexPermeabilityRealInterps, complexPermeabilityRealFrequencySpans);
+    buildInterpolator(std::get<std::vector<PermeabilityPoint>>(imaginaryPart), "imaginary", complexPermeabilityImaginaryInterps, complexPermeabilityImaginaryFrequencySpans);
+    return cacheKey;
+}
+
+std::pair<double, double> ComplexPermeability::get_frequency_range(std::string coreMaterialName) {
+    return get_frequency_range(Core::resolve_material(coreMaterialName));
+}
+
+std::pair<double, double> ComplexPermeability::get_frequency_range(CoreMaterial coreMaterial) {
+    return frequency_range_for_key(ensure_interpolators(coreMaterial), coreMaterial.get_name());
+}
+
+std::pair<double, double> ComplexPermeability::frequency_range_for_key(const std::string& cacheKey, const std::string& materialName) {
+    const auto& realSpan = complexPermeabilityRealFrequencySpans.at(cacheKey);
+    const auto& imaginarySpan = complexPermeabilityImaginaryFrequencySpans.at(cacheKey);
+    // Both parts are needed for every value returned, so the usable range is where both exist.
+    double minimum = std::max(realSpan.first, imaginarySpan.first);
+    double maximum = std::min(realSpan.second, imaginarySpan.second);
+    if (minimum > maximum) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Complex permeability of " + materialName +
+                                    ": the real part is tabulated over " + std::to_string(realSpan.first) + "-" + std::to_string(realSpan.second) +
+                                    " Hz and the imaginary part over " + std::to_string(imaginarySpan.first) + "-" + std::to_string(imaginarySpan.second) +
+                                    " Hz; the two do not overlap");
     }
-    auto realSpan = complexPermeabilityRealFrequencySpans[coreMaterial.get_name()];
-    double complexPermeabilityRealValue = std::max(1., complexPermeabilityRealInterps[coreMaterial.get_name()](std::clamp(frequency, realSpan.first, realSpan.second)));
+    return {minimum, maximum};
+}
 
+std::pair<double, double> ComplexPermeability::get_tabulated_complex_permeability(const CoreMaterial& coreMaterial, double frequency) {
+    // Inside the tabulated range only. Outside it there is no data: holding the last point
+    // (as this used to) read K081's stale 1 MHz point at 350 MHz, and a mu' floor of 1 hid a
+    // tabulated value below vacuum instead of reporting it. Both are gone; a mu' below 1 in
+    // the data is returned as it is.
+    const std::string cacheKey = ensure_interpolators(coreMaterial);
+    auto [minimumFrequency, maximumFrequency] = frequency_range_for_key(cacheKey, coreMaterial.get_name());
+    if (!(frequency >= minimumFrequency && frequency <= maximumFrequency)) {
+        throw ComplexPermeabilityFrequencyOutOfRangeException(coreMaterial.get_name(), frequency, minimumFrequency, maximumFrequency);
+    }
+    double complexPermeabilityRealValue = complexPermeabilityRealInterps.at(cacheKey)(frequency);
     if (std::isnan(complexPermeabilityRealValue)) {
         throw NaNResultException("complex Permeability real part must be a number, not NaN");
     }
-
-    if (!complexPermeabilityImaginaryInterps.contains(coreMaterial.get_name()))
-    {
-        int n = imaginaryPermeabilityPoints.size();
-        std::vector<double> x, y;
-
-        std::sort(imaginaryPermeabilityPoints.begin(), imaginaryPermeabilityPoints.end(), [](const PermeabilityPoint& b1, const PermeabilityPoint& b2) {
-            return b1.get_frequency().value() < b2.get_frequency().value();
-        });
-
-
-        for (int i = 0; i < n; i++) {
-            if (x.empty() || fabs(*imaginaryPermeabilityPoints[i].get_frequency() - x.back()) > 1e-9) {
-                x.push_back(*imaginaryPermeabilityPoints[i].get_frequency());
-                y.push_back(imaginaryPermeabilityPoints[i].get_value());
-            }
-        }
-
-        tk::spline interp(x, y, tk::spline::cspline_hermite);
-        complexPermeabilityImaginaryInterps[coreMaterial.get_name()] = interp;
-        complexPermeabilityImaginaryFrequencySpans[coreMaterial.get_name()] = {x.front(), x.back()};
-    }
-    auto imaginarySpan = complexPermeabilityImaginaryFrequencySpans[coreMaterial.get_name()];
-    double complexPermeabilityImaginaryValue = complexPermeabilityImaginaryInterps[coreMaterial.get_name()](std::clamp(frequency, imaginarySpan.first, imaginarySpan.second));
-
+    double complexPermeabilityImaginaryValue = complexPermeabilityImaginaryInterps.at(cacheKey)(frequency);
     if (std::isnan(complexPermeabilityImaginaryValue)) {
         throw NaNResultException("complex Permeability imaginary part must be a number, not NaN");
     }
-
     return {complexPermeabilityRealValue, complexPermeabilityImaginaryValue};
+}
+
+std::shared_ptr<const ComplexPermeabilityEstimate> ComplexPermeability::find_or_build_estimate(const CoreMaterial& coreMaterial, const std::string& cacheKey) {
+    if (complexPermeabilityEstimateRefusals.contains(cacheKey)) {
+        return nullptr;
+    }
+    auto cached = complexPermeabilityEstimates.find(cacheKey);
+    if (cached != complexPermeabilityEstimates.end()) {
+        return cached->second;
+    }
+    std::shared_ptr<const ComplexPermeabilityEstimate> estimate;
+    try {
+        estimate = std::make_shared<const ComplexPermeabilityEstimate>(estimate_complex_permeability(coreMaterial));
+    }
+    catch (const ComplexPermeabilityEstimatorRefusal& exception) {
+        // Only the estimator's own refusal (unsupported class, too few donors, ...) is recorded; the
+        // caller turns it into ComplexPermeabilityEstimateUnavailableException. Anything else (e.g.
+        // malformed MAS data) propagates.
+        complexPermeabilityEstimateRefusals.emplace(cacheKey, exception.reason());
+        return nullptr;
+    }
+    // One WARNING per material, as the heat-conductivity estimate (ABT #1753).
+    OM_WARNING(estimate->summary());
+    complexPermeabilityEstimates[cacheKey] = estimate;
+    return estimate;
+}
+
+const ComplexPermeabilityEstimate& ComplexPermeability::estimate_for(const CoreMaterial& coreMaterial, const std::string& cacheKey, double frequency) {
+    auto estimate = find_or_build_estimate(coreMaterial, cacheKey);
+    if (!estimate) {
+        auto [minimumFrequency, maximumFrequency] = frequency_range_for_key(cacheKey, coreMaterial.get_name());
+        throw ComplexPermeabilityEstimateUnavailableException(coreMaterial.get_name(), frequency, minimumFrequency, maximumFrequency,
+                                                              complexPermeabilityEstimateRefusals.at(cacheKey));
+    }
+    return *estimate;
+}
+
+ComplexPermeabilityValue ComplexPermeability::get_complex_permeability_with_source(const CoreMaterial& coreMaterial, double frequency) {
+    // The range first: building the tables throws for parts that do not overlap.
+    const std::string cacheKey = ensure_interpolators(coreMaterial);
+    auto [minimumFrequency, maximumFrequency] = frequency_range_for_key(cacheKey, coreMaterial.get_name());
+    if (frequency >= minimumFrequency && frequency <= maximumFrequency) {
+        auto [real, imaginary] = get_tabulated_complex_permeability(coreMaterial, frequency);
+        return {real, imaginary, ComplexPermeabilitySource::TABULATED, ComplexPermeabilitySource::TABULATED, "", ""};
+    }
+    // A frequency that is not a finite positive number has no complex permeability, tabulated or not.
+    if (!std::isfinite(frequency) || frequency <= 0) {
+        throw ComplexPermeabilityFrequencyOutOfRangeException(coreMaterial.get_name(), frequency, minimumFrequency, maximumFrequency);
+    }
+    // Outside the range where both parts are tabulated: each part from its own table where it has
+    // one, the approved estimate where it has not (ABT #1861).
+    const std::string& materialName = coreMaterial.get_name();
+    const auto& estimate = estimate_for(coreMaterial, cacheKey, frequency);
+    ComplexPermeabilityValue value;
+    auto evaluatePart = [&](ComplexPermeabilityPart part, std::map<std::string, tk::spline>& interps,
+                            std::map<std::string, std::pair<double, double>>& spans,
+                            double& result, ComplexPermeabilitySource& source, std::string& method) {
+        const auto& span = spans.at(cacheKey);
+        if (frequency >= span.first && frequency <= span.second) {
+            result = interps.at(cacheKey)(frequency);
+            if (std::isnan(result)) {
+                throw NaNResultException("complex permeability " + std::string(part == ComplexPermeabilityPart::REAL ? "real" : "imaginary") +
+                                         " part must be a number, not NaN");
+            }
+            source = ComplexPermeabilitySource::TABULATED;
+            return;
+        }
+        auto side = frequency < span.first ? ComplexPermeabilityGapSide::BELOW : ComplexPermeabilityGapSide::ABOVE;
+        const auto& gap = estimate.gap(part, side);
+        try {
+            std::tie(result, source) = gap.evaluate(frequency);
+        }
+        catch (const ComplexPermeabilityEstimatorRefusal& exception) {
+            throw ComplexPermeabilityEstimateUnavailableException(materialName, frequency, minimumFrequency, maximumFrequency, exception.reason());
+        }
+        method = gap.method(source);
+    };
+    evaluatePart(ComplexPermeabilityPart::REAL, complexPermeabilityRealInterps, complexPermeabilityRealFrequencySpans,
+                 value.real, value.realSource, value.realMethod);
+    evaluatePart(ComplexPermeabilityPart::IMAGINARY, complexPermeabilityImaginaryInterps, complexPermeabilityImaginaryFrequencySpans,
+                 value.imaginary, value.imaginarySource, value.imaginaryMethod);
+    return value;
+}
+
+std::pair<double, double> ComplexPermeability::get_complex_permeability(CoreMaterial coreMaterial, double frequency) {
+    auto value = get_complex_permeability_with_source(coreMaterial, frequency);
+    return {value.real, value.imaginary};
+}
+
+std::vector<ComplexPermeabilityEstimatedRange> ComplexPermeability::get_estimated_ranges(const CoreMaterial& coreMaterial) {
+    auto estimate = find_or_build_estimate(coreMaterial, ensure_interpolators(coreMaterial));
+    if (!estimate) {
+        // Refused: nothing outside the table is answered, so nothing is estimated.
+        return {};
+    }
+    return OpenMagnetics::get_estimated_ranges(*estimate);
 }
 
 } // namespace OpenMagnetics

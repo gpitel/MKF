@@ -40,26 +40,40 @@
 
 #include <source_location>
 #include <cmath>
+#include <numbers>
 #include <filesystem>
 #include <fstream>
 #include <vector>
 #include <utility>
+#include <algorithm>
+#include <iterator>
+#include <limits>
 #include "json.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/benchmark/catch_benchmark.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "advisers/MagneticFilter.h"
 #include "advisers/MagneticAdviser.h"
+#include "advisers/CoreAdviser.h"
+#include "physical_models/Temperature.h"
 #include "constructive_models/Magnetic.h"
 #include "constructive_models/Core.h"
 #include "constructive_models/Coil.h"
 #include "constructive_models/Wire.h"
+#include "physical_models/ComplexPermeability.h"
+#include "physical_models/WindingLosses.h"
+#include "physical_models/WindingSkinEffectLosses.h"
 #include "processors/Inputs.h"
+#include "processors/ResultsAnalyzer.h"
+#include "physical_models/MagnetizingInductance.h"
 #include "support/Settings.h"
 #include "support/Utils.h"
 #include "support/Exceptions.h"
+#include "support/Logger.h"
 
 #include "TestingUtils.h"
 
@@ -215,9 +229,20 @@ const std::map<std::string, Snapshot> kSnapshots = {
     // E35 ferrite at ~1.73 A peak has isat << margin·ipeak, so SATURATION
     // flips valid true→false (was {true, 0.1185}). ENERGY_STORED (-0.4 %) and
     // TEMPERATURE (-1.4 %) drift from the same reclassified flux/B recompute.
-    {"ENERGY_STORED",                                   {true,  0.00018781148528340766}},
+    // Re-pinned 2026-10-12 (ABT #1766, user-approved): the E 35 fixture's le/Ve now carry the field-exact
+    // right-angle bends (Ae unchanged), i.e. a lower core reluctance: ENERGY_STORED 1.8781148528340766e-4 ->
+    // 1.8031756024430384e-4, COST 4.45732988417687 -> 4.3620705094657808 (smaller Ve, lighter core),
+    // MAGNETIZING_INDUCTANCE 5.7629428244944511e-3 -> 6.006604362371216e-3.
+    {"ENERGY_STORED",                                   {true,  0.00018031756024430384}},
     {"ESTIMATED_COST",                                  {true,  1.7774692926005085}},
-    {"COST",                                            {true,  7.0}},
+    // COST re-derived 2026-09-30: the filter now scores the unit cost in US$ at 1000 pieces (CostBasis) instead
+    // of numberLayers + wire relative cost (7.0). By hand, for this fixture:
+    //   core      E 35 Ve 8.07 cm3 x 3C97 4800 kg/m3 = 38.74 g; MnZn law 21.03 x 0.03874^0.6407 = US$2.620
+    //   conductor 60 turns, 3.004 m (50 mm/turn round the 10 x 10 mm centre leg) of 1.00 mm copper
+    //             = 21.09 g x US$14.737/kg                                          = US$0.311
+    //   labour    60 x 0.105 min / 0.5 = 12.6 min at US$7.27/h                      = US$1.527
+    //   total                                                                       = US$4.457
+    {"COST",                                            {true,  4.3620705094657808}},
     // CORE_AND_DC_LOSSES returns (false, 0) here because the reference
     // magnetic has no DcResistance computed on the wound coil → ohmic
     // losses model rejects it. This locks the silent invalid-fallthrough
@@ -247,7 +272,8 @@ const std::map<std::string, Snapshot> kSnapshots = {
     {"DC_CURRENT_DENSITY",                              {false, 0.0}},
     {"EFFECTIVE_CURRENT_DENSITY",                       {false, 0.0}},
     {"IMPEDANCE",                                       {true,  0.0}},
-    {"MAGNETIZING_INDUCTANCE",                          {false, 0.0057629428244944511}},
+    // Re-pinned 2026-10-12 (ABT #1766): 5.7629428244944511e-3 -> 6.006604362371216e-3, exact le (lower core reluctance).
+    {"MAGNETIZING_INDUCTANCE",                          {false, 0.006006604362371216}},
     {"SKIN_LOSSES_DENSITY",                             {false, 0.0}},
     {"TEMPERATURE_RISE",                                {true,  25.0}},
     // LOCKS BUG: MagnetomotiveForce only push_backs in INSULATION branch
@@ -387,6 +413,87 @@ TEST_CASE("MagneticFilter LOSSES_NO_PROXIMITY snapshot",
     // The captured snapshot reflects this double-count; once fixed, snapshot
     // must be regenerated.
     evaluate_and_check("LOSSES_NO_PROXIMITY", MagneticFilters::LOSSES_NO_PROXIMITY);
+}
+
+// ABT #838: the loss filters and the core adviser's post-processing publish core AND winding
+// losses from ONE loss <-> temperature solve. The published pair must be self-consistent: heating
+// the thermal network with exactly these losses puts the core's hottest node at the temperature
+// the core losses were evaluated at and the mean turn at the temperature the winding losses were
+// evaluated at. (The filters used to compute the winding losses at ambient, or at the inputs'
+// maximum temperature, beside core losses solved with their own copy of the winding losses.)
+// Each publishes the winding-loss model it always did: full, DC + skin (no proximity), DC only.
+TEST_CASE("Loss filters publish core and winding losses solved at one operating temperature",
+          "[magnetic-filter][losses][smoke-test]") {
+    settings.reset();
+    const double tolerance = MagneticSimulator::kOperatingTemperatureTolerance;
+    // A wound inductor that heats up measurably (the reference magnetic above has two windings
+    // and the reference inputs one excitation, so the loss filters reject it: their snapshots
+    // are {false, 0}).
+    auto examplePath = std::filesystem::path{std::source_location::current().file_name()}
+        .parent_path().append("..").append("MAS").append("examples").append("01_simple_inductor_etd34_n87.json");
+    REQUIRE(std::filesystem::exists(examplePath));
+    auto exampleMas = OpenMagneticsTesting::mas_loader(examplePath.string());
+    auto exampleMagnetic = OpenMagnetics::magnetic_autocomplete(exampleMas.get_magnetic());
+    auto inputs = OpenMagnetics::inputs_autocomplete(exampleMas.get_inputs(), exampleMagnetic);
+    if (!exampleMagnetic.get_coil().get_turns_description()) {
+        exampleMagnetic.get_mutable_coil().wind();
+    }
+    const double ambientTemperature = inputs.get_operating_points()[0].get_conditions().get_ambient_temperature();
+
+    auto checkSelfConsistent = [&](const OpenMagnetics::Magnetic& magnetic, const MAS::OperatingPoint& operatingPoint, const OpenMagnetics::Outputs& output) {
+        REQUIRE(output.get_core_losses());
+        REQUIRE(output.get_winding_losses());
+        REQUIRE(output.get_winding_losses()->get_temperature());
+        const double coreTemperature = output.get_core_losses()->get_temperature();
+        const double windingTemperature = output.get_winding_losses()->get_temperature().value();
+        auto network = Temperature(magnetic, TemperatureConfig::fromSimulatedOutput(operatingPoint, output)).calculateTemperatures();
+        REQUIRE(network.maximumCoreTemperature);
+        REQUIRE(network.averageTurnTemperature);
+        CAPTURE(coreTemperature, windingTemperature, network.maximumCoreTemperature.value(), network.averageTurnTemperature.value(),
+                output.get_core_losses()->get_core_losses(), output.get_winding_losses()->get_winding_losses());
+        // The design must actually heat up, or "evaluated at ambient" would pass too.
+        REQUIRE(windingTemperature > ambientTemperature + 4 * tolerance);
+        CHECK(std::fabs(network.maximumCoreTemperature.value() - coreTemperature) < tolerance);
+        CHECK(std::fabs(network.averageTurnTemperature.value() - windingTemperature) < tolerance);
+    };
+
+    SECTION("MagneticFilterLosses: full winding losses") {
+        auto magnetic = exampleMagnetic;
+        std::vector<OpenMagnetics::Outputs> outputs;
+        auto [valid, score] = MagneticFilterLosses().evaluate_magnetic(&magnetic, &inputs, &outputs);
+        REQUIRE(valid);
+        REQUIRE(outputs.size() == inputs.get_operating_points().size());
+        checkSelfConsistent(magnetic, inputs.get_operating_points()[0], outputs[0]);
+        auto operatingPoint = inputs.get_operating_points()[0];
+        double expected = MagneticSimulator().calculate_winding_losses(operatingPoint, magnetic,
+            outputs[0].get_winding_losses()->get_temperature().value()).get_winding_losses();
+        CHECK_THAT(outputs[0].get_winding_losses()->get_winding_losses(), WithinRel(expected, 1e-9));
+        CHECK_THAT(score, WithinRel(outputs[0].get_core_losses()->get_core_losses() + expected, 1e-9));
+    }
+    SECTION("MagneticFilterLossesNoProximity: DC + skin effect, no proximity") {
+        auto magnetic = exampleMagnetic;
+        std::vector<OpenMagnetics::Outputs> outputs;
+        auto [valid, score] = MagneticFilterLossesNoProximity().evaluate_magnetic(&magnetic, &inputs, &outputs);
+        REQUIRE(valid);
+        REQUIRE(outputs.size() == inputs.get_operating_points().size());
+        checkSelfConsistent(magnetic, inputs.get_operating_points()[0], outputs[0]);
+        const double windingTemperature = outputs[0].get_winding_losses()->get_temperature().value();
+        auto operatingPoint = inputs.get_operating_points()[0];
+        double expected = WindingSkinEffectLosses::calculate_skin_effect_losses(magnetic.get_coil(), windingTemperature,
+            WindingOhmicLosses::calculate_ohmic_losses(magnetic.get_coil(), operatingPoint, windingTemperature), 0.5).get_winding_losses();
+        CHECK_THAT(outputs[0].get_winding_losses()->get_winding_losses(), WithinRel(expected, 1e-9));
+    }
+    SECTION("CoreAdviser::post_process_core: DC winding losses") {
+        auto magnetic = exampleMagnetic;
+        auto mas = CoreAdviser().post_process_core(magnetic, inputs);
+        REQUIRE(mas.get_outputs().size() == inputs.get_operating_points().size());
+        const auto& output = mas.get_outputs()[0];
+        const auto& operatingPoint = mas.get_inputs().get_operating_points()[0];
+        checkSelfConsistent(mas.get_magnetic(), operatingPoint, output);
+        double expected = WindingOhmicLosses::calculate_ohmic_losses(mas.get_magnetic().get_coil(), operatingPoint,
+            output.get_winding_losses()->get_temperature().value()).get_winding_losses();
+        CHECK_THAT(output.get_winding_losses()->get_winding_losses(), WithinRel(expected, 1e-9));
+    }
 }
 
 TEST_CASE("MagneticFilter DIMENSIONS snapshot",
@@ -591,8 +698,41 @@ TEST_CASE("MagneticFilter TEMPERATURE snapshot",
     // CRASH. We construct via the explicit 2-arg ctor to keep this test alive,
     // and assert that the factory variant THROWS or crashes — proving the bug.
     settings.reset();
+    // Fixture correction: the temperature filter now solves the copper of every winding the
+    // inputs excite, and a coil with a winding the inputs do not excite has no current to give
+    // it (MagneticFilter::with_every_winding throws). The reference inputs excite one winding,
+    // so the filter gets the reference magnetic's first winding alone (40 turns), wound.
     auto magnetic = make_reference_magnetic();
-    auto inputs = make_reference_inputs();
+    {
+        auto coil = magnetic.get_coil();
+        auto windings = coil.get_functional_description();
+        windings.resize(1);
+        coil.set_functional_description(windings);
+        coil.unwind();
+        coil.wind();
+        magnetic.set_coil(coil);
+    }
+    // With one winding and one excitation the current IS the magnetizing current, and this
+    // ungapped E 35 is 5.86 mH, not the 100 uH the reference inputs state: their 1.73 A peak
+    // drove it to 2.5 T (3.4 kW of core losses, 2304 C, invalid). The two-winding reference
+    // had hidden that: its flux came from the inputs' 100 uH, 0.043 T. The snapshot keeps that
+    // excitation, the same volt-seconds, on the magnetic's own inductance: 1.73 A x 100 uH / L
+    // of current, the same 0.043 T and core losses, and the copper the filter now scores.
+    OpenMagnetics::Inputs inputs;
+    {
+        MagnetizingInductance magnetizingInductanceModel;
+        const double ownInductance = magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(magnetic)
+                                         .get_magnetizing_inductance().get_nominal().value();
+        OpenMagneticsTesting::QuickInputsConfig cfg;
+        cfg.frequency = 100000;
+        cfg.magnetizingInductance = ownInductance;
+        cfg.temperature = 25;
+        cfg.label = WaveformLabel::TRIANGULAR;
+        cfg.peakToPeak = 2 * 1.73205 * 100e-6 / ownInductance;
+        cfg.dutyCycle = 0.5;
+        cfg.offset = 0;
+        inputs = OpenMagneticsTesting::create_quick_test_inputs(cfg);
+    }
     MagneticFilterTemperature filter(inputs, 130.0);
     auto [valid, score] = filter.evaluate_magnetic(&magnetic, &inputs);
 
@@ -606,6 +746,54 @@ TEST_CASE("MagneticFilter TEMPERATURE snapshot",
         // core-model refinements (column footprint area, conductivity resolution, radiation).
         check_or_print("TEMPERATURE", valid, score, snap.valid, snap.score, 0.05);
     }
+}
+
+TEST_CASE("Test_MagneticFilter_Temperature_Memo_Tells_The_Wires_Apart", "[magnetic-filter][temperature-filter][abt-1704]") {
+    // ABT #1704: the per-advise temperature memo was keyed by the core, turns, gaps and operating
+    // points, not the wires, so the same magnetic wound with another wire read the first one's
+    // temperature. A 1 mm gapped E 35 3C97 with 40 turns of Round 1.00, and the same coil in
+    // Round 0.5 (four times the DC resistance), must each get their own hottest temperature.
+    settings.reset();
+    auto wound = [](const std::string& wireName) {
+        OpenMagneticsTesting::QuickMagneticConfig cfg;
+        cfg.numberTurns = {40};
+        cfg.numberParallels = {1};
+        cfg.coreShapeName = "E 35";
+        cfg.coreMaterialName = "3C97";
+        cfg.wireNames = {wireName};
+        auto magnetic = OpenMagneticsTesting::create_quick_test_magnetic(cfg);
+        magnetic.set_core(OpenMagneticsTesting::get_quick_core("E 35", OpenMagneticsTesting::get_ground_gap(1e-3), 1, "3C97"));
+        magnetic.get_mutable_coil().wind();
+        return magnetic;
+    };
+    auto magnetic = wound("Round 1.00 - Grade 1");
+    auto thinMagnetic = wound("Round 0.5 - Grade 1");
+    OpenMagnetics::Inputs inputs;
+    {
+        MagnetizingInductance magnetizingInductanceModel;
+        const double ownInductance = magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(magnetic)
+                                         .get_magnetizing_inductance().get_nominal().value();
+        OpenMagneticsTesting::QuickInputsConfig cfg;
+        cfg.frequency = 100000;
+        cfg.magnetizingInductance = ownInductance;
+        cfg.temperature = 25;
+        cfg.label = WaveformLabel::TRIANGULAR;
+        cfg.peakToPeak = 1;
+        cfg.dutyCycle = 0.5;
+        cfg.offset = 3;  // a DC current whose copper losses show in the temperature
+        inputs = OpenMagneticsTesting::create_quick_test_inputs(cfg);
+    }
+    const double thickAlone = MagneticFilterTemperature(inputs, 1000.0).evaluate_magnetic(&magnetic, &inputs).second;
+    const double thinAlone = MagneticFilterTemperature(inputs, 1000.0).evaluate_magnetic(&thinMagnetic, &inputs).second;
+    INFO("Round 1.00: " << thickAlone << " C, Round 0.5: " << thinAlone << " C");
+    REQUIRE(thickAlone < 1000.0);
+    REQUIRE(thinAlone < 1000.0);
+    REQUIRE(thinAlone > thickAlone + 0.5);
+
+    MagneticFilterTemperature shared(inputs, 1000.0);
+    CHECK_THAT(shared.evaluate_magnetic(&magnetic, &inputs).second, Catch::Matchers::WithinRel(thickAlone, 1e-9));
+    CHECK_THAT(shared.evaluate_magnetic(&thinMagnetic, &inputs).second, Catch::Matchers::WithinRel(thinAlone, 1e-9));
+    settings.reset();
 }
 
 TEST_CASE("MagneticFilter TURN_COUNT snapshot",
@@ -1117,5 +1305,952 @@ TEST_CASE("MagneticAdviser catalogue path drops parts whose material has no loss
         INFO(mas.get_magnetic().get_reference());
         CHECK(mas.get_magnetic().get_core().get_material_name() != "TP5H");
     }
+    settings.reset();
+}
+
+// ABT #1652 (Alf): advisers NEVER extrapolate, even with Settings::allowMaterialDataExtrapolation on (the web
+// turns it on for hand edits). The same TP5H-at-100 kHz catalogue as above, flag ON: the span gate must still
+// drop every TP5H part, no extrapolated loss may be computed (no WARNING from module MaterialDataExtrapolation),
+// and once the adviser is gone the flag works again, so the setup really had it on.
+TEST_CASE("MagneticAdviser catalogue path keeps barring out-of-span parts with material extrapolation allowed",
+          "[adviser][magnetic-adviser][abt-1652]") {
+    settings.reset();
+    clear_databases();
+    Logger::getInstance().disableCollector();
+    Logger::getInstance().enableCollector(LogLevel::WARNING);
+
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+        100000, 100e-6, 25, WaveformLabel::TRIANGULAR, 2, 0.5, 1);
+    auto part = [&](const std::string& material, double gap, int64_t turns, const std::string& reference) {
+        auto magnetic = OpenMagneticsTesting::get_quick_magnetic("E 42/21/15", OpenMagneticsTesting::get_ground_gap(gap),
+                                                                 std::vector<int64_t>{turns}, 1, material);
+        MAS::MagneticManufacturerInfo manufacturerInfo;
+        manufacturerInfo.set_name("ABT 1652 test");
+        manufacturerInfo.set_reference(reference);
+        magnetic.set_manufacturer_info(manufacturerInfo);
+        return OpenMagnetics::magnetic_autocomplete(magnetic);
+    };
+    std::vector<OpenMagnetics::Magnetic> catalogue;
+    for (int i = 0; i < 10; ++i) {
+        catalogue.push_back(part("TP5H", 0.0005 + 0.0001 * i, 15 + i, "TP5H-" + std::to_string(i)));
+    }
+    catalogue.push_back(part("N87", 0.001, 20, "N87-0"));
+
+    settings.set_allow_material_data_extrapolation(true);
+    Logger::getInstance().drainCollected();
+    std::vector<std::pair<OpenMagnetics::Mas, double>> results;
+    {
+        MagneticAdviser adviser;
+        std::vector<MagneticFilterOperation> flow{MagneticFilterOperation(MagneticFilters::CORE_AND_DC_LOSSES, true, false, true, 1.0)};
+        REQUIRE_NOTHROW(results = adviser.get_advised_magnetic(inputs, catalogue, flow, 11, false));
+    }
+    auto collected = Logger::getInstance().drainCollected();
+    size_t extrapolationRecords = 0;
+    for (auto& record : collected) {
+        if (record.moduleOfOrigin == kMaterialDataExtrapolationModule) {
+            UNSCOPED_INFO("extrapolated under the adviser: " << record.message);
+            extrapolationRecords++;
+        }
+    }
+    CHECK(extrapolationRecords == 0);
+    REQUIRE_FALSE(results.empty());
+    for (auto& [mas, scoring] : results) {
+        INFO(mas.get_magnetic().get_reference());
+        CHECK(mas.get_magnetic().get_core().get_material_name() != "TP5H");
+    }
+
+    // The adviser is gone: the caller's flag is back, and the same gate now lets TP5H through.
+    auto spanFilter = MagneticFilter::factory(MagneticFilters::LOSS_MODEL_FREQUENCY_SPAN);
+    CHECK(settings.get_allow_material_data_extrapolation());
+    CHECK(spanFilter->evaluate_magnetic(&catalogue[0], &inputs).first);
+
+    Logger::getInstance().disableCollector();
+    settings.reset();
+}
+
+// ---------------------------------------------------------------------------
+// COST: the unit cost in US$ at 1000 pieces = core + conductor + labour (see CostBasis).
+// Every expected value below is derived by hand from the reference magnetic, not read back
+// from the filter.
+// ---------------------------------------------------------------------------
+namespace {
+double sum_of_turn_lengths(OpenMagnetics::Magnetic& magnetic) {
+    double length = 0;
+    auto turns = magnetic.get_coil().get_turns_description().value();
+    for (const auto& turn : turns) {
+        length += turn.get_length();
+    }
+    return length;
+}
+}  // namespace
+
+TEST_CASE("MagneticFilter COST breakdown of the reference magnetic",
+          "[magnetic-filter][cost]") {
+    auto magnetic = make_reference_magnetic();
+    auto cost = MagneticFilterCost().calculate_cost(magnetic);
+
+    // Labour: 60 turns x 0.105 min / 0.5 winding share = 12.6 min at US$7.27/h.
+    CHECK_THAT(cost.labour, WithinRel(12.6 / 60 * 7.27, 1e-12));
+
+    // Conductor: Round 1.00 mm, conducting area pi x (0.5 mm)^2, copper 8940 kg/m3 at US$14.737/kg,
+    // no litz premium, over the wound length of all 60 turns.
+    double area = std::numbers::pi * 0.5e-3 * 0.5e-3;
+    CHECK_THAT(cost.conductor, WithinRel(sum_of_turn_lengths(magnetic) * area * 8940 * 14.737, 1e-9));
+
+    // Core: 3C97 is a MnZn ferrite, price = 21.03 x mass^0.6407, mass = Ve(E 35) x 4800 kg/m3.
+    double mass = magnetic.get_core().get_effective_volume() * 4800;
+    REQUIRE(cost.priced());
+    CHECK_THAT(*cost.core, WithinRel(21.03 * std::pow(mass, 0.6407), 1e-9));
+
+    CHECK_THAT(cost.total(), WithinRel(*cost.core + cost.conductor + cost.labour, 1e-12));
+}
+
+TEST_CASE("MagneticFilter COST scores a priced core as valid",
+          "[magnetic-filter][cost]") {
+    auto magnetic = make_reference_magnetic();
+    auto inputs = make_reference_inputs();
+    auto [valid, score] = MagneticFilterCost().evaluate_magnetic(&magnetic, &inputs);
+    CHECK(valid);
+    CHECK_THAT(score, WithinRel(MagneticFilterCost().calculate_cost(magnetic).total(), 1e-12));
+}
+
+TEST_CASE("MagneticFilter COST charges Sullivan's strand premium on litz",
+          "[magnetic-filter][cost]") {
+    OpenMagneticsTesting::QuickMagneticConfig cfg;
+    cfg.numberTurns = {40, 20};
+    cfg.numberParallels = {1, 1};
+    cfg.coreShapeName = "E 35";
+    cfg.coreMaterialName = "3C97";
+    cfg.wireNames = {"Litz 4x0.1 - Grade 1 - Single Served", "Litz 4x0.1 - Grade 1 - Single Served"};
+    auto magnetic = OpenMagneticsTesting::create_quick_test_magnetic(cfg);
+    magnetic.get_mutable_coil().wind();
+    auto cost = MagneticFilterCost().calculate_cost(magnetic);
+    // 4 strands of 0.1 mm copper; C_m(0.1 mm) = 1 + 6e-26/(1e-4)^6 + 2.7e-9/(1e-4)^2 = 1 + 0.06 + 0.27.
+    double area = 4 * std::numbers::pi * 0.05e-3 * 0.05e-3;
+    CHECK_THAT(cost.conductor, WithinRel(sum_of_turn_lengths(magnetic) * area * 8940 * 14.737 * 1.33, 1e-9));
+}
+
+TEST_CASE("MagneticFilter COST flags a core with no price law instead of estimating or dropping it",
+          "[magnetic-filter][cost]") {
+    OpenMagneticsTesting::QuickMagneticConfig cfg;
+    cfg.numberTurns = {40, 20};
+    cfg.numberParallels = {1, 1};
+    cfg.coreShapeName = "E 35";
+    cfg.coreMaterialName = "46";  // Fair-Rite MgZn ferrite: no distributor prices fitted
+    cfg.wireNames = {"Round 1.00 - Grade 1", "Round 1.00 - Grade 1"};
+    auto magnetic = OpenMagneticsTesting::create_quick_test_magnetic(cfg);
+    magnetic.get_mutable_coil().wind();
+    auto cost = MagneticFilterCost().calculate_cost(magnetic);
+    CHECK_FALSE(cost.priced());
+    CHECK_THAT(cost.coreUnpricedReason, Catch::Matchers::ContainsSubstring("no price law for ferrite/MgZn"));
+    // Copper and labour are still known; only the total is not.
+    CHECK_THAT(cost.labour, WithinRel(12.6 / 60 * 7.27, 1e-12));
+    CHECK_THROWS_WITH(cost.total(), Catch::Matchers::ContainsSubstring("unit cost unknown"));
+    // The filter reports it as a failed scoring, which a non-strict adviser flow ranks worst for cost.
+    auto inputs = make_reference_inputs();
+    CHECK(MagneticFilterCost().evaluate_magnetic(&magnetic, &inputs) == std::pair<bool, double>{false, 0.0});
+
+    // The same MnZn reference is unpriced when the basis carries no law for its class.
+    auto reference = make_reference_magnetic();
+    auto basis = MagneticFilterCost::default_basis();
+    basis.corePrice.erase("ferrite/MnZn");
+    auto unpriced = MagneticFilterCost(basis).calculate_cost(reference);
+    CHECK_FALSE(unpriced.priced());
+    CHECK_THAT(unpriced.coreUnpricedReason, Catch::Matchers::ContainsSubstring("no price law for ferrite/MnZn"));
+}
+
+TEST_CASE("MagneticAdviser keeps a core COST cannot price and ranks it last for cost",
+          "[magnetic-filter][cost][magnetic-adviser]") {
+    settings.reset();
+    clear_databases();
+    // Two ~100 uH parts on an E 42/21/15 (the same inputs as the ABT #1456 catalogue test), both gapped
+    // 1 mm at 21 turns so the gap sets the inductance: N87 (priced, ferrite/MnZn) and Fair-Rite 46 (MgZn
+    // ferrite, which has no price law).
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+        100000, 100e-6, 25, WaveformLabel::TRIANGULAR, 2, 0.5, 1);
+    auto part = [&](const std::string& material, double gap, int64_t turns, const std::string& reference) {
+        auto magnetic = OpenMagneticsTesting::get_quick_magnetic("E 42/21/15", OpenMagneticsTesting::get_ground_gap(gap),
+                                                                 std::vector<int64_t>{turns}, 1, material);
+        MAS::MagneticManufacturerInfo manufacturerInfo;
+        manufacturerInfo.set_name("COST test");
+        manufacturerInfo.set_reference(reference);
+        magnetic.set_manufacturer_info(manufacturerInfo);
+        return OpenMagnetics::magnetic_autocomplete(magnetic);
+    };
+    std::vector<OpenMagnetics::Magnetic> catalogue{part("46", 0.001, 21, "unpriced MgZn"), part("N87", 0.001, 21, "priced MnZn")};
+    std::vector<MagneticFilterOperation> flow{MagneticFilterOperation(MagneticFilters::COST, true, false, false, 1.0)};
+    MagneticAdviser adviser;
+    std::vector<std::pair<OpenMagnetics::Mas, double>> results;
+    REQUIRE_NOTHROW(results = adviser.get_advised_magnetic(inputs, catalogue, flow, 5, false));
+    REQUIRE(results.size() == 2);
+    CHECK(results[0].first.get_magnetic().get_reference() == "priced MnZn");
+    CHECK(results[1].first.get_magnetic().get_reference() == "unpriced MgZn");
+    CHECK(results[1].second < results[0].second);
+    settings.reset();
+}
+
+TEST_CASE("MagneticFilter COST prices a proprietary grade only with its own manufacturer's law",
+          "[magnetic-filter][cost]") {
+    auto make = [](const std::string& material) {
+        OpenMagneticsTesting::QuickMagneticConfig cfg;
+        cfg.numberTurns = {40, 20};
+        cfg.numberParallels = {1, 1};
+        cfg.coreShapeName = "E 35";
+        cfg.coreMaterialName = material;
+        cfg.wireNames = {"Round 1.00 - Grade 1", "Round 1.00 - Grade 1"};
+        auto magnetic = OpenMagneticsTesting::create_quick_test_magnetic(cfg);
+        magnetic.get_mutable_coil().wind();
+        return magnetic;
+    };
+    // Micrometals OC 60: powder/proprietary, priced by the law fitted on Micrometals' own grades.
+    auto micrometals = make("OC 60");
+    CHECK(MagneticFilterCost().calculate_cost(micrometals).priced());
+    // Poco GPC 60 is also powder/proprietary, but no Poco part was priced: the Micrometals law must not be
+    // borrowed for it.
+    auto poco = make("GPC 60");
+    auto cost = MagneticFilterCost().calculate_cost(poco);
+    CHECK_FALSE(cost.priced());
+    CHECK_THAT(cost.coreUnpricedReason, Catch::Matchers::ContainsSubstring("no price law for powder/proprietary/Poco"));
+}
+
+// =============================================================================
+// Impedance display |Z| outside the core material's mu(f) span; adviser failure report
+// =============================================================================
+namespace {
+OpenMagnetics::Magnetic load_wound_cmc_catalogue_part(const std::string& partNumber) {
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "cmc_catalogue_" + partNumber + ".json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    return magnetic_autocomplete(OpenMagnetics::Magnetic(json::parse(file)));
+}
+
+// The same part without its datasheet's measured impedance curve: IMPEDANCE then judges it on the
+// core material's mu(f) range alone (the measured band judges points outside it on that curve).
+OpenMagnetics::Magnetic without_measured_impedance(OpenMagnetics::Magnetic magnetic) {
+    auto manufacturerInfo = magnetic.get_manufacturer_info().value();
+    auto datasheetInfo = manufacturerInfo.get_datasheet_info().value();
+    auto electrical = datasheetInfo.get_electrical().value();
+    for (auto& entry : electrical) {
+        entry.set_impedance_points(std::nullopt);
+    }
+    datasheetInfo.set_electrical(electrical);
+    manufacturerInfo.set_datasheet_info(datasheetInfo);
+    magnetic.set_manufacturer_info(manufacturerInfo);
+    REQUIRE_FALSE(MagneticFilterImpedance::get_measured_impedance_curve(magnetic));
+    return magnetic;
+}
+
+OpenMagnetics::Inputs make_cmc_inputs(double frequency) {
+    // Two windings (turns ratio 1), sinusoidal line current: a common-mode choke's operating point.
+    return OpenMagnetics::Inputs::create_quick_operating_point_only_current(
+        frequency, 0.001, 25, WaveformLabel::SINUSOIDAL, {1.0, 1.0}, 0.5, 0, {1.0});
+}
+
+void set_minimum_impedance(OpenMagnetics::Inputs& inputs, double frequency, double magnitude) {
+    ImpedancePoint impedancePoint;
+    impedancePoint.set_magnitude(magnitude);
+    ImpedanceAtFrequency impedanceAtFrequency;
+    impedanceAtFrequency.set_frequency(frequency);
+    impedanceAtFrequency.set_impedance(impedancePoint);
+    inputs.get_mutable_design_requirements().set_minimum_impedance(std::vector<ImpedanceAtFrequency>{impedanceAtFrequency});
+}
+}
+
+// El Choker hands the adviser a CMC's noise point (150 kHz) and its 50 Hz mains point (line
+// current, thermal). The IMPEDANCE filter's display |Z| at every operating point asked the core
+// material for mu(50 Hz); every CMC ferrite is tabulated from above 50 Hz, so that threw and the
+// adviser dropped the part: 4 of 299 chokes survived. The display |Z| is now written only where
+// the material has mu(f) data and is absent elsewhere; the requirement and the score are unchanged.
+TEST_CASE("MagneticFilter_Impedance_Display_Output_Only_Inside_Material_Mu_Span", "[magnetic-filter][impedance][mu-span]") {
+    settings.reset();
+    auto magnetic = load_wound_cmc_catalogue_part("7448052502");
+    auto [minimumMaterialFrequency, maximumMaterialFrequency] = ComplexPermeability().get_frequency_range(magnetic.get_core().resolve_material());
+    REQUIRE(minimumMaterialFrequency > 50);
+    REQUIRE(minimumMaterialFrequency < 150000);
+    REQUIRE(maximumMaterialFrequency > 150000);
+
+    auto noiseOnly = make_cmc_inputs(150000);
+    set_minimum_impedance(noiseOnly, 150000, 100);
+    auto noiseAndMains = noiseOnly;
+    noiseAndMains.get_mutable_operating_points().push_back(make_cmc_inputs(50).get_operating_points()[0]);
+    REQUIRE(noiseAndMains.get_operating_points().size() == 2);
+    REQUIRE(noiseAndMains.get_operating_points()[1].get_excitations_per_winding()[0].get_frequency() == 50);
+
+    auto filter = MagneticFilter::factory(MagneticFilters::IMPEDANCE, noiseOnly);
+
+    std::vector<OpenMagnetics::Outputs> outputsNoiseOnly;
+    auto [validNoiseOnly, scoringNoiseOnly] = filter->evaluate_magnetic(&magnetic, &noiseOnly, &outputsNoiseOnly);
+
+    std::vector<OpenMagnetics::Outputs> outputs;
+    auto [valid, scoring] = filter->evaluate_magnetic(&magnetic, &noiseAndMains, &outputs);
+
+    CHECK(valid);
+    CHECK(valid == validNoiseOnly);
+    CHECK(scoring == scoringNoiseOnly);
+    REQUIRE(outputs.size() == 2);
+    REQUIRE(outputs[0].get_impedance());
+    REQUIRE(outputs[0].get_impedance()->get_impedance_matrix());
+    auto impedanceMatrix = outputs[0].get_impedance()->get_impedance_matrix().value();
+    REQUIRE(impedanceMatrix.size() == 1);
+    CHECK(impedanceMatrix[0].get_frequency() == 150000);
+    auto expectedMatrix = outputsNoiseOnly[0].get_impedance()->get_impedance_matrix().value()[0];
+    auto windingName = magnetic.get_coil().get_functional_description()[0].get_name();
+    CHECK(impedanceMatrix[0].get_magnitude().at(windingName).at(windingName).get_nominal().value() ==
+          expectedMatrix.get_magnitude().at(windingName).at(windingName).get_nominal().value());
+    CHECK_FALSE(outputs[1].get_impedance());
+
+    // A minimum-impedance REQUIREMENT with no point inside the material's data cannot be judged at
+    // all, and is an error (points outside are skipped only when some point is judged: covered-band).
+    auto requirementOutsideSpan = noiseAndMains;
+    set_minimum_impedance(requirementOutsideSpan, 50, 1);
+    std::vector<OpenMagnetics::Outputs> outputsRequirementOutsideSpan;
+    REQUIRE_THROWS_AS(filter->evaluate_magnetic(&magnetic, &requirementOutsideSpan, &outputsRequirementOutsideSpan),
+                      RequirementOutsideMaterialDataException);
+}
+
+// A candidate whose evaluation raises is still kept out of the ranking, but the adviser reports it
+// with its error instead of returning fewer parts with no word why. 7448229004's A07 is tabulated
+// from 9.9 kHz, so a 1 kHz impedance requirement cannot be evaluated on it; 7448052502's SC-1K107
+// starts at 418 Hz and can.
+TEST_CASE("MagneticAdviser_Reports_Candidates_Whose_Evaluation_Throws", "[magnetic-adviser][failed-candidates][mu-span]") {
+    settings.reset();
+    auto evaluable = load_wound_cmc_catalogue_part("7448052502");
+    // Without its measured curve (which starts at 1 kHz and would judge the point: measured-band).
+    auto notEvaluable = without_measured_impedance(load_wound_cmc_catalogue_part("7448229004"));
+    const double requirementFrequency = 1000;
+    REQUIRE(ComplexPermeability().get_frequency_range(evaluable.get_core().resolve_material()).first < requirementFrequency);
+    REQUIRE(ComplexPermeability().get_frequency_range(notEvaluable.get_core().resolve_material()).first > requirementFrequency);
+
+    auto inputs = make_cmc_inputs(150000);
+    set_minimum_impedance(inputs, requirementFrequency, 1e-3);
+
+    std::map<std::string, OpenMagnetics::Magnetic> catalogue{{evaluable.get_reference(), evaluable},
+                                                             {notEvaluable.get_reference(), notEvaluable}};
+    bool strictlyRequired = GENERATE(true, false);
+    INFO("strictlyRequired " << strictlyRequired);
+    std::vector<MagneticFilterOperation> filterFlow{MagneticFilterOperation(MagneticFilters::IMPEDANCE, true, true, strictlyRequired, 1.0)};
+
+    MagneticAdviser adviser(false);
+    auto results = adviser.get_advised_magnetic(inputs, catalogue, filterFlow, 10);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].first.get_magnetic().get_reference() == evaluable.get_reference());
+
+    const auto& failedCandidates = adviser.get_failed_candidates();
+    REQUIRE(failedCandidates.size() == 1);
+    CHECK(failedCandidates[0].first == notEvaluable.get_reference());
+    CHECK_THAT(failedCandidates[0].second, Catch::Matchers::ContainsSubstring("IMPEDANCE"));
+    CHECK_THAT(failedCandidates[0].second, Catch::Matchers::ContainsSubstring("A07"));
+}
+
+// ABT #1861 guard: the advisers select parts on data, never on the complex-permeability estimate
+// (Alf, 2026-10-14; proposal D5). ComplexPermeability now answers A07 at 1 kHz with an estimate
+// (its mu'' is tabulated from 9.9 kHz), but the CORE_MINIMUM_IMPEDANCE filter keeps the tabulated
+// span: a 1 kHz minimum-impedance requirement on 7448229004 still throws the span exception, not
+// the "cannot be estimated" one.
+TEST_CASE("MagneticFilter_Core_Minimum_Impedance_Stays_On_Tabulated_Complex_Permeability", "[magnetic-filter][impedance][mu-span][abt-1861]") {
+    settings.reset();
+    auto part = without_measured_impedance(load_wound_cmc_catalogue_part("7448229004"));
+    auto material = part.get_core().resolve_material();
+    REQUIRE(material.get_name() == "A07");
+    const double requirementFrequency = 1000;
+    REQUIRE(ComplexPermeability().get_frequency_range(material).first > requirementFrequency);
+    auto estimated = ComplexPermeability().get_complex_permeability_with_source(material, requirementFrequency);
+    REQUIRE(estimated.is_estimated());
+
+    auto inputs = make_cmc_inputs(150000);
+    set_minimum_impedance(inputs, requirementFrequency, 1e-3);
+    MagneticFilterCoreMinimumImpedance filter;
+    try {
+        filter.evaluate_magnetic(&part, &inputs);
+        FAIL("CORE_MINIMUM_IMPEDANCE must not judge A07 at 1 kHz on the estimate");
+    }
+    catch (const ComplexPermeabilityEstimateUnavailableException& e) {
+        FAIL(std::string("the estimator was asked, and refused: ") + e.what());
+    }
+    catch (const ComplexPermeabilityFrequencyOutOfRangeException& e) {
+        CHECK(e.material_name() == "A07");
+        CHECK(e.frequency() == requirementFrequency);
+    }
+}
+
+// ABT #1861 guard: Impedance::calculate_minimum_number_turns is a design decision and stays on the
+// tabulated complex permeability (Alf, 2026-10-14), whatever the instance's flag says, and gives the
+// flag back as it found it, also when it throws.
+TEST_CASE("Impedance_Minimum_Number_Turns_Stays_On_Tabulated_Complex_Permeability", "[physical-model][impedance][mu-span][abt-1861]") {
+    settings.reset();
+    auto part = without_measured_impedance(load_wound_cmc_catalogue_part("7448229004"));
+    REQUIRE(part.get_core().resolve_material().get_name() == "A07");
+    const double requirementFrequency = 1000;
+    REQUIRE(ComplexPermeability().get_complex_permeability_with_source(part.get_core().resolve_material(), requirementFrequency).is_estimated());
+    auto inputs = make_cmc_inputs(150000);
+    set_minimum_impedance(inputs, requirementFrequency, 1e-3);
+
+    OpenMagnetics::Impedance impedance;
+    REQUIRE_FALSE(impedance.get_tabulated_complex_permeability_only());
+    try {
+        impedance.calculate_minimum_number_turns(part, inputs);
+        FAIL("calculate_minimum_number_turns must not size A07 at 1 kHz on the estimate");
+    }
+    catch (const ComplexPermeabilityEstimateUnavailableException& e) {
+        FAIL(std::string("the estimator was asked, and refused: ") + e.what());
+    }
+    catch (const ComplexPermeabilityFrequencyOutOfRangeException& e) {
+        CHECK(e.material_name() == "A07");
+        CHECK(e.frequency() == requirementFrequency);
+    }
+    CHECK_FALSE(impedance.get_tabulated_complex_permeability_only());
+}
+
+// =============================================================================
+// Rank on the covered part: IMPEDANCE judges a minimumImpedance point only inside the core
+// material's tabulated mu(f) range (El Choker CISPR-band request up to 30 MHz; 142 of 299 chokes
+// were excluded because their ferrite's data stops at 1-16 MHz).
+// =============================================================================
+namespace {
+void set_minimum_impedances(OpenMagnetics::Inputs& inputs, const std::vector<std::pair<double, double>>& frequencyAndMagnitude) {
+    std::vector<ImpedanceAtFrequency> requirement;
+    for (auto [frequency, magnitude] : frequencyAndMagnitude) {
+        ImpedancePoint impedancePoint;
+        impedancePoint.set_magnitude(magnitude);
+        ImpedanceAtFrequency impedanceAtFrequency;
+        impedanceAtFrequency.set_frequency(frequency);
+        impedanceAtFrequency.set_impedance(impedancePoint);
+        requirement.push_back(impedanceAtFrequency);
+    }
+    inputs.get_mutable_design_requirements().set_minimum_impedance(requirement);
+}
+}
+
+// 7448229004's A07 is tabulated to ~12.5 MHz. A requirement at 150 kHz, 1 MHz and 30 MHz ranks it on
+// the two points it covers, scores it as the mean over those two exactly as a requirement made of
+// only those two would, and reports them as its judged frequencies. The 30 MHz point is not judged.
+TEST_CASE("MagneticAdviser_Impedance_Ranks_On_The_Covered_Requirement_Points", "[magnetic-adviser][impedance][covered-band]") {
+    settings.reset();
+    // Without its measured curve: a part that carries one is judged above the mu(f) range on it (measured-band).
+    auto part = without_measured_impedance(load_wound_cmc_catalogue_part("7448229004"));
+    auto [minimumMaterialFrequency, maximumMaterialFrequency] = ComplexPermeability().get_frequency_range(part.get_core().resolve_material());
+    REQUIRE(minimumMaterialFrequency < 150000);
+    REQUIRE(maximumMaterialFrequency > 1e6);
+    REQUIRE(maximumMaterialFrequency < 30e6);
+
+    auto inputs = make_cmc_inputs(150000);
+    set_minimum_impedances(inputs, {{150000, 1e-3}, {1e6, 1e-3}, {30e6, 1e-3}});
+    auto coveredOnly = make_cmc_inputs(150000);
+    set_minimum_impedances(coveredOnly, {{150000, 1e-3}, {1e6, 1e-3}});
+
+    auto filter = MagneticFilter::factory(MagneticFilters::IMPEDANCE, inputs);
+    auto [valid, scoring] = filter->evaluate_magnetic(&part, &inputs);
+    auto [validCoveredOnly, scoringCoveredOnly] = filter->evaluate_magnetic(&part, &coveredOnly);
+    CHECK(valid);
+    CHECK(validCoveredOnly);
+    CHECK(scoring > 0);
+    CHECK(scoring == scoringCoveredOnly);
+    REQUIRE(filter->get_judged_frequencies(&part, &inputs));
+    CHECK(filter->get_judged_frequencies(&part, &inputs).value() == std::vector<double>{150000, 1e6});
+
+    // A point inside the range that the part fails still invalidates it; one outside is not judged.
+    auto failsInside = make_cmc_inputs(150000);
+    set_minimum_impedances(failsInside, {{150000, 1e9}, {30e6, 1e-3}});
+    CHECK_FALSE(filter->evaluate_magnetic(&part, &failsInside).first);
+    auto hugeOutside = make_cmc_inputs(150000);
+    set_minimum_impedances(hugeOutside, {{150000, 1e-3}, {30e6, 1e9}});
+    CHECK(filter->evaluate_magnetic(&part, &hugeOutside).first);
+
+    bool strictlyRequired = GENERATE(true, false);
+    INFO("strictlyRequired " << strictlyRequired);
+    std::map<std::string, OpenMagnetics::Magnetic> catalogue{{part.get_reference(), part}};
+    std::vector<MagneticFilterOperation> filterFlow{MagneticFilterOperation(MagneticFilters::IMPEDANCE, true, true, strictlyRequired, 1.0)};
+    MagneticAdviser adviser(false);
+    auto results = adviser.get_advised_magnetic(inputs, catalogue, filterFlow, 10);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].first.get_magnetic().get_reference() == part.get_reference());
+    CHECK(adviser.get_failed_candidates().empty());
+    const auto& judgedFrequencies = adviser.get_judged_frequencies();
+    REQUIRE(judgedFrequencies.contains(part.get_reference()));
+    REQUIRE(judgedFrequencies.at(part.get_reference()).contains(MagneticFilters::IMPEDANCE));
+    CHECK(judgedFrequencies.at(part.get_reference()).at(MagneticFilters::IMPEDANCE) == std::vector<double>{150000, 1e6});
+    CHECK(adviser.get_measured_frequencies().at(part.get_reference()).at(MagneticFilters::IMPEDANCE).empty());
+}
+
+// A part whose material has no data at any requirement frequency cannot be judged on it: it is not
+// ranked, and the adviser reports it, naming its range and the requirement's.
+TEST_CASE("MagneticAdviser_Impedance_Reports_A_Part_With_No_Covered_Requirement_Point", "[magnetic-adviser][impedance][covered-band]") {
+    settings.reset();
+    // Without its measured curve (measured-band covers 20 and 30 MHz on a part that has one).
+    auto part = without_measured_impedance(load_wound_cmc_catalogue_part("7448229004"));
+    REQUIRE(ComplexPermeability().get_frequency_range(part.get_core().resolve_material()).second < 20e6);
+
+    auto inputs = make_cmc_inputs(150000);
+    set_minimum_impedances(inputs, {{20e6, 1e-3}, {30e6, 1e-3}});
+
+    auto filter = MagneticFilter::factory(MagneticFilters::IMPEDANCE, inputs);
+    CHECK(filter->get_judged_frequencies(&part, &inputs).value().empty());
+    REQUIRE_THROWS_AS(filter->evaluate_magnetic(&part, &inputs), RequirementOutsideMaterialDataException);
+
+    bool strictlyRequired = GENERATE(true, false);
+    INFO("strictlyRequired " << strictlyRequired);
+    std::map<std::string, OpenMagnetics::Magnetic> catalogue{{part.get_reference(), part}};
+    std::vector<MagneticFilterOperation> filterFlow{MagneticFilterOperation(MagneticFilters::IMPEDANCE, true, true, strictlyRequired, 1.0)};
+    MagneticAdviser adviser(false);
+    auto results = adviser.get_advised_magnetic(inputs, catalogue, filterFlow, 10);
+    CHECK(results.empty());
+    const auto& failedCandidates = adviser.get_failed_candidates();
+    REQUIRE(failedCandidates.size() == 1);
+    CHECK(failedCandidates[0].first == part.get_reference());
+    CHECK_THAT(failedCandidates[0].second, Catch::Matchers::ContainsSubstring("IMPEDANCE"));
+    CHECK_THAT(failedCandidates[0].second, Catch::Matchers::ContainsSubstring("A07"));
+    CHECK_THAT(failedCandidates[0].second, Catch::Matchers::ContainsSubstring("no minimumImpedance frequency"));
+}
+
+// =============================================================================
+// Gate only when losses count (ABT #1679): the loss-model frequency-span gate excludes a part only
+// when the flow or the final simulation computes core losses, and reports every part it excludes.
+// =============================================================================
+namespace {
+// A common-mode choke on P47, whose Steinmetz fit spans 100 kHz to 1 MHz: its losses at the 50 Hz
+// mains point would be an extrapolation of the fit (WE 7448640406-0418 and 7448680200 are of this kind).
+OpenMagnetics::Magnetic make_p47_cmc() {
+    auto part = load_wound_cmc_catalogue_part("7448229004");
+    part.get_mutable_core().get_mutable_functional_description().set_material("P47");
+    auto manufacturerInfo = part.get_manufacturer_info().value();
+    manufacturerInfo.set_reference("P47 choke");
+    part.set_manufacturer_info(manufacturerInfo);
+    return part;
+}
+
+OpenMagnetics::Inputs make_cmc_inputs_with_mains() {
+    auto inputs = make_cmc_inputs(150000);
+    inputs.get_mutable_operating_points().push_back(make_cmc_inputs(50).get_operating_points()[0]);
+    return inputs;
+}
+}
+
+TEST_CASE("MagneticAdviser_Loss_Span_Gate_Keeps_A_Part_When_No_Losses_Are_Computed", "[magnetic-adviser][loss-span-gate][covered-band]") {
+    settings.reset();
+    auto part = make_p47_cmc();
+    auto inputs = make_cmc_inputs_with_mains();
+    REQUIRE_FALSE(MagneticFilterLossModelFrequencySpan::is_material_evaluable(part.get_core().resolve_material(), inputs));
+
+    std::map<std::string, OpenMagnetics::Magnetic> catalogue{{part.get_reference(), part}};
+    std::vector<MagneticFilterOperation> filterFlow{MagneticFilterOperation(MagneticFilters::VOLUME, true, true, false, 1.0),
+                                                    MagneticFilterOperation(MagneticFilters::TURNS_RATIOS, true, false, true, 1.0)};
+    MagneticAdviser adviser(false);
+    auto results = adviser.get_advised_magnetic(inputs, catalogue, filterFlow, 10);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].first.get_magnetic().get_reference() == "P47 choke");
+    CHECK(adviser.get_failed_candidates().empty());
+}
+
+TEST_CASE("MagneticAdviser_Loss_Span_Gate_Reports_A_Part_When_Losses_Are_Computed", "[magnetic-adviser][loss-span-gate][covered-band]") {
+    settings.reset();
+    auto part = make_p47_cmc();
+    auto inputs = make_cmc_inputs_with_mains();
+    std::map<std::string, OpenMagnetics::Magnetic> catalogue{{part.get_reference(), part}};
+
+    SECTION("a loss-based filter in the flow") {
+        std::vector<MagneticFilterOperation> filterFlow{MagneticFilterOperation(MagneticFilters::VOLUME, true, true, false, 1.0),
+                                                        MagneticFilterOperation(MagneticFilters::LOSSES_NO_PROXIMITY, true, true, false, 1.0)};
+        MagneticAdviser adviser(false);
+        auto results = adviser.get_advised_magnetic(inputs, catalogue, filterFlow, 10);
+        CHECK(results.empty());
+        const auto& failedCandidates = adviser.get_failed_candidates();
+        REQUIRE(failedCandidates.size() == 1);
+        CHECK(failedCandidates[0].first == "P47 choke");
+        CHECK_THAT(failedCandidates[0].second, Catch::Matchers::ContainsSubstring("LOSS_MODEL_FREQUENCY_SPAN"));
+        CHECK_THAT(failedCandidates[0].second, Catch::Matchers::ContainsSubstring("P47"));
+        CHECK_THAT(failedCandidates[0].second, Catch::Matchers::ContainsSubstring("50.000000 Hz"));
+        CHECK_THAT(failedCandidates[0].second, Catch::Matchers::ContainsSubstring("a filter of the flow computes core losses"));
+    }
+    SECTION("the final simulation, which computes core losses at every operating point") {
+        std::vector<MagneticFilterOperation> filterFlow{MagneticFilterOperation(MagneticFilters::VOLUME, true, true, false, 1.0)};
+        MagneticAdviser adviser(true);
+        auto results = adviser.get_advised_magnetic(inputs, catalogue, filterFlow, 10);
+        CHECK(results.empty());
+        const auto& failedCandidates = adviser.get_failed_candidates();
+        REQUIRE(failedCandidates.size() == 1);
+        CHECK(failedCandidates[0].first == "P47 choke");
+        CHECK_THAT(failedCandidates[0].second, Catch::Matchers::ContainsSubstring("LOSS_MODEL_FREQUENCY_SPAN"));
+        CHECK_THAT(failedCandidates[0].second, Catch::Matchers::ContainsSubstring("final simulation"));
+    }
+}
+
+// =============================================================================
+// A solid wire stored without numberConductors (optional in MAS basicWire) is one conductor.
+// WE-CMB / WE-CMBNC chokes (e.g. 7448012002, 744842565) store their round wire that way; the Albach
+// skin-effect model threw "Missing number of conductors" on it, so El Choker's final simulation
+// excluded them, while Wire::calculate_conducting_area already read such a wire as one conductor.
+// =============================================================================
+TEST_CASE("Wire_Without_Number_Of_Conductors_Is_One_Conductor_Unless_Litz", "[wire-conductors][covered-band]") {
+    settings.reset();
+    auto counted = OpenMagnetics::find_wire_by_name("Round 0.475 - Grade 1");
+    counted.set_number_conductors(1);
+    auto uncounted = counted;
+    uncounted.set_number_conductors(std::nullopt);
+    REQUIRE_FALSE(uncounted.get_number_conductors());
+    CHECK(uncounted.resolve_number_conductors() == 1);
+
+    WindingSkinEffectLossesAlbachModel albach;
+    for (double frequency : {1e5, 1e6, 1e7}) {
+        INFO("frequency " << frequency);
+        CHECK(albach.calculate_skin_factor(uncounted, frequency, 25) == albach.calculate_skin_factor(counted, frequency, 25));
+    }
+
+    auto litz = OpenMagnetics::find_wire_by_name("Litz 225x0.04 - Grade 1 - Double Served");
+    litz.set_number_conductors(std::nullopt);
+    CHECK_THROWS_AS(litz.resolve_number_conductors(), InvalidInputException);
+    CHECK_THROWS_AS(albach.calculate_skin_factor(litz, 1e6, 25), InvalidInputException);
+
+    // End to end: the winding losses of a catalogue choke whose round wires carry no count.
+    auto part = load_wound_cmc_catalogue_part("7448229004");
+    for (const auto& winding : part.get_coil().get_functional_description()) {
+        REQUIRE_FALSE(OpenMagnetics::Coil::resolve_wire(winding).get_number_conductors());
+    }
+    auto inputs = make_cmc_inputs(150000);
+    auto operatingPoint = inputs.get_operating_points()[0];
+    WindingLossesOutput losses;
+    REQUIRE_NOTHROW(losses = WindingLosses().calculate_losses(part, operatingPoint, 25));
+    CHECK(losses.get_winding_losses() > 0);
+}
+
+// =============================================================================
+// Measured band: a minimumImpedance point outside the core material's mu(f) range is judged on the
+// part's own measured common-mode |Z| (datasheet impedancePoints, zero DC bias), interpolated
+// log|Z| vs log f between the two bracketing measured points, never extrapolated. ACME's A07 mu(f)
+// ends at ~12.5 MHz (the plot stops at mu = 10) while 7448229004 is measured from 1 kHz to 1 GHz.
+// =============================================================================
+namespace {
+// 7448229004's measured points bracketing 22 MHz (tests/testData/cmc_catalogue_7448229004.json).
+constexpr double kBracketLowFrequency = 21256900.0;
+constexpr double kBracketLowMagnitude = 741.031;
+constexpr double kBracketHighFrequency = 22387200.0;
+constexpr double kBracketHighMagnitude = 728.922;
+// Hand-computed: exp(ln 741.031 + (ln 22e6 - ln 21256900) / (ln 22387200 - ln 21256900) * (ln 728.922 - ln 741.031)).
+constexpr double kMeasuredMagnitudeAt22MHz = 732.9775932440663;
+
+OpenMagnetics::Magnetic with_impedance_points(OpenMagnetics::Magnetic magnetic, std::vector<DatasheetImpedancePoint> points) {
+    auto manufacturerInfo = magnetic.get_manufacturer_info().value();
+    auto datasheetInfo = manufacturerInfo.get_datasheet_info().value();
+    auto electrical = datasheetInfo.get_electrical().value();
+    REQUIRE(electrical.size() == 1);
+    electrical[0].set_impedance_points(points);
+    datasheetInfo.set_electrical(electrical);
+    manufacturerInfo.set_datasheet_info(datasheetInfo);
+    magnetic.set_manufacturer_info(manufacturerInfo);
+    return magnetic;
+}
+
+std::vector<DatasheetImpedancePoint> impedance_points_of(const OpenMagnetics::Magnetic& magnetic) {
+    return magnetic.get_manufacturer_info()->get_datasheet_info()->get_electrical()->at(0).get_impedance_points().value();
+}
+
+DatasheetImpedancePoint make_impedance_point(double frequency, double magnitude) {
+    ImpedancePoint impedance;
+    impedance.set_magnitude(magnitude);
+    DatasheetImpedancePoint point;
+    point.set_frequency(frequency);
+    point.set_impedance(impedance);
+    return point;
+}
+}
+
+TEST_CASE("MagneticFilter_Impedance_Judges_Above_The_Mu_Span_On_The_Measured_Curve", "[magnetic-filter][impedance][measured-band]") {
+    settings.reset();
+    auto part = load_wound_cmc_catalogue_part("7448229004");
+    auto [minimumMaterialFrequency, maximumMaterialFrequency] = ComplexPermeability().get_frequency_range(part.get_core().resolve_material());
+    REQUIRE(maximumMaterialFrequency > 1e6);
+    REQUIRE(maximumMaterialFrequency < 13e6);
+
+    auto curve = MagneticFilterImpedance::get_measured_impedance_curve(part);
+    REQUIRE(curve);
+    CHECK(curve->front().first == 1000);
+    CHECK(curve->back().first == 1e9);
+    auto upper = std::find_if(curve->begin(), curve->end(), [](const auto& point) { return point.first >= 22e6; });
+    REQUIRE(upper != curve->begin());
+    REQUIRE(upper != curve->end());
+    CHECK(std::prev(upper)->first == kBracketLowFrequency);
+    CHECK(std::prev(upper)->second == kBracketLowMagnitude);
+    CHECK(upper->first == kBracketHighFrequency);
+    CHECK(upper->second == kBracketHighMagnitude);
+
+    double measuredAt22MHz = MagneticFilterImpedance::interpolate_measured_impedance(curve.value(), 22e6);
+    CHECK_THAT(measuredAt22MHz, WithinRel(kMeasuredMagnitudeAt22MHz, 1e-12));
+    // A measured frequency returns its own point; outside the measured range nothing is extrapolated.
+    CHECK(MagneticFilterImpedance::interpolate_measured_impedance(curve.value(), kBracketHighFrequency) == kBracketHighMagnitude);
+    CHECK_THROWS_AS(MagneticFilterImpedance::interpolate_measured_impedance(curve.value(), 2e9), InvalidInputException);
+    CHECK_THROWS_AS(MagneticFilterImpedance::interpolate_measured_impedance(curve.value(), 500), InvalidInputException);
+
+    auto filter = MagneticFilter::factory(MagneticFilters::IMPEDANCE, make_cmc_inputs(150000));
+
+    // Same pass/fail and the same per-point score as a model point: valid just under the measured |Z|,
+    // invalid just over it, score log10(Zmeasured / Zreq).
+    auto under = make_cmc_inputs(150000);
+    set_minimum_impedances(under, {{22e6, 100}});
+    auto [validUnder, scoringUnder] = filter->evaluate_magnetic(&part, &under);
+    CHECK(validUnder);
+    CHECK_THAT(scoringUnder, WithinRel(std::log10(kMeasuredMagnitudeAt22MHz / 100), 1e-9));
+    auto justUnder = make_cmc_inputs(150000);
+    set_minimum_impedances(justUnder, {{22e6, kMeasuredMagnitudeAt22MHz * 0.999}});
+    CHECK(filter->evaluate_magnetic(&part, &justUnder).first);
+    auto justOver = make_cmc_inputs(150000);
+    set_minimum_impedances(justOver, {{22e6, kMeasuredMagnitudeAt22MHz * 1.001}});
+    CHECK_FALSE(filter->evaluate_magnetic(&part, &justOver).first);
+
+    // A mixed requirement: model points inside the mu(f) range, measured points above it, and a point
+    // above the measured range that is not judged. The score is the mean over the judged points.
+    auto inputs = make_cmc_inputs(150000);
+    set_minimum_impedances(inputs, {{150000, 1e-3}, {1e6, 1e-3}, {22e6, 100}, {30e6, 1e-3}, {2e9, 1e-3}});
+    auto modelOnly = make_cmc_inputs(150000);
+    set_minimum_impedances(modelOnly, {{150000, 1e-3}, {1e6, 1e-3}});
+    auto thirtyOnly = make_cmc_inputs(150000);
+    set_minimum_impedances(thirtyOnly, {{30e6, 1e-3}});
+    auto [valid, scoring] = filter->evaluate_magnetic(&part, &inputs);
+    auto [validModelOnly, scoringModelOnly] = filter->evaluate_magnetic(&part, &modelOnly);
+    auto [validThirtyOnly, scoringThirtyOnly] = filter->evaluate_magnetic(&part, &thirtyOnly);
+    CHECK(valid);
+    CHECK(validModelOnly);
+    CHECK(validThirtyOnly);
+    CHECK_THAT(scoring, WithinRel((2 * scoringModelOnly + scoringUnder + scoringThirtyOnly) / 4, 1e-9));
+    CHECK(filter->get_judged_frequencies(&part, &inputs).value() == std::vector<double>{150000, 1e6, 22e6, 30e6});
+    CHECK(filter->get_measured_frequencies(&part, &inputs).value() == std::vector<double>{22e6, 30e6});
+
+    // The adviser reports both lists.
+    bool strictlyRequired = GENERATE(true, false);
+    INFO("strictlyRequired " << strictlyRequired);
+    std::map<std::string, OpenMagnetics::Magnetic> catalogue{{part.get_reference(), part}};
+    std::vector<MagneticFilterOperation> filterFlow{MagneticFilterOperation(MagneticFilters::IMPEDANCE, true, true, strictlyRequired, 1.0)};
+    MagneticAdviser adviser(false);
+    auto results = adviser.get_advised_magnetic(inputs, catalogue, filterFlow, 10);
+    REQUIRE(results.size() == 1);
+    CHECK(adviser.get_failed_candidates().empty());
+    CHECK(adviser.get_judged_frequencies().at(part.get_reference()).at(MagneticFilters::IMPEDANCE) == std::vector<double>{150000, 1e6, 22e6, 30e6});
+    CHECK(adviser.get_measured_frequencies().at(part.get_reference()).at(MagneticFilters::IMPEDANCE) == std::vector<double>{22e6, 30e6});
+}
+
+// A point measured under DC bias is a different curve: only the zero-bias points are read.
+TEST_CASE("MagneticFilter_Impedance_Measured_Curve_Ignores_DC_Biased_Points", "[magnetic-filter][impedance][measured-band]") {
+    settings.reset();
+    auto part = load_wound_cmc_catalogue_part("7448229004");
+    auto points = impedance_points_of(part);
+    auto biased = make_impedance_point(22e6, 1e6);
+    biased.set_current(2.0);
+    points.push_back(biased);
+    auto partWithBiased = with_impedance_points(part, points);
+    auto curve = MagneticFilterImpedance::get_measured_impedance_curve(partWithBiased);
+    REQUIRE(curve);
+    CHECK(curve->size() == impedance_points_of(part).size());
+    CHECK_THAT(MagneticFilterImpedance::interpolate_measured_impedance(curve.value(), 22e6), WithinRel(kMeasuredMagnitudeAt22MHz, 1e-12));
+
+    // Only biased points: no zero-bias curve, so the part is judged on the mu(f) range alone.
+    auto onlyBiased = with_impedance_points(part, {biased});
+    CHECK_FALSE(MagneticFilterImpedance::get_measured_impedance_curve(onlyBiased));
+}
+
+// A part without a measured curve keeps the covered-band behaviour: points above the mu(f) range
+// are not judged, and the score is the one of its covered points.
+TEST_CASE("MagneticFilter_Impedance_Without_Measured_Curve_Keeps_The_Covered_Band", "[magnetic-filter][impedance][measured-band]") {
+    settings.reset();
+    auto part = without_measured_impedance(load_wound_cmc_catalogue_part("7448229004"));
+    auto inputs = make_cmc_inputs(150000);
+    set_minimum_impedances(inputs, {{150000, 1e-3}, {1e6, 1e-3}, {22e6, 1e9}});
+    auto coveredOnly = make_cmc_inputs(150000);
+    set_minimum_impedances(coveredOnly, {{150000, 1e-3}, {1e6, 1e-3}});
+    auto filter = MagneticFilter::factory(MagneticFilters::IMPEDANCE, inputs);
+    auto [valid, scoring] = filter->evaluate_magnetic(&part, &inputs);
+    auto [validCoveredOnly, scoringCoveredOnly] = filter->evaluate_magnetic(&part, &coveredOnly);
+    CHECK(valid);
+    CHECK(scoring == scoringCoveredOnly);
+    CHECK(filter->get_judged_frequencies(&part, &inputs).value() == std::vector<double>{150000, 1e6});
+    CHECK(filter->get_measured_frequencies(&part, &inputs).value().empty());
+
+    // With its curve the 22 MHz point is judged, and the 1 GOhm request fails it.
+    auto measuredPart = load_wound_cmc_catalogue_part("7448229004");
+    CHECK_FALSE(filter->evaluate_magnetic(&measuredPart, &inputs).first);
+}
+
+// Malformed measured data throws a specific error; nothing is skipped or guessed.
+TEST_CASE("MagneticFilter_Impedance_Malformed_Measured_Curve_Throws", "[magnetic-filter][impedance][measured-band]") {
+    settings.reset();
+    auto part = load_wound_cmc_catalogue_part("7448229004");
+    auto inputs = make_cmc_inputs(150000);
+    set_minimum_impedances(inputs, {{150000, 1e-3}, {22e6, 1e-3}});
+    auto filter = MagneticFilter::factory(MagneticFilters::IMPEDANCE, inputs);
+    auto points = impedance_points_of(part);
+
+    SECTION("a non-positive magnitude") {
+        auto bad = points;
+        bad[100].get_mutable_impedance().set_magnitude(0);
+        auto badPart = with_impedance_points(part, bad);
+        CHECK_THROWS_AS(filter->evaluate_magnetic(&badPart, &inputs), InvalidDatasheetImpedanceException);
+        CHECK_THROWS_AS(MagneticFilterImpedance::get_measured_impedance_curve(badPart), InvalidDatasheetImpedanceException);
+    }
+    SECTION("a non-finite frequency") {
+        auto bad = points;
+        bad[100].set_frequency(std::numeric_limits<double>::quiet_NaN());
+        auto badPart = with_impedance_points(part, bad);
+        CHECK_THROWS_AS(filter->evaluate_magnetic(&badPart, &inputs), InvalidDatasheetImpedanceException);
+    }
+    SECTION("two values at one frequency") {
+        auto bad = points;
+        bad.push_back(make_impedance_point(kBracketLowFrequency, 2 * kBracketLowMagnitude));
+        auto badPart = with_impedance_points(part, bad);
+        CHECK_THROWS_AS(filter->evaluate_magnetic(&badPart, &inputs), InvalidDatasheetImpedanceException);
+    }
+    SECTION("two commonModeChoke entries with a zero-bias curve") {
+        auto manufacturerInfo = part.get_manufacturer_info().value();
+        auto datasheetInfo = manufacturerInfo.get_datasheet_info().value();
+        auto electrical = datasheetInfo.get_electrical().value();
+        electrical.push_back(electrical[0]);
+        datasheetInfo.set_electrical(electrical);
+        manufacturerInfo.set_datasheet_info(datasheetInfo);
+        auto badPart = part;
+        badPart.set_manufacturer_info(manufacturerInfo);
+        CHECK_THROWS_AS(filter->evaluate_magnetic(&badPart, &inputs), InvalidDatasheetImpedanceException);
+    }
+    SECTION("a point without magnitude does not even parse") {
+        json magneticJson;
+        to_json(magneticJson, part);
+        magneticJson["manufacturerInfo"]["datasheetInfo"]["electrical"][0]["impedancePoints"][100]["impedance"].erase("magnitude");
+        CHECK_THROWS(OpenMagnetics::Magnetic(magneticJson));
+    }
+}
+
+// ABT #1740: an operating point that saturates the core is a verdict on the candidate: the saturation
+// filter rejects it, and the core-and-DC losses filter stops its turn sweep at the last count that does
+// not saturate instead of dropping the candidate (any other exception still propagates, ABT #1456).
+// Until ABT #1855 the inductance model refused such a point with a SaturationException and the filters
+// acted on that exception; since then (Alf approved this rewrite 2026-10-14, ABT #1855) the model gives
+// its numbers for a saturated core and the filters judge them with the shared saturation check
+// analyze_results makes (ResultsAnalyzer::check_saturation).
+//
+// The design: an ungapped E 35 / 3C97 inductor carrying 10 A of DC. The bias MMF N I is imposed by the
+// current, so the DC point moves up the material's magnetisation curve with every turn, past the knee
+// on the vacuum's slope, until its B peak passes the material's B_sat. The current is given as a raw waveform
+// (no processed data), which keeps the losses filter's saturation-current cap (it reads the processed
+// peak) out of the way, so the sweep meets the model's refusal itself.
+namespace {
+OpenMagnetics::Inputs saturating_dc_inductor_inputs(double dcCurrent = 10.0) {
+    const double frequency = 100e3;
+    const int samples = 64;
+    json time = json::array(), data = json::array();
+    for (int k = 0; k <= samples; ++k) {
+        time.push_back(k / (samples * frequency));
+        data.push_back(dcCurrent + (k < samples / 2 ? -0.5 + 1.0 * k / (samples / 2) : 0.5 - 1.0 * (k - samples / 2) / (samples / 2)));
+    }
+    OpenMagnetics::Inputs inputs(json{
+        {"designRequirements", {{"magnetizingInductance", {{"minimum", 1e-9}}},
+                                {"turnsRatios", json::array()}, {"isolationSides", {"primary"}}, {"topology", "buckConverter"}}},
+        {"operatingPoints", {{{"name", "dc 10 A"}, {"conditions", {{"ambientTemperature", 25}}},
+                              {"excitationsPerWinding", {{{"name", "Primary"}, {"frequency", frequency},
+                                                          {"current", {{"waveform", {{"time", time}, {"data", data}}}}}}}}}}}});
+    // Inputs processes the waveform on construction; drop the processed data and harmonics again so the
+    // losses filter's saturation-current cap, which reads the processed peak, stays out of the way.
+    for (auto& operatingPoint : inputs.get_mutable_operating_points()) {
+        for (auto& excitation : operatingPoint.get_mutable_excitations_per_winding()) {
+            auto current = excitation.get_current().value();
+            current.set_processed(std::nullopt);
+            current.set_harmonics(std::nullopt);
+            excitation.set_current(current);
+        }
+    }
+    return inputs;
+}
+
+OpenMagnetics::Magnetic saturating_dc_inductor(int64_t numberTurns) {
+    OpenMagneticsTesting::QuickMagneticConfig cfg;
+    cfg.numberTurns = {numberTurns};
+    cfg.numberParallels = {1};
+    cfg.coreShapeName = "E 35";
+    cfg.coreMaterialName = "3C97";
+    cfg.wireNames = {"Round 1.00 - Grade 1"};
+    auto magnetic = OpenMagneticsTesting::create_quick_test_magnetic(cfg);
+    magnetic.get_mutable_coil().wind();
+    return magnetic;
+}
+
+// Whether the shared saturation check (margin 1, the operating point's ambient) calls that turn count
+// saturated: the inductance model's B peak above the material's B_sat, or the bias collapsing the
+// permeability to mu_r = 1 at the model's DC point (both criteria, Alf 2026-10-14).
+bool saturating_dc_inductor_saturates(int64_t numberTurns, const OpenMagnetics::Inputs& inputs) {
+    auto magnetic = saturating_dc_inductor(numberTurns);
+    auto operatingPoint = inputs.get_operating_points()[0];
+    MagnetizingInductance model;
+    auto fluxDensity = model.calculate_inductance_and_magnetic_flux_density(magnetic.get_core(), magnetic.get_coil(), &operatingPoint).second;
+    return ResultsAnalyzer::check_saturation(magnetic.get_core().resolve_material(), ResultsAnalyzer::get_peak_flux_density(fluxDensity),
+                                             operatingPoint.get_conditions().get_ambient_temperature(), 1.0, model.get_last_dc_bias_point()).saturates;
+}
+
+// The highest turn count whose B peak at that bias is not above B_sat; one more is.
+int64_t last_turn_count_before_saturation_refusal() {
+    auto inputs = saturating_dc_inductor_inputs();
+    for (int64_t numberTurns = 1; numberTurns <= 200; ++numberTurns) {
+        if (saturating_dc_inductor_saturates(numberTurns, inputs)) {
+            return numberTurns - 1;
+        }
+    }
+    throw std::runtime_error("no turn count up to 200 saturates the test inductor");
+}
+}  // namespace
+
+TEST_CASE("MagneticFilter SATURATION rejects a candidate the inductance model refuses as saturated",
+          "[magnetic-filter][saturation][abt-1740]") {
+    settings.reset();
+    clear_databases();
+    auto inputs = saturating_dc_inductor_inputs();
+    int64_t lastWorking = last_turn_count_before_saturation_refusal();
+    INFO("last turn count before the refusal: " << lastWorking);
+    REQUIRE(lastWorking >= 2);
+
+    // The model gives its numbers for the saturated count, and the shared check says it saturates.
+    auto saturated = saturating_dc_inductor(lastWorking + 1);
+    auto operatingPoint = inputs.get_operating_point(0);
+    std::pair<MagnetizingInductanceOutput, SignalDescriptor> saturatedResult;
+    MagnetizingInductance saturatedModel;
+    REQUIRE_NOTHROW(saturatedResult = saturatedModel.calculate_inductance_and_magnetic_flux_density(saturated.get_core(), saturated.get_coil(), &operatingPoint));
+    double saturatedInductance = resolve_dimensional_values(saturatedResult.first.get_magnetizing_inductance());
+    auto saturationVerdict = ResultsAnalyzer::check_saturation(saturated.get_core().resolve_material(), ResultsAnalyzer::get_peak_flux_density(saturatedResult.second), 25,
+                                                               1.0, saturatedModel.get_last_dc_bias_point());
+    INFO(lastWorking + 1 << " turns: L " << saturatedInductance << " H, B peak " << saturationVerdict.peakFluxDensity << " T, B_sat " << saturationVerdict.saturationFluxDensity << " T");
+    CHECK(std::isfinite(saturatedInductance));
+    CHECK(saturatedInductance > 0);
+    CHECK(saturationVerdict.saturates);
+    CHECK_FALSE(saturating_dc_inductor_saturates(lastWorking, inputs));
+
+    // The filter's verdict on it is a reject, not an exception.
+    MagneticFilterSaturation filter;
+    std::pair<bool, double> verdict{true, -1};
+    CHECK_NOTHROW(verdict = filter.evaluate_magnetic(&saturated, &inputs));
+    CHECK(verdict == std::pair<bool, double>{false, 0.0});
+
+    // Control: a single turn of the same core at 1 A of DC (about 0.04 T) is far from it, and passes.
+    auto light = saturating_dc_inductor(1);
+    auto lightInputs = saturating_dc_inductor_inputs(1.0);
+    CHECK(filter.evaluate_magnetic(&light, &lightInputs).first);
+    settings.reset();
+}
+
+TEST_CASE("MagneticFilter CORE_AND_DC_LOSSES turn sweep stops at the last count that does not saturate",
+          "[magnetic-filter][losses][abt-1740]") {
+    settings.reset();
+    clear_databases();
+    auto inputs = saturating_dc_inductor_inputs();
+    int64_t lastWorking = last_turn_count_before_saturation_refusal();
+    INFO("last turn count before the refusal: " << lastWorking);
+    REQUIRE(lastWorking >= 2);
+
+    // The sweep starts at the last working count; its next step (one more turn) is refused as saturated.
+    // The candidate keeps the count that worked, with its losses.
+    auto magnetic = saturating_dc_inductor(lastWorking);
+    MagneticFilterCoreAndDcLosses filter(inputs);
+    std::pair<bool, double> verdict{false, 0};
+    REQUIRE_NOTHROW(verdict = filter.evaluate_magnetic(&magnetic, &inputs));
+    // Scored with its losses, not the {false, 0} reject. (Its valid flag compares those losses with a power
+    // budget derived from the inputs, which a current-only operating point does not give: not judged here.)
+    CHECK(verdict.second > 0);
+    CHECK(magnetic.get_coil().get_functional_description()[0].get_number_turns() == lastWorking);
+
+    // A candidate whose very first count saturates has no count to keep: it is rejected.
+    auto saturated = saturating_dc_inductor(lastWorking + 1);
+    REQUIRE_NOTHROW(verdict = filter.evaluate_magnetic(&saturated, &inputs));
+    CHECK(verdict == std::pair<bool, double>{false, 0.0});
     settings.reset();
 }

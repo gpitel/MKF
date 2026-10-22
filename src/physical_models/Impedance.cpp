@@ -25,10 +25,21 @@ std::complex<double> Impedance::calculate_impedance(Magnetic magnetic, double fr
 }
 
 std::complex<double> Impedance::calculate_differential_mode_impedance(Magnetic magnetic, double frequency, double temperature) {
-    return calculate_differential_mode_impedance(magnetic.get_core(), magnetic.get_coil(), frequency, temperature);
+    auto parameters = calculate_differential_mode_parameters(magnetic, frequency, temperature);
+    return differential_mode_impedance_from_parameters(parameters, frequency);
 }
 
-DifferentialModeParameters Impedance::calculate_differential_mode_parameters(Core core, Coil coil, double referenceFrequency, double temperature) {
+DifferentialModeParameters Impedance::calculate_differential_mode_parameters(Magnetic magnetic, double referenceFrequency, double temperature) {
+    // The magnetic carries the core's electrical reference (floating, grounded, tied to a
+    // terminal); a bonded core diverts the through-core inter-winding path to the reference, so
+    // the DM capacitance must see it. The Core/Coil overload has no magnetic and treats the core
+    // as floating, which is what an absent reference means.
+    return calculate_differential_mode_parameters(magnetic.get_core(), magnetic.get_coil(), referenceFrequency, temperature,
+                                                  magnetic.get_core_electrical_reference());
+}
+
+DifferentialModeParameters Impedance::calculate_differential_mode_parameters(Core core, Coil coil, double referenceFrequency, double temperature,
+                                                                            std::optional<CoreElectricalReference> coreElectricalReference) {
     // Differential mode: the two windings carry opposing currents, so the flux
     // they drive into the core cancels. The inductance seen is therefore the
     // *leakage* inductance (the flux that does not couple through the core),
@@ -53,7 +64,11 @@ DifferentialModeParameters Impedance::calculate_differential_mode_parameters(Cor
     // The leakage path is essentially air-cored (no core permeability), so the
     // inductive branch is purely reactive; the winding resistance is the
     // dominant loss term. Sign convention matches calculate_impedance().
-    double windingResistance = WindingOhmicLosses::calculate_dc_resistance_per_winding(coil, temperature)[0];
+    // The differential-mode current flows through both windings in series (the
+    // series-opposing loop whose inductance is the leakage above), so the loop
+    // resistance is the sum of the two windings' DC resistances, not winding 0's alone.
+    auto dcResistancePerWinding = WindingOhmicLosses::calculate_dc_resistance_per_winding(coil, temperature);
+    double windingResistance = dcResistancePerWinding[0] + dcResistancePerWinding[1];
 
     // Inter-winding capacitance: the off-diagonal term of the stray-capacitance
     // matrix (between the two windings). On a separated-winding CMC the two
@@ -63,7 +78,11 @@ DifferentialModeParameters Impedance::calculate_differential_mode_parameters(Cor
     if (!coil.get_turns_description()) {
         coil.wind();
     }
-    auto capacitanceMatrix = StrayCapacitance().calculate_capacitance(coil, core).get_capacitance_among_windings().value();
+    // The stray-capacitance model is the one selected in the settings, as in the common-mode
+    // tank; it used to be the constructor default here, so a model chosen in the settings changed
+    // the CM self-capacitance but silently not the DM inter-winding capacitance.
+    auto strayCapacitanceModel = Settings::GetInstance().get_stray_capacitance_model();
+    auto capacitanceMatrix = StrayCapacitance(strayCapacitanceModel).calculate_capacitance(coil, core, std::nullopt, coreElectricalReference).get_capacitance_among_windings().value();
     auto primaryName = coil.get_functional_description()[0].get_name();
     auto secondaryName = coil.get_functional_description()[1].get_name();
     double interWindingCapacitance = capacitanceMatrix[primaryName][secondaryName];
@@ -71,21 +90,33 @@ DifferentialModeParameters Impedance::calculate_differential_mode_parameters(Cor
     // the through-core path carries the core image factor at the frequency it acts (ABT #848).
     if (leakageInductance > 0 && interWindingCapacitance > 0) {
         double differentialResonance = 1.0 / (2.0 * std::numbers::pi * std::sqrt(leakageInductance * interWindingCapacitance));
-        capacitanceMatrix = StrayCapacitance().calculate_capacitance(coil, core, differentialResonance).get_capacitance_among_windings().value();
+        capacitanceMatrix = StrayCapacitance(strayCapacitanceModel).calculate_capacitance(coil, core, differentialResonance, coreElectricalReference).get_capacitance_among_windings().value();
         interWindingCapacitance = capacitanceMatrix[primaryName][secondaryName];
     }
 
-    return {leakageInductance, windingResistance, interWindingCapacitance};
+    // The capacitance that shunts the leakage at the DM port is not the inter-winding entry
+    // alone: driving the windings in series opposition also charges the turn-to-turn
+    // capacitances INSIDE each winding (their turns sit at the DM ramp, not at one potential) and
+    // every turn's element to the core. calculate_differential_mode_capacitance sums that energy
+    // (C_DM = 2 W / V_port^2). Same second pass at the resonance it implies, for the image factor.
+    StrayCapacitance differentialModeCapacitanceModel(strayCapacitanceModel);
+    double differentialModeCapacitance = differentialModeCapacitanceModel.calculate_differential_mode_capacitance(coil, core, std::nullopt, coreElectricalReference);
+    if (leakageInductance > 0 && differentialModeCapacitance > 0) {
+        double differentialResonance = 1.0 / (2.0 * std::numbers::pi * std::sqrt(leakageInductance * differentialModeCapacitance));
+        differentialModeCapacitance = differentialModeCapacitanceModel.calculate_differential_mode_capacitance(coil, core, differentialResonance, coreElectricalReference);
+    }
+
+    return {leakageInductance, windingResistance, interWindingCapacitance, differentialModeCapacitance};
 }
 
 std::complex<double> Impedance::differential_mode_impedance_from_parameters(const DifferentialModeParameters& parameters, double frequency) {
     auto angularFrequency = 2 * std::numbers::pi * frequency;
     auto inductiveImpedance = std::complex<double>(parameters.windingResistance, angularFrequency * parameters.leakageInductance);
-    if (parameters.interWindingCapacitance <= 0) {
+    if (parameters.differentialModeCapacitance <= 0) {
         // No capacitive path: the DM impedance is purely the leakage branch.
         return inductiveImpedance;
     }
-    auto capacitiveImpedance = std::complex<double>(0, -1.0 / (angularFrequency * parameters.interWindingCapacitance));
+    auto capacitiveImpedance = std::complex<double>(0, -1.0 / (angularFrequency * parameters.differentialModeCapacitance));
     return 1.0 / (1.0 / inductiveImpedance + 1.0 / capacitiveImpedance);
 }
 
@@ -94,9 +125,9 @@ std::complex<double> Impedance::calculate_differential_mode_impedance(Core core,
     return differential_mode_impedance_from_parameters(parameters, frequency);
 }
 
-double Impedance::estimate_resonance_frequency(Core& core, double airCoredInductance, double capacitance) {
-    // Where a tank built from this air-cored inductance and capacitance resonates, with the
-    // core's initial permeability (25 C, no bias) as the inductance multiplier: the frequency
+double Impedance::estimate_resonance_frequency(Core& core, double airCoredInductance, double gapReluctanceRatio, double capacitance) {
+    // Where a tank built from this inductance and capacitance resonates, with the core's initial
+    // permeability (25 C, no bias) in N^2/(R_core(mu=1)/mu_i + R_gap): the frequency
     // at which the stray capacitance actually acts, which StrayCapacitance::core_image_factor
     // needs to read the core material's permittivity. An estimate is all that is wanted —
     // the factor is slow in frequency — so the low-frequency permeability is the honest
@@ -108,7 +139,8 @@ double Impedance::estimate_resonance_frequency(Core& core, double airCoredInduct
     if (initialPermeability <= 0) {
         return 0.0;
     }
-    return 1.0 / (2.0 * std::numbers::pi * std::sqrt(airCoredInductance * initialPermeability * capacitance));
+    double lowFrequencyInductance = airCoredInductance * initialPermeability / (1.0 + initialPermeability * gapReluctanceRatio);
+    return 1.0 / (2.0 * std::numbers::pi * std::sqrt(lowFrequencyInductance * capacitance));
 }
 
 ImpedanceTank Impedance::build_magnetizing_tank(Core& core, Coil& coil) {
@@ -126,10 +158,19 @@ ImpedanceTank Impedance::build_magnetizing_tank(Core& core, Coil& coil) {
             "Impedance needs the core's processed description (effective area and length) to "
             "build the magnetizing tank; the core carries only its functional description");
     }
+    // The core and its gaps are in series on the flux path: L(f) = N^2 / (R_core(mu=1)/mu(f) + R_gap).
+    // R_core(mu=1) = l_e/(mu0 A_e) scales with the complex permeability; the gapping reluctance
+    // R_gap (fringing included, the default reluctance model -- the one MagnetizingInductance uses)
+    // does not. Multiplying N^2/(R_core(mu=1) + R_gap) by mu(f), as this tank used to, weights the
+    // gap by mu too and so drops it: a 0.5 mm ground gap, or the residual gaps of an ungapped
+    // two-piece core, left the common-mode inductance at the gapless value.
     auto reluctanceModel = OpenMagnetics::ReluctanceModel::factory();
     double numberTurns = coil.get_functional_description()[0].get_number_turns();
-    double reluctanceCoreUnityPermeability = reluctanceModel->get_core_reluctance(core, 1).get_core_reluctance();
+    auto unityPermeabilityReluctance = reluctanceModel->get_core_reluctance(core, 1);
+    double reluctanceCoreUnityPermeability = unityPermeabilityReluctance.get_ungapped_core_reluctance().value();
+    double gapReluctance = OpenMagnetics::ReluctanceModel::gapping_reluctance_in_series(core, unityPermeabilityReluctance);
     double airCoredInductance = numberTurns * numberTurns / reluctanceCoreUnityPermeability;
+    double gapReluctanceRatio = gapReluctance / reluctanceCoreUnityPermeability;
 
     double capacitance;
     auto& settings = Settings::GetInstance();
@@ -180,7 +221,7 @@ ImpedanceTank Impedance::build_magnetizing_tank(Core& core, Coil& coil) {
         // resonance from the low-frequency inductance, the second evaluates the capacitance
         // there. beta varies slowly with frequency (NiZn eps_r 25 -> 12 over 1-100 MHz), so one
         // refinement is enough; a third pass changes the result by well under a percent.
-        double resonanceEstimate = estimate_resonance_frequency(core, airCoredInductance, capacitance);
+        double resonanceEstimate = estimate_resonance_frequency(core, airCoredInductance, gapReluctanceRatio, capacitance);
         if (resonanceEstimate > 0) {
             capacitanceMatrix = StrayCapacitance(strayCapacitanceModel).calculate_capacitance(coil, core, resonanceEstimate).get_capacitance_among_windings().value();
             capacitance = capacitanceMatrix[windingName][windingName];
@@ -202,7 +243,9 @@ ImpedanceTank Impedance::build_magnetizing_tank(Core& core, Coil& coil) {
         capacitance *= static_cast<double>(windingCount);
     }
 
-    return ImpedanceTank{airCoredInductance, capacitance, true};
+    ImpedanceTank tank{airCoredInductance, capacitance, true};
+    tank.gapReluctanceRatio = gapReluctanceRatio;
+    return tank;
 }
 
 
@@ -306,7 +349,9 @@ std::complex<double> Impedance::impedance_from_model(const WidebandImpedanceMode
     double complexPermeabilityRealPart = 1.0;
     double complexPermeabilityImaginaryPart = 0.0;
     if (model.coreMaterial) {
-        auto [muReal, muImag] = OpenMagnetics::ComplexPermeability().get_complex_permeability(model.coreMaterial.value(), frequency);
+        auto [muReal, muImag] = model.tabulatedComplexPermeabilityOnly
+            ? OpenMagnetics::ComplexPermeability().get_tabulated_complex_permeability(model.coreMaterial.value(), frequency)
+            : OpenMagnetics::ComplexPermeability().get_complex_permeability(model.coreMaterial.value(), frequency);
         // ABT #848: dimensional / eddy-dielectric attenuation across the core cross-section.
         // Complex multiply in e^{jwt}: (mu' - j mu'') * factor, then read back mu', mu''.
         auto factor = core_dimensional_attenuation(model.coreMaterial.value(), frequency, std::complex<double>(muReal, muImag), model.coreCrossSectionDimensions);
@@ -354,7 +399,11 @@ std::complex<double> Impedance::impedance_from_model(const WidebandImpedanceMode
     for (const auto& tank : model.tanks) {
         std::complex<double> seriesArm;
         if (tank.usesCorePermeability) {
-            seriesArm = angularFrequency * tank.inductance * std::complex<double>(complexPermeabilityImaginaryPart, complexPermeabilityRealPart);
+            // Z = j w N^2 / (R_core(mu=1)/mu + R_gap) = j w L_air mu / (1 + mu R_gap/R_core(mu=1)),
+            // mu = mu' - j mu'' (e^{jwt}). Without a gap this is w L_air (mu'' + j mu').
+            std::complex<double> permeability(complexPermeabilityRealPart, -complexPermeabilityImaginaryPart);
+            std::complex<double> effectivePermeability = permeability / (1.0 + permeability * tank.gapReluctanceRatio);
+            seriesArm = std::complex<double>(0, angularFrequency * tank.inductance) * effectivePermeability;
         }
         else {
             // Leakage loop resistance referred to winding 0: R_0 + (N_0/N_j)²·R_j.
@@ -380,6 +429,7 @@ WidebandImpedanceModel Impedance::build_wideband_impedance_model(Magnetic magnet
 
     WidebandImpedanceModel model;
     model.coreMaterial = core.resolve_material();
+    model.tabulatedComplexPermeabilityOnly = _tabulatedComplexPermeabilityOnly;
     if (core.get_processed_description() && !core.get_processed_description()->get_columns().empty()) {
         auto column = core.get_processed_description()->get_columns()[0];
         model.coreCrossSectionDimensions = {column.get_width(), column.get_depth()};
@@ -407,7 +457,7 @@ WidebandImpedanceModel Impedance::build_wideband_impedance_model(Magnetic magnet
         // Inter-winding capacitances: the off-diagonal terms of the stray-capacitance
         // matrix (the through-core path on a separated-winding choke). The whole
         // matrix is computed once here, not per frequency.
-        auto capacitanceMatrix = StrayCapacitance().calculate_capacitance(coil, core, std::nullopt, magnetic.get_core_electrical_reference()).get_capacitance_among_windings().value();
+        auto capacitanceMatrix = StrayCapacitance(Settings::GetInstance().get_stray_capacitance_model()).calculate_capacitance(coil, core, std::nullopt, magnetic.get_core_electrical_reference()).get_capacitance_among_windings().value();
         auto primaryName = coil.get_functional_description()[0].get_name();
         double primaryTurns = coil.get_functional_description()[0].get_number_turns();
 
@@ -446,13 +496,31 @@ WidebandImpedanceModel Impedance::build_wideband_impedance_model(Magnetic magnet
                 continue;  // no leakage path to this winding -> no extra resonance
             }
             auto secondaryName = coil.get_functional_description()[windingIndex].get_name();
-            double interWindingCapacitance = capacitanceMatrix[primaryName][secondaryName];
-            // Second pass at this leakage tank's resonance: the through-core inter-winding path
-            // carries the core image factor at the frequency where it acts (ABT #848).
-            if (interWindingCapacitance > 0) {
-                double differentialResonance = 1.0 / (2.0 * std::numbers::pi * std::sqrt(leakageInductance * interWindingCapacitance));
-                auto refined = StrayCapacitance().calculate_capacitance(coil, core, differentialResonance, magnetic.get_core_electrical_reference()).get_capacitance_among_windings().value();
-                interWindingCapacitance = refined[primaryName][secondaryName];
+            double interWindingCapacitance;
+            if (numberWindings == 2) {
+                // Two windings: the leakage tank is the DM port's resonance, shunted by everything
+                // the port charges (calculate_differential_mode_capacitance), not by the
+                // inter-winding matrix entry alone. Second pass at its resonance, for the image
+                // factor (ABT #848).
+                StrayCapacitance differentialModeCapacitanceModel(Settings::GetInstance().get_stray_capacitance_model());
+                interWindingCapacitance = differentialModeCapacitanceModel.calculate_differential_mode_capacitance(coil, core, std::nullopt, magnetic.get_core_electrical_reference());
+                if (interWindingCapacitance > 0) {
+                    double differentialResonance = 1.0 / (2.0 * std::numbers::pi * std::sqrt(leakageInductance * interWindingCapacitance));
+                    interWindingCapacitance = differentialModeCapacitanceModel.calculate_differential_mode_capacitance(coil, core, differentialResonance, magnetic.get_core_electrical_reference());
+                }
+            }
+            else {
+                // More than two windings: a pair's DM port leaves the other windings open, at
+                // potentials the port does not define, so calculate_differential_mode_capacitance
+                // does not apply; the tank keeps the pair's inter-winding matrix entry.
+                interWindingCapacitance = capacitanceMatrix[primaryName][secondaryName];
+                // Second pass at this leakage tank's resonance: the through-core inter-winding path
+                // carries the core image factor at the frequency where it acts (ABT #848).
+                if (interWindingCapacitance > 0) {
+                    double differentialResonance = 1.0 / (2.0 * std::numbers::pi * std::sqrt(leakageInductance * interWindingCapacitance));
+                    auto refined = StrayCapacitance(Settings::GetInstance().get_stray_capacitance_model()).calculate_capacitance(coil, core, differentialResonance, magnetic.get_core_electrical_reference()).get_capacitance_among_windings().value();
+                    interWindingCapacitance = refined[primaryName][secondaryName];
+                }
             }
             // Referral factor (N_0/N_j)² for the secondary resistance in this leakage loop.
             double secondaryTurns = coil.get_functional_description()[windingIndex].get_number_turns();
@@ -474,6 +542,7 @@ WidebandImpedanceModel Impedance::build_common_mode_impedance_model(Magnetic mag
 
     WidebandImpedanceModel model;
     model.coreMaterial = core.resolve_material();
+    model.tabulatedComplexPermeabilityOnly = _tabulatedComplexPermeabilityOnly;
     if (core.get_processed_description() && !core.get_processed_description()->get_columns().empty()) {
         auto column = core.get_processed_description()->get_columns()[0];
         model.coreCrossSectionDimensions = {column.get_width(), column.get_depth()};
@@ -488,6 +557,7 @@ std::complex<double> Impedance::calculate_impedance(Core core, Coil coil, double
     // first resonance). The wideband sweep adds the leakage tanks on top of this.
     WidebandImpedanceModel model;
     model.coreMaterial = core.resolve_material();
+    model.tabulatedComplexPermeabilityOnly = _tabulatedComplexPermeabilityOnly;
     if (core.get_processed_description() && !core.get_processed_description()->get_columns().empty()) {
         auto column = core.get_processed_description()->get_columns()[0];
         model.coreCrossSectionDimensions = {column.get_width(), column.get_depth()};
@@ -512,6 +582,7 @@ std::complex<double> Impedance::calculate_impedance(Core core, Coil coil, double
     // scaled by µ(H_dc)/µ(0) to account for permeability rolloff under DC bias.
     WidebandImpedanceModel model;
     model.coreMaterial = coreMaterial;
+    model.tabulatedComplexPermeabilityOnly = _tabulatedComplexPermeabilityOnly;
     if (core.get_processed_description() && !core.get_processed_description()->get_columns().empty()) {
         auto column = core.get_processed_description()->get_columns()[0];
         model.coreCrossSectionDimensions = {column.get_width(), column.get_depth()};
@@ -523,6 +594,17 @@ std::complex<double> Impedance::calculate_impedance(Core core, Coil coil, double
 }
 
 int64_t Impedance::calculate_minimum_number_turns(Magnetic magnetic, Inputs inputs) {
+    // A design decision: it stays on the material's tabulated complex permeability, as the advisers
+    // and filters do (Alf, 2026-10-14, ABT #1861). The flag is restored on every exit, exceptions included.
+    struct TabulatedOnlyScope {
+        bool& flag;
+        bool previous;
+        explicit TabulatedOnlyScope(bool& value) : flag(value), previous(value) { flag = true; }
+        ~TabulatedOnlyScope() { flag = previous; }
+        TabulatedOnlyScope(const TabulatedOnlyScope&) = delete;
+        TabulatedOnlyScope& operator=(const TabulatedOnlyScope&) = delete;
+    } tabulatedOnly(_tabulatedComplexPermeabilityOnly);
+
     NumberTurns numberTurns(1, inputs.get_design_requirements());
     if (!inputs.get_design_requirements().get_minimum_impedance()) {
         throw std::invalid_argument("Missing impedance requirement");
@@ -598,8 +680,11 @@ double Impedance::calculate_self_resonant_frequency(Core core, Coil coil, double
         {
             auto reluctanceModel = OpenMagnetics::ReluctanceModel::factory();
             double numberTurns = coil.get_functional_description()[0].get_number_turns();
-            double airCoredInductance = numberTurns * numberTurns / reluctanceModel->get_core_reluctance(core, 1).get_core_reluctance();
-            double resonanceEstimate = estimate_resonance_frequency(core, airCoredInductance, capacitance);
+            auto unityPermeabilityReluctance = reluctanceModel->get_core_reluctance(core, 1);
+            double reluctanceCoreUnityPermeability = unityPermeabilityReluctance.get_ungapped_core_reluctance().value();
+            double airCoredInductance = numberTurns * numberTurns / reluctanceCoreUnityPermeability;
+            double gapReluctanceRatio = OpenMagnetics::ReluctanceModel::gapping_reluctance_in_series(core, unityPermeabilityReluctance) / reluctanceCoreUnityPermeability;
+            double resonanceEstimate = estimate_resonance_frequency(core, airCoredInductance, gapReluctanceRatio, capacitance);
             if (resonanceEstimate > 0) {
                 capacitanceMatrix = StrayCapacitance().calculate_capacitance(coil, core, resonanceEstimate, coreElectricalReference).get_capacitance_among_windings().value();
                 capacitance = capacitanceMatrix[windingName][windingName];
@@ -609,9 +694,12 @@ double Impedance::calculate_self_resonant_frequency(Core core, Coil coil, double
         // magnetic coupling forces every open winding to mirror the driven winding's
         // per-turn potential profile (a 1:1 transformer), so each one's turn-to-core
         // elements charge identically and add in parallel. Multiplying the single-winding
-        // self term by the winding count is that mirror, and it lands both measured SRF
-        // anchors (T12.5/7.5/5 110-turn: 180 kHz; Test_Impedance_0: 1.4 MHz) inside
-        // tolerance where the bare single-winding term sat ~1.7x high (ABT #848).
+        // self term by the winding count is that mirror (ABT #848: the bare single-winding
+        // term sat ~1.7x high). The 110-turn anchor of Test_Self_Resonant_Frequency_Many_Turns
+        // is the measured s4p common-mode peak of WE-CMB 744821039, 137.2 kHz (it used to read
+        // 180 kHz, which no measurement of the part gives). The model currently reads 103.0 kHz
+        // there: its inter-layer turn-to-turn capacitance puts C_CM at 59.4 pF, about 2x the
+        // 30.2 pF the measurement implies (1/((2 pi 137246)^2 * 44.59 mH)). Under investigation.
         capacitance *= static_cast<double>(coil.get_functional_description().size());
     }
 

@@ -62,6 +62,91 @@ TEST_CASE("Calculate leakage inductance for a E core with same number of turns",
     settings.reset();
 }
 
+// Leaves `value` in the stack region the next calls will use, so that a local read before it is written reads `value`.
+[[gnu::noinline]] static double fill_stack_with(double value) {
+    volatile double region[131072];
+    for (size_t index = 0; index < 131072; ++index) {
+        region[index] = value;
+    }
+    return region[65536];
+}
+
+TEST_CASE("The leakage operating point states its ambient temperature", "[physical-model][leakage-inductance]") {
+    // ABT #1759: the leakage model builds its own unit-current operating point, and the field solution reads its
+    // conditions: with parallels, the current split takes the core's permeability and the conductors' resistivity at the
+    // ambient temperature. The generated OperatingConditions leaves that temperature uninitialised, so the split was solved
+    // at whatever the stack held -- seven MAS examples (02 flyback, 06 LLC, 09 planar, 11 push-pull, 20, 22, 24) threw
+    // MATERIAL_TEMPERATURE_OUT_OF_RANGE at a stale Curie temperature, or not, from run to run. The leakage of a design with
+    // parallels must not depend on what the stack held before the call.
+    settings.reset();
+    std::vector<int64_t> numberTurns({42, 7});
+    std::vector<int64_t> numberParallels({1, 3});
+    std::string shapeName = "E 42/33/20";
+    std::vector<OpenMagnetics::Wire> wires;
+    wires.push_back(OpenMagnetics::Wire::create_quick_litz_wire(0.00005, 25));
+    wires.push_back(OpenMagnetics::Wire::create_quick_litz_wire(0.00005, 25));
+    auto coil = OpenMagnetics::Coil::create_quick_coil(shapeName, numberTurns, numberParallels, wires);
+    auto core = OpenMagnetics::Core::create_quick_core(shapeName, "3C95", OpenMagnetics::Core::create_ground_gapping(2e-5, 3));
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(coil);
+
+    std::vector<double> leakageInductances;
+    for (double stale : {1e9, -1e9, 244.0}) {
+        INFO("stack filled with " << stale);
+        CHECK(fill_stack_with(stale) == stale);
+        double leakageInductance = 0;
+        REQUIRE_NOTHROW(leakageInductance = LeakageInductance().calculate_leakage_inductance(magnetic, 100000).get_leakage_inductance_per_winding()[0].get_nominal().value());
+        leakageInductances.push_back(leakageInductance);
+    }
+    CHECK(leakageInductances[0] > 0);
+    CHECK(leakageInductances[1] == leakageInductances[0]);
+    CHECK(leakageInductances[2] == leakageInductances[0]);
+    settings.reset();
+}
+
+// ABT #1759: leakage is the conductors' field with gap fringing off, so the global fringing model -- the winding-loss
+// choice -- must not enter it, and a window-boundary model there (MMF_BOUNDARY, which refuses fringing off) must not make
+// leakage throw. Counter-check: hand MagneticField the global fringing model in LeakageInductance.cpp and the
+// MMF_BOUNDARY leg throws.
+TEST_CASE("Test_Leakage_Inductance_Ignores_The_Global_Fringing_Model", "[physical-model][leakage-inductance][mmf-boundary]") {
+    settings.reset();
+    std::vector<int64_t> numberTurns({30, 15});
+    std::vector<int64_t> numberParallels({1, 1});
+    std::string shapeName = "E 42/21/20";
+    std::vector<OpenMagnetics::Wire> wires;
+    wires.push_back(OpenMagnetics::Wire::create_quick_litz_wire(0.00005, 25));
+    wires.push_back(OpenMagnetics::Wire::create_quick_litz_wire(0.00005, 50));
+    auto coil = OpenMagnetics::Coil::create_quick_coil(shapeName, numberTurns, numberParallels, wires);
+    auto gapping = OpenMagnetics::Core::create_ground_gapping(0.001, 3);
+    auto core = OpenMagnetics::Core::create_quick_core(shapeName, "3C97", gapping);
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(core);
+    magnetic.set_coil(coil);
+    const double frequency = 100000;
+
+    auto leakageWith = [&](std::optional<MagneticFieldStrengthFringingEffectModels> globalFringingModel) {
+        settings.reset();
+        if (globalFringingModel) {
+            settings.set_magnetic_field_strength_fringing_effect_model(globalFringingModel.value());
+        }
+        auto value = LeakageInductance().calculate_leakage_inductance(magnetic, frequency).get_leakage_inductance_per_winding()[0].get_nominal().value();
+        // Leakage leaves the global fringing switch as it found it.
+        CHECK(settings.get_magnetic_field_include_fringing());
+        return value;
+    };
+    const double byDefault = leakageWith(std::nullopt);
+    CHECK(byDefault > 0);
+    for (auto model : {MagneticFieldStrengthFringingEffectModels::MMF_BOUNDARY, MagneticFieldStrengthFringingEffectModels::ALBACH,
+                       MagneticFieldStrengthFringingEffectModels::SULLIVAN}) {
+        INFO(magic_enum::enum_name(model));
+        double value = 0;
+        REQUIRE_NOTHROW(value = leakageWith(model));
+        CHECK(value == byDefault);
+    }
+    settings.reset();
+}
+
 TEST_CASE("Calculate leakage inductance for a E core with different number of turns", "[physical-model][leakage-inductance]") {
     std::vector<int64_t> numberTurns({64, 20});
     std::vector<int64_t> numberParallels({1, 1});
@@ -501,7 +586,14 @@ TEST_CASE("Calculate leakage inductance for toroidal cores with contiguous secti
     // an MKF characterization value. 0.43 % of the 222 mH self-inductance.
     // ABT #1240: 0.9138e-3 -> 0.94808e-3 (+3.7 %), the field inside the round wires (it was zeroed) now stores
     // its energy; the toroid grid and Kelvin images are unchanged.
-    double expectedLeakageInductance = 0.94808e-3;
+    // 2026-09-30: 0.94808e-3 -> 4.8260e-3. The toroid grid is replaced by the exact per-region ring-plane
+    // solution plus the 3-D correction (LeakageInductance.h, "Toroidal cores"); the old model read 0.10x the
+    // measured differential-mode inductance across 225 WE common-mode chokes. Check on the new value: winding 0
+    // is concentrated in 14 degrees against winding 1 spread over the whole ring, so the MMF is a sawtooth of
+    // 200 A-turns whose harmonics |S_m| stay near 200 up to m ~ 2 pi / 14 deg; (2 mu0 / pi) * 200^2 * sum 1/m gives
+    // about 0.12 H/m, and the model's ring-plane part is 0.096 H/m (x 31 mm half turn = 3.0 mH), plus a 1.85 mH
+    // 3-D correction (large here because the low harmonics dominate). 2.2 % of the 222 mH self-inductance.
+    double expectedLeakageInductance = 4.8260e-3;
 
     auto leakageInductance = LeakageInductance().calculate_leakage_inductance(magnetic, frequency, 1, 0).get_leakage_inductance_per_winding()[0].get_nominal().value();
     CHECK_THAT(leakageInductance, WithinRel(expectedLeakageInductance, maximumError));
@@ -560,7 +652,10 @@ TEST_CASE("Calculate leakage inductance for toroidal cores with contiguous secti
     // contiguous two-sector (common-mode-choke) toroidal topology.
     // ABT #1211: halved as above (6.27273e-6 / (2 a^2)); characterization value, no independent reference. 0.58 %.
     // ABT #1240: 3.1617e-6 -> 3.2288e-6 (+2.1 %), the in-wire field as in the sibling test.
-    double expectedLeakageInductance = 3.2288e-6;
+    // 2026-09-30: 3.2288e-6 -> 1.6359e-5, the toroidal model of the sibling test above. Winding 0 spans 108 degrees
+    // and winding 1 (5 turns at twice the current) only 24 degrees, so the MMF is far from balanced along the ring:
+    // ring-plane 0.28 mH/m x 34 mm = 9.4 uH plus a 7.0 uH 3-D correction. 2.9 % of the 0.556 mH self-inductance.
+    double expectedLeakageInductance = 1.6359e-5;
 
     auto leakageInductance = LeakageInductance().calculate_leakage_inductance(magnetic, frequency, 0, 1).get_leakage_inductance_per_winding()[0].get_nominal().value();
     CHECK_THAT(leakageInductance, WithinRel(expectedLeakageInductance, maximumError));
@@ -1025,7 +1120,7 @@ TEST_CASE("Test_Leakage_Inductance_New_Core_Families",
     cores.emplace_back("drumSemishielded", buildCustomCore(
         {{"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "drumSemishielded"},
          {"aliases", json::array()}, {"name", "LQS-like 4018"}, {"dimensions", semishieldedDimensions}},
-        "pieceAndPlate", {{"type", "magneticEpoxy"}, {"thickness", 0.0001}, {"material", "Kool M\u00b5 26"}}, "3C90"));
+        "pieceAndPlate", {{"type", "magneticEpoxy"}, {"thickness", {{"nominal", 0.0001}}}, {"material", "Kool M\u00b5 26"}}, "3C90"));
     cores.emplace_back("molded", buildCustomCore(
         {{"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "molded"},
          {"aliases", json::array()}, {"name", "MAPI-like 4020"},

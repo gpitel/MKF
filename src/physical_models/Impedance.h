@@ -22,14 +22,20 @@ namespace OpenMagnetics {
 struct DifferentialModeParameters {
     double leakageInductance;
     double windingResistance;
+    // The inter-winding entry of the capacitance matrix (one branch of what the DM port sees).
     double interWindingCapacitance;
+    // What actually shunts the leakage at the DM port: the energy-method capacitance of the two
+    // windings in series opposition, every turn pair and the core included
+    // (StrayCapacitance::calculate_differential_mode_capacitance). The DM impedance uses this.
+    double differentialModeCapacitance;
 };
 
 // One arm of the wideband terminal-impedance model: a parallel-RLC tank. The
 // terminal impedance is the SERIES sum of these tanks (a Foster ladder), each
 // contributing one resonance. usesCorePermeability distinguishes the two kinds:
-//   - magnetizing tank: the inductance is the air-cored inductance to be
-//     multiplied by the core complex permeability µ(f) at each frequency, and
+//   - magnetizing tank: the inductance is the air-cored inductance N²/R_core(µ=1),
+//     turned into N²/(R_core(µ=1)/µ(f) + R_gap) with the core complex
+//     permeability µ(f) and the gapping reluctance at each frequency, and
 //     its loss comes from µ''(f) (no series resistor). This is the first/main
 //     resonance, present for every magnetic.
 //   - leakage tank: a flat air-cored leakage inductance in series with the
@@ -47,6 +53,12 @@ struct ImpedanceTank {
     // is R_0(f) + turnsRatioSquared·R_secondary(f) with turnsRatioSquared = (N_0/N_j)².
     size_t secondaryWindingIndex = 0;
     double turnsRatioSquared = 0.0;
+    // Magnetizing tank only: R_gap / R_core(mu=1), the gapping reluctance (fringing included, the
+    // same reluctance model MagnetizingInductance uses) over the core's unity-permeability
+    // reluctance l_e/(mu0 A_e). With inductance = N^2/R_core(mu=1) the tank inductance is
+    //   L(f) = N^2 / (R_core(mu=1)/mu(f) + R_gap) = inductance * mu / (1 + mu * gapReluctanceRatio),
+    // with mu the complex permeability. 0 for a core without gaps (a toroid).
+    double gapReluctanceRatio = 0.0;
 };
 
 // Precomputed, frequency-independent building blocks of the full wideband
@@ -55,6 +67,11 @@ struct ImpedanceTank {
 // evaluated cheaply at each frequency by impedance_from_model().
 struct WidebandImpedanceModel {
     std::optional<CoreMaterial> coreMaterial;   // complex permeability µ(f) for the magnetizing tank
+    // true: µ(f) only inside the material's tabulated range (ComplexPermeability::
+    // get_tabulated_complex_permeability; throws outside it). The advisers' filters set it, so they
+    // rank parts on data and never on the estimate (ABT #1861, proposal D5). false (default): µ(f)
+    // everywhere, estimated outside the table (ComplexPermeability::get_complex_permeability).
+    bool tabulatedComplexPermeabilityOnly = false;
     // ABT #848: the core's cross-section (column width, depth) for the dimensional / eddy-
     // dielectric attenuation of the magnetizing permeability. Only acts when the material
     // carries permittivity data; empty or missing data means no correction, never a guess.
@@ -81,13 +98,15 @@ double interpolate_permittivity_points(const MAS::Permittivity& data, double fre
 class Impedance {
     private:
         bool _fastCapacitance;
+        bool _tabulatedComplexPermeabilityOnly = false;  // see WidebandImpedanceModel
         size_t _maximumNumberTurns = 200;
         // The magnetizing tank (air-cored inductance ∥ winding self-capacitance),
         // the first resonance shared by calculate_impedance and the wideband model.
         ImpedanceTank build_magnetizing_tank(Core& core, Coil& coil);
-        // Resonance of (air-cored inductance x initial permeability) with a capacitance: the
-        // frequency the stray-capacitance core image factor is evaluated at (ABT #848).
-        static double estimate_resonance_frequency(Core& core, double airCoredInductance, double capacitance);
+        // Resonance of the low-frequency magnetizing inductance N^2/(R_core(mu=1)/mu_i + R_gap)
+        // with a capacitance: the frequency the stray-capacitance core image factor is evaluated
+        // at (ABT #848). airCoredInductance = N^2/R_core(mu=1), gapReluctanceRatio = R_gap/R_core(mu=1).
+        static double estimate_resonance_frequency(Core& core, double airCoredInductance, double gapReluctanceRatio, double capacitance);
     protected:
     public:
     // DEFAULT: the FULL energy-based StrayCapacitance model (owner decision, 2026-08-23): per-pair
@@ -108,6 +127,12 @@ class Impedance {
 
     virtual ~Impedance() = default;
 
+    // Restrict the core's complex permeability to its tabulated range (throws outside it), for the
+    // advisers and filters, which select parts on data only (ABT #1861). Off by default: graphs and
+    // the analysis of a chosen design read the estimate outside the table.
+    void set_tabulated_complex_permeability_only(bool value) { _tabulatedComplexPermeabilityOnly = value; }
+    bool get_tabulated_complex_permeability_only() const { return _tabulatedComplexPermeabilityOnly; }
+
         // ABT #848: complex factor mu_eff/mu for the EM wave crossing the core cross-section,
         // tan(k d/2)/(k d/2) per dimension (Snelling, Soft Ferrites, dimensional resonance), with
         // k = w*sqrt(mu0*mu*eps0*eps) from the material's complex permittivity. Returns 1 when the
@@ -127,7 +152,9 @@ class Impedance {
     // referenceFrequency — it is essentially air-cored and flat). Then evaluate the
     // impedance cheaply at each frequency. A sweep should call the first once and the
     // second per point rather than calling calculate_differential_mode_impedance N times.
-    DifferentialModeParameters calculate_differential_mode_parameters(Core core, Coil coil, double referenceFrequency, double temperature = Defaults().ambientTemperature);
+    DifferentialModeParameters calculate_differential_mode_parameters(Magnetic magnetic, double referenceFrequency, double temperature = Defaults().ambientTemperature);
+    DifferentialModeParameters calculate_differential_mode_parameters(Core core, Coil coil, double referenceFrequency, double temperature = Defaults().ambientTemperature,
+                                                                      std::optional<CoreElectricalReference> coreElectricalReference = std::nullopt);
     std::complex<double> differential_mode_impedance_from_parameters(const DifferentialModeParameters& parameters, double frequency);
     // Wideband terminal impedance as a series cascade of resonant tanks (a Foster
     // ladder): the magnetizing tank (first resonance) plus one leakage tank per

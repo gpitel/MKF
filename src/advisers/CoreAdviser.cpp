@@ -37,6 +37,14 @@ CMRC_DECLARE(data);
 
 namespace OpenMagnetics {
 
+double resolve_maximum_design_temperature(Inputs& inputs) {
+    auto operatingTemperature = inputs.get_design_requirements().get_operating_temperature();
+    if (operatingTemperature) {
+        return resolve_dimensional_values(operatingTemperature.value(), DimensionalValues::MAXIMUM);
+    }
+    return Settings::GetInstance().get_core_adviser_maximum_temperature();
+}
+
 namespace {
 // ABT #153: marker appended to a result's manufacturer reference and core name
 // when the synthetic STANDARD_CORES catalogue produced nothing and the adviser
@@ -132,6 +140,8 @@ void sort_magnetics_by_scoring(std::vector<std::pair<Magnetic, double>>* magneti
 
 
 std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs, size_t maximumNumberResults) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
+    AdviseScoringScope adviseScoringScope(*this);
     std::map<CoreAdviserFilters, double> weights;
     magic_enum::enum_for_each<CoreAdviserFilters>([&] (auto val) {
         CoreAdviserFilters filter = val;
@@ -146,6 +156,8 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(
         size_t maximumNumberResults,
         const LibraryContext* ctx,
         const AdviserConstraints& constraints) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
+    AdviseScoringScope adviseScoringScope(*this);
     // Apply per-call library override (RAII swap on the global *Database maps).
     auto scope = ctx ? ctx->applyScoped() : LibraryContext::Scope{};
 
@@ -196,6 +208,8 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(
 }
 
 std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs, std::map<CoreAdviserFilters, double> weights, size_t maximumNumberResults){
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
+    AdviseScoringScope adviseScoringScope(*this);
     if (get_mode() == CoreAdviserModes::AVAILABLE_CORES) {
         if (coreDatabase.empty() && !LibraryContext::Scope::anyActive()) {
             load_cores();
@@ -265,6 +279,8 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
 }
 
 std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs, std::vector<Core>* cores, size_t maximumNumberResults) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
+    AdviseScoringScope adviseScoringScope(*this);
     std::map<CoreAdviserFilters, double> weights;
     magic_enum::enum_for_each<CoreAdviserFilters>([&] (auto val) {
         CoreAdviserFilters filter = val;
@@ -274,6 +290,8 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
 }
 
 std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs, std::vector<Core>* cores, size_t maximumNumberResults, size_t maximumNumberCores) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
+    AdviseScoringScope adviseScoringScope(*this);
     std::map<CoreAdviserFilters, double> weights;
     magic_enum::enum_for_each<CoreAdviserFilters>([&] (auto val) {
         CoreAdviserFilters filter = val;
@@ -321,6 +339,8 @@ static void throw_if_inputs_are_not_processed(Inputs& inputs) {
 }
 
 std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs, std::map<CoreAdviserFilters, double> weights, std::vector<Core>* cores, size_t maximumNumberResults, size_t maximumNumberCores) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
+    AdviseScoringScope adviseScoringScope(*this);
 
     throw_if_inputs_are_not_processed(inputs);
 
@@ -356,6 +376,11 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
 }
 
 std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs, std::map<CoreAdviserFilters, double> weights, std::vector<Core>* cores, size_t maximumNumberResults){
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
+    AdviseScoringScope adviseScoringScope(*this);
+    // ABT #1718: the loss filters integrate the primary voltage of every candidate; an unbalanced
+    // voltage is rejected once, here, instead of culling every core.
+    Inputs::check_adviser_inputs_volt_second_balance(inputs);
     _weights = weights;
  
     size_t maximumMagneticsAfterFiltering = settings.get_core_adviser_maximum_magnetics_after_filtering();
@@ -389,8 +414,41 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
         // near 8 GB natively and ran the browser engine out of memory (std::bad_alloc).
         maximumMagneticsAfterFiltering = std::min<size_t>(magnetics.size(),
             maximumMagneticsAfterFiltering * defaults.coreAdviserMaximumNumberStacks);
-        filteredMagnetics = filter_available_cores_power_application(&magnetics, inputs, weights, maximumMagneticsAfterFiltering, maximumNumberResults);
-        return filteredMagnetics;
+        auto widerSearchMagnetics = filter_available_cores_power_application(&magnetics, inputs, weights, maximumMagneticsAfterFiltering, maximumNumberResults);
+
+        // Merge both searches. The wider search is a RETRY for more results, not a
+        // replacement: its pre-loss cap ranks a 5x larger pool by cost/size score, so it can
+        // cull designs the first search had already validated (No_Toroids_Two_Windings: the
+        // first search returned 9 cores under the temperature limit, the wider one 1). Returning
+        // only the wider search therefore made the adviser return FEWER designs after asking for
+        // more. Both lists are fully post-processed, valid designs: rank them together by
+        // score, drop the duplicates (a single core both searches returned), cut to the limit.
+        const bool uniqueShapes = get_unique_core_shapes();
+        auto mergeKey = [&](const std::pair<Mas, double>& result) {
+            const auto& magnetic = result.first.get_magnetic();
+            if (uniqueShapes) {
+                return magnetic.get_core().get_shape_name();
+            }
+            if (!magnetic.get_manufacturer_info() || !magnetic.get_manufacturer_info()->get_reference()) {
+                throw std::runtime_error("CoreAdviser: cannot merge the stacked search with the first one: an advised magnetic has no reference to identify it by");
+            }
+            return magnetic.get_manufacturer_info()->get_reference().value();
+        };
+        std::move(widerSearchMagnetics.begin(), widerSearchMagnetics.end(), std::back_inserter(filteredMagnetics));
+        stable_sort_by_index(filteredMagnetics, [](const std::pair<Mas, double>& b1, const std::pair<Mas, double>& b2) {
+            return b1.second > b2.second;
+        });
+        std::vector<std::pair<Mas, double>> mergedMagnetics;
+        std::set<std::string> usedKeys;
+        for (auto& result : filteredMagnetics) {
+            if (mergedMagnetics.size() >= maximumNumberResults) {
+                break;
+            }
+            if (usedKeys.insert(mergeKey(result)).second) {
+                mergedMagnetics.push_back(std::move(result));
+            }
+        }
+        return mergedMagnetics;
     }
     else {
         filteredMagnetics = filter_available_cores_suppression_application(&magnetics, inputs, weights, maximumMagneticsAfterFiltering, maximumNumberResults);
@@ -399,7 +457,10 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
 }
 
 std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs, std::vector<CoreShape>* shapes, size_t maximumNumberResults) {
+    LossSolveMemoScope lossSolveMemoScope;  // exact repeats of a loss solve are answered from this run's memo
+    AdviseScoringScope adviseScoringScope(*this);
     throw_if_inputs_are_not_processed(inputs);
+    Inputs::check_adviser_inputs_volt_second_balance(inputs);  // ABT #1718
     auto globalIncludeStacks = settings.get_core_adviser_include_stacks();
     auto magnetics = create_magnetic_dataset(inputs, shapes, globalIncludeStacks);
 

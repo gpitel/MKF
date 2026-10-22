@@ -3,6 +3,7 @@
 #include "support/Painter.h"
 #include "physical_models/InitialPermeability.h"
 #include "processors/Inputs.h"
+#include "processors/ResultsAnalyzer.h"
 #include "support/Utils.h"
 #include "json.hpp"
 
@@ -350,7 +351,9 @@ TEST_CASE("Test_One_Operating_Point_Two_Generated_Windings_Turns_Ratios", "[proc
     windingExcitation["frequency"] = 100000;
     windingExcitation["current"]["waveform"]["data"] = {-5, 5, -5};
     windingExcitation["current"]["waveform"]["time"] = {0, 0.0000025, 0.00001};
-    windingExcitation["voltage"]["waveform"]["data"] = {0, 1, 1, 0, 0};
+    // Volt-second balanced (ABT #1585): the same 1 V peak-to-peak, D = 0.25 square, shifted to zero mean
+    // (+0.75 V for 25 %, -0.25 V for 75 %); the former unipolar 0/1 V square is rejected as unbalanced.
+    windingExcitation["voltage"]["waveform"]["data"] = {-0.25, 0.75, 0.75, -0.25, -0.25};
     windingExcitation["voltage"]["waveform"]["time"] = {0, 0, 0.0000025, 0.0000025, 0.00001};
     operatingPoint["excitationsPerWinding"] = json::array();
     operatingPoint["excitationsPerWinding"].push_back(windingExcitation);
@@ -382,16 +385,19 @@ TEST_CASE("Test_One_Operating_Point_Two_Generated_Windings_Turns_Ratios", "[proc
         REQUIRE_THAT(excitation_primary.get_current().value().get_harmonics().value().get_frequencies()[0], Catch::Matchers::WithinAbs(0, max_error));
         REQUIRE_THAT(excitation_primary.get_current().value().get_harmonics().value().get_frequencies()[1], Catch::Matchers::WithinAbs(100000, max_error * 100000));
 
-        REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_rms().value(), Catch::Matchers::WithinAbs(0.5, max_error * 0.5));
+        // ABT #1585: the balanced fixture (-0.25/+0.75 V, D = 0.25) has RMS sqrt(0.25 * 0.75^2 + 0.75 * 0.25^2) = 0.433 V
+        // (the former unipolar 0/1 V square: 0.5 V). The processed value, 0.428 V, is the 128-point sampled waveform's.
+        REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_rms().value(), Catch::Matchers::WithinAbs(0.43301270189221935, max_error * 0.433));
         // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128).
         REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_thd().value(), Catch::Matchers::WithinAbs(0.91374449406562508, max_error * 0.92));
         // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128).
-        REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(546440.67624448077, max_error * 546440.67624448077));
+        // ABT #1585: the balanced fixture has no DC component, which the unipolar 0/1 V square's 546440.68 Hz included.
+        REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_effective_frequency().value(), Catch::Matchers::WithinAbs(590582.20189317246, max_error * 590582.20189317246));
         REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_peak_to_peak().value(), Catch::Matchers::WithinAbs(1, max_error * 1));
         REQUIRE_THAT(excitation_primary.get_voltage().value().get_processed().value().get_offset(), Catch::Matchers::WithinAbs(0, max_error * 0.25));
 
-        // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128). The DC of the D=0.25 square is exactly 0.25 (was 31/128).
-        REQUIRE_THAT(excitation_primary.get_voltage().value().get_harmonics().value().get_amplitudes()[0], Catch::Matchers::WithinAbs(0.25, max_error * 0.25));
+        // ABT #1585: the balanced fixture's mean is 0.25 * 0.75 - 0.75 * 0.25 = 0 V (the former unipolar 0/1 V square's DC was 0.25 V).
+        REQUIRE_THAT(excitation_primary.get_voltage().value().get_harmonics().value().get_amplitudes()[0], Catch::Matchers::WithinAbs(0, max_error * 0.25));
         // ABT #1460: exact 64-harmonic series of the piecewise-linear waveform (previously an aliased DFT128). Fundamental = (2/pi) sin(pi/4).
         REQUIRE_THAT(excitation_primary.get_voltage().value().get_harmonics().value().get_amplitudes()[1], Catch::Matchers::WithinAbs(0.45015815807855303, max_error * 0.451));
         REQUIRE_THAT(excitation_primary.get_voltage().value().get_harmonics().value().get_frequencies()[0], Catch::Matchers::WithinAbs(0, max_error));
@@ -1410,7 +1416,9 @@ TEST_CASE("Test_Induced_Voltage_And_Magnetizing_Current_Sinusoidal", "[processor
     double max_error = 0.02;
     size_t numberPointsSampledWaveforms = 69;
     for (size_t i = 0; i < numberPointsSampledWaveforms; ++i) {
-        double angle = i * 2 * M_PI / numberPointsSampledWaveforms;
+        // One full period on both axes (the angle used to step by 2*pi/69 against a time step of
+        // T/68, leaving the current 2.3 A short of closing, a drift the integral then reproduced).
+        double angle = i * 2 * M_PI / (numberPointsSampledWaveforms - 1);
         time.push_back(i / frequency / (numberPointsSampledWaveforms - 1));
         data.push_back((sin(angle) * peakToPeak / 2) + offset);
     }
@@ -1567,12 +1575,18 @@ TEST_CASE("Test_Reflect_Unipolar_Rectangular_Ratio_1", "[processor][inputs][smok
 
     SignalDescriptor signal;
     signal.set_waveform(waveform);
-    auto processed = OpenMagnetics::Inputs::calculate_processed_data(signal.get_waveform().value());
+    auto processed = OpenMagnetics::Inputs::calculate_processed_data(signal.get_waveform().value(), 100000);
     
+    // A unipolar pulse reflects by ampere-turn scaling, shape and timing kept (a current
+    // transformer's secondary conducts during the pulse); the flyback's off-time transfer
+    // belongs to the FLYBACK_* labels.
     auto reflectedSignal = OpenMagnetics::Inputs::reflect_waveform(signal, ratio, WaveformLabel::UNIPOLAR_RECTANGULAR);
-    auto reflectedProcessed = OpenMagnetics::Inputs::calculate_processed_data(reflectedSignal.get_waveform().value());
+    auto reflectedProcessed = OpenMagnetics::Inputs::calculate_processed_data(reflectedSignal.get_waveform().value(), 100000);
 
-    REQUIRE_THAT(-processed.get_average().value() * ratio, Catch::Matchers::WithinAbs(reflectedProcessed.get_average().value(), max_error * processed.get_average().value() * ratio));
+    REQUIRE_THAT(processed.get_average().value() * ratio, Catch::Matchers::WithinAbs(reflectedProcessed.get_average().value(), max_error * processed.get_average().value() * ratio));
+    for (size_t i = 0; i < waveform.get_data().size(); ++i) {
+        CHECK_THAT(reflectedSignal.get_waveform()->get_data()[i], Catch::Matchers::WithinAbs(waveform.get_data()[i] * ratio, 1e-12));
+    }
 }
 
 TEST_CASE("Test_Reflect_Unipolar_Rectangular_Ratio_2", "[processor][inputs][smoke-test]") {
@@ -1586,12 +1600,18 @@ TEST_CASE("Test_Reflect_Unipolar_Rectangular_Ratio_2", "[processor][inputs][smok
 
     SignalDescriptor signal;
     signal.set_waveform(waveform);
-    auto processed = OpenMagnetics::Inputs::calculate_processed_data(signal.get_waveform().value());
+    auto processed = OpenMagnetics::Inputs::calculate_processed_data(signal.get_waveform().value(), 100000);
     
+    // A unipolar pulse reflects by ampere-turn scaling, shape and timing kept (a current
+    // transformer's secondary conducts during the pulse); the flyback's off-time transfer
+    // belongs to the FLYBACK_* labels.
     auto reflectedSignal = OpenMagnetics::Inputs::reflect_waveform(signal, ratio, WaveformLabel::UNIPOLAR_RECTANGULAR);
-    auto reflectedProcessed = OpenMagnetics::Inputs::calculate_processed_data(reflectedSignal.get_waveform().value());
+    auto reflectedProcessed = OpenMagnetics::Inputs::calculate_processed_data(reflectedSignal.get_waveform().value(), 100000);
 
-    REQUIRE_THAT(-processed.get_average().value() * ratio, Catch::Matchers::WithinAbs(reflectedProcessed.get_average().value(), max_error * processed.get_average().value() * ratio));
+    REQUIRE_THAT(processed.get_average().value() * ratio, Catch::Matchers::WithinAbs(reflectedProcessed.get_average().value(), max_error * processed.get_average().value() * ratio));
+    for (size_t i = 0; i < waveform.get_data().size(); ++i) {
+        CHECK_THAT(reflectedSignal.get_waveform()->get_data()[i], Catch::Matchers::WithinAbs(waveform.get_data()[i] * ratio, 1e-12));
+    }
 }
 
 TEST_CASE("Test_Reflect_Unipolar_Triangular_Ratio_2", "[processor][inputs][smoke-test]") {
@@ -1605,10 +1625,10 @@ TEST_CASE("Test_Reflect_Unipolar_Triangular_Ratio_2", "[processor][inputs][smoke
 
     SignalDescriptor signal;
     signal.set_waveform(waveform);
-    auto processed = OpenMagnetics::Inputs::calculate_processed_data(signal.get_waveform().value());
+    auto processed = OpenMagnetics::Inputs::calculate_processed_data(signal.get_waveform().value(), 100000);
     
     auto reflectedSignal = OpenMagnetics::Inputs::reflect_waveform(signal, ratio, WaveformLabel::UNIPOLAR_TRIANGULAR);
-    auto reflectedProcessed = OpenMagnetics::Inputs::calculate_processed_data(reflectedSignal.get_waveform().value());
+    auto reflectedProcessed = OpenMagnetics::Inputs::calculate_processed_data(reflectedSignal.get_waveform().value(), 100000);
 
     REQUIRE_THAT(processed.get_average().value() * ratio, Catch::Matchers::WithinAbs(reflectedProcessed.get_average().value(), max_error * processed.get_average().value() * ratio));
 }
@@ -1663,6 +1683,156 @@ TEST_CASE("Test_Reflect_Flyback_Primary_Web", "[processor][inputs][smoke-test]")
     auto reflectedCurrentSignalDescriptor = OpenMagnetics::Inputs::reflect_waveform(primaryExcitation.get_current().value(), turnRatio, currentSignalDescriptorProcessed.get_label());
     auto processed = OpenMagnetics::Inputs::calculate_basic_processed_data(reflectedCurrentSignalDescriptor.get_waveform().value());
     REQUIRE(processed.get_label() == WaveformLabel::FLYBACK_SECONDARY);
+}
+
+TEST_CASE("Test_Reflect_Secondary_Default_Web_Rectangular_Voltage", "[processor][inputs][bug]") {
+    // ABT #1670: the web's default two-winding operating point. Its primary voltage is the
+    // two-level rectangle -20.5/70.5 V at duty 0.5 (with a processed block, stale, claiming
+    // peakToPeak 100 and offset 0). Reflecting it 1:1 gave 0/-100 V -- a -50 V DC level across
+    // a winding -- because the label guessed from the data (unipolarRectangular, the volt-
+    // seconds do not balance) picked a branch that then read its numbers from the stale block.
+    // A winding voltage reflects by Faraday's law: v2 = v1 / n, point by point, nothing added.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "default_two_winding_pq2715_no_coil_found.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    auto masJson = json::parse(file);
+    OperatingPointExcitation primary(masJson["inputs"]["operatingPoints"][0]["excitationsPerWinding"][0]);
+    auto primaryVoltage = primary.get_voltage().value();
+    auto primaryData = primaryVoltage.get_waveform()->get_data();
+    REQUIRE(primary.get_name().value() == "Primary winding excitation");
+
+    for (double turnsRatio : {1.0, 2.0}) {
+        auto secondary = OpenMagnetics::Inputs::calculate_reflected_secondary(primary, turnsRatio, std::string("Secondary winding excitation"));
+        auto secondaryWaveform = secondary.get_voltage()->get_waveform().value();
+        REQUIRE(secondaryWaveform.get_data().size() == primaryData.size());
+        for (size_t i = 0; i < primaryData.size(); ++i) {
+            CHECK_THAT(secondaryWaveform.get_data()[i], Catch::Matchers::WithinAbs(primaryData[i] / turnsRatio, 1e-12));
+            CHECK_THAT(secondaryWaveform.get_time().value()[i], Catch::Matchers::WithinAbs(primaryVoltage.get_waveform()->get_time().value()[i], 1e-15));
+        }
+        // The primary's own average (+25 V, a web-side issue of its default) scales; no DC is
+        // invented. Both averages go through the same sampled-waveform pipeline that fills the
+        // secondary's processed block, so they are compared like for like.
+        auto primarySampled = OpenMagnetics::Inputs::calculate_sampled_waveform(primaryVoltage.get_waveform().value(), primary.get_frequency());
+        auto primaryVoltageReprocessed = primaryVoltage;
+        primaryVoltageReprocessed.set_processed(std::nullopt);
+        primaryVoltageReprocessed.set_harmonics(OpenMagnetics::Inputs::calculate_harmonics_data(primaryVoltage.get_waveform().value(), primarySampled, primary.get_frequency()));
+        auto primaryAverage = OpenMagnetics::Inputs::calculate_processed_data(primaryVoltageReprocessed, primarySampled, true).get_average().value();
+        CHECK(primaryAverage > 20);
+        CHECK_THAT(secondary.get_voltage()->get_processed()->get_average().value(), Catch::Matchers::WithinAbs(primaryAverage / turnsRatio, 1e-9 * std::fabs(primaryAverage)));
+        CHECK(secondary.get_name().value() == "Secondary winding excitation");
+        // The current is a triangle: scaled by n, shape kept.
+        CHECK_THAT(secondary.get_current()->get_processed()->get_peak_to_peak().value(), Catch::Matchers::WithinRel(10 * turnsRatio, 1e-6));
+    }
+    CHECK(!OpenMagnetics::Inputs::calculate_reflected_secondary(primary, 1.0).get_name());
+
+    // The label-dispatched reflection (the web binding's path) must not synthesise a different
+    // waveform. A rectangle straddling zero is labelled rectangular (acddb0f6) and reflects
+    // by plain scaling; a unipolarRectangular that does not rest at zero has no unipolar
+    // reflection.
+    auto label = OpenMagnetics::Inputs::calculate_basic_processed_data(primaryVoltage.get_waveform().value()).get_label();
+    REQUIRE(label == WaveformLabel::RECTANGULAR);
+    auto asLabelled = OpenMagnetics::Inputs::reflect_waveform(primaryVoltage, 1.0, label);
+    for (size_t i = 0; i < primaryData.size(); ++i) {
+        CHECK_THAT(asLabelled.get_waveform()->get_data()[i], Catch::Matchers::WithinAbs(primaryData[i], 1e-12));
+    }
+    // Even forced to unipolarRectangular, the reflection is the same waveform scaled: no
+    // label synthesises a shape the winding does not have.
+    auto asUnipolar = OpenMagnetics::Inputs::reflect_waveform(primaryVoltage, 1.0, WaveformLabel::UNIPOLAR_RECTANGULAR);
+    for (size_t i = 0; i < primaryData.size(); ++i) {
+        CHECK_THAT(asUnipolar.get_waveform()->get_data()[i], Catch::Matchers::WithinAbs(primaryData[i], 1e-12));
+    }
+    // Shape-preserving labels reflect by plain scaling.
+    auto asRectangular = OpenMagnetics::Inputs::reflect_waveform(primaryVoltage, 0.5, WaveformLabel::RECTANGULAR);
+    for (size_t i = 0; i < primaryData.size(); ++i) {
+        CHECK_THAT(asRectangular.get_waveform()->get_data()[i], Catch::Matchers::WithinAbs(primaryData[i] * 0.5, 1e-12));
+    }
+}
+
+TEST_CASE("Test_Reflect_Secondary_Current_Transformer_Unipolar_Pulse", "[processor][inputs][bug]") {
+    // A current transformer (or a forward) carries a unipolar primary current pulse, 0 A then
+    // 2 A for 30% of the period. Its secondary conducts DURING the pulse: i2 = n i1, point by
+    // point. The unipolar labels used to be reflected as a flyback (the current moved into
+    // the off time, scaled by D/(1-D)), which is what the FLYBACK_* labels are for.
+    double frequency = 100000;
+    double period = 1.0 / frequency;
+    double turnsRatio = 50;
+    for (auto [shape, data] : std::vector<std::pair<std::string, std::vector<double>>>{
+             {"rectangular", {0, 2, 2, 0, 0}}, {"triangular", {0, 2, 0, 0}}}) {
+        std::vector<double> time = shape == "rectangular" ? std::vector<double>{0, 0, 0.3 * period, 0.3 * period, period}
+                                                          : std::vector<double>{0, 0.3 * period, 0.3 * period, period};
+        Waveform waveform;
+        waveform.set_data(data);
+        waveform.set_time(time);
+        auto label = OpenMagnetics::Inputs::calculate_basic_processed_data(waveform).get_label();
+        INFO(shape);
+        CHECK(label == (shape == "rectangular" ? WaveformLabel::UNIPOLAR_RECTANGULAR : WaveformLabel::UNIPOLAR_TRIANGULAR));
+
+        SignalDescriptor current;
+        current.set_waveform(waveform);
+        auto reflected = OpenMagnetics::Inputs::reflect_waveform(current, 1.0 / turnsRatio, label);
+        REQUIRE(reflected.get_waveform()->get_data().size() == data.size());
+        for (size_t i = 0; i < data.size(); ++i) {
+            CHECK_THAT(reflected.get_waveform()->get_data()[i], Catch::Matchers::WithinAbs(data[i] / turnsRatio, 1e-12));
+            CHECK_THAT(reflected.get_waveform()->get_time().value()[i], Catch::Matchers::WithinAbs(time[i], 1e-15));
+        }
+    }
+}
+
+TEST_CASE("Test_Reflected_Primary_Mirrors_Reflected_Secondary", "[processor][inputs][bug]") {
+    // ABT #1698: the web reflected the primary in its own binding, a copy of the old logic
+    // (plain current scaling, aliased harmonics). MKF owns it now: the primary from the
+    // secondary is the exact inverse of calculate_reflected_secondary.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "default_two_winding_pq2715_no_coil_found.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    auto masJson = json::parse(file);
+    OperatingPointExcitation primary(masJson["inputs"]["operatingPoints"][0]["excitationsPerWinding"][0]);
+    auto primaryVoltageData = primary.get_voltage()->get_waveform()->get_data();
+    auto primaryCurrentData = primary.get_current()->get_waveform()->get_data();
+
+    for (double turnsRatio : {1.0, 2.0, 0.25}) {
+        auto secondary = OpenMagnetics::Inputs::calculate_reflected_secondary(primary, turnsRatio, std::string("Secondary winding excitation"));
+        auto back = OpenMagnetics::Inputs::calculate_reflected_primary(secondary, turnsRatio, std::string("Primary winding excitation"));
+        CHECK(back.get_name().value() == "Primary winding excitation");
+        auto voltage = back.get_voltage()->get_waveform()->get_data();
+        auto current = back.get_current()->get_waveform()->get_data();
+        REQUIRE(voltage.size() == primaryVoltageData.size());
+        REQUIRE(current.size() == primaryCurrentData.size());
+        for (size_t i = 0; i < voltage.size(); ++i) {
+            CHECK_THAT(voltage[i], Catch::Matchers::WithinAbs(primaryVoltageData[i], 1e-9));
+        }
+        for (size_t i = 0; i < current.size(); ++i) {
+            CHECK_THAT(current[i], Catch::Matchers::WithinAbs(primaryCurrentData[i], 1e-9));
+        }
+        // v1 = v2 * n: the reflected primary's processed block is computed, not copied.
+        CHECK_THAT(back.get_voltage()->get_processed()->get_peak_to_peak().value(),
+                   Catch::Matchers::WithinRel(secondary.get_voltage()->get_processed()->get_peak_to_peak().value() * turnsRatio, 1e-9));
+        CHECK(back.get_voltage()->get_harmonics());
+        CHECK(back.get_current()->get_harmonics());
+    }
+    CHECK(!OpenMagnetics::Inputs::calculate_reflected_primary(primary, 1.0).get_name());
+
+    // A flyback current goes to the secondary as a flyback secondary one and comes back as a
+    // flyback primary one (the label-dispatched current reflection, in both directions).
+    Waveform waveform;
+    waveform.set_data(std::vector<double>({0, 30, 80, 0, 0}));
+    waveform.set_time(std::vector<double>({0, 0, 1.4e-6, 1.4e-6, 0.00001}));
+    SignalDescriptor flybackPrimaryCurrent;
+    flybackPrimaryCurrent.set_waveform(waveform);
+    OperatingPointExcitation flybackPrimary(primary);
+    flybackPrimary.set_current(flybackPrimaryCurrent);
+    auto flybackSecondary = OpenMagnetics::Inputs::calculate_reflected_secondary(flybackPrimary, 2.0);
+    CHECK(OpenMagnetics::Inputs::calculate_basic_processed_data(flybackSecondary.get_current()->get_waveform().value()).get_label() == WaveformLabel::FLYBACK_SECONDARY);
+    auto flybackBack = OpenMagnetics::Inputs::calculate_reflected_primary(flybackSecondary, 2.0);
+    auto flybackBackProcessed = OpenMagnetics::Inputs::calculate_basic_processed_data(flybackBack.get_current()->get_waveform().value());
+    CHECK(flybackBackProcessed.get_label() == WaveformLabel::FLYBACK_PRIMARY);
+    auto flybackOriginalProcessed = OpenMagnetics::Inputs::calculate_basic_processed_data(waveform);
+    CHECK_THAT(flybackBackProcessed.get_peak_to_peak().value(), Catch::Matchers::WithinRel(flybackOriginalProcessed.get_peak_to_peak().value(), 0.04));
+
+    // Missing signals throw; nothing is invented.
+    OperatingPointExcitation noCurrent(primary);
+    noCurrent.set_current(std::nullopt);
+    REQUIRE_THROWS(OpenMagnetics::Inputs::calculate_reflected_primary(noCurrent, 1.0));
 }
 
 TEST_CASE("Test_Imported_Rectangle_Is_Custom_Not_Sinusoidal_Via_Inputs", "[processor][inputs][mas-migration][bug]") {
@@ -2099,4 +2269,520 @@ TEST_CASE("Test_Excitation_With_Proportional_Voltage_And_Current_Recalculates_Pr
     auto unloaded = OpenMagnetics::Inputs::get_excitation_with_proportional_current(excitation, 0);
     REQUIRE_THAT(unloaded.get_current()->get_processed()->get_peak().value(), Catch::Matchers::WithinAbs(0, 1e-12));
     REQUIRE_THAT(unloaded.get_current()->get_processed()->get_rms().value(), Catch::Matchers::WithinAbs(0, 1e-12));
+}
+
+// ABT #1585: a voltage whose volt-seconds do not balance over its period has no periodic steady
+// state, and its integral is a drift, not a magnetizing current. These build a rectangular winding
+// voltage of +10 V for half the period and `lowVoltage` for the other half.
+static Waveform abt1585_sampled_rectangular_voltage(double lowVoltage, double frequency) {
+    Waveform waveform;
+    double period = 1.0 / frequency;
+    waveform.set_data({10, 10, lowVoltage, lowVoltage, 10});
+    waveform.set_time(std::vector<double>{0, period / 2, period / 2, period, period});
+    return OpenMagnetics::Inputs::calculate_sampled_waveform(waveform, frequency);
+}
+
+TEST_CASE("Test_Volt_Second_Balance_Unbalanced_Voltage_Throws", "[processor][inputs][abt-1585]") {
+    double frequency = 100000;
+    // Mean 2.5 V: the net 25 uV*s per period is 0.67 of the 37.5 uV*s AC swing, above the 0.25 bound.
+    auto unbalanced = abt1585_sampled_rectangular_voltage(-5, frequency);
+    REQUIRE_THROWS_AS(OpenMagnetics::Inputs::check_volt_second_balance(unbalanced, "test"), InvalidInputException);
+
+    OperatingPointExcitation excitation;
+    excitation.set_frequency(frequency);
+    excitation.set_name("unbalanced");
+    REQUIRE_THROWS_WITH(OpenMagnetics::Inputs::calculate_magnetizing_current(excitation, unbalanced, 100e-6, false),
+                        Catch::Matchers::ContainsSubstring("Excitation 'unbalanced'") &&
+                        Catch::Matchers::ContainsSubstring("not volt-second balanced"));
+}
+
+TEST_CASE("Test_Volt_Second_Balance_Balanced_Voltage_Integrates", "[processor][inputs][abt-1585]") {
+    double frequency = 100000;
+    auto balanced = abt1585_sampled_rectangular_voltage(-10, frequency);
+    REQUIRE_NOTHROW(OpenMagnetics::Inputs::check_volt_second_balance(balanced, "test"));
+
+    OperatingPointExcitation excitation;
+    excitation.set_frequency(frequency);
+    auto magnetizingCurrent = OpenMagnetics::Inputs::calculate_magnetizing_current(excitation, balanced, 100e-6, false);
+    // 10 V over half of 10 us across 100 uH: 0.5 A peak to peak.
+    REQUIRE_THAT(magnetizingCurrent.get_processed()->get_peak_to_peak().value(), Catch::Matchers::WithinRel(0.5, 0.02));
+}
+
+TEST_CASE("Test_Unbalanced_Voltage_Loads_And_Is_Reported_For_Its_Operating_Point", "[processor][inputs][abt-1855]") {
+    // ABT #1855 (Alf, 2026-10-14): a voltage that is not volt-second balanced stops only its own
+    // operating point's induced-current calculation (calculate_magnetizing_current of an excitation,
+    // the bindings' calculate_induced_current, whose message the web shows next to the voltage).
+    // Loading the design integrates its balanced part, and analyze_results reports the imbalance for
+    // that operating point. Two points: a balanced +-10 V square and the +10 / -5 V one (mean 2.5 V).
+    auto operatingPointJson = [](const std::string& name, double lowVoltage) {
+        json operatingPoint;
+        operatingPoint["name"] = name;
+        operatingPoint["conditions"]["ambientTemperature"] = 25;
+        json windingExcitation;
+        windingExcitation["name"] = "Primary";
+        windingExcitation["frequency"] = 100000;
+        windingExcitation["voltage"]["waveform"]["data"] = {10, 10, lowVoltage, lowVoltage, 10};
+        windingExcitation["voltage"]["waveform"]["time"] = {0, 5e-6, 5e-6, 1e-5, 1e-5};
+        operatingPoint["excitationsPerWinding"] = json::array({windingExcitation});
+        return operatingPoint;
+    };
+    json inputsJson;
+    inputsJson["operatingPoints"] = json::array({operatingPointJson("Balanced", -10), operatingPointJson("Unbalanced", -5)});
+    inputsJson["designRequirements"]["magnetizingInductance"]["nominal"] = 100e-6;
+    inputsJson["designRequirements"]["turnsRatios"] = json::array();
+
+    OpenMagnetics::Inputs inputs;
+    REQUIRE_NOTHROW(inputs = OpenMagnetics::Inputs(inputsJson));
+    REQUIRE(inputs.get_operating_points().size() == 2);
+    // The unbalanced point's magnetizing current is the integral of its balanced part: the +-7.5 V
+    // square left once the 2.5 V mean is removed, 7.5 V over 5 us across 100 uH = 0.375 A peak to peak.
+    auto unbalancedExcitation = inputs.get_operating_points()[1].get_excitations_per_winding()[0];
+    REQUIRE(unbalancedExcitation.get_magnetizing_current());
+    CHECK_THAT(unbalancedExcitation.get_magnetizing_current()->get_processed()->get_peak_to_peak().value(),
+               Catch::Matchers::WithinRel(0.375, 0.02));
+
+    CHECK(OpenMagnetics::ResultsAnalyzer::analyze_volt_second_balance(inputs.get_operating_points()[0], 0).empty());
+    auto findings = OpenMagnetics::ResultsAnalyzer::analyze_volt_second_balance(inputs.get_operating_points()[1], 1);
+    REQUIRE(findings.size() == 1);
+    CHECK(findings[0].code == OpenMagnetics::ResultFindingCode::VOLT_SECOND_IMBALANCE);
+    CHECK(findings[0].operatingPointIndex == 1);
+    CHECK(findings[0].operatingPointName.value() == "Unbalanced");
+    CHECK_THAT(findings[0].message, Catch::Matchers::ContainsSubstring("not volt-second balanced"));
+
+    // The induced current asked for that voltage alone still refuses it, as the web requires.
+    OperatingPointExcitation excitation = inputs.get_operating_points()[1].get_excitations_per_winding()[0];
+    excitation.set_magnetizing_current(std::nullopt);
+    CHECK_THROWS_WITH(OpenMagnetics::Inputs::calculate_magnetizing_current(excitation, 100e-6, false, 0.0),
+                      Catch::Matchers::ContainsSubstring("not volt-second balanced"));
+}
+
+TEST_CASE("Test_Single_Winding_Inductor_With_Current_Uses_It_As_Magnetizing_Current", "[processor][inputs][abt-1585]") {
+    // A line-cycle PFC-like case: the voltage is not volt-second balanced, but the winding current is
+    // given, and for a single-winding inductor that current is the magnetizing current.
+    json inputsJson;
+    inputsJson["operatingPoints"] = json::array();
+    json operatingPoint = json();
+    operatingPoint["name"] = "Nominal";
+    operatingPoint["conditions"]["ambientTemperature"] = 25;
+    json windingExcitation = json();
+    windingExcitation["frequency"] = 100000;
+    windingExcitation["voltage"]["waveform"]["data"] = {10, 10, -5, -5, 10};
+    windingExcitation["voltage"]["waveform"]["time"] = {0, 5e-6, 5e-6, 1e-5, 1e-5};
+    windingExcitation["current"]["waveform"]["data"] = {11, 13, 11};
+    windingExcitation["current"]["waveform"]["time"] = {0, 5e-6, 1e-5};
+    operatingPoint["excitationsPerWinding"] = json::array();
+    operatingPoint["excitationsPerWinding"].push_back(windingExcitation);
+    inputsJson["operatingPoints"].push_back(operatingPoint);
+    inputsJson["designRequirements"]["magnetizingInductance"]["nominal"] = 100e-6;
+    inputsJson["designRequirements"]["turnsRatios"] = json::array();
+
+    OpenMagnetics::Inputs inputs(inputsJson);
+    auto excitation = inputs.get_operating_points()[0].get_excitations_per_winding()[0];
+    REQUIRE(excitation.get_magnetizing_current().has_value());
+    double currentPeak = excitation.get_current()->get_processed()->get_peak().value();
+    double magnetizingPeak = excitation.get_magnetizing_current()->get_processed()->get_peak().value();
+    REQUIRE_THAT(currentPeak, Catch::Matchers::WithinRel(13, 0.01));
+    REQUIRE_THAT(magnetizingPeak, Catch::Matchers::WithinRel(currentPeak, 1e-9));
+}
+
+TEST_CASE("Test_Mas_Autocomplete_Single_Winding_Inductor_Unbalanced_Voltage_Uses_Its_Current", "[processor][inputs][abt-1585][smoke-test]") {
+    // Saved web design (WebFrontend fixture etd49_wound_10uH_5T): one winding carrying a symmetric
+    // +-5 A triangular current and a voltage whose volt-seconds do not balance (-20.5 / +70.5 V,
+    // mean ~25 V). Since ABT #1585 the winding current of a single-winding inductor IS its
+    // magnetizing current, but mas_autocomplete / inputs_autocomplete still integrated the voltage
+    // and refused the whole file ("not volt-second balanced"): every such design stopped loading.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "inductor_unbalanced_voltage_with_current.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    OpenMagnetics::Mas mas(json::parse(file));
+    REQUIRE(mas.get_inputs().get_design_requirements().get_turns_ratios().empty());
+
+    auto autocompletedMas = OpenMagnetics::mas_autocomplete(mas, false, json::object());
+
+    auto excitation = autocompletedMas.get_inputs().get_operating_points()[0].get_excitations_per_winding()[0];
+    REQUIRE(excitation.get_magnetizing_current());
+    REQUIRE(excitation.get_current());
+    double magnetizingPeak = excitation.get_magnetizing_current()->get_processed()->get_peak().value();
+    double currentPeak = excitation.get_current()->get_processed()->get_peak().value();
+    CHECK_THAT(magnetizingPeak, Catch::Matchers::WithinRel(currentPeak, 1e-9));
+    CHECK_THAT(currentPeak, Catch::Matchers::WithinRel(5.0, 1e-6));
+
+    auto autocompletedInputs = OpenMagnetics::inputs_autocomplete(mas.get_inputs(), mas.get_magnetic(), json::object());
+    auto inputsExcitation = autocompletedInputs.get_operating_points()[0].get_excitations_per_winding()[0];
+    CHECK_THAT(inputsExcitation.get_magnetizing_current()->get_processed()->get_peak().value(), Catch::Matchers::WithinRel(5.0, 1e-6));
+}
+
+TEST_CASE("Test_Magnetizing_Current_Removes_A_Small_Volt_Second_Imbalance", "[processor][inputs][abt-1585][smoke-test]") {
+    // A measured winding voltage (oscilloscope upload) carries a probe offset, a resistive drop or a
+    // capture that is not a whole number of periods. Within the tolerance the mean used to stay in
+    // the integral and tilt the magnetizing current by the imbalance; a winding in periodic steady
+    // state has zero net volt-seconds, so the mean is removed and the result equals the balanced one.
+    auto magnetizingCurrentFor = [](double voltageOffset) {
+        OperatingPointExcitation excitation;
+        excitation.set_name("Primary winding excitation");
+        excitation.set_frequency(100000);
+        Waveform waveform;
+        waveform.set_data({-50 + voltageOffset, 50 + voltageOffset, 50 + voltageOffset, -50 + voltageOffset, -50 + voltageOffset});
+        waveform.set_time(std::vector<double>{0, 0, 0.000005, 0.000005, 0.00001});
+        SignalDescriptor voltage;
+        voltage.set_waveform(waveform);
+        excitation.set_voltage(voltage);
+        return OpenMagnetics::Inputs::calculate_magnetizing_current(excitation, 100e-6, false, 0.0).get_waveform()->get_data();
+    };
+    auto balanced = magnetizingCurrentFor(0);
+    auto offset = magnetizingCurrentFor(2);  // 2 V mean: 8 % of the 25 uV*s swing, inside the 25 % limit
+    REQUIRE(balanced.size() == offset.size());
+    for (size_t i = 0; i < balanced.size(); ++i) {
+        CHECK_THAT(offset[i], Catch::Matchers::WithinAbs(balanced[i], 1e-9));
+    }
+    CHECK_THROWS_AS(magnetizingCurrentFor(10), InvalidInputException);  // 40 % of the swing: still refused
+}
+
+
+TEST_CASE("Test_Switching_Frequency_Read_From_The_Waveform_Not_The_Cached_Harmonics", "[processor][inputs][bug]") {
+    // ABT #1764: the web DMC wizard's operating point, 50 Hz line current with a 100 kHz ripple
+    // sampled at 16384 points. Its processed copy (harmonics cached) and the same operating point as
+    // stored (waveforms only) are the same excitation, so they have the same switching frequency.
+    // get_switching_frequency returned the line frequency for the stored copy, and the magnetizing
+    // inductance then saw no line swing below the switching frequency: no DC-bias roll-off, mu 300
+    // instead of ~104 on the advised MPP 300 toroid, and 16.3 W of core losses instead of 1.74 W.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/dmc_calculate_advised_magnetics_switching_ripple.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    auto fixture = json::parse(file);
+    OperatingPointExcitation storedExcitation(fixture["inputs"]["operatingPoints"][0]["excitationsPerWinding"][0]);
+    REQUIRE(storedExcitation.get_current()->get_waveform());
+    REQUIRE_FALSE(storedExcitation.get_current()->get_harmonics());
+
+    OpenMagnetics::Inputs inputs(fixture["inputs"]);
+    auto processedExcitation = inputs.get_operating_point(0).get_excitations_per_winding()[0];
+    REQUIRE(processedExcitation.get_current()->get_harmonics());
+
+    double processedSwitchingFrequency = OpenMagnetics::Inputs::get_switching_frequency(processedExcitation);
+    CHECK_THAT(processedSwitchingFrequency, Catch::Matchers::WithinRel(100000, 1e-3));
+    CHECK_THAT(OpenMagnetics::Inputs::get_switching_frequency(storedExcitation), Catch::Matchers::WithinRel(processedSwitchingFrequency, 1e-9));
+}
+
+TEST_CASE("Test_Scale_Time_To_Frequency_Keeps_No_Spectrum_Of_The_Old_Time_Axis", "[processor][inputs][bug]") {
+    // ABT #1764: rescaling an excitation's time axis without reprocessing kept the harmonics of the old
+    // axis. The web DMC record moved to 500 Hz kept a 100 kHz ripple harmonic while its waveform's
+    // ripple sat at 1 MHz. Without reprocessing the stale spectrum and processed data are dropped;
+    // with it they are those of the rescaled waveform.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/dmc_calculate_advised_magnetics_switching_ripple.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    OpenMagnetics::Inputs inputs(json::parse(file)["inputs"]);
+    auto excitation = inputs.get_operating_point(0).get_excitations_per_winding()[0];
+    REQUIRE(excitation.get_current()->get_harmonics());
+    REQUIRE(excitation.get_voltage()->get_harmonics());
+
+    auto unprocessed = excitation;
+    OpenMagnetics::Inputs::scale_time_to_frequency(unprocessed, 500, false, false);
+    CHECK_FALSE(unprocessed.get_current()->get_harmonics());
+    CHECK_FALSE(unprocessed.get_current()->get_processed());
+    CHECK_FALSE(unprocessed.get_voltage()->get_harmonics());
+    CHECK_FALSE(unprocessed.get_voltage()->get_processed());
+    REQUIRE(unprocessed.get_current()->get_waveform());
+
+    auto reprocessed = excitation;
+    OpenMagnetics::Inputs::scale_time_to_frequency(reprocessed, 500, false, true);
+    auto harmonics = reprocessed.get_current()->get_harmonics().value();
+    size_t strongestRipple = 2;
+    for (size_t index = 2; index < harmonics.get_amplitudes().size(); ++index) {
+        if (harmonics.get_amplitudes()[index] > harmonics.get_amplitudes()[strongestRipple]) {
+            strongestRipple = index;
+        }
+    }
+    CHECK_THAT(harmonics.get_frequencies()[1], Catch::Matchers::WithinRel(500, 1e-6));
+    CHECK_THAT(harmonics.get_frequencies()[strongestRipple], Catch::Matchers::WithinRel(1e6, 1e-3));
+}
+
+TEST_CASE("Test_Switching_Frequency_Of_A_Line_Cycle_Record_At_Any_Frequency", "[processor][inputs][bug]") {
+    // ABT #1764: a line-cycle record (a record of repeated switching cycles described at its line
+    // frequency) is recognised from its waveform, not by a fixed f < 400 Hz gate. The web DMC record
+    // swept to 500 Hz and 5 kHz switches at 1 MHz and 10 MHz; the gate returned 500 Hz and 5 kHz,
+    // so the magnetizing inductance saw no line swing to bias the core with.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/dmc_calculate_advised_magnetics_switching_ripple.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    auto fixture = json::parse(file);
+    OperatingPointExcitation storedExcitation(fixture["inputs"]["operatingPoints"][0]["excitationsPerWinding"][0]);
+    CHECK_THAT(OpenMagnetics::Inputs::get_switching_frequency(storedExcitation), Catch::Matchers::WithinRel(100000, 1e-9));
+    for (double lineFrequency : {500.0, 5000.0}) {
+        for (bool processSignals : {false, true}) {
+            auto swept = storedExcitation;
+            OpenMagnetics::Inputs::scale_time_to_frequency(swept, lineFrequency, false, processSignals);
+            INFO("line frequency " << lineFrequency << " Hz, processed " << processSignals);
+            CHECK_THAT(OpenMagnetics::Inputs::get_switching_frequency(swept), Catch::Matchers::WithinRel(2000 * lineFrequency, 1e-9));
+        }
+    }
+
+    // One period of a converter's current is not a record of switching cycles: its frequency is
+    // its switching frequency.
+    auto converter = OpenMagnetics::Inputs::create_quick_operating_point(100000, 100e-6, 25, WaveformLabel::TRIANGULAR, 10, 0.5, 0);
+    auto converterExcitation = converter.get_operating_point(0).get_excitations_per_winding()[0];
+    CHECK_THAT(OpenMagnetics::Inputs::get_switching_frequency(converterExcitation), Catch::Matchers::WithinRel(100000, 1e-12));
+}
+
+// ABT #1467: the derived magnetizing current is Faraday on the winding voltage, never a shape
+// rebuilt from the load current's label. Fixtures shared with ABT #1463 (TestWindingLosses).
+namespace {
+    json abt1467_inputs_without_magnetizing_current(const std::string& fileName) {
+        auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), fileName);
+        std::ifstream in(path);
+        json masJson = json::parse(in);
+        json inputsJson = masJson["inputs"];
+        for (auto& operatingPoint : inputsJson["operatingPoints"]) {
+            for (auto& excitation : operatingPoint["excitationsPerWinding"]) {
+                excitation.erase("magnetizingCurrent");
+            }
+        }
+        return inputsJson;
+    }
+}
+
+TEST_CASE("Test_Magnetizing_Current_Dcm_Flyback_Keeps_The_Dead_Time", "[processor][inputs][abt-1467]") {
+    // DCM flyback, 42:6, 100 kHz, L_m 250 uH: 235 V for 2.5 us (32 of 128 samples), -139.26 V while
+    // the secondary demagnetizes (54 samples), 0 V for the last 42. The flux (and the magnetizing
+    // current) rises 235 V * 2.5 us / 250 uH = 2.35 A and stays flat through the dead time. The
+    // FLYBACK_PRIMARY label used to rebuild a triangle rising over D and falling over all of 1 - D:
+    // no dead time. The fixture is the #1463 flyback with its reset balanced (235 * 32 / 54 V instead
+    // of 137.2 V, which left 8.7 uV*s per period): any mean removed from an unbalanced voltage tilts
+    // the 0 V dead time, so the dead time is flat only on a balanced one.
+    OpenMagnetics::Inputs inputs(abt1467_inputs_without_magnetizing_current("Test_Magnetizing_Current_Dcm_Flyback_Balanced.json"));
+    auto excitation = inputs.get_operating_points()[0].get_excitations_per_winding()[0];
+    REQUIRE(excitation.get_magnetizing_current());
+    auto magnetizingCurrent = excitation.get_magnetizing_current().value();
+    auto waveform = magnetizingCurrent.get_waveform().value();
+    const auto& data = waveform.get_data();
+    REQUIRE(data.size() == 128);
+    double maximum = *std::max_element(data.begin(), data.end());
+    double minimum = *std::min_element(data.begin(), data.end());
+    double faradaySwing = 235.0 * 2.5e-6 / 250e-6;
+    double deadTimeLevel = data.back();
+    size_t flatSamples = 0;
+    for (auto value : data) {
+        if (std::fabs(value - deadTimeLevel) <= 1e-9 * faradaySwing) {
+            flatSamples++;
+        }
+    }
+    INFO("i_m max " << maximum << " A, min " << minimum << " A, dead-time level " << deadTimeLevel << " A over " << flatSamples << " samples");
+    CHECK(flatSamples >= 42);
+    CHECK_THAT(maximum - minimum, Catch::Matchers::WithinRel(faradaySwing, 0.01));
+    // DCM: the dead time sits at the flux's minimum (the balanced fixture's volt-seconds close).
+    CHECK(std::fabs(deadTimeLevel - minimum) < 0.02 * faradaySwing);
+    // DC anchor (ABT #907): the magnetizing current peaks where the primary current does (its
+    // 128-sample peak, 2.277 A, is 3 % under the knot peak).
+    CHECK_THAT(maximum, Catch::Matchers::WithinRel(faradaySwing, 0.05));
+}
+
+TEST_CASE("Test_Magnetizing_Current_Ideal_Sinusoidal_Transformer_Is_Faraday", "[processor][inputs][abt-1467]") {
+    // 1:1, 20 V cos on each winding, 3 A sinusoidal currents that cancel (opposite isolation sides by
+    // MKF's index convention), L_m 100 uH, 200 kHz: the magnetizing current is V / (w L_m) = 0.159 A,
+    // not the 3 A load current (it used to be read as a common-mode choke and stored as a +-3 A
+    // triangle).
+    OpenMagnetics::Inputs inputs(abt1467_inputs_without_magnetizing_current("Test_Winding_Losses_Abt1463_Transformer.json"));
+    auto excitation = inputs.get_operating_points()[0].get_excitations_per_winding()[0];
+    REQUIRE(excitation.get_magnetizing_current());
+    auto processed = excitation.get_magnetizing_current()->get_processed().value();
+    double expectedAmplitude = 20.0 / (2 * std::numbers::pi * 200000 * 100e-6);
+    INFO("i_m peak to peak " << processed.get_peak_to_peak().value() << " A, peak " << processed.get_peak().value() << " A");
+    CHECK_THAT(processed.get_peak_to_peak().value() / 2, Catch::Matchers::WithinRel(expectedAmplitude, 0.02));
+    CHECK_THAT(processed.get_peak().value(), Catch::Matchers::WithinRel(expectedAmplitude, 0.02));
+}
+
+TEST_CASE("Test_Magnetizing_Current_Of_Zero_Volt_Second_Voltage_Has_No_Dc", "[processor][inputs][abt-1467][abt-1713]") {
+    // ABT #1713: 688.5 V for a quarter of the period and -229.5 V for the rest balance exactly, so
+    // the flux is a zero-mean triangle. The integration constant was the trapezoid average of the
+    // samples over N - 1 intervals, not the period average, leaving ~1 % of the peak as DC.
+    double frequency = 100000;
+    size_t numberPoints = 128;
+    std::vector<double> data(numberPoints, -229.5);
+    std::vector<double> time(numberPoints);
+    for (size_t i = 0; i < numberPoints; ++i) {
+        time[i] = i / (frequency * numberPoints);
+        if (i < numberPoints / 4) {
+            data[i] = 688.5;
+        }
+    }
+    Waveform voltage;
+    voltage.set_data(data);
+    voltage.set_time(time);
+    OperatingPointExcitation excitation;
+    excitation.set_frequency(frequency);
+    auto magnetizingCurrent = OpenMagnetics::Inputs::calculate_magnetizing_current(excitation, voltage, 1e-3, false, 0.0);
+    double peak = magnetizingCurrent.get_processed()->get_peak().value();
+    double dc = magnetizingCurrent.get_harmonics()->get_amplitudes()[0];
+    double sampleMean = 0;
+    auto magnetizingCurrentWaveform = magnetizingCurrent.get_waveform().value();
+    for (auto value : magnetizingCurrentWaveform.get_data()) {
+        sampleMean += value / numberPoints;
+    }
+    INFO("peak " << peak << " A, DC harmonic " << dc << " A, sample mean " << sampleMean << " A");
+    REQUIRE(peak > 0);
+    CHECK(std::fabs(dc) < 1e-9 * peak);
+    CHECK(std::fabs(sampleMean) < 1e-9 * peak);
+}
+
+TEST_CASE("Test_Magnetizing_Current_Forward_Reset_Is_Faraday_From_Zero", "[processor][inputs][abt-1467]") {
+    // Single-switch forward, 1:1, 100 kHz, judged on a core with L_m 100 uH: +100 V for 2.5 us (on),
+    // -100 V for 2.5 us (reset), 0 V for 5 us (dead time). The flux rises 100 V * 2.5 us / 100 uH
+    // = 2.5 A and the reset brings it back to zero, where it stays: the magnetizing current goes
+    // 0 -> 2.5 A -> 0. The currents were simulated with another magnetizing inductance (200 uH:
+    // the primary ramps 1.25 A over its 10 A of reflected load and resets from 1.25 A), as a
+    // converter simulation judged on a candidate core always is. In the dead time no winding
+    // conducts, so by Ampere the magnetizing current is zero there whatever L_m the currents had.
+    // Anchoring the DC at the primary current's peak (11.25 A, load included) read an 11 A
+    // magnetizing peak; at the reset's first current (1.25 A) a 1.25 A one, offset by -1.25 A
+    // through the dead time; ignoring the currents (zero-mean Faraday) a 1.9 A one.
+    json operatingPointJson = json::parse(R"({
+        "conditions": {"ambientTemperature": 25},
+        "excitationsPerWinding": [
+            {"frequency": 100000, "name": "Primary",
+             "current": {"waveform": {"time": [0, 2.5e-6, 2.5e-6, 5e-6, 1e-5], "data": [10, 11.25, 1.25, 0, 0]}},
+             "voltage": {"waveform": {"time": [0, 2.5e-6, 2.5e-6, 5e-6, 5e-6, 1e-5], "data": [100, 100, -100, -100, 0, 0]}}},
+            {"frequency": 100000, "name": "Secondary",
+             "current": {"waveform": {"time": [0, 2.5e-6, 2.5e-6, 1e-5], "data": [10, 10, 0, 0]}},
+             "voltage": {"waveform": {"time": [0, 2.5e-6, 2.5e-6, 5e-6, 5e-6, 1e-5], "data": [100, 100, -100, -100, 0, 0]}}}
+        ]
+    })");
+    OperatingPoint operatingPoint(operatingPointJson);
+    auto processed = OpenMagnetics::Inputs::process_operating_point(operatingPoint, 100e-6, std::vector<double>{1});
+    auto magnetizingCurrent = processed.get_excitations_per_winding()[0].get_magnetizing_current().value();
+    auto waveform = magnetizingCurrent.get_waveform().value();
+    const auto& data = waveform.get_data();
+    double maximum = *std::max_element(data.begin(), data.end());
+    double minimum = *std::min_element(data.begin(), data.end());
+    INFO("i_m max " << maximum << " A, min " << minimum << " A, last sample (dead time) " << data.back() << " A");
+    CHECK_THAT(maximum - minimum, Catch::Matchers::WithinRel(2.5, 0.01));
+    CHECK_THAT(maximum, Catch::Matchers::WithinRel(2.5, 0.01));
+    CHECK(std::fabs(minimum) < 0.01 * 2.5);
+    CHECK(std::fabs(data.back()) < 0.01 * 2.5);
+}
+
+TEST_CASE("Test_Sampled_Waveform_Rejects_A_Time_Axis_That_Does_Not_Span_The_Period", "[processor][inputs][abt-1467]") {
+    // A flyback primary given over its 5 us on-time only, at 100 kHz (10 us period). The sampler
+    // used to take the axis length as the period and stretch the ramp over all 10 us: a 100 %
+    // duty cycle and twice the RMS. It must refuse such an axis, and an axis of two periods too.
+    Waveform onTimeOnly;
+    onTimeOnly.set_data({0, 0, 2.35, 0});
+    onTimeOnly.set_time(std::vector<double>{0, 0, 5e-6, 5e-6});
+    REQUIRE_THROWS_AS(OpenMagnetics::Inputs::calculate_sampled_waveform(onTimeOnly, 100000), std::invalid_argument);
+
+    Waveform twoPeriods;
+    twoPeriods.set_data({0, 1, 0, 1, 0});
+    twoPeriods.set_time(std::vector<double>{0, 5e-6, 1e-5, 1.5e-5, 2e-5});
+    REQUIRE_THROWS_AS(OpenMagnetics::Inputs::calculate_sampled_waveform(twoPeriods, 100000), std::invalid_argument);
+
+    // A frequency is required: 0 is not "the axis is the period", it throws like NaN, inf and negative.
+    Waveform onePeriod;
+    onePeriod.set_data({0, 1, 0});
+    onePeriod.set_time(std::vector<double>{0, 5e-6, 1e-5});
+    REQUIRE_THROWS_AS(OpenMagnetics::Inputs::calculate_sampled_waveform(onePeriod, 0), std::invalid_argument);
+    REQUIRE_THROWS_AS(OpenMagnetics::Inputs::calculate_sampled_waveform(onePeriod, std::numeric_limits<double>::quiet_NaN()), std::invalid_argument);
+    REQUIRE_THROWS_AS(OpenMagnetics::Inputs::calculate_sampled_waveform(onePeriod, std::numeric_limits<double>::infinity()), std::invalid_argument);
+    REQUIRE_THROWS_AS(OpenMagnetics::Inputs::calculate_sampled_waveform(onePeriod, -100000), std::invalid_argument);
+    REQUIRE_NOTHROW(OpenMagnetics::Inputs::calculate_sampled_waveform(onePeriod, 100000));
+
+    // The same primary over the whole period, zero in the off-time, is sampled as given: the
+    // second half of the samples is zero.
+    Waveform fullPeriod;
+    fullPeriod.set_data({0, 0, 2.35, 0, 0});
+    fullPeriod.set_time(std::vector<double>{0, 0, 5e-6, 5e-6, 1e-5});
+    auto sampled = OpenMagnetics::Inputs::calculate_sampled_waveform(fullPeriod, 100000);
+    const auto& data = sampled.get_data();
+    size_t zeroSamples = 0;
+    for (auto value : data) {
+        if (value == 0) {
+            zeroSamples++;
+        }
+    }
+    CHECK(zeroSamples >= data.size() / 2);
+    CHECK_THAT(*std::max_element(data.begin(), data.end()), Catch::Matchers::WithinRel(2.35, 0.02));
+
+    // A sampled waveform (open axis [0, T - dt]) spans the period too, and resampling it to the same
+    // number of points gives it back: the last sample holds until T. Taking the axis length as the
+    // period squeezed it by (N - 1) / N on every resampling (forward.mas.json reached 511^2 / 512^2).
+    auto resampled = OpenMagnetics::Inputs::calculate_sampled_waveform(sampled, 100000, data.size());
+    REQUIRE(resampled.get_data().size() == data.size());
+    CHECK_THAT(resampled.get_time().value().back(), Catch::Matchers::WithinRel(sampled.get_time().value().back(), 1e-9));
+    for (size_t index = 0; index < data.size(); ++index) {
+        CHECK_THAT(resampled.get_data()[index], Catch::Matchers::WithinAbs(data[index], 1e-9));
+    }
+}
+
+// ABT #1837: the sampled magnetizing current has a closed time axis (it reaches t0 + T). Compressed
+// without the frequency it was closed a second time and spanned T + dt (113 points over 128/127 of
+// the period), which the sampler then refuses: MKF rejected its own output in mas_autocomplete.
+TEST_CASE("Test_Compressed_Magnetizing_Current_Spans_Exactly_One_Period", "[processor][inputs][abt-1837]") {
+    double frequency = 1e6;
+    double magnetizingInductance = 26e-6;
+    std::vector<double> turnsRatios = {2.0};
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point(frequency, magnetizingInductance, 25, WaveformLabel::SINUSOIDAL, 10, 0.5, 0, turnsRatios);
+    auto operatingPoint = OpenMagnetics::Inputs::process_operating_point(inputs.get_operating_points()[0], magnetizingInductance, turnsRatios);
+
+    for (bool compress : {false, true}) {
+        CAPTURE(compress);
+        auto magnetizingCurrent = OpenMagnetics::Inputs::calculate_magnetizing_current(operatingPoint, 0, magnetizingInductance, turnsRatios, compress);
+        REQUIRE(magnetizingCurrent.get_waveform());
+        auto time = magnetizingCurrent.get_waveform()->get_time().value();
+        REQUIRE(time.size() >= 2);
+        CHECK_THAT((time.back() - time.front()) * frequency, Catch::Matchers::WithinRel(1.0, 1e-9));
+        // What the autocomplete does next with it.
+        CHECK_NOTHROW(OpenMagnetics::Inputs::calculate_sampled_waveform(magnetizingCurrent.get_waveform().value(), frequency));
+    }
+}
+
+// ABT #1878. A labelled waveform must have its label's vertices. These are the MKF flows that
+// handed on a label their data did not have: the magnetizing current integrated from a
+// labelled voltage copied the voltage's label (a triangle called "rectangular" or
+// "bipolarRectangular"), and a current scaled to zero kept "rectangular" on 2 vertices.
+TEST_CASE("Test_Magnetizing_Current_Of_A_Labelled_Voltage_Is_Not_Labelled_As_The_Voltage", "[processor][inputs][abt-1878]") {
+    const double frequency = 100000;
+    const double magnetizingInductance = 100e-6;
+    for (auto [label, dutyCycle] : std::vector<std::pair<WaveformLabel, double>>{{WaveformLabel::RECTANGULAR, 0.3},
+                                                                                 {WaveformLabel::BIPOLAR_RECTANGULAR, 0.4}}) {
+        INFO(magic_enum::enum_name(label));
+        auto voltageWaveform = OpenMagnetics::Inputs::create_waveform(label, 20, frequency, dutyCycle);
+        REQUIRE(voltageWaveform.get_ancillary_label() == label);
+        auto sampledVoltage = OpenMagnetics::Inputs::calculate_sampled_waveform(voltageWaveform, frequency);
+        CHECK(!OpenMagnetics::Inputs::calculate_integral_waveform(sampledVoltage, true).get_ancillary_label());
+
+        SignalDescriptor voltage;
+        voltage.set_waveform(voltageWaveform);
+        OperatingPointExcitation excitation;
+        excitation.set_frequency(frequency);
+        excitation.set_voltage(voltage);
+        SignalDescriptor magnetizingCurrent;
+        REQUIRE_NOTHROW(magnetizingCurrent = OpenMagnetics::Inputs::integrate_magnetizing_current(excitation, magnetizingInductance, true, 0.0));
+        auto processed = magnetizingCurrent.get_processed().value();
+        CHECK(processed.get_label() != label);
+        REQUIRE(processed.get_duty_cycle());
+        CHECK(processed.get_duty_cycle().value() >= 0);
+        CHECK(processed.get_duty_cycle().value() <= 1);
+        if (label == WaveformLabel::RECTANGULAR) {
+            // A rectangle integrates to a triangle rising over the rectangle's high level.
+            CHECK(processed.get_label() == WaveformLabel::TRIANGULAR);
+            CHECK_THAT(processed.get_duty_cycle().value(), Catch::Matchers::WithinAbs(dutyCycle, 1.0 / 128));
+        }
+    }
+}
+
+TEST_CASE("Test_Waveform_Scaled_By_Zero_Or_A_Negative_Factor_Keeps_No_Label", "[processor][inputs][abt-1878]") {
+    const double frequency = 100000;
+    auto rectangle = OpenMagnetics::Inputs::create_waveform(WaveformLabel::RECTANGULAR, 10, frequency, 0.3);
+    CHECK(OpenMagnetics::Inputs::multiply_waveform(rectangle, 2).get_ancillary_label() == WaveformLabel::RECTANGULAR);
+    CHECK(!OpenMagnetics::Inputs::multiply_waveform(rectangle, 0).get_ancillary_label());
+    CHECK(!OpenMagnetics::Inputs::multiply_waveform(rectangle, -1).get_ancillary_label());
+
+    OpenMagnetics::Inputs inputs = OpenMagnetics::Inputs::create_quick_operating_point(
+        frequency, 100e-6, 25, WaveformLabel::RECTANGULAR, 10, 0.5, 0);
+    auto excitation = inputs.get_operating_points()[0].get_excitations_per_winding()[0];
+    OperatingPointExcitation unloaded;
+    REQUIRE_NOTHROW(unloaded = OpenMagnetics::Inputs::get_excitation_with_proportional_current(excitation, 0));
+    CHECK(unloaded.get_current()->get_processed()->get_label() != WaveformLabel::RECTANGULAR);
+    CHECK(!unloaded.get_current()->get_waveform()->get_ancillary_label());
+    OperatingPointExcitation silent;
+    REQUIRE_NOTHROW(silent = OpenMagnetics::Inputs::get_excitation_with_proportional_voltage(excitation, 0));
+    CHECK(!silent.get_voltage()->get_waveform()->get_ancillary_label());
 }

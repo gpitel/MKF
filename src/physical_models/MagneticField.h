@@ -9,6 +9,7 @@
 #include "support/CoilMesher.h"
 #include <MAS.hpp>
 #include <cmath>
+#include <complex>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -21,6 +22,45 @@
 using namespace MAS; // QUAL-001 TODO: qualify types and remove
 
 namespace OpenMagnetics {
+
+// ABT #1645: thin-strip transmission. A foil turn is a strip of width W (its wide conducting dimension) and thickness
+// t << W. In a uniform field H0 normal to its wide face it carries, to first order, the eddy sheet current
+// K(x) = j omega mu0 sigma t H0 x (Faraday, curl E = -j omega mu0 H, with x across the width from the centre and no
+// net current; t << delta, so the current is uniform through the thickness). Line currents K dx at +-x give the
+// centre a normal field -K dx / (2 pi x) each, so the sheet adds -(dK/dx) W / (2 pi) = -j omega mu0 sigma t W / (2 pi)
+// H0 = -j W t / (pi delta^2) H0 (omega mu0 sigma = 2 / delta^2), opposing H0. Solved self-consistently (the eddy current is driven by the total normal field H, not
+// by H0): H = H0 - j (W t / (pi delta^2)) H, so the strip transmits the normal component with
+// T = 1 / (1 + j W t / (pi delta^2)) and leaves the tangential one alone. It applies to the field of any source
+// reaching a conductor (foil, round or litz) through the strip: the strips counted are the FOIL turns strictly
+// between the source and the induced point whose plane the straight source-to-point line crosses within the strip's
+// width. T is complex and per harmonic; it multiplies the normal component of the phasor (in-phase and quadrature).
+struct ScreeningStrip {
+    double centreX;
+    double centreY;
+    double tangentX;  // along the wide dimension
+    double tangentY;
+    double normalX;   // normal to the wide face
+    double normalY;
+    double width;     // the wide conducting dimension, W
+    double thickness; // the thin conducting dimension, t
+    size_t windingIndex;
+    int64_t turnIndex;
+};
+
+// A unit-current field contribution (Hx, Hy) that crosses `strips` (indices into the strip list, ordered from the
+// source to the induced point) on its way.
+struct ScreenedFieldSum {
+    size_t windingIndex;
+    std::vector<uint32_t> strips;
+    double fieldX;
+    double fieldY;
+};
+
+// The strips strictly between the source (sourceX, sourceY) and the induced point, ordered from the source; the
+// source's own strip (excludedSourceTurn, for a real turn) and the induced point's own strip (excludedInducedTurn)
+// never count.
+std::vector<uint32_t> strips_between(const std::vector<ScreeningStrip>& strips, double sourceX, double sourceY, double pointX, double pointY,
+                                     std::optional<int64_t> excludedSourceTurn, std::optional<int64_t> excludedInducedTurn);
 
 class MagneticFieldStrengthModel {
     public:
@@ -42,8 +82,76 @@ class MagneticFieldStrengthModel {
 
 class MagneticFieldStrengthFringingEffectModel {
     public:
+        virtual ~MagneticFieldStrengthFringingEffectModel() = default;
         virtual FieldPoint get_equivalent_inducing_point_for_gap(CoreGap gap, double magneticFieldStrengthGap) = 0;
         virtual ComplexFieldPoint get_magnetic_field_strength_between_gap_and_point(CoreGap gap, double magneticFieldStrengthGap, FieldPoint inducedFieldPoint) = 0;
+
+        // A WINDOW-BOUNDARY model (ABT #1304) places the magnetic circuit's MMF drops on the winding-window boundary
+        // instead of evaluating gaps one by one. Its sources are only consistent with a conductor field built the same
+        // way -- one point per turn with the complete-cell image lattice, a turn's own images counted -- and
+        // MagneticField builds it so when this returns true.
+        virtual bool is_window_boundary_model() const { return false; }
+        virtual void setup_window_boundary([[maybe_unused]] Magnetic magnetic, [[maybe_unused]] std::optional<OperatingPoint> operatingPoint) {
+            throw ModelNotAvailableException("This fringing effect model has no window-boundary sources");
+        }
+        // Field at (x, y) of the boundary sources for a net winding MMF of netAmpereTurns, Binns-Lawrenson sign convention.
+        virtual std::pair<double, double> get_window_boundary_field([[maybe_unused]] double pointX, [[maybe_unused]] double pointY,
+                                                                    [[maybe_unused]] double netAmpereTurns) const {
+            throw ModelNotAvailableException("This fringing effect model has no window-boundary sources");
+        }
+        // The same field per unit net MMF, split by the foil strips it crosses on its way to (x, y) (ABT #1645): returns
+        // the part that crosses none and appends the screened parts to `screened`, grouped by the strips they cross.
+        virtual std::pair<double, double> get_window_boundary_field_screened([[maybe_unused]] double pointX, [[maybe_unused]] double pointY,
+                                                                             [[maybe_unused]] const std::vector<ScreeningStrip>& strips,
+                                                                             [[maybe_unused]] std::optional<int64_t> inducedTurn,
+                                                                             [[maybe_unused]] std::vector<ScreenedFieldSum>& screened) const {
+            throw ModelNotAvailableException("This fringing effect model has no window-boundary sources");
+        }
+};
+
+// ABT #1314: the physical current split between the parallels of each winding. The parallels of a winding are strands
+// connected at both ends: every strand of a winding sees the same terminal voltage and the strand currents sum to the
+// winding's current. A strand runs through all the turns of its parallel in series, so its voltage is the sum over its
+// turn crossings of (R_t I + j w l_t A_t), A_t the 2D vector potential at crossing t (per unit length, averaged over the
+// conductor's section) from every conductor, its core images and the window-wall sources that return the net MMF.
+// Solved per harmonic as one small dense complex system; DC splits by resistance (WindingOhmicLosses) as before.
+//
+// Which model splits a magnetic's parallels is chosen per geometry by MagneticField::parallel_current_split_model:
+//  - NEUTRAL_WINDOW_IMPEDANCE: the strand impedance system above. Its strand inductance needs the neutral window frame
+//    (core image lattice + MMF_BOUNDARY window-wall sources), which exists for single-window, non-toroidal cores whose
+//    turns cross the section once.
+//  - RESISTIVE: every harmonic splits between the parallels by their DC conductance (series turn resistance plus the
+//    connection resistance), exactly the DC split, with no inductive term. Chosen deliberately (Alf, 2026-10-11, ABT
+//    #1759) for the geometries that have no neutral window frame yet: toroids (#1767), multi-window cores (#1768) and
+//    turns with additionalCoordinates (#1769). It ignores the proximity-driven redistribution between parallels, so
+//    it understates the AC losses of parallels that see different fields; those tickets carry the real AC split.
+enum class ParallelCurrentSplitModel {
+    NEUTRAL_WINDOW_IMPEDANCE,
+    RESISTIVE
+};
+
+struct ParallelCurrentSplit {
+    // The model that produced this split (see ParallelCurrentSplitModel).
+    ParallelCurrentSplitModel model = ParallelCurrentSplitModel::NEUTRAL_WINDOW_IMPEDANCE;
+    // The harmonics solved, as frequencies k f_excitation (k >= 1, ascending), and per harmonic every frequency the
+    // windings' harmonics lists give it (a list built from a waveform's own time span can differ from k f_excitation).
+    std::vector<double> frequencies;
+    std::vector<std::vector<double>> listedFrequenciesPerFrequency;
+    // Per solved frequency, per turn: the complex peak current of the turn's strand, MAS current frame (into the dot),
+    // phases referred to the gauge winding as CoilMesher::calculate_current_phase_per_winding does.
+    std::vector<std::vector<std::complex<double>>> currentPerTurnPerFrequency;
+    // Per solved frequency, per winding: the winding's complex peak current (amplitude x exp(j phase)).
+    std::vector<std::vector<std::complex<double>>> currentPerWindingPerFrequency;
+    // Per solved frequency, per winding: the winding lists this harmonic but it is zero both in its list and in its
+    // waveform (WaveformProcessor::is_zero_harmonic, ABT #1880). Its current is the zero phasor, and so is every strand's.
+    std::vector<std::vector<bool>> zeroHarmonicPerWindingPerFrequency;
+    // The strand (winding, parallel) of every turn, numbered 0 .. numberStrands - 1, and the winding of every strand.
+    std::vector<size_t> strandPerTurn;
+    std::vector<size_t> windingPerStrand;
+    // The index in `frequencies` of a harmonic frequency, solved or listed; throws when it was not solved.
+    size_t frequency_index(double frequency) const;
+    // The same, empty when the harmonic was not solved.
+    std::optional<size_t> find_frequency_index(double frequency) const;
 };
 
 class MagneticField {
@@ -66,9 +174,12 @@ class MagneticField {
             _fringingEffectModel = factory(_magneticFieldStrengthFringingEffectModel);
         }
 
+        // frequency: the excitation's, so a magnetizing current given on a closed axis ([t0, t0 + T])
+        // is told from a sampled open one when it is compressed (ABT #1467).
         static SignalDescriptor calculate_magnetic_flux(SignalDescriptor magnetizingCurrent,
-                                                        double MagneticField,
-                                                        double numberTurns);
+                                                        double reluctance,
+                                                        double numberTurns,
+                                                        double frequency);
         static SignalDescriptor calculate_magnetic_flux_density(SignalDescriptor magneticFlux,
                                                                 double area);
         static SignalDescriptor calculate_magnetic_field_strength(SignalDescriptor magneticFluxDensity,
@@ -79,7 +190,7 @@ class MagneticField {
         // Default current directions follow the MAS excitation convention by isolation side
         // (CoilMesher::calculate_current_direction_per_winding); a custom vector overrides
         // them. Phases always come from the windings' current waveforms.
-        WindingWindowMagneticStrengthFieldPhasorOutput calculate_magnetic_field_strength_field(OperatingPoint operatingPoint, Magnetic magnetic, std::optional<Field> externalInducedField = std::nullopt, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding = std::nullopt, std::optional<CoilMesherModels> coilMesherModel = std::nullopt);
+        WindingWindowMagneticStrengthFieldPhasorOutput calculate_magnetic_field_strength_field(OperatingPoint operatingPoint, Magnetic magnetic, std::optional<Field> externalInducedField = std::nullopt, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding = std::nullopt, std::optional<CoilMesherModels> coilMesherModel = std::nullopt, std::optional<ParallelCurrentSplit> parallelCurrentSplit = std::nullopt);
 
         static std::shared_ptr<MagneticFieldStrengthFringingEffectModel> factory(MagneticFieldStrengthFringingEffectModels modelName);
         static std::shared_ptr<MagneticFieldStrengthModel> factory(MagneticFieldStrengthModels modelName);
@@ -93,6 +204,14 @@ class MagneticField {
             size_t entries = 0;
             size_t bytes = 0;
         };
+        // ABT #1314: the split of every winding's harmonic currents between its parallels (see ParallelCurrentSplit), at the
+        // conductors' temperature, by the model parallel_current_split_model chooses for the magnetic. Empty when no
+        // winding has more than one parallel.
+        static std::optional<ParallelCurrentSplit> calculate_parallel_current_split(Magnetic magnetic, OperatingPoint operatingPoint, double temperature,
+                                                                                    std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding = std::nullopt);
+        // ABT #1759: the parallel current split model for this magnetic's geometry: RESISTIVE for toroids, multi-window
+        // cores and turns with additionalCoordinates (no neutral window frame), NEUTRAL_WINDOW_IMPEDANCE otherwise.
+        static ParallelCurrentSplitModel parallel_current_split_model(const Magnetic& magnetic);
         static TurnSumsCacheStatistics get_turn_sums_cache_statistics();
         static void clear_turn_sums_cache();
 };
@@ -246,6 +365,55 @@ class MagneticFieldStrengthSullivanModel : public MagneticFieldStrengthFringingE
     int _imageUnitsX = 2;
     /// Number of image unit repetitions in the Y direction (parallel to gap)
     int _imageUnitsY = 2;
+};
+
+// MMF_BOUNDARY (ABT #1304): the winding-window field as a charge-neutral image problem.
+//
+// The image lattice of a single rectangular window mirrors every conductor in the four core walls, taken as mu -> inf.
+// A winding with net ampere-turns NI then sits in a closed box that cannot hold net current (Ampere round the box would
+// need H inside the walls), and a truncated lattice carries a spurious, nearly uniform field. In the real core the NI
+// drops across the gaps and along the ferrite. This model puts exactly those drops on the window boundary as uniform
+// current sheets returning -NI: each gap's share of the MMF (its reluctance over the core's total, MKF's own reluctance
+// composition) across its slot mouth, and the ferrite's share along the four walls in proportion to length x H with
+// H = B / mu. Sheets and conductors are imaged by the same complete-cell lattice, so every cell is neutral and the sum
+// converges; the tangential field just inside each wall equals that wall's MMF density, as the wall boundary condition
+// requires. No fitted constant: geometry and the reluctance model only.
+//
+// It generalises SULLIVAN (gap MMF as imaged filaments) to every MMF drop in the circuit, made consistent with the
+// conductors' own lattice. Single rectangular windows with the pure 2-D BINNS_LAWRENSON kernel only: it throws for
+// toroids, multi-window cores, LAMMERANER (its finite-length factor breaks the lattice's neutrality), DOWELL (1-D, no
+// images), WANG (its own two-point mesh) and ALBACH. WindingLosses picks BINNS_LAWRENSON for it when the field model is
+// chosen automatically.
+class MagneticFieldStrengthMmfBoundaryModel : public MagneticFieldStrengthFringingEffectModel {
+  private:
+    std::vector<WindowWallSheet> _sheets;
+    // ABT #1645: per sheet, its centre and the normalised moments <zeta^k> (k = 0, 2, ..., 12) of a uniform line source,
+    // for the multipole form of calculate_sheet_field far from the sheet (see get_window_boundary_field).
+    struct SheetMultipole {
+        double centreX;
+        double centreY;
+        double farRadiusSquared;
+        double momentRe[7];
+        double momentIm[7];
+    };
+    std::vector<SheetMultipole> _sheetMultipoles;
+    bool _isSetUp = false;
+  public:
+    std::string methodName = "MmfBoundary";
+    ComplexFieldPoint get_magnetic_field_strength_between_gap_and_point([[maybe_unused]] CoreGap gap, [[maybe_unused]] double magneticFieldStrengthGap,
+                                                                        [[maybe_unused]] FieldPoint inducedFieldPoint) {
+        throw ModelNotAvailableException("MMF_BOUNDARY is not a per-gap model: the ferrite carries part of the MMF; use get_window_boundary_field");
+    }
+    FieldPoint get_equivalent_inducing_point_for_gap([[maybe_unused]] CoreGap gap, [[maybe_unused]] double magneticFieldStrengthGap) {
+        throw ModelNotAvailableException("MMF_BOUNDARY is not a per-gap model: the ferrite carries part of the MMF; use get_window_boundary_field");
+    }
+    bool is_window_boundary_model() const override { return true; }
+    void setup_window_boundary(Magnetic magnetic, std::optional<OperatingPoint> operatingPoint) override;
+    std::pair<double, double> get_window_boundary_field(double pointX, double pointY, double netAmpereTurns) const override;
+    std::pair<double, double> get_window_boundary_field_screened(double pointX, double pointY, const std::vector<ScreeningStrip>& strips,
+                                                                 std::optional<int64_t> inducedTurn, std::vector<ScreenedFieldSum>& screened) const override;
+    // Closed-form field of one uniform sheet (see the definition), Binns-Lawrenson sign convention.
+    static std::pair<double, double> calculate_sheet_field(const WindowWallSheet& sheet, double current, double pointX, double pointY);
 };
 
 
@@ -415,7 +583,7 @@ class MagneticFieldStrengthImagedMmfSheetsModel : public MagneticFieldStrengthMo
 
     // Field of all turns (per winding current amplitudes, signed), own real turn excluded.
     std::pair<double, double> turns_field(double x, double y, const std::vector<double>& currentPerWinding,
-                                          std::optional<size_t> excludedTurn) const;
+                                          std::optional<size_t> excludedTurn, const std::vector<double>* multiplierPerTurn = nullptr) const;
     // Field of all gap sheets per ampere of magnetizing current.
     std::pair<double, double> gaps_field(double x, double y) const;
 

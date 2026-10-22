@@ -1,3 +1,6 @@
+#include <locale>
+#include <sstream>
+#include <limits>
 #include "support/Utils.h"
 #include "Defaults.h"
 #include "processors/CircuitSimulatorInterface.h"
@@ -92,6 +95,17 @@ std::string to_string(double d, size_t precision) {
     std::ostringstream out;
     out.precision(precision);
     out << std::fixed << d;
+    return out.str();
+}
+
+// Shortest decimal that reads back as the same double: max_digits10 significant digits
+// (C++ [numeric.limits.members]; IEEE 754-2008 §5.12.2). Used for coupling coefficients, whose
+// distance from 1 is the leakage: a fixed 6- or 12-decimal print rounds a k of 0.9999996 to
+// exactly 1, a singular coupling, where the double itself is strictly below 1.
+std::string to_string_round_trip(double d) {
+    std::ostringstream out;
+    out.precision(std::numeric_limits<double>::max_digits10);
+    out << d;
     return out.str();
 }
 
@@ -1928,17 +1942,59 @@ void CircuitSimulationReader::process_line_with_context(const std::string& line,
                     " has more columns than the header (" +
                     std::to_string(_columns.size()) + ")");
             }
-            double value;
-            try {
-                size_t consumed = 0;
-                value = std::stod(token, &consumed);
-                (void)consumed;
+            // ABT #1624: the parse is locale-independent (std::stod follows the C locale, so a
+            // process running under a decimal-comma locale read "0.001" as 0), and the whole token
+            // must be the number: stod stopped at the first character it could not use and
+            // returned the prefix, so a decimal-comma "0,001" was silently read as 0.
+            // ABT #1695: no std::from_chars(double), which the WASM toolchain's libc++ (emscripten
+            // 3.1.51, libc++ 17) does not provide. The token is first matched against the plain
+            // decimal grammar [+-]digits[.digits][(e|E)[+-]digits] (at least one mantissa digit),
+            // because the stream parsers differ between standard libraries (libc++ also reads hex
+            // floats and "inf"); only a whole match is then converted, by a stream imbued with the
+            // classic locale.
+            size_t numberLength = 0;
+            {
+                size_t position = 0;
+                auto isDigit = [&](size_t index) { return index < token.size() && token[index] >= '0' && token[index] <= '9'; };
+                if (position < token.size() && (token[position] == '+' || token[position] == '-')) {
+                    ++position;
+                }
+                size_t mantissaDigits = 0;
+                while (isDigit(position)) { ++position; ++mantissaDigits; }
+                if (position < token.size() && token[position] == '.') {
+                    ++position;
+                    while (isDigit(position)) { ++position; ++mantissaDigits; }
+                }
+                if (mantissaDigits > 0) {
+                    numberLength = position;
+                    if (position < token.size() && (token[position] == 'e' || token[position] == 'E')) {
+                        size_t exponentPosition = position + 1;
+                        if (exponentPosition < token.size() && (token[exponentPosition] == '+' || token[exponentPosition] == '-')) {
+                            ++exponentPosition;
+                        }
+                        if (isDigit(exponentPosition)) {
+                            while (isDigit(exponentPosition)) { ++exponentPosition; }
+                            numberLength = exponentPosition;
+                        }
+                    }
+                }
             }
-            catch (const std::exception&) {
+            double value = std::numeric_limits<double>::quiet_NaN();
+            bool parsed = false;
+            if (numberLength == token.size()) {
+                std::istringstream numberStream(token);
+                numberStream.imbue(std::locale::classic());
+                numberStream >> value;
+                parsed = !numberStream.fail() && numberStream.peek() == std::char_traits<char>::eof();
+            }
+            if (!parsed || !std::isfinite(value)) {
                 throw InvalidInputException(ErrorCode::INVALID_INPUT,
                     "Could not parse number on line " + std::to_string(lineNumber) +
                     ", column " + std::to_string(currentColumnIndex + 1) + " (\"" +
-                    _columns[currentColumnIndex].name + "\"): \"" + token + "\"");
+                    _columns[currentColumnIndex].name + "\"): \"" + token + "\"" +
+                    (numberLength > 0 && numberLength < token.size()
+                         ? " (only \"" + token.substr(0, numberLength) + "\" is a number; "
+                           "is the decimal separator a comma?)" : ""));
             }
             _columns[currentColumnIndex].data.push_back(value);
             currentColumnIndex++;
@@ -2201,14 +2257,17 @@ Waveform CircuitSimulationReader::get_one_period(Waveform waveform, double frequ
         }
 
 
+        // The window closes at the first sample at or past one period after its first sample.
+        // A sample that misses the end only by the rounding of the exported time column counts
+        // as on it: comparing exactly took the next sample too, a window of T plus one step
+        // (ABT #1467).
+        const double windowEnd = time[periodStartIndex] + period;
+        const double endRoundingTolerance = 1e-6 * period;
         for (size_t i = periodStartIndex; i < time.size(); ++i)
         {
-            if (time[i] >= periodStart + period) {
+            if (time[i] >= windowEnd - endRoundingTolerance) {
                 periodStopIndex = i + 1;
                 break;
-            }
-            else {
-
             }
         }
         // If the alignment back-walk pulled periodStart so far back that
@@ -2244,6 +2303,24 @@ Waveform CircuitSimulationReader::get_one_period(Waveform waveform, double frequ
     double offset = periodTime[0];
     for (size_t index = 0; index < periodTime.size(); index++) {
         periodTime[index] -= offset;
+    }
+    // Exactly one period, [0, T]: the last sample is on T up to the column's rounding, or past it,
+    // and then the waveform is cut at T between it and the previous sample (ABT #1467).
+    if (periodTime.size() < 2) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "CircuitSimulationReader::get_one_period: the period window on time axis \"" + timeAxisName + "\" holds fewer than 2 samples");
+    }
+    {
+        const size_t last = periodTime.size() - 1;
+        if (std::fabs(periodTime[last] - period) > 1e-6 * period) {
+            if (periodTime[last] < period || periodTime[last - 1] >= period) {
+                throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                    "CircuitSimulationReader::get_one_period: the period window on time axis \"" + timeAxisName + "\" does not bracket one period of " + std::to_string(period) + " s");
+            }
+            const double fraction = (period - periodTime[last - 1]) / (periodTime[last] - periodTime[last - 1]);
+            periodData[last] = periodData[last - 1] + fraction * (periodData[last] - periodData[last - 1]);
+        }
+        periodTime[last] = period;
     }
 
 

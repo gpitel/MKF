@@ -108,6 +108,12 @@ class CoilAdviser : public WireAdviser {
         std::map<MagneticFilters, std::shared_ptr<MagneticFilter>> _filters;
         std::vector<MagneticFilterOperation> _loadedFilterFlow;
         OpenMagnetics::WireAdviser _wireAdviser;
+        // Set only while get_advised_coil retries a core on which no coil fits within the wire
+        // limits (defaults.maximumEffectiveCurrentDensity, defaults.maximumNumberParallels): the
+        // per-pattern searches then also draw wires at twice the current density and/or twice the
+        // parallels (the four configurations every search used to run), and every coil found that
+        // way comes back marked INVALID with the limit it breaks, never as a valid design.
+        bool _relaxedWireLimits = false;
         // ABT #1110: Settings' preferred wire standard wins; with no preference the coil
         // adviser keeps its built-in one (Defaults::commonWireStandard, a preference that
         // falls back to every standard when the catalog has none of it, see get_advised_coil).
@@ -115,9 +121,9 @@ class CoilAdviser : public WireAdviser {
             ? Settings::GetInstance().get_preferred_wire_standard()
             : std::optional<WireStandard>(defaults.commonWireStandard);
         std::vector<MagneticFilterOperation> _defaultCustomMagneticFilterFlow{
-            MagneticFilterOperation(MagneticFilters::EFFECTIVE_RESISTANCE, true, true, 1.0),
+            MagneticFilterOperation(MagneticFilters::EFFECTIVE_RESISTANCE, true, true, false, 1.0),
             MagneticFilterOperation(MagneticFilters::EFFECTIVE_CURRENT_DENSITY, true, true, true, 1.0),  // Strictly required - designs exceeding current density are invalid
-            MagneticFilterOperation(MagneticFilters::MAGNETOMOTIVE_FORCE, true, true, 1.0),
+            MagneticFilterOperation(MagneticFilters::MAGNETOMOTIVE_FORCE, true, true, false, 1.0),
         };
 
         // ABT #415: zero-result diagnosis, accumulated across every pattern/insulation attempt of
@@ -132,6 +138,10 @@ class CoilAdviser : public WireAdviser {
         std::string _diagnosisNoWiresDetail;
         double _diagnosisBestOverfill = std::numeric_limits<double>::max();
         std::string _diagnosisBestFailure;     // failing constraint of the closest losing candidate
+        size_t _diagnosisRealWindingRefusals = 0;  // ranked coils the real winder refused (ABT #1699)
+        std::string _diagnosisRealWindingRefusal;  // the first such refusal, as the real winder named it
+        size_t _diagnosisInsulationOutsideWindow = 0;  // wound coils whose insulation escapes the window (ABT #838)
+        std::string _diagnosisInsulationOutsideWindowReason;  // the first such escape
         std::optional<std::string> _lastNoResultsReason;
 
     public:
@@ -146,6 +156,31 @@ class CoilAdviser : public WireAdviser {
             return _lastNoResultsReason;
         }
 
+        // ABT #1699: the first maximumNumberResults of `rankedMases` (in their order). With real
+        // winding geometry on, only those MagneticFilterRealWinding accepts; refusals are counted
+        // in the no-results diagnosis.
+        std::vector<Mas> select_real_windable(std::vector<Mas> rankedMases, size_t maximumNumberResults);
+
+        /**
+         * @brief The wires get_advised_coil(mas) advises from: the catalogue (or the active
+         * LibraryContext inventory) narrowed by the wire-type constraint, the include-type settings
+         * and the preferred wire standard (insulated wires of any standard kept; every standard
+         * accepted when the preferred one leaves nothing).
+         */
+        std::vector<Wire> get_catalogue_wires();
+        /**
+         * @brief With margin tape, the coil stage limits each wire to a single-layer coating of
+         * grade up to 3 (the tape carries the insulation); this applies that limit.
+         */
+        static void limit_wire_insulation_requirements_for_margin(std::vector<WireSolidInsulationRequirements>& solidInsulationRequirementsForWires);
+        /**
+         * @brief The section layout the coil stage winds a core with (ABT #838): toroids CONTIGUOUS
+         * sectors SPREAD around the ring (turns CENTERED in filter mode), every other core OVERLAPPING
+         * sections from the inner side. Also writes it into the bobbin's winding window, whose stale
+         * quick-bobbin orientation would otherwise win in wind_by_sections. The core adviser winds its
+         * stand-in coil with the same layout, so it judges a core by the winding the coil stage builds.
+         */
+        static void apply_coil_stage_winding_layout(Coil& coil, CoreType coreType, bool filterMode);
         std::vector<Mas> get_advised_coil(Mas mas, size_t maximumNumberResults=1);
     // ABT #1176, behind Settings::get_coil_adviser_size_magnetic_shunts().
     void add_magnetic_shunts_for_leakage_target(std::vector<Mas>& candidates);

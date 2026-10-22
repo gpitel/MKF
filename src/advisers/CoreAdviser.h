@@ -1,4 +1,5 @@
 #pragma once
+#include "support/Settings.h"
 #include "advisers/MagneticFilter.h"
 #include "physical_models/CoreLosses.h"
 #include "physical_models/Impedance.h"
@@ -10,6 +11,7 @@
 #include "processors/MagneticSimulator.h"
 #include "processors/Outputs.h"
 #include "processors/Inputs.h"
+#include <optional>
 #include "constructive_models/Core.h"
 #include "constructive_models/Mas.h"
 #include <cmath>
@@ -20,6 +22,13 @@
 using namespace MAS;
 
 namespace OpenMagnetics {
+
+// The hot-spot limit the advisers' temperature gates hold a design to: the maximum of the design
+// requirements' operatingTemperature when the inputs state one, else the configured
+// Settings::get_core_adviser_maximum_temperature() (an explicit setting, 130 C unless changed, not
+// a hidden default: callers set it to their own limit). One rule for every gate, so the core-only
+// gate in CoreAdviser and the assembled-part gate in MagneticAdviser cannot disagree.
+double resolve_maximum_design_temperature(Inputs& inputs);
 
 /**
  * @class CoreAdviser
@@ -96,6 +105,10 @@ namespace OpenMagnetics {
  * - Colonel Wm. T. McLyman, "Transformer and Inductor Design Handbook"
  */
 class CoreAdviser {
+    private:
+        // ABT #1652: first member, so no adviser code runs without it: while this adviser exists,
+        // material data is never extrapolated (see MaterialDataExtrapolationBarrier in Settings.h).
+        MaterialDataExtrapolationBarrier _materialDataExtrapolationBarrier;
     public: 
         enum class CoreAdviserFilters : int {
             COST,
@@ -156,6 +169,26 @@ class CoreAdviser {
                 { CoreAdviserFilters::TURN_COUNT,         { {"invert", true}, {"log", false} } }
             };
         std::map<CoreAdviserFilters, std::map<std::string, double>> _scorings;
+    private:
+        // ABT #1620: _scorings describes ONE advise. The outermost get_advised_core starts it empty;
+        // the overloads it calls (the batches of a batched advise, the stacked retry) fill it in.
+        // It used to survive across calls, so a second advise reported the first one's cores too.
+        size_t _adviseDepth = 0;
+        class AdviseScoringScope {
+            public:
+                explicit AdviseScoringScope(CoreAdviser& coreAdviser) : _coreAdviser(coreAdviser) {
+                    if (_coreAdviser._adviseDepth == 0) {
+                        _coreAdviser._scorings.clear();
+                    }
+                    ++_coreAdviser._adviseDepth;
+                }
+                ~AdviseScoringScope() { --_coreAdviser._adviseDepth; }
+                AdviseScoringScope(const AdviseScoringScope&) = delete;
+                AdviseScoringScope& operator=(const AdviseScoringScope&) = delete;
+            private:
+                CoreAdviser& _coreAdviser;
+        };
+    public:
         CoreAdviser(std::map<std::string, std::string> models) {
             auto defaults = OpenMagnetics::Defaults();
             _models = models;
@@ -224,10 +257,24 @@ class CoreAdviser {
         // Honours unique-core-shapes (a shape is only burned by a SURVIVING
         // candidate). withAlternativeMaterials additionally runs the
         // alternative-materials lookup per kept candidate (STANDARD_CORES path).
+        // maximumTemperature (ABT #1802): the temperature gate's limit when that gate ran; a
+        // candidate whose published loss-temperature solve is hotter is dropped and backfilled.
         std::vector<std::pair<Mas, double>> post_process_and_cut(std::vector<std::pair<Magnetic, double>>& magneticsWithScoring,
                                                                  Inputs& inputs,
                                                                  size_t maximumNumberResults,
-                                                                 bool withAlternativeMaterials = false);
+                                                                 bool withAlternativeMaterials = false,
+                                                                 std::optional<double> maximumTemperature = std::nullopt);
+        // The same walk, appending to parts already kept (ABT #1875): it stops when `kept` holds
+        // maximumNumberResults, and a shape already in `kept` (with unique core shapes) is
+        // skipped. post_process_and_cut(list) is post_process_and_append(list, ..., kept = {}), and
+        // appending two lists one after the other keeps what post-processing their concatenation would.
+        // The pipeline's temperature walk counts its "enough" on `kept`, the parts these gates pass.
+        void post_process_and_append(std::vector<std::pair<Magnetic, double>>& magneticsWithScoring,
+                                     Inputs& inputs,
+                                     size_t maximumNumberResults,
+                                     bool withAlternativeMaterials,
+                                     std::optional<double> maximumTemperature,
+                                     std::vector<std::pair<Mas, double>>& kept);
 
         /**
          * @brief Calculate gap constraints for STANDARD_CORES mode.
@@ -304,6 +351,13 @@ class CoreAdviser {
          * gate: no candidate is removed. Run it on a pruned pool, before the loss ranking.
          */
         void select_inductor_turns_and_gap_by_losses(std::vector<std::pair<Magnetic, double>>* magneticsWithScoring, Inputs inputs);
+        /**
+         * Rejects, with its numbers in the log, every candidate whose winding window cannot
+         * hold the copper of all the input's windings at the maximum effective current
+         * density (MagneticFilterWindowCopperCapacity). Run once the turns are seeded.
+         */
+        void filter_by_window_copper_capacity(std::vector<std::pair<Magnetic, double>>* magneticsWithScoring,
+                                              const Inputs& inputs, const std::string& stage);
 
 
 
@@ -373,12 +427,11 @@ class CoreAdviser {
             bool _useCache = true;
 
             void add_scoring(std::string name, CoreAdviser::CoreAdviserFilters filter, double scoring) {
+                // ABT #1620: a candidate's score under a filter is its value, written, not summed: a
+                // core scored by both the first search and the stacked retry of one advise used to
+                // report twice its value.
                 if (scoring != -1) {
-                    if ((*_scorings)[filter].find(name) == (*_scorings)[filter].end()) {
-                        (*_scorings)[filter][name] = 0;
-                    }
-                    auto oldScoring = (*_scorings)[filter][name];
-                    (*_scorings)[filter][name] = oldScoring + scoring;
+                    (*_scorings)[filter][name] = scoring;
                 }
             }
             void set_scorings(std::map<CoreAdviserFilters, std::map<std::string, double>>* scorings) {
@@ -407,7 +460,15 @@ class CoreAdviser {
 
         public:
             MagneticCoreFilterAreaProduct(Inputs inputs);
+            // Every filter_magnetics CONSUMES the pool it is given (ABT #1785): callers replace the
+            // pool with the result, and the survivors are handed back without a second copy.
             std::vector<std::pair<Magnetic, double>> filter_magnetics(std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics, Inputs inputs, double weight=1, bool firstFilter=false);
+            // The same filter over a pool that must survive it (the adviser's whole dataset, which
+            // the retries and the stacked second search start from again): only the survivors are
+            // copied, instead of copying the whole dataset first and filtering the copy. With
+            // keepBest only the best keepBest of them are copied: the same result as filtering
+            // everything and then resize(keepBest), without holding the rest.
+            std::vector<std::pair<Magnetic, double>> filter_magnetics_from(const std::vector<std::pair<Magnetic, double>>& source, Inputs inputs, double weight=1, std::optional<size_t> keepBest=std::nullopt);
     };
     
     class MagneticCoreFilterEnergyStored : public MagneticCoreFilter {
@@ -442,7 +503,7 @@ class CoreAdviser {
             MagneticFilterCoreDcAndSkinLosses _filter; // F23 FIX: use DC+skin losses instead of DC-only
 
         public:
-            MagneticCoreFilterLosses(Inputs inputs, std::map<std::string, std::string> models);
+            MagneticCoreFilterLosses(Inputs inputs, std::map<std::string, std::string> models, MAS::MagneticApplication application);
             std::vector<std::pair<Magnetic, double>> filter_magnetics(std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics, Inputs inputs, double weight=1, bool firstFilter=false);
     };
     
@@ -485,7 +546,7 @@ class CoreAdviser {
         MagneticFilterTemperature _filter;
     public:
         MagneticCoreFilterTemperature(Inputs inputs, std::map<std::string, std::string> models,
-                                      double maximumTemperature);
+                                      double maximumTemperature, MAS::MagneticApplication application);
         std::vector<std::pair<Magnetic, double>> filter_magnetics(
             std::vector<std::pair<Magnetic, double>>* unfilteredMagnetics,
             Inputs inputs, double weight = 1, bool firstFilter = false);
@@ -562,7 +623,6 @@ inline void to_json(json & j, const CoreAdviser::CoreAdviserFilters & x) {
 
 // Free helper functions used by CoreAdviser and MagneticAdviser fast path
 void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *magneticsWithScoring, const Inputs& inputs);
-void correct_windings(std::vector<std::pair<Magnetic, double>> *magneticsWithScoring, const Inputs& inputs);
 Inputs pre_process_inputs(Inputs inputs);
 
 } // namespace OpenMagnetics

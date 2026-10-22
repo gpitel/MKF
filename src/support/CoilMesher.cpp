@@ -1,6 +1,8 @@
 #include "support/CoilMesher.h"
+#include "physical_models/Reluctance.h"
 #include "physical_models/WindingOhmicLosses.h"
 #include "processors/Inputs.h"
+#include "processors/WaveformProcessor.h"
 #include "constructive_models/Coil.h"
 #include "support/Utils.h"
 
@@ -10,7 +12,9 @@
 #include <complex>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <numbers>
 #include <streambuf>
 #include <vector>
@@ -365,26 +369,13 @@ std::vector<int8_t> CoilMesher::calculate_current_direction_per_winding(Coil coi
 }
 
 std::complex<double> CoilMesher::calculate_harmonic_phasor(const Waveform& waveform, double excitationFrequency, double harmonicFrequency) {
-    auto sampledWaveform = Inputs::calculate_sampled_waveform(waveform, excitationFrequency);
-    const auto& sampledData = sampledWaveform.get_data();
-    // get_time() returns the optional BY VALUE: copy, never bind a reference into it.
-    const auto sampledTimeOptional = sampledWaveform.get_time();
-    if (!sampledTimeOptional || sampledTimeOptional->size() != sampledData.size() || sampledData.empty()) {
-        throw CalculationException(ErrorCode::CALCULATION_ERROR, "Sampled waveform has no matching time axis");
-    }
-    const auto& sampledTime = sampledTimeOptional.value();
-    // Peak phasor X = (2/N) sum x_n exp(-j w t_n): x(t) = Re(X exp(+j w t)).
-    double realPart = 0;
-    double imaginaryPart = 0;
-    double angularFrequency = 2 * std::numbers::pi * harmonicFrequency;
-    for (size_t sampleIndex = 0; sampleIndex < sampledData.size(); ++sampleIndex) {
-        realPart += sampledData[sampleIndex] * std::cos(angularFrequency * sampledTime[sampleIndex]);
-        imaginaryPart -= sampledData[sampleIndex] * std::sin(angularFrequency * sampledTime[sampleIndex]);
-    }
-    return std::complex<double>(realPart, imaginaryPart) * (2.0 / static_cast<double>(sampledData.size()));
+    // The same Fourier coefficients the MAS amplitudes come from (ABT #1880), never a second,
+    // resampled DFT: that one added its own resampling error and, at noise-level harmonics,
+    // compared noise against noise.
+    return WaveformProcessor::calculate_harmonic_phasor(waveform, excitationFrequency, harmonicFrequency, settings.get_inputs_number_points_sampled_waveforms());
 }
 
-std::vector<std::vector<double>> CoilMesher::calculate_current_phase_per_winding(Coil coil, OperatingPoint operatingPoint, const std::vector<size_t>& harmonicIndexes, std::vector<std::optional<double>>* gaugePhasePerHarmonic) {
+std::vector<std::vector<double>> CoilMesher::calculate_current_phase_per_winding(Coil coil, OperatingPoint operatingPoint, const std::vector<size_t>& harmonicIndexes, std::vector<std::optional<double>>* gaugePhasePerHarmonic, std::vector<std::vector<double>>* currentAmplitudePerHarmonic) {
     size_t numberWindings = coil.get_functional_description().size();
     auto excitations = operatingPoint.get_excitations_per_winding();
     if (excitations.size() < numberWindings) {
@@ -392,10 +383,13 @@ std::vector<std::vector<double>> CoilMesher::calculate_current_phase_per_winding
                                     " excitations for a coil with " + std::to_string(numberWindings) + " windings");
     }
     size_t referenceWindingIndex = get_reference_winding_index(coil);
+    // Each winding's Fourier series, computed once, on first use (ABT #1880).
+    std::vector<std::optional<WaveformProcessor::FourierSeries>> seriesPerWinding(numberWindings);
 
     std::vector<std::vector<double>> phasePerHarmonicPerWinding;
     for (auto harmonicIndex : harmonicIndexes) {
         std::vector<double> phasePerWinding(numberWindings, 0.0);
+        std::vector<double> amplitudePerWinding(numberWindings, 0.0);
         std::vector<bool> excitedPerWinding(numberWindings, false);
         for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
             auto current = excitations[windingIndex].get_current();
@@ -413,15 +407,30 @@ std::vector<std::vector<double>> CoilMesher::calculate_current_phase_per_winding
                                             " has a harmonic at " + std::to_string(harmonicFrequency) +
                                             " Hz but no waveform to take its phase from");
             }
-            auto phasor = calculate_harmonic_phasor(current->get_waveform().value(), excitations[windingIndex].get_frequency(), harmonicFrequency);
+            if (!seriesPerWinding[windingIndex]) {
+                auto waveform = current->get_waveform().value();
+                if (!waveform.get_time()) {
+                    // As MKF lists its harmonics: Inputs::calculate_harmonics_data(waveform, sampled, f).
+                    waveform = Inputs::calculate_sampled_waveform(waveform, excitations[windingIndex].get_frequency());
+                }
+                seriesPerWinding[windingIndex] = WaveformProcessor::calculate_fourier_series(waveform, excitations[windingIndex].get_frequency(),
+                                                                                             settings.get_inputs_number_points_sampled_waveforms());
+            }
+            auto phasor = WaveformProcessor::calculate_harmonic_phasor(seriesPerWinding[windingIndex].value(), excitations[windingIndex].get_frequency(), harmonicFrequency);
             double phasorAmplitude = std::abs(phasor);
-            if (!(phasorAmplitude >= 1e-6 * amplitude)) {
-                throw InvalidInputException(ErrorCode::INVALID_INPUT, "Current waveform of winding " + std::to_string(windingIndex) +
-                                            " does not contain the harmonic its MAS harmonics list at " + std::to_string(harmonicFrequency) +
-                                            " Hz (DFT amplitude " + std::to_string(phasorAmplitude) + " A vs " + std::to_string(amplitude) +
-                                            " A): its phase is undefined");
+            if (WaveformProcessor::is_zero_harmonic(seriesPerWinding[windingIndex].value(), amplitude, phasor)) {
+                continue;  // zero in the list and in the waveform (a symmetric wave's even harmonics): no current, no phase (ABT #1880)
+            }
+            if (!(phasorAmplitude >= WaveformProcessor::harmonicConsistencyTolerance * amplitude)) {
+                std::ostringstream message;
+                message << std::setprecision(6) << "MAS harmonics list a component of " << amplitude << " A at " << harmonicFrequency
+                        << " Hz that the current waveform of winding " << windingIndex << " does not contain (its Fourier amplitude there is "
+                        << phasorAmplitude << " A, its largest harmonic "
+                        << WaveformProcessor::calculate_largest_harmonic_amplitude(seriesPerWinding[windingIndex].value()) << " A): its phase is undefined";
+                throw InvalidInputException(ErrorCode::INVALID_INPUT, message.str());
             }
             phasePerWinding[windingIndex] = std::arg(phasor);
+            amplitudePerWinding[windingIndex] = amplitude;
             excitedPerWinding[windingIndex] = true;
         }
 
@@ -451,6 +460,9 @@ std::vector<std::vector<double>> CoilMesher::calculate_current_phase_per_winding
         if (gaugePhasePerHarmonic) {
             gaugePhasePerHarmonic->push_back(gaugePhaseThisHarmonic);
         }
+        if (currentAmplitudePerHarmonic) {
+            currentAmplitudePerHarmonic->push_back(amplitudePerWinding);
+        }
     }
     return phasePerHarmonicPerWinding;
 }
@@ -459,7 +471,7 @@ std::vector<Field> CoilMesher::generate_mesh_inducing_coil(Magnetic magnetic, Op
     return generate_mesh_inducing_coil_phasors(magnetic, operatingPoint, windingLossesHarmonicAmplitudeThreshold, customCurrentDirectionPerWinding, coilMesherModel).fieldPerHarmonic;
 }
 
-InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnetic, OperatingPoint operatingPoint, double windingLossesHarmonicAmplitudeThreshold, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding, std::optional<CoilMesherModels> coilMesherModel) {
+InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnetic, OperatingPoint operatingPoint, double windingLossesHarmonicAmplitudeThreshold, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding, std::optional<CoilMesherModels> coilMesherModel, bool unitCurrentForSilentParallels) {
     auto coil = magnetic.get_coil();
     if (!coil.get_turns_description()) {
         throw CoilNotProcessedException("Winding does not have turns description");
@@ -526,7 +538,9 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
     auto commonHarmonicIndexes = get_common_harmonic_indexes(operatingPoint, windingLossesHarmonicAmplitudeThreshold);
 
     std::map<size_t, Field> tempFieldPerHarmonic;
+    std::map<size_t, std::vector<double>> amplitudePerWindingPerHarmonic;
     for (auto harmonicIndex : commonHarmonicIndexes) {
+        amplitudePerWindingPerHarmonic[harmonicIndex].assign(coil.get_functional_description().size(), 0.0);
         Field field;
         for (auto excitation : operatingPoint.get_excitations_per_winding()) {
             if (harmonicIndex < excitation.get_current()->get_harmonics().value().get_frequencies().size()) {
@@ -542,6 +556,12 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
 
 
 
+    // Each winding's phase and the current it carries per common harmonic: its MAS amplitude, 0 where it carries none
+    // (ABT #1880: a harmonic zero both in the list and in the waveform contributes nothing, whatever its phase).
+    std::vector<std::optional<double>> gaugePhasePerCommonHarmonic;
+    std::vector<std::vector<double>> currentAmplitudePerCommonHarmonic;
+    auto phasePerCommonHarmonic = calculate_current_phase_per_winding(coil, operatingPoint, commonHarmonicIndexes, &gaugePhasePerCommonHarmonic, &currentAmplitudePerCommonHarmonic);
+
     // Hoisted: the MAS getter copies the whole Core (cached material datasets included);
     // fetching it per turn dominated this loop's cost.
     auto meshCore = magnetic.get_core();
@@ -553,15 +573,16 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
         if (!excitationCurrent || !excitationCurrent->get_harmonics()) {
             throw InvalidInputException(ErrorCode::MISSING_DATA, "Current for winding " + std::to_string(windingIndex) + " is missing harmonics in Coil Mesher");
         }
-        auto harmonics = excitationCurrent->get_harmonics().value();
 
         auto fieldPoints = breakdownModelPerWinding[windingIndex]->generate_mesh_inducing_turn(turn, wire, turnIndex, turn.get_length(), meshCore);
 
-        for (auto harmonicIndex : commonHarmonicIndexes) {
-            double harmonicCurrentPeak = 0;
-            if (harmonicIndex < harmonics.get_amplitudes().size()) {
-                harmonicCurrentPeak = harmonics.get_amplitudes()[harmonicIndex];  // Because a harmonic is always sinusoidal
+        for (size_t commonPosition = 0; commonPosition < commonHarmonicIndexes.size(); ++commonPosition) {
+            auto harmonicIndex = commonHarmonicIndexes[commonPosition];
+            double harmonicCurrentPeak = currentAmplitudePerCommonHarmonic[commonPosition][windingIndex];  // Because a harmonic is always sinusoidal
+            if (unitCurrentForSilentParallels && harmonicCurrentPeak == 0 && coil.get_number_parallels(windingIndex) > 1) {
+                harmonicCurrentPeak = 1;
             }
+            amplitudePerWindingPerHarmonic[harmonicIndex][windingIndex] = harmonicCurrentPeak;
             auto harmonicCurrentPeakInTurn = harmonicCurrentPeak * currentDividerPerTurn[turnIndex];
             if (std::isnan(harmonicCurrentPeakInTurn)) {
                 throw NaNResultException("NaN found in harmonicCurrentPeakInTurn value");
@@ -574,11 +595,11 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
             }
         }
     }
-    std::vector<std::optional<double>> gaugePhasePerCommonHarmonic;
-    auto phasePerCommonHarmonic = calculate_current_phase_per_winding(coil, operatingPoint, commonHarmonicIndexes, &gaugePhasePerCommonHarmonic);
     std::vector<Field> fieldPerHarmonic;
     std::vector<std::vector<double>> phasePerHarmonicPerWinding;
     std::vector<std::optional<double>> gaugePhasePerHarmonic;
+    std::vector<std::vector<double>> amplitudePerHarmonicPerWinding;
+    std::vector<std::vector<double>> currentAmplitudePerHarmonicPerWinding;
     for (size_t harmonicIndex = 0; harmonicIndex < tempFieldPerHarmonic.size(); ++harmonicIndex){
         if (tempFieldPerHarmonic[harmonicIndex].get_data().size() > 0) {
             fieldPerHarmonic.push_back(tempFieldPerHarmonic[harmonicIndex]);
@@ -589,6 +610,8 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
             }
             phasePerHarmonicPerWinding.push_back(phasePerCommonHarmonic[static_cast<size_t>(commonPosition - commonHarmonicIndexes.begin())]);
             gaugePhasePerHarmonic.push_back(gaugePhasePerCommonHarmonic[static_cast<size_t>(commonPosition - commonHarmonicIndexes.begin())]);
+            amplitudePerHarmonicPerWinding.push_back(amplitudePerWindingPerHarmonic.at(harmonicIndex));
+            currentAmplitudePerHarmonicPerWinding.push_back(currentAmplitudePerCommonHarmonic[static_cast<size_t>(commonPosition - commonHarmonicIndexes.begin())]);
         }
     }
 
@@ -610,7 +633,7 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
         }
     }
 
-    return {fieldPerHarmonic, phasePerHarmonicPerWinding, gaugePhasePerHarmonic};
+    return {fieldPerHarmonic, phasePerHarmonicPerWinding, gaugePhasePerHarmonic, amplitudePerHarmonicPerWinding, currentAmplitudePerHarmonicPerWinding};
 }
 
 std::vector<Field> CoilMesher::generate_mesh_induced_coil(Magnetic magnetic, OperatingPoint operatingPoint, double windingLossesHarmonicAmplitudeThreshold) {
@@ -773,6 +796,11 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(const
             if (completeCells) {
                 cellsX = M * static_cast<int>(std::max(1.0, std::ceil(frameB / frameA)));
                 cellsY = N * static_cast<int>(std::max(1.0, std::ceil(frameA / frameB)));
+                // A neutral lattice (MMF_BOUNDARY) has no dipole remainder to damp: square cells converge (ABT #1304).
+                if (settings.get_magnetic_field_mirroring_neutral_cells()) {
+                    cellsX = M;
+                    cellsY = N;
+                }
             }
             int mMinimum = completeCells && cellsX > 0 ? -2 * cellsX - 1 : -cellsX;
             int mMaximum = completeCells && cellsX > 0 ? 2 * cellsX : cellsX;
@@ -795,6 +823,12 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(const
                         currentMultiplier = (corePermeability - std::max(fabs(m), fabs(n))) / (corePermeability + std::max(fabs(m), fabs(n)));
                     }
                     mirroredFieldPoint.set_value(signMultiplier * currentMultiplier);  // Will be multiplied later
+                    // ABT #1304: an image is the core's response, not the conductor. A window-boundary fringing model
+                    // (MMF_BOUNDARY) keeps a turn's own images when it evaluates that turn, so it must tell them apart.
+                    // Only the Wang field model reads inducing labels, and it refuses image points outright.
+                    if (m != 0 || n != 0) {
+                        mirroredFieldPoint.set_label("image");
+                    }
                     if (turnLength) {
                         mirroredFieldPoint.set_turn_length(turnLength.value());
                     }
@@ -1168,6 +1202,212 @@ std::vector<FieldPoint> CoilMesherWangModel::generate_mesh_inducing_turn(const T
 
     return fieldPoints;
 }
+
+
+std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic magnetic, std::optional<OperatingPoint> operatingPoint) {
+    auto core = magnetic.get_core();
+    if (!core.get_processed_description()) {
+        throw CoreNotProcessedException("Core is not processed");
+    }
+    if (core.get_shape_family() == CoreShapeFamily::T) {
+        throw NotImplementedException("Neutral window field (ABT #1304): toroids have no rectangular window boundary");
+    }
+    auto processedDescription = core.get_processed_description().value();
+    auto windingWindows = processedDescription.get_winding_windows();
+    if (windingWindows.size() != 1) {
+        throw NotImplementedException("Neutral window field (ABT #1304): only single-window cores are described by this "
+                                      "frame; this core has " + std::to_string(windingWindows.size()) + " winding windows");
+    }
+    auto windingWindow = windingWindows[0];
+    if (!windingWindow.get_width() || !windingWindow.get_height()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Neutral window field (ABT #1304): the winding window has no width/height");
+    }
+    auto columns = core.get_columns();
+    size_t mainColumnIndex = core.get_main_column_index();
+
+    // The frame CoilMesherCenterModel mirrors in: the window lies between the main column face and the lateral
+    // column face, vertically centred.
+    const double A = windingWindow.get_width().value();
+    const double B = windingWindow.get_height().value();
+    const double x0 = columns[mainColumnIndex].get_width() / 2;
+    const double y0 = -B / 2;
+    const double x1 = x0 + A;
+    const double y1 = y0 + B;
+
+    // MMF split of the magnetic circuit, exactly as MKF composes it for the inductance: the ferrite, the main
+    // column's gaps in series, and the lateral branches in parallel.
+    auto reluctanceModel = ReluctanceModel::factory();
+    auto reluctanceOutput = reluctanceModel->get_core_reluctance(core, operatingPoint);
+    const double totalReluctance = reluctanceOutput.get_core_reluctance();
+    if (!reluctanceOutput.get_ungapped_core_reluctance()) {
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field (ABT #1304): the reluctance model returned no ferrite reluctance");
+    }
+    const double ferriteReluctance = reluctanceOutput.get_ungapped_core_reluctance().value();
+    if (!(totalReluctance > 0) || !(ferriteReluctance >= 0)) {
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field (ABT #1304): non-positive core reluctance");
+    }
+
+    std::vector<WindowWallSheet> originals;
+    auto gapping = core.get_functional_description().get_gapping();
+    std::vector<AirGapReluctanceOutput> reluctancePerGap;
+    if (!gapping.empty()) {
+        if (!reluctanceOutput.get_reluctance_per_gap() || reluctanceOutput.get_reluctance_per_gap()->size() != gapping.size()) {
+            throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field (ABT #1304): the reluctance model did not return one reluctance per gap");
+        }
+        reluctancePerGap = reluctanceOutput.get_reluctance_per_gap().value();
+    }
+
+    // Which lateral limb this window's outer wall (x1) stands for. An E-type core has its lateral limbs displaced in x
+    // and the window faces the one at x > 0. The EP family's single back leg is displaced only in z (x = 0): it is the
+    // whole return path of the window, and the 2-D section represents it by the outer wall x1, as the CENTER mesher's
+    // image frame already does (ABT #1759: EP 17 with a lateral residual gap at x = 0 used to throw here). A core mixing
+    // both kinds of lateral limb has no such single wall and is refused.
+    bool anyLateralInX = false;
+    bool anyLateralInZOnly = false;
+    for (size_t columnIndex = 0; columnIndex < columns.size(); ++columnIndex) {
+        if (columnIndex == mainColumnIndex) {
+            continue;
+        }
+        if (columns[columnIndex].get_coordinates()[0] == 0) {
+            anyLateralInZOnly = true;
+        }
+        else {
+            anyLateralInX = true;
+        }
+    }
+    if (anyLateralInX && anyLateralInZOnly) {
+        throw NotImplementedException("Neutral window field (ABT #1304) on a core with lateral limbs displaced both in x and only in z");
+    }
+    auto facesThisWindow = [&](double lateralX) {
+        return anyLateralInZOnly ? lateralX == 0 : lateralX > 0;
+    };
+
+    // Lateral branches: their parallel reluctance carries the lateral MMF; on THIS window's side it drops across
+    // the lateral gaps of the limb the window faces, shared among them by reluctance (series within that limb), so
+    // the window's sources stay exactly neutral however MKF groups them.
+    double inverseLateralReluctance = 0;
+    double lateralReluctanceThisSide = 0;
+    for (size_t gapIndex = 0; gapIndex < gapping.size(); ++gapIndex) {
+        if (!gapping[gapIndex].get_coordinates()) {
+            throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Neutral window field (ABT #1304): a gap has no coordinates");
+        }
+        auto coordinates = gapping[gapIndex].get_coordinates().value();
+        if (static_cast<size_t>(core.find_closest_column_index_by_coordinates(coordinates)) != mainColumnIndex) {
+            inverseLateralReluctance += 1 / reluctancePerGap[gapIndex].get_reluctance();
+            if (facesThisWindow(coordinates[0])) {
+                lateralReluctanceThisSide += reluctancePerGap[gapIndex].get_reluctance();
+            }
+        }
+    }
+    const double lateralMmfFraction = inverseLateralReluctance > 0 ? (1 / inverseLateralReluctance) / totalReluctance : 0.0;
+    if (lateralMmfFraction > 0 && !(lateralReluctanceThisSide > 0)) {
+        throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Neutral window field (ABT #1304): the core has lateral gaps but none on the lateral limb this window faces");
+    }
+
+    // A gap's slot mouth on the window boundary: its axial extent, clipped to the wall it opens onto.
+    auto gapSheet = [&](double wallX, double gapY, double gapLength, double current) {
+        double yStart = std::max(y0, gapY - gapLength / 2);
+        double yEnd = std::min(y1, gapY + gapLength / 2);
+        if (!(yEnd > yStart)) {
+            throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Neutral window field (ABT #1304): a gap at y = " + std::to_string(gapY) +
+                               " opens nowhere onto the winding window (y in [" + std::to_string(y0) + ", " + std::to_string(y1) + "])");
+        }
+        originals.push_back({{wallX, yStart}, {wallX, yEnd}, current});
+    };
+
+    double gapMmfFractionThisWindow = 0;
+    for (size_t gapIndex = 0; gapIndex < gapping.size(); ++gapIndex) {
+        auto coordinates = gapping[gapIndex].get_coordinates().value();
+        double gapLength = gapping[gapIndex].get_length();
+        double reluctance = reluctancePerGap[gapIndex].get_reluctance();
+        if (static_cast<size_t>(core.find_closest_column_index_by_coordinates(coordinates)) == mainColumnIndex) {
+            double fraction = reluctance / totalReluctance;
+            gapSheet(x0, coordinates[1], gapLength, -fraction);
+            gapMmfFractionThisWindow += fraction;
+        }
+        else if (facesThisWindow(coordinates[0])) {
+            double fraction = lateralMmfFraction * reluctance / lateralReluctanceThisSide;
+            gapSheet(x1, coordinates[1], gapLength, -fraction);
+            gapMmfFractionThisWindow += fraction;
+        }
+    }
+
+    // Ferrite: what Ampere leaves for the walls once the gaps are placed. Distributed by length x tangential H, with
+    // H proportional to the flux through each wall's limb over that limb's section: the main column carries all of
+    // it, this side's lateral limb and the two plates its area share.
+    const double ferriteMmfFraction = 1 - gapMmfFractionThisWindow;
+    if (ferriteMmfFraction < -1e-9) {
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field (ABT #1304): the gaps' MMF exceeds the winding's");
+    }
+    if (ferriteMmfFraction > 1e-12) {
+        double lateralAreaTotal = 0;
+        double lateralAreaThisSide = 0;
+        for (size_t columnIndex = 0; columnIndex < columns.size(); ++columnIndex) {
+            if (columnIndex == mainColumnIndex) {
+                continue;
+            }
+            lateralAreaTotal += columns[columnIndex].get_area();
+            if (facesThisWindow(columns[columnIndex].get_coordinates()[0])) {
+                lateralAreaThisSide += columns[columnIndex].get_area();
+            }
+        }
+        const double mainArea = columns[mainColumnIndex].get_area();
+        const double plateThickness = (processedDescription.get_height() - B) / 2;
+        const double plateArea = processedDescription.get_depth() * plateThickness;
+        if (!(mainArea > 0) || !(lateralAreaThisSide > 0) || !(lateralAreaTotal > 0) || !(plateArea > 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Neutral window field (ABT #1304): the core's limb sections are not all positive");
+        }
+        const double sideFluxShare = lateralAreaThisSide / lateralAreaTotal;
+        const double weightMain = B / mainArea;
+        const double weightLateral = B * sideFluxShare / lateralAreaThisSide;
+        const double weightPlate = A * sideFluxShare / plateArea;
+        const double weightTotal = weightMain + weightLateral + 2 * weightPlate;
+        // The whole wall carries the sheet; where a gap sits on it, the gap's own sheet adds the gap's drop.
+        originals.push_back({{x0, y0}, {x0, y1}, -ferriteMmfFraction * weightMain / weightTotal});
+        originals.push_back({{x1, y0}, {x1, y1}, -ferriteMmfFraction * weightLateral / weightTotal});
+        originals.push_back({{x0, y0}, {x1, y0}, -ferriteMmfFraction * weightPlate / weightTotal});
+        originals.push_back({{x0, y1}, {x1, y1}, -ferriteMmfFraction * weightPlate / weightTotal});
+    }
+
+    double sum = 0;
+    for (auto& sheet : originals) {
+        sum += sheet.current;
+    }
+    if (std::abs(sum + 1) > 1e-9) {
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field (ABT #1304): the wall sources return " +
+                                   std::to_string(-sum) + " of the winding MMF instead of all of it");
+    }
+
+    // The complete-cell lattice of #1240, the same index ranges and positions CoilMesherCenterModel uses for the
+    // conductors, so conductors and wall sources are imaged identically.
+    const int M = settings.get_magnetic_field_mirroring_dimension();
+    if (M < 1) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Neutral window field (ABT #1304): needs the image lattice (mirroring dimension >= 1)");
+    }
+    const double corePermeability = core.get_initial_permeability(defaults.ambientTemperature);
+    // Same extent as the conductors' lattice (CoilMesherCenterModel), so both are imaged identically.
+    const bool neutralCells = settings.get_magnetic_field_mirroring_neutral_cells();
+    const int cellsX = neutralCells ? M : M * static_cast<int>(std::max(1.0, std::ceil(B / A)));
+    const int cellsY = neutralCells ? M : M * static_cast<int>(std::max(1.0, std::ceil(A / B)));
+    auto imagePosition = [&](const std::vector<double>& point, int m, int n) {
+        double a = point[0] - x0;
+        double b = point[1] - y0;
+        double imageA = (m % 2 == 0) ? m * A + a : m * A + A - a;
+        double imageB = (n % 2 == 0) ? n * B + b : n * B + B - b;
+        return std::vector<double>{imageA + x0, imageB + y0};
+    };
+    std::vector<WindowWallSheet> sheets;
+    for (int m = -2 * cellsX - 1; m <= 2 * cellsX; ++m) {
+        for (int n = -2 * cellsY - 1; n <= 2 * cellsY; ++n) {
+            double imageFactor = std::pow((corePermeability - 1.0) / (corePermeability + 1.0), std::abs(m) + std::abs(n));
+            for (auto& sheet : originals) {
+                sheets.push_back({imagePosition(sheet.start, m, n), imagePosition(sheet.end, m, n), sheet.current * imageFactor});
+            }
+        }
+    }
+    return sheets;
+}
+
 
 } // namespace OpenMagnetics
 

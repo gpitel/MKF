@@ -21,17 +21,19 @@ using namespace MAS; // QUAL-001 TODO: qualify types and remove
 
 namespace OpenMagnetics {
 
+struct ParallelCurrentSplit;  // physical_models/MagneticField.h (ABT #1314)
+
 
 class WindingSkinEffectLossesModel {
  private:
  protected:
     std::map<size_t, std::map<double, std::map<double, double>>> _skinFactorPerWirePerFrequencyPerTemperature;
-    std::optional<double> try_get_skin_factor(Wire wire, double frequency, double temperature);
-    void set_skin_factor(Wire wire, double frequency, double temperature, double skinFactor);
+    std::optional<double> try_get_skin_factor(const Wire& wire, double frequency, double temperature);
+    void set_skin_factor(const Wire& wire, double frequency, double temperature, double skinFactor);
 
  public:
     std::string methodName = "Default";
-    virtual double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0) = 0;
+    virtual double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0) = 0;
     static std::shared_ptr<WindingSkinEffectLossesModel> factory(WindingSkinEffectLossesModels modelName);
 };
 
@@ -42,9 +44,9 @@ class WindingSkinEffectLosses {
  public:
     static std::shared_ptr<WindingSkinEffectLossesModel> get_model(WireType wireType, std::optional<WindingSkinEffectLossesModels> modelOverride = std::nullopt);
     static double calculate_skin_depth(WireMaterialDataOrNameUnion material, double frequency, double temperature);
-    static double calculate_skin_depth(Wire wire, double frequency, double temperature);
-    static WindingLossesOutput calculate_skin_effect_losses(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, double windingLossesHarmonicAmplitudeThreshold = Defaults().harmonicAmplitudeThreshold, std::optional<WindingSkinEffectLossesModels> modelOverride = std::nullopt);
-    static std::pair<double, std::vector<std::pair<double, double>>> calculate_skin_effect_losses_per_meter(Wire wire, SignalDescriptor current, double temperature, double currentDivider = 1, std::optional<WindingSkinEffectLossesModels> modelOverride = std::nullopt);
+    static double calculate_skin_depth(const Wire& wire, double frequency, double temperature);
+    static WindingLossesOutput calculate_skin_effect_losses(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, double windingLossesHarmonicAmplitudeThreshold = Defaults().harmonicAmplitudeThreshold, std::optional<WindingSkinEffectLossesModels> modelOverride = std::nullopt, std::optional<std::map<WireType, WindingSkinEffectLossesModels>> modelPerWireType = std::nullopt, const ParallelCurrentSplit* parallelCurrentSplit = nullptr);
+    static std::pair<double, std::vector<std::pair<double, double>>> calculate_skin_effect_losses_per_meter(const Wire& wire, SignalDescriptor current, double temperature, double currentDivider = 1, std::optional<WindingSkinEffectLossesModels> modelOverride = std::nullopt, const std::vector<double>* currentDividerPerHarmonic = nullptr);
 };
 
 
@@ -72,7 +74,7 @@ class WindingSkinEffectLossesDowellModel : public WindingSkinEffectLossesModel {
 public:
     std::string methodName = "Dowell";
     double calculate_skin_factor(const Wire& wire, double frequency, double temperature);
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 
@@ -94,7 +96,7 @@ public:
     std::string methodName = "Wojda";
     double calculate_skin_factor(const Wire& wire, double frequency, double temperature);
     double calculate_penetration_ratio(const Wire& wire, double frequency, double temperature);
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 
@@ -117,7 +119,7 @@ public:
 class WindingSkinEffectLossesAlbachModel : public WindingSkinEffectLossesModel {
 public:
     double calculate_skin_factor(const Wire& wire, double frequency, double temperature);
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 
@@ -138,7 +140,7 @@ public:
 // ============================================================================
 class WindingSkinEffectLossesPayneModel : public WindingSkinEffectLossesModel {
 public:
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 
@@ -162,7 +164,7 @@ class WindingSkinEffectLossesNanModel : public WindingSkinEffectLossesModel {
 public:
     std::string methodName = "Nan";
     double calculate_skin_factor(const Wire& wire, double frequency, double temperature);
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 
@@ -189,7 +191,7 @@ class WindingSkinEffectLossesKazimierczukModel : public WindingSkinEffectLossesM
 public:
     std::string methodName = "Kazimierczuk";
     double calculate_skin_factor(const Wire& wire, double frequency, double temperature);
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 
@@ -210,7 +212,7 @@ public:
 // ============================================================================
 class WindingSkinEffectLossesKutkutModel : public WindingSkinEffectLossesModel {
 public:
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 
@@ -233,7 +235,7 @@ public:
 class WindingSkinEffectLossesFerreiraModel : public WindingSkinEffectLossesModel {
 public:
     double calculate_skin_factor(const Wire& wire, double frequency, double temperature);
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 
@@ -261,7 +263,7 @@ class WindingSkinEffectLossesDimitrakakisModel : public WindingSkinEffectLossesM
 public:
     std::string methodName = "Dimitrakakis";
     double calculate_skin_factor(const Wire& wire, double frequency, double temperature);
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 
@@ -292,7 +294,7 @@ class WindingSkinEffectLossesMuehlethalerModel : public WindingSkinEffectLossesM
 public:
     std::string methodName = "Muehlethaler";
     double calculate_skin_factor(const Wire& wire, double frequency, double temperature);
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 
@@ -319,7 +321,7 @@ public:
 class WindingSkinEffectLossesWangModel : public WindingSkinEffectLossesModel {
 public:
     std::string methodName = "Wang";
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 
@@ -344,7 +346,7 @@ class WindingSkinEffectLossesHolguinModel : public WindingSkinEffectLossesModel 
 public:
     std::string methodName = "Holguin";
     double calculate_skin_factor(const Wire& wire, double frequency, double temperature);
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 
@@ -355,7 +357,7 @@ public:
 // ============================================================================
 class WindingSkinEffectLossesLotfiModel : public WindingSkinEffectLossesModel {
 public:
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 
@@ -380,7 +382,7 @@ class WindingSkinEffectLossesPerryModel : public WindingSkinEffectLossesModel {
 public:
     std::string methodName = "Perry";
     double calculate_skin_factor(const Wire& wire, double frequency, double temperature);
-    double calculate_turn_losses(Wire wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
+    double calculate_turn_losses(const Wire& wire, double dcLossTurn, double frequency, double temperature, double currentRms = 0);
 };
 
 

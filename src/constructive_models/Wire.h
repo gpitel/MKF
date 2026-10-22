@@ -194,10 +194,15 @@ class Wire : public MAS::Wire {
         // one point so litz cannot answer differently to different callers.
         static std::optional<InsulationWireCoating> resolve_insulating_coating(const Wire& wire);
         static WireRound resolve_strand(const Wire& wire);
-        WireRound resolve_strand();
+        WireRound resolve_strand() const;
+        // The material's thermal conductivity at `temperature` (deg C), W/(m K), interpolated
+        // linearly between the points MAS tabulates. Throws when the material has no table,
+        // when two points share a temperature, or when `temperature` lies outside the table:
+        // a conductivity is never extrapolated or defaulted.
+        static double get_thermal_conductivity(const WireMaterial& material, double temperature);
         static WireMaterial resolve_material(Wire wire);
         static WireMaterial resolve_material(WireRound wire);
-        WireMaterial resolve_material();
+        WireMaterial resolve_material() const;
         static InsulationMaterial resolve_coating_insulation_material(Wire wire);
         static InsulationMaterial resolve_coating_insulation_material(WireRound wire);
         static InsulationMaterial resolve_coating_insulation_material(InsulationWireCoating coating);
@@ -282,6 +287,10 @@ class Wire : public MAS::Wire {
         double calculate_effective_current_density(SignalDescriptor current, double temperature);
         double calculate_effective_current_density(double rms, double frequency, double temperature);
         double calculate_effective_conducting_area(double frequency, double temperature);
+        // The number of conductors of this wire. A non-litz wire (round, rectangular, foil, planar)
+        // is one conductor by definition, so a missing numberConductors (optional in MAS basicWire)
+        // means 1; a litz wire without it is incomplete data and throws INVALID_WIRE_DATA.
+        int64_t resolve_number_conductors() const;
         double calculate_conducting_area();
         double calculate_outer_area();
 
@@ -290,11 +299,17 @@ class Wire : public MAS::Wire {
         static int calculate_number_parallels_needed(SignalDescriptor current, double temperature, Wire& wire, double maximumEffectiveCurrentDensity);
         static int calculate_number_parallels_needed(double rms, double effectiveFrequency, double temperature, Wire& wire, double maximumEffectiveCurrentDensity);
 
-        double get_maximum_outer_width();
-        double get_maximum_outer_height();
+        // Key of the per-wire skin/proximity factor caches: every property the factors depend on (type,
+        // conductors, conducting and outer dimensions, material), plus the name. A name alone is not enough:
+        // a named planar trace is re-cut to many widths, and an unnamed key of outer dimensions alone made a
+        // 1 mm round wire and a 1 x 1 mm rectangle the same wire (ABT #1498).
+        static std::size_t calculate_loss_factor_cache_key(const Wire& wire);
+
+        double get_maximum_outer_width() const;
+        double get_maximum_outer_height() const;
         double get_maximum_outer_dimension();
-        double get_maximum_conducting_width();
-        double get_maximum_conducting_height();
+        double get_maximum_conducting_width() const;
+        double get_maximum_conducting_height() const;
         double get_minimum_conducting_dimension();
         double get_minimum_outer_dimension();
 
@@ -307,9 +322,10 @@ class Wire : public MAS::Wire {
         static double get_coating_thermal_conductivity(Wire wire);  // NEW: Static version
         // NEW: Overloads that work directly with InsulationWireCoating (for thermal modeling)
         static double get_coating_thickness(const InsulationWireCoating& coating);
-        // The film a foil is wound with: one per turn interval, so a foil's layer pitch is the
-        // foil plus this. A declared coating gives its thickness; otherwise the standard
-        // polyester (Constants::foilInterlayerInsulationThickness). See Wire.cpp.
+        // The film a foil is wound with: one per turn interval, so a foil's layer pitch (its
+        // wound width, get_maximum_outer_width) is the foil plus this. A declared coating gives its
+        // thickness; otherwise the standard polyester (Constants::foilInterlayerInsulationThickness).
+        // The wire's own outerWidth does NOT carry the undeclared film (ABT #1151). See Wire.cpp.
         static double get_foil_interlayer_insulation(const Wire& wire);
 
         static double get_coating_thermal_conductivity(const InsulationWireCoating& coating);
@@ -334,6 +350,21 @@ class Wire : public MAS::Wire {
         static Wire create_quick_litz_wire(double conductingDiameter, int64_t numberStrands);
         static Wire create_quick_rectangular_wire(double conductingWidth, double conductingHeight);
 
+        // WOUND LITZ (ABT #1531). A litz bundle in a wound layer is no rigid circle of its free-air OD:
+        // it flattens into an OVAL (a stadium: a rectangle with semicircular ends) of the bundle's
+        // area, its short side k x OD. Elektrisola (Litz Wire Info, "IV Example") gives how far: the
+        // processed OD reduced 10 % for a served bundle and 15-20 % for an unserved one, so k >= 0.90
+        // served and >= 0.85 bare. The winder sets the footprint; the outer width/height getters then
+        // return it, so every layout read sees the flattened turn. Conducting dimensions (the
+        // strands) are unchanged. Not part of MAS: the turns carry it, as crossSectionalShape oval.
+        static double minimum_litz_flattening(const Wire& wire);
+        // The oval of the bundle's area whose short side is k x OD: {short side, long side}.
+        static std::pair<double, double> flattened_litz_sides(double outerDiameter, double k);
+        void set_wound_footprint(double width, double height);
+        std::optional<std::pair<double, double>> get_wound_footprint() const { return _woundFootprint; }
+
+    private:
+        std::optional<std::pair<double, double>> _woundFootprint;   // {width, height}, litz only
 };
 
 bool operator==(Wire lhs, Wire rhs);

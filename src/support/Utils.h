@@ -7,6 +7,7 @@
 #include "constructive_models/InsulationMaterial.h"
 
 #include <MAS.hpp>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -114,6 +115,12 @@ inline std::map<std::string, OpenMagnetics::Wire> wireDatabase;
 inline std::map<std::string, OpenMagnetics::Bobbin> bobbinDatabase;
 inline std::map<std::string, OpenMagnetics::InsulationMaterial> insulationMaterialDatabase;
 inline std::map<std::string, MAS::WireMaterial> wireMaterialDatabase;
+// ABT #1626: bumped whenever the catalogues above are cleared, (re)loaded or swapped by a
+// LibraryContext scope. A memo derived from a catalogue keys itself on it: the wire memo of
+// get_wires() used to key on the database SIZE, so a swap or reload to a different catalogue of the
+// same size returned the old wires.
+inline std::atomic<uint64_t> catalogueGeneration{0};
+inline void bump_catalogue_generation() { catalogueGeneration.fetch_add(1, std::memory_order_relaxed); }
 
 // The loaded part catalogue. SHARED between threads, under the same contract
 // as the catalogues above: load it before the parallel region (or freeze it
@@ -144,6 +151,14 @@ std::optional<InductanceFluxCacheEntry> get_cached_inductance_flux(
 // Verbosity levels: 0=ERROR, 1=WARNING, 2=INFO, 3+=DEBUG
 void logEntry(std::string entry, std::string module = "", uint8_t entryVerbosity = 1);
 std::string read_log();
+
+// Settings::allowMaterialDataExtrapolation (off by default). Every site that uses a core material outside the data
+// it carries asks this before throwing: when the flag is off it returns false and logs nothing, and the caller
+// throws exactly as before; when it is on it logs `what` (which must name the material, the quantity, the value
+// and the range the data covers) as a WARNING from module kMaterialDataExtrapolationModule and returns true, and
+// the caller evaluates the same model outside its range.
+inline constexpr const char* kMaterialDataExtrapolationModule = "MaterialDataExtrapolation";
+bool material_data_extrapolation_allowed(const std::string& what);
 
 bool check_requirement(DimensionWithTolerance requirement, double value);
 Core find_core_by_name(std::string name);
@@ -296,6 +311,14 @@ double decibels_to_amplitude(double decibels);
 double amplitude_to_decibels(double amplitude);
 
 std::string fix_filename(std::string filename);
+// ABT #1623: free text (a part reference) written into a generated netlist or script. A line
+// break in it ends a SPICE/PLECS comment and turns the rest into netlist or script that runs on
+// open; a quote or backslash ends a PLECS quoted string. These throw, naming `where`, instead of
+// silently rewriting the user's reference.
+std::string require_single_line_text(const std::string& text, const std::string& where);
+std::string require_plecs_quoted_text(const std::string& text, const std::string& where);
+// & < > " ' escaped for XML text and attribute values.
+std::string escape_xml(const std::string& text);
 Inputs inputs_autocomplete(Inputs inputs, std::optional<Magnetic> magnetic = std::nullopt, json configuration = {});
 // Whether the magnetic's coil must be (re-)wound before its turns can be trusted: it has no
 // turns yet, or real winding geometry is on (a stored layout never reserved the lead
@@ -309,6 +332,13 @@ bool magnetic_coil_needs_winding(Magnetic& magnetic);
 // not fit (Coil::get_last_fit_failure() names why when it can). Callers that paint or export
 // the result must not ignore a false.
 bool wind_magnetic_coil_as_described(Magnetic& magnetic, json configuration = {}, std::optional<Inputs> inputs = std::nullopt);
+// ABT #1699: rebuilds a wound magnetic the way a stored design is rebuilt with real winding
+// geometry (its JSON without layersDescription, Coil(json, false), then
+// wind_magnetic_coil_as_described with coil_use_real_winding_geometry on) and returns why the
+// real winder refuses it, or nullopt when it winds: turns present, connection blocking applied,
+// every turn inside its window. The verdict is the real winder's own; a COIL_WINDING_ERROR it
+// throws is its refusal and is returned as the reason, any other exception propagates.
+std::optional<std::string> real_winding_refusal(const Magnetic& woundMagnetic, std::optional<Inputs> inputs = std::nullopt);
 // inputs, when provided, carries the design's declared insulation/environmental
 // requirements into the coil BEFORE it winds (ABT #620): without it, wind() has no
 // way to know an insulation standard applies and falls back to

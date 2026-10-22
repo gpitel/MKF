@@ -899,6 +899,9 @@ bool Core::distribute_and_process_gap() {
     }
 
     if (numberNonResidualGaps + numberResidualGaps == 0) {
+        // The data states no gap: every column gets the normally-ground residual gap
+        // (Constants::residualGap, EPCOS processing notes p.2, see Constants.h). A core whose
+        // ungapped A_L is published states its own residual gapping and never reaches here.
         for (size_t i = 0; i < columns.size(); ++i) {
             CoreGap gap;
             gap.set_type(GapType::RESIDUAL);
@@ -1140,6 +1143,8 @@ bool Core::distribute_and_process_gap() {
             newGapping.push_back(gap);
         }
         if (residualGaps.size() < returnColumns.size()) {
+            // Return columns the data gives no residual gap for: the normally-ground value per
+            // column (Constants::residualGap, EPCOS processing notes p.2, see Constants.h).
             for (size_t i = 0; i < returnColumns.size(); ++i) {
                 CoreGap gap;
                 gap.set_type(GapType::RESIDUAL);
@@ -1799,26 +1804,30 @@ double Core::get_toroid_edge_radius() const {
     return std::min(sourced, geometricLimit);
 }
 
-double Core::get_coating_thickness() const {
+double Core::get_coating_thickness(DimensionalValues preferredValue) const {
     if (!get_functional_description().get_coating()) {
-        // A toroid is jacketed (epoxy/parylene) in practice even when the catalogue omits
-        // the coating — a bare-ferrite toroid wound with bare wire is rare, and the coating
-        // is part of the winding-to-core dielectric path. So an uncoated toroid falls back
-        // to a default coating, with the TYPE chosen by size as manufacturers do (small
-        // toroids -> thin parylene, larger -> epoxy). Non-toroidal cores are bobbin-wound:
-        // the winding never touches the ferrite, so there is no core coating — return 0.
-        if (get_shape_family() == CoreShapeFamily::T) {
-            auto defaults = Defaults();
-            return get_default_toroid_coating_is_parylene()
-                ? defaults.defaultParyleneCoreCoatingThickness
-                : get_default_epoxy_coating_thickness();
-        }
+        // A core that declares no coating is bare: 0. The coating is a property of the part,
+        // and it varies from 0 (bare MnZn rings) to 0.6 mm (epoxy-jacketed rings) across real
+        // catalogues, so no single default stands for an unknown one. The catalogue states the
+        // coating of every part that has one; a toroid without that statement is taken as
+        // wound on bare ferrite, which is also how the core processing, the bobbin and the
+        // winder seat its turns, so the dielectric path and the winding geometry agree.
         return 0;
     }
     auto coating = get_functional_description().get_coating().value();
-    // Explicit coating data (CoreCoating object): use its thickness directly.
+    // Explicit coating data (CoreCoating object). Its thickness is a dimensionWithTolerance:
+    // sources bound the coating rather than state a nominal (ACME epoxy "0.6 mm max", the
+    // Easy Magnet LoPs' per-ring minima), so collapse it with the shared resolver -- it throws
+    // when no bound is present. An explicit 0 is a bare core and stays 0: it never reaches the
+    // undeclared-toroid default above.
     if (std::holds_alternative<CoreCoating>(coating)) {
-        return std::get<CoreCoating>(coating).get_thickness();
+        const double thickness = resolve_dimensional_values(std::get<CoreCoating>(coating).get_thickness(), preferredValue);
+        if (thickness < 0) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "Core coating thickness resolves to a negative value (" +
+                std::to_string(thickness) + " m); a coating thickness is >= 0, with 0 meaning a bare core");
+        }
+        return thickness;
     }
     // Name-only coating (legacy string form): resolve the datasheet default
     // thickness for the coating type. Throw for an unknown type rather than
@@ -1837,21 +1846,8 @@ double Core::get_coating_thickness() const {
 
 double Core::get_coating_relative_permittivity() const {
     if (!get_functional_description().get_coating()) {
-        // Mirror get_coating_thickness(): an uncoated toroid falls back to the default
-        // coating material — parylene or epoxy, chosen by size; a non-toroidal core has no
-        // coating and must not be queried for one (its thickness is 0, never reached).
-        if (get_shape_family() == CoreShapeFamily::T) {
-            auto defaults = Defaults();
-            auto materialName = get_default_toroid_coating_is_parylene()
-                ? defaults.defaultParyleneCoreCoatingMaterial
-                : defaults.defaultEpoxyCoreCoatingMaterial;
-            auto material = find_insulation_material_by_name(materialName);
-            if (!material.get_relative_permittivity()) {
-                throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
-                    "Default toroid coating material '" + materialName + "' has no relative permittivity in the database");
-            }
-            return material.get_relative_permittivity().value();
-        }
+        // Mirror get_coating_thickness(): a core that declares no coating is bare, so it has
+        // no coating dielectric to ask about (its thickness is 0 and callers stop there).
         throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
             "Core has no coating; cannot resolve coating relative permittivity");
     }
@@ -2184,9 +2180,46 @@ void Core::process_data() {
     scale_to_stacks(get_number_stacks());
 }
 
-double Core::get_magnetic_flux_density_saturation(CoreMaterial coreMaterial, double temperature, bool proportion) {
+// ABT #1736: remanence and coercive force are tabulated up to some temperature, usually 100 C, and
+// the hysteresis loop built from them is asked for up to the Curie temperature. Past the last data
+// point the value goes linearly to ZERO AT THE MATERIAL'S OWN CURIE TEMPERATURE, where
+// ferromagnetism ends, and stays zero above it. Extrapolating the table's last slope instead made
+// remanence and coercive force cross zero below Curie (N87: Br at 149.8 C, Hc at 207 C, Curie
+// 210 C; Fair-Rite 97: Br at 146 C, Hc at 175 C, Curie 220 C), where the loop is singular and the
+// permeability came out as 0 or a few tens.
+// Inside the data, and below its first point, the value is what interp() gives, as before.
+// A material without a Curie temperature cannot be evaluated past its data: that throws.
+// Anchored: remanence and coercive force (Alf, 2026-10-12) and the saturation field strength
+// (Alf, 2026-10-17, ABT #1908). The saturation flux density is not: the tip of the loop keeps
+// get_magnetic_flux_density_saturation, so the loop and the saturation gates share one B_sat(T).
+static double interpolate_ferromagnetic_property_to_curie(const CoreMaterial& coreMaterial,
+                                                          const std::vector<std::pair<double, double>>& data,
+                                                          double temperature,
+                                                          const std::string& propertyName) {
+    if (data.empty()) {
+        throw MaterialException(ErrorCode::MATERIAL_DATA_MISSING, "Missing " + propertyName + " data in core material " + coreMaterial.get_name());
+    }
+    auto lastPoint = *std::max_element(data.begin(), data.end(), [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
+        return a.first < b.first;
+    });
+    if (temperature <= lastPoint.first) {
+        return interp(data, temperature);
+    }
+    if (!coreMaterial.get_curie_temperature()) {
+        throw MaterialException(ErrorCode::MATERIAL_DATA_MISSING,
+            "Core material " + coreMaterial.get_name() + " has no Curie temperature: its " + propertyName + " cannot be evaluated at " +
+            std::to_string(temperature) + " C, above its last data point at " + std::to_string(lastPoint.first) + " C");
+    }
+    double curieTemperature = coreMaterial.get_curie_temperature().value();
+    if (temperature >= curieTemperature || lastPoint.first >= curieTemperature) {
+        return 0;
+    }
+    return lastPoint.second * (curieTemperature - temperature) / (curieTemperature - lastPoint.first);
+}
+
+double Core::get_magnetic_flux_density_saturation(const CoreMaterial& coreMaterial, double temperature, bool proportion) {
     auto defaults = Defaults();
-    auto saturationData = coreMaterial.get_saturation();
+    const auto& saturationData = coreMaterial.get_saturation();
     std::vector<std::pair<double, double>> data;
 
     if (saturationData.size() == 0) {
@@ -2212,15 +2245,15 @@ double Core::get_magnetic_flux_density_saturation(double temperature, bool propo
     return get_magnetic_flux_density_saturation(coreMaterial, temperature, proportion);
 }
 
-double Core::get_magnetic_flux_density_saturation(CoreMaterial coreMaterial, bool proportion) {
+double Core::get_magnetic_flux_density_saturation(const CoreMaterial& coreMaterial, bool proportion) {
     return get_magnetic_flux_density_saturation(coreMaterial, 25, proportion);
 }
 double Core::get_magnetic_flux_density_saturation(bool proportion) {
     return get_magnetic_flux_density_saturation(25, proportion);
 }
 
-double Core::get_magnetic_field_strength_saturation(CoreMaterial coreMaterial, double temperature) {
-    auto saturationData = coreMaterial.get_saturation();
+double Core::get_magnetic_field_strength_saturation(const CoreMaterial& coreMaterial, double temperature) {
+    const auto& saturationData = coreMaterial.get_saturation();
     std::vector<std::pair<double, double>> data;
 
     if (saturationData.size() == 0) {
@@ -2231,7 +2264,11 @@ double Core::get_magnetic_field_strength_saturation(CoreMaterial coreMaterial, d
         data.push_back(std::pair<double, double>{datum.get_temperature(), datum.get_magnetic_field()});
     }
 
-    double saturationMagneticFieldStrength = interp(data, temperature);
+    // ABT #1908 (Alf, 2026-10-17): past its last tabulated point the saturation field strength goes
+    // linearly to zero at the Curie temperature, as remanence and coercive force do. Extrapolating the
+    // table's monotonic Hermite spline instead crossed zero far below Curie (DMR71: 211.2 C, Curie 255 C;
+    // DMR24: 241.1 C, Curie 280 C), where the magnetisation curve cannot be built.
+    double saturationMagneticFieldStrength = interpolate_ferromagnetic_property_to_curie(coreMaterial, data, temperature, "saturation field strength");
 
     return saturationMagneticFieldStrength;
 }
@@ -2241,7 +2278,7 @@ double Core::get_magnetic_field_strength_saturation(double temperature) {
     return get_magnetic_field_strength_saturation(coreMaterial, temperature);
 }
 
-double Core::get_remanence(CoreMaterial coreMaterial, double temperature, bool returnZeroIfMissing) {
+double Core::get_remanence(const CoreMaterial& coreMaterial, double temperature, bool returnZeroIfMissing) {
     if (!coreMaterial.get_remanence()) {
         if (returnZeroIfMissing) {
             return 0;
@@ -2260,7 +2297,7 @@ double Core::get_remanence(CoreMaterial coreMaterial, double temperature, bool r
         data.push_back(std::pair<double, double>{datum.get_temperature(), datum.get_magnetic_flux_density()});
     }
 
-    double remanence = interp(data, temperature);
+    double remanence = interpolate_ferromagnetic_property_to_curie(coreMaterial, data, temperature, "remanence");
 
     return remanence;
 }
@@ -2270,7 +2307,7 @@ double Core::get_remanence(double temperature) {
     return get_remanence(coreMaterial, temperature);
 }
 
-double Core::get_curie_temperature(CoreMaterial coreMaterial) {
+double Core::get_curie_temperature(const CoreMaterial& coreMaterial) {
     if (!coreMaterial.get_curie_temperature()) {
         return std::numeric_limits<double>::quiet_NaN();
     }
@@ -2282,7 +2319,7 @@ double Core::get_curie_temperature() {
     return get_curie_temperature(coreMaterial);
 }
 
-double Core::get_coercive_force(CoreMaterial coreMaterial, double temperature, bool returnZeroIfMissing) {
+double Core::get_coercive_force(const CoreMaterial& coreMaterial, double temperature, bool returnZeroIfMissing) {
     if (!coreMaterial.get_coercive_force()) {
         if (returnZeroIfMissing) {
             return 0;
@@ -2301,7 +2338,7 @@ double Core::get_coercive_force(CoreMaterial coreMaterial, double temperature, b
         data.push_back(std::pair<double, double>{datum.get_temperature(), datum.get_magnetic_field()});
     }
 
-    double coerciveForce = interp(data, temperature);
+    double coerciveForce = interpolate_ferromagnetic_property_to_curie(coreMaterial, data, temperature, "coercive force");
 
     return coerciveForce;
 }
@@ -2317,7 +2354,7 @@ double Core::get_initial_permeability(double temperature){
     return get_initial_permeability(coreMaterial, temperature);
 }
 
-double Core::get_initial_permeability(CoreMaterial coreMaterial, double temperature){
+double Core::get_initial_permeability(const CoreMaterial& coreMaterial, double temperature){
     InitialPermeability initialPermeability;
     auto initialPermeabilityValue = initialPermeability.get_initial_permeability(coreMaterial, temperature, std::nullopt, std::nullopt);
     return initialPermeabilityValue;
@@ -2357,7 +2394,7 @@ double Core::get_resistivity(CoreMaterial coreMaterial, double temperature){
     return resistivity;
 }
 
-double Core::get_density(CoreMaterial coreMaterial) {
+double Core::get_density(const CoreMaterial& coreMaterial) {
     if (!coreMaterial.get_density()) {
         return std::numeric_limits<double>::quiet_NaN();
     }
@@ -2813,6 +2850,71 @@ void from_json(const json& j, Core& x) {
     }
 
     MAS::from_json(migrated, static_cast<MAS::MagneticCore&>(x));
+}
+
+namespace {
+
+// ABT #1218: the members core/spacer.json and core/piece.json define. Both are
+// `additionalProperties: false`, so these are also the ONLY keys each variant may carry.
+const std::vector<std::string> spacerElementKeys = {"type", "insulationMaterial", "dimensions", "coordinates"};
+const std::vector<std::string> pieceElementKeys = {"type", "material", "shape", "coordinates", "rotation", "machining"};
+
+// The generated serialiser writes an unset optional as a `null` value under its key. MAS models
+// "unset" as the key being absent (no member of the core schemas is nullable), so drop those keys
+// at every depth. A REQUIRED member is never optional in the generated struct, so it is never
+// null here and is never dropped.
+void drop_unset_keys(json& node) {
+    if (node.is_object()) {
+        for (auto it = node.begin(); it != node.end();) {
+            if (it.value().is_null()) {
+                it = node.erase(it);
+            }
+            else {
+                drop_unset_keys(it.value());
+                ++it;
+            }
+        }
+    }
+    else if (node.is_array()) {
+        for (auto& element : node) {
+            drop_unset_keys(element);
+        }
+    }
+}
+
+// Keep on a serialised geometricalDescription element only the keys of the variant its `type`
+// names. The generated serialiser always writes `type` (it is required in both variants).
+void keep_only_variant_keys(json& element) {
+    const auto& type = element.at("type");
+    const auto& allowedKeys = (type.get<std::string>() == "spacer") ? spacerElementKeys : pieceElementKeys;
+    for (auto it = element.begin(); it != element.end();) {
+        if (std::find(allowedKeys.begin(), allowedKeys.end(), it.key()) == allowedKeys.end()) {
+            it = element.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+}
+
+} // anonymous namespace
+
+json geometrical_description_element_to_json(const CoreGeometricalDescriptionElement& element) {
+    json j;
+    MAS::to_json(j, element);
+    keep_only_variant_keys(j);
+    drop_unset_keys(j);
+    return j;
+}
+
+void to_json(json& j, const Core& x) {
+    MAS::to_json(j, static_cast<const MAS::MagneticCore&>(x));
+    if (j.contains("geometricalDescription") && j.at("geometricalDescription").is_array()) {
+        for (auto& element : j.at("geometricalDescription")) {
+            keep_only_variant_keys(element);
+        }
+    }
+    drop_unset_keys(j);
 }
 
 } // namespace OpenMagnetics

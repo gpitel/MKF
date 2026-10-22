@@ -10,6 +10,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
+#include <catch2/matchers/catch_matchers_exception.hpp>
 #include <filesystem>
 #include <cfloat>
 #include <limits>
@@ -356,7 +357,10 @@ namespace {
 
         REQUIRE(find_core_shape_by_name("RM 6-S").get_name().value() == "RM 6-S");
         REQUIRE(find_core_shape_by_name("RM 6/I").get_name().value() == "RM 6/I");
-        REQUIRE(find_core_shape_by_name("RM 6").get_name().value() == "RM 6");
+        // Since MAS 5158b4f "RM 6" is an alias of RM 6-S (one record): it resolves to its owner, and
+        // the other RM 6 aliases still resolve to theirs.
+        REQUIRE(find_core_shape_by_name("RM 6").get_name().value() == "RM 6-S");
+        REQUIRE(find_core_shape_by_name("RM 6S/I").get_name().value() == "RM 6/I");
         REQUIRE(find_core_shape_by_name("ER 28L").get_name().value() == "ER 28L");
         REQUIRE(find_core_shape_by_name("EER 35/21/11").get_name().value() == "EER 35/21/11");
     }
@@ -412,7 +416,15 @@ namespace {
         }
     }
 
-    TEST_CASE("Test_Load_Cores_In_Stock", "[support][utils][smoke-test]") {
+    TEST_CASE("Test_Load_Cores_In_Stock", "[support][utils][smoke-test][abt-1168]") {
+        // ABT #1168: this test ends with the stock-only catalogue loaded. The settings listener
+        // resets the setting before the next test but not the catalogue, so a next test that asks
+        // for the full catalogue (Test_Mas_Autocomplete: PQ 32/30 - 3C90 - Gapped 0.492 mm) found
+        // the stock one already loaded and threw "Core not found". Drop the catalogues on every
+        // exit, a failed REQUIRE included.
+        struct ClearDatabasesOnExit {
+            ~ClearDatabasesOnExit() { clear_databases(); }
+        } clearDatabasesOnExit;
         clear_databases();
         settings.reset();
         settings.set_use_only_cores_in_stock(false);
@@ -427,6 +439,28 @@ namespace {
 
         auto onlyCoresInStock = coreDatabase;
         REQUIRE(allCores.size() > onlyCoresInStock.size());
+    }
+
+    TEST_CASE("Test_Get_Wires_Memo_Follows_A_Catalogue_Of_The_Same_Size", "[support][utils][abt-1626]") {
+        // ABT #1626: get_wires() memoised its filtered copy on the wire database SIZE, so a
+        // catalogue swapped for another of the same size returned the old wires.
+        clear_databases();
+        load_wires();
+        const auto originalWires = wireDatabase;
+        const size_t roundWiresBefore = get_wires(WireType::ROUND, std::nullopt).size();
+        const auto round = std::find_if(originalWires.begin(), originalWires.end(), [](const auto& entry) { return entry.second.get_type() == WireType::ROUND; });
+        const auto rectangular = std::find_if(originalWires.begin(), originalWires.end(), [](const auto& entry) { return entry.second.get_type() == WireType::RECTANGULAR; });
+        REQUIRE(round != originalWires.end());
+        REQUIRE(rectangular != originalWires.end());
+
+        auto swappedWires = originalWires;
+        swappedWires.erase(round->first);
+        swappedWires[rectangular->first + " (copy)"] = rectangular->second;
+        REQUIRE(swappedWires.size() == originalWires.size());
+        clear_databases();
+        wireDatabase = swappedWires;
+        CHECK(get_wires(WireType::ROUND, std::nullopt).size() == roundWiresBefore - 1);
+        clear_databases();
     }
 
     TEST_CASE("Test_Core_Materials_External", "[support][utils][smoke-test]") {
@@ -702,12 +736,14 @@ namespace {
         settings.set_use_only_cores_in_stock(false);
         auto core = find_core_by_name("PQ 32/30 - 3C90 - Gapped 0.492 mm");
         OpenMagnetics::Coil coil;
-        OpenMagnetics::Winding dummyWinding;
-        dummyWinding.set_name("");
-        dummyWinding.set_number_turns(0);
-        dummyWinding.set_number_parallels(0);
-        dummyWinding.set_wire("");
-        coil.get_mutable_functional_description().push_back(dummyWinding);
+        // A real winding (ABT #1849: mas_autocomplete refuses to simulate the placeholder it
+        // would invent for a winding with no turns, no parallels and no wire).
+        OpenMagnetics::Winding winding;
+        winding.set_name("Primary");
+        winding.set_number_turns(10);
+        winding.set_number_parallels(1);
+        winding.set_wire("Round 1.00 - Grade 1");
+        coil.get_mutable_functional_description().push_back(winding);
         OpenMagnetics::Magnetic magnetic;
         magnetic.set_core(core);
         magnetic.set_coil(coil);
@@ -748,6 +784,70 @@ namespace {
         REQUIRE(autocompletedMas.get_outputs()[0].get_core_losses());
         REQUIRE(autocompletedMas.get_outputs()[0].get_winding_losses());
         REQUIRE(autocompletedMas.get_outputs()[0].get_inductance());
+    }
+
+    // ABT #1849: a winding that states no turns, no parallels or no wire is completed by
+    // magnetic_autocomplete with a placeholder (1 turn, 1 parallel of the 10 um "Dummy" wire) so
+    // the geometry can be drawn. mas_autocomplete used to simulate that stand-in as the design:
+    // 12 Ohm, 48.3 W and 5880 C published for a PQ 32/30. It must refuse, naming the winding,
+    // still complete the geometry when asked not to simulate, and still simulate a real winding.
+    TEST_CASE("ABT1849_Mas_Autocomplete_Refuses_To_Simulate_An_Invented_Winding", "[support][utils][abt-1849][smoke-test]") {
+        settings.reset();
+        clear_databases();
+        settings.set_use_only_cores_in_stock(false);
+        auto core = find_core_by_name("PQ 32/30 - 3C90 - Gapped 0.492 mm");
+        OpenMagnetics::Inputs inputs = OpenMagnetics::Inputs::create_quick_operating_point(100000, 42e-6, 42, WaveformLabel::SINUSOIDAL, 10, 0.5, 2);
+        auto buildMas = [&](const std::string& name, int64_t numberTurns, int64_t numberParallels, const std::string& wire) {
+            OpenMagnetics::Coil coil;
+            OpenMagnetics::Winding winding;
+            winding.set_name(name);
+            winding.set_number_turns(numberTurns);
+            winding.set_number_parallels(numberParallels);
+            winding.set_wire(wire);
+            coil.get_mutable_functional_description().push_back(winding);
+            OpenMagnetics::Magnetic magnetic;
+            magnetic.set_core(core);
+            magnetic.set_coil(coil);
+            OpenMagnetics::Mas mas;
+            mas.set_inputs(inputs);
+            mas.set_magnetic(magnetic);
+            return mas;
+        };
+
+        SECTION("a winding with no turns, no parallels and no wire is not simulated") {
+            auto mas = buildMas("", 0, 0, "");
+            REQUIRE_THROWS_MATCHES(mas_autocomplete(mas), OpenMagnetics::InvalidInputException,
+                Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("winding 0 (''")
+                    && Catch::Matchers::ContainsSubstring("numberTurns is 0")
+                    && Catch::Matchers::ContainsSubstring("numberParallels is 0")
+                    && Catch::Matchers::ContainsSubstring("it names no wire")));
+        }
+        SECTION("a real turn count on the placeholder wire is not simulated either") {
+            auto mas = buildMas("Primary", 10, 1, "Dummy");
+            REQUIRE_THROWS_MATCHES(mas_autocomplete(mas), OpenMagnetics::InvalidInputException,
+                Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("winding 0 ('Primary')")
+                    && Catch::Matchers::ContainsSubstring("placeholder 'Dummy'")));
+        }
+        SECTION("the geometry is still completed when no simulation is asked for") {
+            auto mas = buildMas("", 0, 0, "");
+            auto completed = mas_autocomplete(mas, false);
+            REQUIRE(completed.get_magnetic().get_coil().get_turns_description());
+            REQUIRE(completed.get_magnetic().get_coil().get_functional_description()[0].get_number_turns() == 1);
+            REQUIRE(completed.get_outputs().empty());
+        }
+        SECTION("a real winding is simulated") {
+            auto mas = buildMas("Primary", 10, 1, "Round 1.00 - Grade 1");
+            auto completed = mas_autocomplete(mas);
+            REQUIRE(completed.get_outputs().size() == 1);
+            REQUIRE(completed.get_outputs()[0].get_winding_losses());
+            const double windingLosses = completed.get_outputs()[0].get_winding_losses()->get_winding_losses();
+            INFO("winding losses " << windingLosses << " W");
+            // Ten turns of 1 mm copper carrying a few amperes: a fraction of a watt, not the
+            // placeholder's 48 W.
+            REQUIRE(windingLosses > 0);
+            REQUIRE(windingLosses < 5);
+        }
+        settings.reset();
     }
 
     // ABT #1071: the web builder swaps the SHAPE of an existing core and keeps everything else,
@@ -1183,6 +1283,48 @@ TEST_CASE("Autocomplete picks the winding orientation from the WINDOW, not the c
 
     // The two-piece case this rule always got right, as a control: it must not have moved.
     CHECK(orientationAfterAutocomplete("E 55/28/21") == WindingOrientation::OVERLAPPING);
+}
+
+TEST_CASE("Autocomplete keeps a piece-and-plate ET/UT core and its catalogue effective length", "[support][utils][piece-and-plate-autocomplete]") {
+    // magnetic_autocomplete re-typed EI and UT cores TWO_PIECE_SET even when the input said
+    // pieceAndPlate, mirroring the E/U piece: le doubled and the common-mode inductance of the
+    // WE-FC (ET 20, UT 20) and WE-FCL (ET 35) chokes came out at exactly 0.5x.
+    //
+    // References, independent of MKF:
+    //   ET 20: le 50.6 mm, ET 35: le 86.7 mm -- TDK "Ferrite for Switching Power Supplies, ET, UU
+    //          and FT Series" (001-01 / 20070122 / e147), table "ET Cores", HS72ET20 / HS72ET35.
+    //   UT 20: le 53 mm -- the WE-FC UT20 list of parameters (Cenker LoP_IndFC_UT20_v.2, core
+    //          Ae 13 mm^2 / le 53 mm), the value the supplier catalogues quote for a UT 20 set.
+    // Each catalogue quotes le to its last printed digit, so the tolerance is half of that digit:
+    // 0.05 mm for TDK, 0.5 mm for the LoP. A mirrored core (2x) is far outside either.
+    auto autocompletedCore = [](const std::string& shapeName) {
+        json coilJson;
+        coilJson["bobbin"] = "Dummy";
+        coilJson["functionalDescription"] = json::array({{
+            {"name", "winding 0"}, {"numberTurns", 12}, {"numberParallels", 1},
+            {"isolationSide", "primary"}, {"wire", "Round 0.1 - Grade 1"}}});
+        json coreJson;
+        coreJson["functionalDescription"] = {{"type", "pieceAndPlate"}, {"material", "3C95"},
+                                             {"shape", shapeName}, {"gapping", json::array()},
+                                             {"numberStacks", 1}};
+        OpenMagnetics::Magnetic magnetic;
+        // Functional description only, as a catalogue part arrives: autocomplete is the one
+        // that processes the core, so the type it settles on decides le.
+        magnetic.set_core(OpenMagnetics::Core(coreJson, false, false, false));
+        magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
+        return OpenMagnetics::magnetic_autocomplete(magnetic).get_core();
+    };
+
+    struct Reference { std::string shape; double le; double halfDigit; };
+    for (const auto& reference : {Reference{"ET 20", 50.6e-3, 0.05e-3},
+                                  Reference{"ET 35", 86.7e-3, 0.05e-3},
+                                  Reference{"UT 20", 53e-3, 0.5e-3}}) {
+        INFO(reference.shape);
+        auto core = autocompletedCore(reference.shape);
+        CHECK(core.get_functional_description().get_type() == CoreType::PIECE_AND_PLATE);
+        double le = core.get_processed_description()->get_effective_parameters().get_effective_length();
+        CHECK_THAT(le, Catch::Matchers::WithinAbs(reference.le, reference.halfDigit));
+    }
 }
 
 // ABT #1471: magnetic_autocomplete resolved every layer's insulation material through the static
