@@ -98,12 +98,12 @@ std::pair<size_t, size_t> LeakageInductance::calculate_number_points_needed_for_
     return {numberPointsX, numberPointsY};
 }
 
-std::pair<ComplexField, double> LeakageInductance::calculate_magnetic_field(OperatingPoint operatingPoint, Magnetic magnetic, size_t sourceIndex, size_t destinationIndex, size_t harmonicIndex, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding) {
+std::pair<ComplexField, double> LeakageInductance::calculate_magnetic_field(const OperatingPoint& operatingPoint, Magnetic magnetic, size_t sourceIndex, size_t destinationIndex, size_t harmonicIndex, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding) {
     auto phasorField = calculate_magnetic_field_phasor(operatingPoint, magnetic, sourceIndex, destinationIndex, harmonicIndex, customCurrentDirectionPerWinding);
     return {phasorField.inPhase, phasorField.dA};
 }
 
-LeakageInductance::PhasorField LeakageInductance::calculate_magnetic_field_phasor(OperatingPoint operatingPoint, Magnetic magnetic, size_t sourceIndex, size_t destinationIndex, size_t harmonicIndex, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding) {
+LeakageInductance::PhasorField LeakageInductance::calculate_magnetic_field_phasor(const OperatingPoint& operatingPoint, Magnetic magnetic, size_t sourceIndex, size_t destinationIndex, size_t harmonicIndex, std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding) {
 
     auto harmonics = operatingPoint.get_excitations_per_winding()[0].get_current()->get_harmonics().value();
     auto frequency = harmonics.get_frequencies()[harmonicIndex];
@@ -219,8 +219,7 @@ LeakageInductanceOutput LeakageInductance::calculate_leakage_inductance(Magnetic
     // "std::get: wrong index for variant". Surface it clearly instead.
     if (!magnetic.get_core().get_processed_description()) {
         throw CoreNotProcessedException(
-            "Cannot calculate leakage inductance: the core has no processed description "
-            "(effective parameters/shape unresolved). Run magnetic autocomplete / process the core first.");
+            "needed to calculate the leakage inductance");
     }
 
     // Magnetic shunts (MAS-RFC 0015, ABT #1176). A sheet across the window carries the leakage flux
@@ -462,8 +461,7 @@ double LeakageInductance::calculate_leakage_field_energy(Magnetic magnetic, cons
     }
     if (!magnetic.get_core().get_processed_description()) {
         throw CoreNotProcessedException(
-            "Cannot calculate leakage field energy: the core has no processed description "
-            "(effective parameters/shape unresolved). Run magnetic autocomplete / process the core first.");
+            "needed to calculate the leakage field energy");
     }
     size_t numberWindings = magnetic.get_coil().get_functional_description().size();
     if (currentsRmsSigned.size() != numberWindings) {
@@ -986,7 +984,7 @@ LeakageInductance::ToroidalRingPlaneConductors LeakageInductance::calculate_toro
         throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Toroidal leakage model called on a core that is not toroidal");
     }
     if (!core.get_processed_description()) {
-        throw CoreNotProcessedException("Toroidal leakage: the core has no processed description");
+        throw CoreNotProcessedException("needed by the toroidal leakage model");
     }
     auto& coil = magnetic.get_mutable_coil();
     auto windings = coil.get_functional_description();
@@ -1061,7 +1059,8 @@ LeakageInductance::ToroidalRingPlaneConductors LeakageInductance::calculate_toro
             throw CoilNotProcessedException("Toroidal leakage: turn " + turn.get_name() + " coordinates are not cartesian");
         }
         if (!turn.get_additional_coordinates() || turn.get_additional_coordinates()->empty() || turn.get_additional_coordinates().value()[0].size() < 2) {
-            throw CoilNotProcessedException("Toroidal leakage: turn " + turn.get_name() + " has no outer crossing (additional coordinates)");
+            throw CoilNotProcessedException("the leakage inductance of a toroid needs the path of every turn around the outside of the "
+                                            "core, and " + describe_turn_for_people(coil, turn.get_name()) + " has none");
         }
         auto inner = turn.get_coordinates();
         auto outer = turn.get_additional_coordinates().value()[0];

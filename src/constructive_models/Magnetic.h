@@ -69,6 +69,11 @@ class Magnetic : public MAS::Magnetic {
     public:
         Magnetic() = default;
         virtual ~Magnetic() = default;
+        // Declared because the virtual destructor suppresses the implicit move: a std::move of a Magnetic copied it.
+        Magnetic(const Magnetic&) = default;
+        Magnetic(Magnetic&&) = default;
+        Magnetic& operator=(const Magnetic&) = default;
+        Magnetic& operator=(Magnetic&&) = default;
 
         bool has_coil() const { return coil.has_value(); }
         bool has_core() const { return core.has_value(); }
@@ -105,12 +110,23 @@ class Magnetic : public MAS::Magnetic {
             give_coil_its_core();
         }
 
+        // Explicit construction from json. Without it Magnetic(json) has three viable candidates (the declared copy and
+        // move constructors and Magnetic(MAS::Magnetic)), each through a different implicit conversion of the json:
+        // MSVC reports C2440 "ambiguous call", GCC silently picks the copy/move route, i.e. from_json(json, Magnetic&).
+        // This constructor is that same route, spelled out, so every Magnetic(json) builds the same on every compiler.
+        Magnetic(const json & j);
+
         Magnetic(const MAS::Magnetic magnetic) {
             if (magnetic.get_core()) {
                 set_core(magnetic.get_core().value());
             }
             if (magnetic.get_coil()) {
-                set_coil(magnetic.get_coil().value());
+                // The coil is built unwound, given this core, and only then wound: wound before
+                // it knew its core, a former that does not state its column corner could not
+                // follow the core column (Bobbin::get_column_corner_radius) and fell to the
+                // catalogue interpolation although the core was right here.
+                set_coil(Coil(magnetic.get_coil().value(), false));
+                coil->wind_as_described();
             }
             if (magnetic.get_distributors_info()) {
                 set_distributors_info(magnetic.get_distributors_info());
@@ -194,7 +210,8 @@ class Magnetic : public MAS::Magnetic {
          * so both numbers are evaluated at the same operating conditions.
          */
         double calculate_saturation_current(OperatingPoint& operatingPoint,
-                                            double temperature = Defaults().ambientTemperature);
+                                            double temperature = Defaults().ambientTemperature,
+                                            bool proportion = true);
 
         /**
          * @brief Rated (heat-limited) current: the steady DC current that raises the
@@ -296,6 +313,10 @@ inline void from_json(const json & j, Magnetic& x) {
     x.set_manufacturer_info(get_stack_optional<MagneticManufacturerInfo>(migrated, "manufacturerInfo"));
     x.set_rotation(get_stack_optional<std::vector<double>>(migrated, "rotation"));
     x.set_shunts(get_stack_optional<std::vector<MagneticShunt>>(migrated, "shunts"));
+}
+
+inline Magnetic::Magnetic(const json & j) {
+    from_json(j, *this);
 }
 
 inline void to_json(json & j, const Magnetic & x) {

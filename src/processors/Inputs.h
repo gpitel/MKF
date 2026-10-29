@@ -19,6 +19,8 @@ using namespace MAS;
 
 namespace OpenMagnetics {
 
+class Coil;
+
 class Inputs : public MAS::Inputs {
   public:
     Inputs(json j, bool processWaveform = true, std::optional<std::variant<double, std::vector<double>>> magnetizingInductance = std::nullopt) {
@@ -46,6 +48,11 @@ class Inputs : public MAS::Inputs {
     }
     Inputs() = default;
     virtual ~Inputs() = default;
+    // Declared because the virtual destructor suppresses the implicit move: a std::move of a Inputs copied it.
+    Inputs(const Inputs&) = default;
+    Inputs(Inputs&&) = default;
+    Inputs& operator=(const Inputs&) = default;
+    Inputs& operator=(Inputs&&) = default;
 
     // ABT #1329: MAS requires inputs.designRequirements and inputs.operatingPoints. Without this
     // check a missing one surfaced as a raw "[json.exception.out_of_range.403] key
@@ -65,19 +72,19 @@ class Inputs : public MAS::Inputs {
     static OperatingPoint process_operating_point(OperatingPoint operatingPoint, double magnetizingInductance, std::optional<std::vector<double>> turnsRatios = std::nullopt, bool isDmcTopology = false,
                                                   std::optional<std::vector<IsolationSide>> isolationSides = std::nullopt);
 
-    static bool is_waveform_sampled(Waveform waveform);
-    static bool is_waveform_imported(Waveform waveform);
-    static bool is_multiport_inductor(OperatingPoint operatingPoint, std::optional<std::vector<IsolationSide>> isolationSides = std::nullopt);
+    static bool is_waveform_sampled(const Waveform& waveform);
+    static bool is_waveform_imported(const Waveform& waveform);
+    static bool is_multiport_inductor(const OperatingPoint& operatingPoint, std::optional<std::vector<IsolationSide>> isolationSides = std::nullopt);
     // isolationSides, when given: a common-mode choke has every winding on one side. Windings on
     // different sides oppose, so identical currents on them cancel (a transformer), ABT #1467.
-    static bool can_be_common_mode_choke(OperatingPoint operatingPoint, std::optional<std::vector<IsolationSide>> isolationSides = std::nullopt);
-    static bool can_be_differential_mode_choke(OperatingPoint operatingPoint, bool isDmcTopology = false);
+    static bool can_be_common_mode_choke(const OperatingPoint& operatingPoint, std::optional<std::vector<IsolationSide>> isolationSides = std::nullopt);
+    static bool can_be_differential_mode_choke(const OperatingPoint& operatingPoint, bool isDmcTopology = false);
 
     static Waveform calculate_sampled_waveform(Waveform waveform, double frequency, std::optional<size_t> numberPoints=std::nullopt, std::optional<size_t> maximumNumberPoints=std::nullopt);
     static ProcessedWaveform calculate_processed_data(Waveform waveform, double frequency, bool includeAdvancedData=true, std::optional<ProcessedWaveform> processed=std::nullopt);
     static ProcessedWaveform calculate_processed_data(SignalDescriptor excitation, Waveform sampledWaveform, bool includeAdvancedData=true, std::optional<ProcessedWaveform> processed=std::nullopt);
     static ProcessedWaveform calculate_processed_data(Harmonics harmonics, Waveform waveform, bool includeAdvancedData=true, std::optional<ProcessedWaveform> processed=std::nullopt);
-    static Harmonics calculate_harmonics_data(Waveform waveform, double frequency);
+    static Harmonics calculate_harmonics_data(const Waveform& waveform, double frequency);
     // Harmonics of `waveform` from its own knots when it has a time axis (the exact series, no
     // sampling), else of `sampledWaveform`, its uniform resample: a data-only waveform has no
     // knots to be exact about (ABT #1460).
@@ -99,7 +106,7 @@ class Inputs : public MAS::Inputs {
     // the secondary's. Throws if the secondary lacks either signal.
     static OperatingPointExcitation calculate_reflected_primary(OperatingPointExcitation secondaryExcitation, double turnRatio, std::optional<std::string> primaryName = std::nullopt);
 
-    static bool is_standardized(SignalDescriptor signal);
+    static bool is_standardized(const SignalDescriptor& signal);
     static SignalDescriptor standardize_waveform(SignalDescriptor parameter, double frequency);
     static Waveform reconstruct_signal(Harmonics harmonics, double frequency);
     OperatingPoint get_operating_point(size_t index);
@@ -113,9 +120,11 @@ class Inputs : public MAS::Inputs {
     static SignalDescriptor calculate_induced_voltage(OperatingPointExcitation& excitation, double magnetizingInductance, bool compress=true);
 
     /**
-     * @brief Peak excursion of ∫V dt across the primary voltage waveform.
+     * @brief Peak flux linkage of one period of the voltage waveform.
      *
-     * Returns max|∫V dt| over the waveform's samples. This is the V·s
+     * Returns (max − min)/2 of the running ∫(V − ⟨V⟩) dt over one period:
+     * the peak of the flux linkage about its mean, NOT its peak-to-peak
+     * (a sine of amplitude V_pk gives V_pk/ω, as the fallback). This is the V·s
      * quantity that pairs with Faraday's law (`B_peak = V·s / (N · A_e)`)
      * for non-sinusoidal voltages — DAB squares, CLLLC trapezoids,
      * push-pull rectangulars, etc. — where the sinusoidal V_peak/ω
@@ -145,7 +154,7 @@ class Inputs : public MAS::Inputs {
     static std::vector<bool> calculate_magnetizing_conduction_instants(const WindingConduction& conduction, size_t windingIndex);
     // Whether the windings' currents give the magnetizing DC: a single winding, or windings that do
     // not always conduct together (flyback, forward reset). Time-aware (ABT #1467).
-    static bool include_dc_offset_into_magnetizing_current(OperatingPoint operatingPoint, std::vector<double> turnsRatios);
+    static bool include_dc_offset_into_magnetizing_current(const OperatingPoint& operatingPoint, const std::vector<double>& turnsRatios);
     // The DC of a winding's magnetizing current, taken where that winding carries the magnetizing
     // MMF alone (ABT #907, #1467); 0 when it never does. Throws when a winding has no current (ABT #1814).
     static double calculate_magnetizing_current_dc_anchor(const OperatingPoint& operatingPoint, size_t windingIndex, Waveform voltageSampledWaveform, double magnetizingInductance);
@@ -174,10 +183,20 @@ class Inputs : public MAS::Inputs {
     // current describes the drift, not the magnetizing current: the line-cycle PFC inductor
     // voltages that motivated it carried 16-46 times their swing and gave kA peaks.
     static constexpr double maximumVoltSecondImbalance = 0.25;
+    // ABT #2112: an AC flux-linkage swing (or a mean) no larger than this fraction of the voltage's
+    // scale (its peak magnitude, times the period for a swing) is floating-point residue, not a swing:
+    // integrating a constant leaves ~1e-15 of |v| T (3.6e-15 for the 0 V - R * 170 A of the corpus'
+    // dl__EPC_6x3mm), and a net stated as a multiple of it ("275106406767454 times its AC swing of
+    // 1.5e-16 V*s") is no ratio at all. Such a voltage is a constant.
+    static constexpr double negligibleVoltSecondFraction = 1e-9;
     // The volt-second balance of a sampled voltage over its period (ABT #1855): its mean, the net
     // volt-seconds that mean leaves per period, the AC flux-linkage swing of the rest, and the net
-    // as a fraction of that swing. A constant voltage has no swing (acSwing 0, fraction not finite
-    // when its mean is not zero).
+    // as a fraction of that swing. A constant voltage has no swing: acSwing 0 (a swing within
+    // negligibleVoltSecondFraction of the scale counts as none) and the fraction is infinite when its
+    // mean is not negligible, 0 when it is. `voltageScale` (V) is the magnitude the swing and the mean
+    // are judged negligible against: the voltage's own peak magnitude when nullopt; a voltage computed
+    // as a difference of larger ones (v - R i) passes the larger peak, since its rounding comes from
+    // them. It throws when `voltageScale` is not a finite value >= 0.
     struct VoltSecondBalance {
         double meanVoltage;
         double period;
@@ -185,18 +204,35 @@ class Inputs : public MAS::Inputs {
         double acSwing;
         double imbalance;
     };
-    static VoltSecondBalance calculate_volt_second_balance(const Waveform& voltageSampledWaveform, const std::string& context);
+    static VoltSecondBalance calculate_volt_second_balance(const Waveform& voltageSampledWaveform, const std::string& context,
+                                                           std::optional<double> voltageScale = std::nullopt);
     // The per-topic imbalance check (ABT #1855), shared by check_volt_second_balance and by
     // ResultsAnalyzer: MKF's message when the voltage's net volt-seconds over its period exceed
-    // maximumVoltSecondImbalance of its AC flux-linkage swing (or it is a non-zero constant), nullopt
-    // when it is balanced. `context` names the operating point and winding for the message.
+    // maximumVoltSecondImbalance of its AC flux-linkage swing (or it is a non-zero constant, stated as
+    // that constant: never as a ratio against no swing), nullopt when it is balanced. `context` names
+    // the operating point and winding for the message.
     static std::optional<std::string> describe_volt_second_imbalance(const Waveform& voltageSampledWaveform, const std::string& context);
+    static std::optional<std::string> describe_volt_second_imbalance(const VoltSecondBalance& balance, const std::string& context);
     // Throws InvalidInputException with describe_volt_second_imbalance's message when the voltage is
     // not balanced. Since ABT #1855 only the calculation of an induced current asked for that voltage
     // (calculate_magnetizing_current of an excitation, the bindings' calculate_induced_current) and
     // the advisers' up-front input check refuse it; loading, autocompleting and simulating a design
     // integrate the voltage's balanced part and ResultsAnalyzer reports the imbalance.
     static void check_volt_second_balance(const Waveform& voltageSampledWaveform, const std::string& context);
+    // ABT #2002: a winding's terminal voltage is its own resistive drop plus what moves the flux,
+    // v(t) = R_dc i(t) + N dPhi/dt. A DC current through the winding's resistance gives the voltage a
+    // mean that is not flux drift, so the volt-second balance finding judges the voltage with that
+    // drop taken out. A magnetizing current is derived from the voltage as given, which MKF treats as
+    // the induced voltage (converter models and the web give ideal voltages). `remove_resistive_drop`
+    // returns the excitation with its voltage replaced by v(t) - R_dc i(t), exact on the knots of
+    // both waveforms, over one period (the voltage's own sampled axis, or [t0, t0 + T]); it throws when
+    // the excitation has no voltage or no current, or `dcResistance` is not a finite value >= 0.
+    static OperatingPointExcitation remove_resistive_drop(const OperatingPointExcitation& excitation, double dcResistance);
+    // Each winding's DC resistance at `temperature` from its wire and turns (WindingOhmicLosses::
+    // calculate_dc_resistance_per_winding), or nullopt when the coil has not been wound: without turns
+    // MKF cannot know the winding's length, hence its resistance. A wound coil whose resistance cannot
+    // be computed throws.
+    static std::optional<std::vector<double>> get_winding_dc_resistances(const Coil& coil, double temperature);
     // The mean of the voltage AS GIVEN (not its resampled copy). A winding in periodic steady state
     // has zero net volt-seconds, so what remains (probe offset, I*R drop, a capture that is not a
     // whole number of periods, or a voltage that is not balanced at all) is subtracted before
@@ -308,7 +344,7 @@ class Inputs : public MAS::Inputs {
                                                                               std::vector<double> currentPeakMask,
                                                                               double currentOffset = 0);
 
-    static WaveformLabel try_guess_waveform_label(Waveform waveform);
+    static WaveformLabel try_guess_waveform_label(const Waveform& waveform);
     // ABT #1330: whether a processed description defines a waveform on its own. A signal given only
     // by its processed parameters (label, peakToPeak, offset, dutyCycle...) is rebuilt with
     // create_waveform, which reads the duty cycle for every non-sinusoidal label and the dead time
@@ -322,7 +358,7 @@ class Inputs : public MAS::Inputs {
     // Ignored for non-sinusoidal labels (use `skew` for those).
     static Waveform create_waveform(WaveformLabel label, double peakToPeak, double frequency, double dutyCycle=0.5, double offset=0, double deadTime=0, double skew=0, double phase=0);
     // givenWaveform: the waveform as its producer gave it, when `waveform` is a sampled or compressed copy (ABT #1878).
-    static ProcessedWaveform calculate_basic_processed_data(Waveform waveform, std::optional<Waveform> givenWaveform = std::nullopt);
+    static ProcessedWaveform calculate_basic_processed_data(const Waveform& waveform, const std::optional<Waveform>& givenWaveform = std::nullopt);
     // See WaveformProcessor::compress_waveform: with the frequency a closed axis is not closed twice.
     static Waveform compress_waveform(const Waveform& waveform, std::optional<double> frequency = std::nullopt);
 
@@ -334,7 +370,7 @@ class Inputs : public MAS::Inputs {
     // (WaveformProcessor::check_time_axis_spans_one_period) and averaged as the sampled waveform it
     // is: each sample holds until the next, the last until t0 + T, so the mean of N uniform samples
     // is their sum / N, the same convention calculate_integral_waveform integrates with (ABT #1713).
-    static double calculate_waveform_average(Waveform waveform, std::optional<double> frequency = std::nullopt);
+    static double calculate_waveform_average(const Waveform& waveform, std::optional<double> frequency = std::nullopt);
     static Waveform multiply_waveform(Waveform waveform, double scalarValue);
     static Waveform sum_waveform(Waveform waveform, double scalarValue);
     // Pointwise add two waveforms. Both must have the same number of data points.
@@ -352,7 +388,7 @@ class Inputs : public MAS::Inputs {
     static SignalDescriptor subtract_signals(const SignalDescriptor& a, const SignalDescriptor& b, double frequency);
     static SignalDescriptor shift_signal(const SignalDescriptor& s, int samples, double frequency);
 
-    static double try_guess_duty_cycle(Waveform waveform, WaveformLabel label=WaveformLabel::CUSTOM, double frequency=0);
+    static double try_guess_duty_cycle(const Waveform& waveform, WaveformLabel label=WaveformLabel::CUSTOM, double frequency=0);
     static double calculate_instantaneous_power(OperatingPointExcitation excitation);
 
     static double calculate_waveform_coefficient(OperatingPoint* operatingPoint);
@@ -379,20 +415,23 @@ class Inputs : public MAS::Inputs {
     // of repeated switching cycles by the definition above.
     static std::optional<std::vector<size_t>> find_switching_cycle_valleys(const std::vector<double>& time, const std::vector<double>& data);
     static double get_switching_frequency(const OperatingPointExcitation& excitation);
-    static double get_magnetic_flux_density_peak(OperatingPointExcitation excitation, double switchingFrequency);
-    static double get_magnetic_flux_density_peak_to_peak(OperatingPointExcitation excitation, double switchingFrequency);
+    static double get_magnetic_flux_density_peak(const OperatingPointExcitation& excitation, double switchingFrequency);
+    static double get_magnetic_flux_density_peak_to_peak(const OperatingPointExcitation& excitation, double switchingFrequency);
     // A multiport inductor's magnetizing current (ABT #1467). Flyback-labelled (the windings conduct
     // alternately): Faraday on the primary voltage, DC anchored at the primary current's peak
     // (ABT #907). Without a primary voltage, or with every winding on one isolation side: the
     // ampere-turn sum of the winding currents, referred to the primary (exact while they conduct).
-    static SignalDescriptor get_multiport_inductor_magnetizing_current(OperatingPoint operatingPoint,
+    static SignalDescriptor get_multiport_inductor_magnetizing_current(const OperatingPoint& operatingPoint,
                                                                        double magnetizingInductance,
                                                                        const std::vector<double>& turnsRatios,
                                                                        std::optional<std::vector<IsolationSide>> isolationSides);
+    // Whether get_multiport_inductor_magnetizing_current takes the magnetizing current from the primary voltage
+    // (Faraday, a flyback with a primary voltage) rather than from the windings' ampere-turn sum (ABT #1942).
+    static bool is_multiport_inductor_magnetizing_current_from_voltage(const OperatingPointExcitation& primaryExcitation);
     // The primary current carries a FLYBACK_PRIMARY / FLYBACK_SECONDARY label (processed or ancillary).
     static bool has_flyback_label(const OperatingPointExcitation& excitation);
-    static SignalDescriptor get_common_mode_choke_magnetizing_current(OperatingPoint operatingPoint);
-    static SignalDescriptor get_differential_mode_choke_magnetizing_current(OperatingPoint operatingPoint);
+    static SignalDescriptor get_common_mode_choke_magnetizing_current(const OperatingPoint& operatingPoint);
+    static SignalDescriptor get_differential_mode_choke_magnetizing_current(const OperatingPoint& operatingPoint);
 
     DimensionWithTolerance get_altitude();
     Cti get_cti();
@@ -441,6 +480,54 @@ inline void to_file(std::filesystem::path filepath, const Inputs & x) {
     myfile << masJson;
 }
 
+
+// What a magnetic does in its circuit, for the choices that are categorical rather than a magnitude:
+// whether the core is gapped, whether the inductor loss optimiser applies, whether an ungappable
+// ferrite toroid is dropped, and the common-mode / differential-mode choke handling. The
+// magnitudes (saturation, the turn seed, the energy check, the loss-sweep cap) never read it:
+// they use the magnetizing current and the volt-seconds of every design.
+enum class MagneticRole { STORING, TRANSFORMER, COMMON_MODE_CHOKE, DIFFERENTIAL_MODE_CHOKE };
+
+// Which evidence decided the role, most reliable first. SINGLE_WINDING: one winding stores energy.
+// TOPOLOGY: designRequirements.topology, when the topology table knows it (a common- or
+// differential-mode choke topology names the component, so it decides even before SINGLE_WINDING). APPLICATION:
+// designRequirements.subApplication (common-/differential-mode noise filtering, power filtering).
+// ISOLATION_SIDES: every declared winding on one isolation side. STORAGE_RATIO: the energy the
+// windings exchange with the core within a period against the energy that passes through it,
+// from the voltage and current of every winding. NET_MAGNETOMOTIVE_FORCE: the net ampere-turns
+// against the largest winding's, from the currents and turns ratios alone. NO_CURRENTS: voltages
+// only, or not every winding's current: a transformer.
+enum class MagneticRoleTier { SINGLE_WINDING, TOPOLOGY, APPLICATION, ISOLATION_SIDES, STORAGE_RATIO, NET_MAGNETOMOTIVE_FORCE, NO_CURRENTS };
+
+struct MagneticRoleDecision {
+    MagneticRole role;
+    MagneticRoleTier tier;
+    // The storage ratio (kappa), the largest over the operating points, when the STORAGE_RATIO tier ran.
+    std::optional<double> storageRatio;
+    // The net magnetomotive force ratio (rho), the largest over the operating points, when the
+    // NET_MAGNETOMOTIVE_FORCE tier ran.
+    std::optional<double> netMagnetomotiveForceRatio;
+    // What the decision rests on and anything the caller should know (e.g. the winding signs read
+    // in the passive convention because the declared sides did not balance the power).
+    std::vector<std::string> findings;
+};
+
+// A storage ratio or net magnetomotive force ratio at or above this is an energy-storing magnetic.
+inline constexpr double magneticRoleStoringThreshold = 0.5;
+
+// One winding and no turns ratios.
+bool is_single_winding_design(const Inputs& inputs);
+// The role a converter topology gives its magnetic; nullopt for a topology the table does not know.
+std::optional<MagneticRole> topology_magnetic_role(MAS::Topology topology);
+// The role from the declarations alone (tiers SINGLE_WINDING to ISOLATION_SIDES); nullopt when
+// none decides. The only tiers that can yield a common-mode or differential-mode choke.
+std::optional<MagneticRoleDecision> declared_magnetic_role(const Inputs& inputs);
+// The role, through every tier. Never throws for missing descriptive metadata.
+MagneticRoleDecision magnetic_role(const Inputs& inputs);
+// The topology the magnetizing-inductance model is given: the declared one, else a
+// differential-mode choke when the declarations make the magnetic one (its magnetizing current is
+// the sum of its windings' line currents).
+std::optional<MAS::Topology> magnetizing_model_topology(const Inputs& inputs);
 
 bool operator==(Inputs lhs, Inputs rhs);
 

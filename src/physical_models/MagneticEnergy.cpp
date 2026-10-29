@@ -1,4 +1,5 @@
 #include "physical_models/MagneticEnergy.h"
+#include "support/Utils.h"
 #include "Defaults.h"
 
 #include <cmath>
@@ -67,7 +68,7 @@ double MagneticEnergy::get_gap_maximum_magnetic_energy(CoreGap gapInfo, double m
         from_json(_models["gapReluctance"], reluctanceModelEnum);
         auto reluctanceModel = OpenMagnetics::ReluctanceModel::factory(reluctanceModelEnum);
 
-        fringingFactorValue = reluctanceModel->get_gap_reluctance(gapInfo).get_fringing_factor();
+        fringingFactorValue = reluctanceModel->get_gap_reluctance(gapInfo, magneticFluxDensitySaturation).get_fringing_factor();
     }
 
     // E = 0.5 * Phi^2 * R_gap with Phi = Bsat * A and R_gap = lg / (mu0 * A * F):
@@ -88,7 +89,7 @@ double MagneticEnergy::calculate_gap_length_by_magnetic_energy(CoreGap gapInfo, 
     from_json(_models["gapReluctance"], reluctanceModelEnum);
     auto reluctanceModel = OpenMagnetics::ReluctanceModel::factory(reluctanceModelEnum);
 
-    double fringingFactor = reluctanceModel->get_gap_reluctance(gapInfo).get_fringing_factor();
+    double fringingFactor = reluctanceModel->get_gap_reluctance(gapInfo, magneticFluxDensitySaturation).get_fringing_factor();
 
     // Inverse of calculate_gap_maximum_storable_magnetic_energy:
     // E = B^2 * A * lg / (2 * mu0 * F)  =>  lg = 2 * E * mu0 * F / (B^2 * A)
@@ -107,7 +108,7 @@ double MagneticEnergy::calculate_gap_length_by_saturation_constraint(CoreGap gap
     from_json(_models["gapReluctance"], reluctanceModelEnum);
     auto reluctanceModel = OpenMagnetics::ReluctanceModel::factory(reluctanceModelEnum);
 
-    double fringingFactor = reluctanceModel->get_gap_reluctance(gapInfo).get_fringing_factor();
+    double fringingFactor = reluctanceModel->get_gap_reluctance(gapInfo, magneticFluxDensitySaturationTarget).get_fringing_factor();
 
     // Get core effective area
     double effectiveArea = core.get_effective_area();
@@ -141,7 +142,7 @@ double MagneticEnergy::calculate_core_maximum_magnetic_energy(Core core, double 
     double totalEnergy = 0;
     double magneticFluxDensitySaturation = core.get_magnetic_flux_density_saturation(temperature, saturationProportion);
 
-    totalEnergy = get_ungapped_core_maximum_magnetic_energy(core, temperature, frequency);
+    totalEnergy = get_ungapped_core_maximum_magnetic_energy(core, temperature, frequency, saturationProportion);
     for (auto& gap_info : core.get_functional_description().get_gapping()) {
         auto gapEnergy = get_gap_maximum_magnetic_energy(gap_info, magneticFluxDensitySaturation);
         totalEnergy += gapEnergy;
@@ -202,7 +203,7 @@ DimensionWithTolerance MagneticEnergy::calculate_required_magnetic_energy(Inputs
         }
         else {
             throw InvalidInputException(ErrorCode::MISSING_DATA,
-                "operating point " + std::to_string(operatingPointIndex) +
+                "At the " + describe_operating_point_for_people(inputs.get_operating_point(operatingPointIndex), operatingPointIndex) +
                 ": the required magnetic energy needs the peak magnetizing current, and this"
                 " operating point's magnetizing current has neither a processed peak nor a"
                 " waveform to derive one from.");

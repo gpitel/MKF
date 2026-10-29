@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <array>
 #include <mutex>
 #include <limits>
 #include <map>
@@ -115,7 +116,11 @@ std::vector<std::pair<double, double>> stadium_contour(double aspect, size_t cap
     return out;
 }
 
-double solve_exclusion_factor(double aspect, bool fieldAlongWide, size_t capPanels = 200) {
+// The exclusion factor of a stadium for each requested field direction (field along the wide axis, field
+// across it). The collocation matrices and their LU factorisation depend only on the contour, not on the
+// field direction, so they are built and factorised once and solved for each direction's right-hand side
+// separately: each direction's arithmetic is exactly that of a solve of its own.
+std::vector<double> solve_exclusion_factors(double aspect, const std::vector<bool>& fieldsAlongWide, size_t capPanels = 200) {
     const auto verts = stadium_contour(aspect, capPanels, 1.12);
     const size_t n = verts.size();
     if (n < 8) {
@@ -135,14 +140,9 @@ double solve_exclusion_factor(double aspect, bool fieldAlongWide, size_t capPane
         midX(i) = 0.5 * (p1.first + p2.first); midY(i) = 0.5 * (p1.second + p2.second);
         startX(i) = p1.first; startY(i) = p1.second;
     }
-    const double ex = fieldAlongWide ? 1.0 : 0.0;
-    const double ey = fieldAlongWide ? 0.0 : 1.0;
-
     Eigen::MatrixXd influence(n, n);
     Eigen::MatrixXd tangentialInfluence(n, n);
-    Eigen::VectorXd rhs(n);
     for (size_t i = 0; i < n; ++i) {
-        rhs(i) = -(normalX(i) * ex + normalY(i) * ey);
         for (size_t j = 0; j < n; ++j) {
             double gx, gy;
             if (i == j) {
@@ -164,14 +164,29 @@ double solve_exclusion_factor(double aspect, bool fieldAlongWide, size_t capPane
             tangentialInfluence(i, j) = gx * tangentX(i) + gy * tangentY(i);
         }
     }
-    const Eigen::VectorXd sigma = influence.partialPivLu().solve(rhs);
-    const Eigen::VectorXd induced = tangentialInfluence * sigma;
-    double integral = 0;
-    for (size_t i = 0; i < n; ++i) {
-        const double tangential = (tangentX(i) * ex + tangentY(i) * ey) + induced(i);
-        integral += tangential * tangential * length(i);
+    const Eigen::PartialPivLU<Eigen::MatrixXd> lu = influence.partialPivLu();
+    std::vector<double> factors;
+    for (bool fieldAlongWide : fieldsAlongWide) {
+        const double ex = fieldAlongWide ? 1.0 : 0.0;
+        const double ey = fieldAlongWide ? 0.0 : 1.0;
+        Eigen::VectorXd rhs(n);
+        for (size_t i = 0; i < n; ++i) {
+            rhs(i) = -(normalX(i) * ex + normalY(i) * ey);
+        }
+        const Eigen::VectorXd sigma = lu.solve(rhs);
+        const Eigen::VectorXd induced = tangentialInfluence * sigma;
+        double integral = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double tangential = (tangentX(i) * ex + tangentY(i) * ey) + induced(i);
+            integral += tangential * tangential * length(i);
+        }
+        factors.push_back(integral / aspect);   // normalised by the wide dimension (thin == 1)
     }
-    return integral / aspect;               // normalised by the wide dimension (thin == 1)
+    return factors;
+}
+
+double solve_exclusion_factor(double aspect, bool fieldAlongWide, size_t capPanels = 200) {
+    return solve_exclusion_factors(aspect, {fieldAlongWide}, capPanels).front();
 }
 
 
@@ -230,26 +245,38 @@ double stadium_exclusion_factor(double wideDimension, double thinDimension, bool
     if (aspect > kMaxAspect) {
         return renormalise * cached_direct_exclusion_factor(aspect, fieldAlongLong);
     }
-    struct Table { std::vector<double> logAspect, perpendicular, parallel; };
-    static Table table;
-    static std::once_flag built;
-    std::call_once(built, [&]() {
-        for (size_t i = 0; i < kPoints; ++i) {
-            const double la = log(kMinAspect) + double(i) / double(kPoints - 1) * (log(kMaxAspect) - log(kMinAspect));
-            table.logAspect.push_back(la);
-            table.perpendicular.push_back(solve_exclusion_factor(exp(la), false));
-            table.parallel.push_back(solve_exclusion_factor(exp(la), true));
+    // Each table point is solved the first time an aspect needs it (both field directions together, they
+    // share the solve's matrices), so a run solves only the brackets its conductors fall in; a point's
+    // value is the same solve whenever it is made.
+    struct Table {
+        std::vector<double> logAspect;
+        std::array<std::once_flag, kPoints> built;
+        std::array<double, kPoints> perpendicular, parallel;
+        Table() {
+            for (size_t i = 0; i < kPoints; ++i) {
+                logAspect.push_back(log(kMinAspect) + double(i) / double(kPoints - 1) * (log(kMaxAspect) - log(kMinAspect)));
+            }
         }
-    });
-    const auto& values = fieldAlongLong ? table.parallel : table.perpendicular;
+    };
+    static Table table;
+    auto point = [&](size_t index) {
+        std::call_once(table.built[index], [&]() {
+            const auto factors = solve_exclusion_factors(exp(table.logAspect[index]), {false, true});
+            table.perpendicular[index] = factors[0];
+            table.parallel[index] = factors[1];
+        });
+        return fieldAlongLong ? table.parallel[index] : table.perpendicular[index];
+    };
     const double la = log(aspect);
     auto upper = std::upper_bound(table.logAspect.begin(), table.logAspect.end(), la);
-    if (upper == table.logAspect.begin()) { return renormalise * values.front(); }
-    if (upper == table.logAspect.end()) { return renormalise * values.back(); }
+    if (upper == table.logAspect.begin()) { return renormalise * point(0); }
+    if (upper == table.logAspect.end()) { return renormalise * point(kPoints - 1); }
     const size_t hi = size_t(upper - table.logAspect.begin());
     const size_t lo = hi - 1;
     const double t = (la - table.logAspect[lo]) / (table.logAspect[hi] - table.logAspect[lo]);
-    return renormalise * (values[lo] + t * (values[hi] - values[lo]));
+    const double valueLo = point(lo);
+    const double valueHi = point(hi);
+    return renormalise * (valueLo + t * (valueHi - valueLo));
 }
 
 }  // namespace
@@ -383,7 +410,16 @@ std::optional<double> WindingProximityEffectLossesModel::try_get_proximity_facto
     return std::nullopt;
 }
 
+namespace {
+thread_local size_t proximityFactorEvaluations = 0;
+}
+
+size_t WindingProximityEffectLossesModel::get_proximity_factor_evaluations() {
+    return proximityFactorEvaluations;
+}
+
 void WindingProximityEffectLossesModel::set_proximity_factor(const Wire& wire,  double frequency, double temperature, double proximityFactor) {
+    ++proximityFactorEvaluations;
     const std::size_t hash = Wire::calculate_loss_factor_cache_key(wire);
 
     _proximityFactorPerWirePerFrequencyPerTemperature[hash][frequency][temperature] = proximityFactor;
@@ -407,7 +443,11 @@ double WindingProximityEffectLossesModel::calculate_turn_losses_from_phasors(con
 }
 
 std::pair<double, std::vector<std::pair<double, double>>> WindingProximityEffectLosses::calculate_proximity_effect_losses_per_meter(const Wire& inputWire, double temperature, std::vector<ComplexField> fields, std::optional<WindingProximityEffectLossesModels> modelOverride, std::optional<std::vector<ComplexField>> quadratureFields, std::optional<double> perpendicularOutlineFactor, std::optional<double> stackSharingNumber) {
-    auto model = get_model(inputWire.get_type(), modelOverride);
+    return calculate_proximity_effect_losses_per_meter(get_model(inputWire.get_type(), modelOverride), inputWire, temperature, std::move(fields),
+                                                       std::move(quadratureFields), perpendicularOutlineFactor, stackSharingNumber);
+}
+
+std::pair<double, std::vector<std::pair<double, double>>> WindingProximityEffectLosses::calculate_proximity_effect_losses_per_meter(const std::shared_ptr<WindingProximityEffectLossesModel>& model, const Wire& inputWire, double temperature, std::vector<ComplexField> fields, std::optional<std::vector<ComplexField>> quadratureFields, std::optional<double> perpendicularOutlineFactor, std::optional<double> stackSharingNumber) {
     if (auto martinezModel = std::dynamic_pointer_cast<WindingProximityEffectLossesMartinezModel>(model)) {
         martinezModel->set_stack_sharing_number(stackSharingNumber);
     }
@@ -523,6 +563,9 @@ WindingLossesOutput WindingProximityEffectLosses::calculate_proximity_effect_los
     auto windingLossesPerTurn = windingLossesOutput.get_winding_losses_per_turn().value();
 
     double totalProximityEffectLosses = 0;
+    // One model per winding (its override is the winding's wire type's), shared by the winding's turns.
+    std::map<size_t, std::shared_ptr<WindingProximityEffectLossesModel>> modelPerWinding;
+    std::vector<std::optional<std::vector<std::vector<size_t>>>> pointIndicesPerTurnPerHarmonic(fieldPerFrequency.size());
 
     for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex)
     {
@@ -587,14 +630,25 @@ WindingLossesOutput WindingProximityEffectLosses::calculate_proximity_effect_los
             std::vector<ComplexFieldPoint> secondaryData;
             std::vector<ComplexFieldPoint> primaryQuadratureData;
             std::vector<ComplexFieldPoint> secondaryQuadratureData;
-            for (size_t pointIndex = 0; pointIndex < fieldPerHarmonic.get_data().size(); ++pointIndex) {
+            // The harmonic's points grouped by the turn they belong to, in their order, built the first time the
+            // harmonic is read (by the first turn, which then also refuses a point without a turn index) instead of
+            // every turn scanning every point.
+            auto& pointsPerTurn = pointIndicesPerTurnPerHarmonic[fieldIndex];
+            if (!pointsPerTurn) {
+                pointsPerTurn.emplace(turns.size());
+                for (size_t pointIndex = 0; pointIndex < fieldPerHarmonic.get_data().size(); ++pointIndex) {
+                    const auto turnIndexOfPoint = fieldPerHarmonic.get_data()[pointIndex].get_turn_index();
+                    if (!turnIndexOfPoint) {
+                        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION, "Missing turn index in field point");
+                    }
+                    // A point of no turn of this coil belongs to none (each turn took the points whose index equals it).
+                    if (turnIndexOfPoint.value() >= 0 && static_cast<uint64_t>(turnIndexOfPoint.value()) < turns.size()) {
+                        (*pointsPerTurn)[static_cast<size_t>(turnIndexOfPoint.value())].push_back(pointIndex);
+                    }
+                }
+            }
+            for (size_t pointIndex : (*pointsPerTurn)[turnIndex]) {
                 auto& fieldPoint = fieldPerHarmonic.get_data()[pointIndex];
-                if (!fieldPoint.get_turn_index()) {
-                    throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION, "Missing turn index in field point");
-                }
-                if (fieldPoint.get_turn_index().value() != int(turnIndex)) {
-                    continue;
-                }
                 // Nearest-crossing classification. The CenterModel emits the secondary
                 // sample exactly AT the secondary coordinate, but the WangModel (ABT
                 // #227.2 parity) emits a whole surface cluster OFFSET around each
@@ -667,10 +721,15 @@ WindingLossesOutput WindingProximityEffectLosses::calculate_proximity_effect_los
         if (stackSharingNumberPerTurn) {
             stackSharingNumber = stackSharingNumberPerTurn.value()[turnIndex];
         }
-        auto primaryLossesPerHarmonic = calculate_proximity_effect_losses_per_meter(wire, temperature, primaryFields, turnModelOverride, primaryQuadrature, perpendicularOutlineFactor, stackSharingNumber).second;
+        auto foundModel = modelPerWinding.find(static_cast<size_t>(windingIndex));
+        if (foundModel == modelPerWinding.end()) {
+            foundModel = modelPerWinding.emplace(static_cast<size_t>(windingIndex), get_model(wire.get_type(), turnModelOverride)).first;
+        }
+        const auto& model = foundModel->second;
+        auto primaryLossesPerHarmonic = calculate_proximity_effect_losses_per_meter(model, wire, temperature, primaryFields, primaryQuadrature, perpendicularOutlineFactor, stackSharingNumber).second;
         std::vector<std::pair<double, double>> secondaryLossesPerHarmonic;
         if (hasSecondaryCrossing) {
-            secondaryLossesPerHarmonic = calculate_proximity_effect_losses_per_meter(wire, temperature, secondaryFields, turnModelOverride, secondaryQuadrature, perpendicularOutlineFactor, stackSharingNumber).second;
+            secondaryLossesPerHarmonic = calculate_proximity_effect_losses_per_meter(model, wire, temperature, secondaryFields, secondaryQuadrature, perpendicularOutlineFactor, stackSharingNumber).second;
             if (secondaryLossesPerHarmonic.size() != primaryLossesPerHarmonic.size()) {
                 throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
                     "Primary and secondary crossing harmonics do not match for turn " + std::to_string(turnIndex));
@@ -678,7 +737,6 @@ WindingLossesOutput WindingProximityEffectLosses::calculate_proximity_effect_los
         }
 
         LossElementPerHarmonic proximityEffectLossesThisTurn;
-        auto model = get_model(coil.get_wire_type(windingIndex), turnModelOverride);
         proximityEffectLossesThisTurn.set_method_used(model->methodName);
         proximityEffectLossesThisTurn.set_origin(ResultOrigin::SIMULATION);
         proximityEffectLossesThisTurn.get_mutable_harmonic_frequencies().push_back(0);

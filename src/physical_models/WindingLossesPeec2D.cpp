@@ -12,6 +12,7 @@
 #include "support/Utils.h"
 
 #include "support/EigenPrivate.h"
+#include <algorithm>
 #include <complex>
 #include <numbers>
 
@@ -59,7 +60,18 @@ constexpr std::array<double, 4> kGaussX = {-0.4305681557970263, -0.1699905217924
 constexpr std::array<double, 4> kGaussW = {0.17392742256872693, 0.32607257743127305,
                                            0.32607257743127305, 0.17392742256872693};
 
+// A source rectangle that IS the receiver cell (same centre, same size): its coefficient is the self
+// GMD, not a mutual one. The quadrature below would put 16 of its 256 point pairs at r = 0.
+inline bool is_same_cell(const Cell& a, double bx, double by, double bw, double bh) {
+    const double tolerance = 1e-9 * std::max({a.w, a.h, bw, bh});
+    return std::abs(a.x - bx) <= tolerance && std::abs(a.y - by) <= tolerance &&
+           std::abs(a.w - bw) <= tolerance && std::abs(a.h - bh) <= tolerance;
+}
+
 double lnGmdMutualQuadrature(const Cell& a, double bx, double by, double bw, double bh) {
+    if (is_same_cell(a, bx, by, bw, bh)) {
+        throw CalculationException(ErrorCode::CALCULATION_ERROR, "PEEC-2D: mutual GMD asked between a cell and itself; the self term is lnGmdSelf");
+    }
     double acc = 0;
     for (size_t i = 0; i < 4; ++i) {
         double x1 = a.x + kGaussX[i] * a.w;
@@ -74,9 +86,14 @@ double lnGmdMutualQuadrature(const Cell& a, double bx, double by, double bw, dou
                     double y2 = by + kGaussX[l] * bh;
                     double wy2 = kGaussW[l];
                     double r = std::hypot(x1 - x2, y1 - y2);
-                    // Two distinct cells can still share a corner point; a zero
-                    // distance at a single quadrature node would poison the sum.
-                    r = std::max(r, 1e-12);
+                    // The Gauss nodes are interior to each rectangle, so two cells that do not
+                    // overlap never put a node pair at r = 0 (touching edges or corners
+                    // included). A zero here means overlapping cells: a broken mesh, not a
+                    // distance to floor.
+                    if (!(r > 0)) {
+                        throw CalculationException(ErrorCode::CALCULATION_ERROR,
+                            "PEEC-2D: two overlapping cells put a quadrature point pair at zero distance in the mutual GMD");
+                    }
                     acc += wx1 * wy1 * wx2 * wy2 * std::log(r);
                 }
             }
@@ -168,7 +185,10 @@ double couplingCoefficient(const Cell& receiver, double srcX, double srcY, doubl
                            const WindowFrame& frame, int mirroringDimension, double corePermeability) {
     double sum = 0;
     for (const auto& image : image_lattice(srcX, srcY, frame, mirroringDimension, corePermeability)) {
-        sum += image.weight * lnGmdMutual(receiver, image.x, image.y, srcW, srcH);
+        // The original of the receiver's own cell is the self term, as in the open (image-free) matrix.
+        double lnGmd = is_same_cell(receiver, image.x, image.y, srcW, srcH) ? lnGmdSelf(srcW, srcH)
+                                                                             : lnGmdMutual(receiver, image.x, image.y, srcW, srcH);
+        sum += image.weight * lnGmd;
     }
     return -(kMu0 / (2 * std::numbers::pi)) * sum;
 }
@@ -321,6 +341,9 @@ WindingLossesOutput WindingLossesPeec2D::calculate_losses(Magnetic magnetic, Ope
                 MagnetizingInductance().calculate_inductance_from_number_turns_and_gapping(
                     core, coil).get_magnetizing_inductance());
             auto reluctanceModel = ReluctanceModel::factory();
+            // ABT #1610: the gap model reports its storable energy at this core's Bsat at the
+            // operating temperature; only the reluctance is read here.
+            double magneticFluxDensitySaturation = core.get_magnetic_flux_density_saturation(temperature, true);
             // The flux through a LATERAL column is only that column's share of the total:
             // lateral columns are parallel paths, each the series sum of its gaps (residual
             // mating surfaces included -- they carry MMF even though they do not fringe),
@@ -337,7 +360,7 @@ WindingLossesOutput WindingLossesPeec2D::calculate_losses(Magnetic magnetic, Ope
                 double x = gap.get_coordinates().value()[0];
                 double halfSection = gap.get_section_dimensions() ? gap.get_section_dimensions().value()[0] / 2 : 0.0;
                 if (std::abs(x) >= halfSection) {
-                    lateralColumnReluctance[std::lround(x * 1e6)] += reluctanceModel->get_gap_reluctance(gap).get_reluctance();
+                    lateralColumnReluctance[std::lround(x * 1e6)] += reluctanceModel->get_gap_reluctance(gap, magneticFluxDensitySaturation).get_reluctance();
                 }
             }
             double lateralConductanceSum = 0;
@@ -351,7 +374,7 @@ WindingLossesOutput WindingLossesPeec2D::calculate_losses(Magnetic magnetic, Ope
                 if (!gap.get_coordinates() || gap.get_coordinates().value()[0] < 0) {
                     continue;  // same x>=0 convention as the fringing path
                 }
-                double gapReluctance = reluctanceModel->get_gap_reluctance(gap).get_reluctance();
+                double gapReluctance = reluctanceModel->get_gap_reluctance(gap, magneticFluxDensitySaturation).get_reluctance();
                 // flux per ampere of primary current: L * 1 / N
                 double fluxPerAmp = magnetizingInductance / numberPrimaryTurns;
                 GapConductor gapConductor;

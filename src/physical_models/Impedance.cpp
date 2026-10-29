@@ -155,8 +155,7 @@ ImpedanceTank Impedance::build_magnetizing_tank(Core& core, Coil& coil) {
     // choke point all four sweep entry points share.
     if (!core.get_processed_description()) {
         throw CoreNotProcessedException(
-            "Impedance needs the core's processed description (effective area and length) to "
-            "build the magnetizing tank; the core carries only its functional description");
+            "needed for the effective area and length of the impedance model's magnetizing branch");
     }
     // The core and its gaps are in series on the flux path: L(f) = N^2 / (R_core(mu=1)/mu(f) + R_gap).
     // R_core(mu=1) = l_e/(mu0 A_e) scales with the complex permeability; the gapping reluctance
@@ -207,7 +206,7 @@ ImpedanceTank Impedance::build_magnetizing_tank(Core& core, Coil& coil) {
             if (!coil.get_turns_description()) {
                 throw InvalidInputException(ErrorCode::INVALID_INPUT,
                     "Impedance could not wind this coil: the winder returned no turns with the "
-                    "preset sections and none on a fresh wind either (see ABT #850).");
+                    "preset sections and none on a fresh wind either.");
             }
         }
         // Pass the core: the winding-to-core self term (ABT #848) needs it, and on
@@ -673,7 +672,10 @@ double Impedance::calculate_self_resonant_frequency(Core core, Coil coil, double
             coil.wind();
         }
         auto windingName = coil.get_functional_description()[0].get_name();
-        auto capacitanceMatrix = StrayCapacitance().calculate_capacitance(coil, core, std::nullopt, coreElectricalReference).get_capacitance_among_windings().value();
+        // The stray-capacitance model is the one selected in the settings, as on every other
+        // impedance path; the constructor default here made the self-resonance ignore that choice.
+        auto strayCapacitanceModel = Settings::GetInstance().get_stray_capacitance_model();
+        auto capacitanceMatrix = StrayCapacitance(strayCapacitanceModel).calculate_capacitance(coil, core, std::nullopt, coreElectricalReference).get_capacitance_among_windings().value();
         capacitance = capacitanceMatrix[windingName][windingName];
         // Second pass at the resonance this capacitance implies, so the core image factor
         // reads the core permittivity where the capacitance acts (see build_magnetizing_tank).
@@ -686,7 +688,7 @@ double Impedance::calculate_self_resonant_frequency(Core core, Coil coil, double
             double gapReluctanceRatio = OpenMagnetics::ReluctanceModel::gapping_reluctance_in_series(core, unityPermeabilityReluctance) / reluctanceCoreUnityPermeability;
             double resonanceEstimate = estimate_resonance_frequency(core, airCoredInductance, gapReluctanceRatio, capacitance);
             if (resonanceEstimate > 0) {
-                capacitanceMatrix = StrayCapacitance().calculate_capacitance(coil, core, resonanceEstimate, coreElectricalReference).get_capacitance_among_windings().value();
+                capacitanceMatrix = StrayCapacitance(strayCapacitanceModel).calculate_capacitance(coil, core, resonanceEstimate, coreElectricalReference).get_capacitance_among_windings().value();
                 capacitance = capacitanceMatrix[windingName][windingName];
             }
         }

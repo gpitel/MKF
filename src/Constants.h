@@ -119,7 +119,6 @@ namespace ThermalDefaults {
     constexpr double kWire_DefaultEnamelConductivity = 0.2;    // [W/(m·K)]
     
     // Insulation & Bobbin
-    constexpr double kInsulation_DefaultConductivity = 0.2;// [W/(m·K)] polyimide
     constexpr double kInsulation_DefaultThickness = 0.0001;// [m] 0.1mm
     
     // Core
@@ -153,9 +152,6 @@ namespace ThermalDefaults {
     // so every turn face of a packed toroidal winding convected its full developed
     // surface and the predicted temperature rise came out ~2.5x low.
     constexpr double kConvection_StagnantAirGap = 1.0e-3;      // [m]
-    
-    // TIM
-    constexpr double kTIM_DefaultResistance = 0.5;             // [K/W]
     
     // Solver
     constexpr double kSolver_MinConductance = 1e-9;            // [W/K]

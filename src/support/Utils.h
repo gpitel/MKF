@@ -149,16 +149,19 @@ std::optional<InductanceFluxCacheEntry> get_cached_inductance_flux(
 
 // Legacy logging interface - prefer using Logger directly
 // Verbosity levels: 0=ERROR, 1=WARNING, 2=INFO, 3+=DEBUG
-void logEntry(std::string entry, std::string module = "", uint8_t entryVerbosity = 1);
+// `module` is required and must be listed in user_facing_log_module (Logger.h); an empty or unlisted one throws.
+void logEntry(std::string entry, std::string module, uint8_t entryVerbosity = 1);
 std::string read_log();
 
-// Settings::allowMaterialDataExtrapolation (off by default). Every site that uses a core material outside the data
+// Settings::allowMaterialDataExtrapolation (on by default since Alf, 2026-10-25; always off under an adviser). Every site that uses a core material outside the data
 // it carries asks this before throwing: when the flag is off it returns false and logs nothing, and the caller
-// throws exactly as before; when it is on it logs `what` (which must name the material, the quantity, the value
-// and the range the data covers) as a WARNING from module kMaterialDataExtrapolationModule and returns true, and
-// the caller evaluates the same model outside its range.
-inline constexpr const char* kMaterialDataExtrapolationModule = "MaterialDataExtrapolation";
-bool material_data_extrapolation_allowed(const std::string& what);
+// throws exactly as before; when it is on it logs a WARNING from module kMaterialDataExtrapolationModule and
+// returns true, and the caller evaluates the same model outside its range.
+// The warning is `summary`, which names the material, the quantity and the range its data covers and is the same
+// for every value asked of that material (so repeats merge into one Engine log row), with `detail` naming the
+// value asked this time (LogRecord::detail). Both are written for the person reading the log: no setting names.
+inline constexpr const char* kMaterialDataExtrapolationModule = "Material data extrapolation";
+bool material_data_extrapolation_allowed(const std::string& summary, const std::string& detail);
 
 bool check_requirement(DimensionWithTolerance requirement, double value);
 Core find_core_by_name(std::string name);
@@ -253,8 +256,8 @@ std::vector<InsulationMaterial> get_insulation_materials();
 std::vector<WireMaterial> get_wire_materials();
 
 
-bool is_size_power_of_2(std::vector<double> data);
-size_t round_up_size_to_power_of_2(std::vector<double> data);
+bool is_size_power_of_2(const std::vector<double>& data);
+size_t round_up_size_to_power_of_2(const std::vector<double>& data);
 size_t round_up_size_to_power_of_2(size_t size);
 
 std::vector<size_t> get_main_harmonic_indexes(OperatingPointExcitation excitation, double windingLossesHarmonicAmplitudeThreshold, std::string signal="current", std::optional<size_t> mainHarmonicIndex=std::nullopt);
@@ -378,6 +381,22 @@ std::vector<MAS::CoreGap> extract_core_gapping(OpenMagnetics::Core ungappedCore,
 
 Inputs get_defaults_inputs(OpenMagnetics::Magnetic magnetic);
 
+
+// A turn of the coil named as the web shows the coil, for messages a person reads: "turn 3 of winding
+// 'Primary'", or "turn 3 of parallel 2 of winding 'Primary'" when the winding has parallels (both counted
+// from 1, in the order of turnsDescription). Throws when the coil has no such turn.
+std::string describe_turn_for_people(const Coil& coil, size_t turnIndex);
+std::string describe_turn_for_people(const Coil& coil, const std::string& turnName);
+// A lead as people read it, from the name the real-winding judgements give it ("entrance lead of '<turn>'"
+// or "exit lead of '<turn>'"): "entrance lead of turn 1 of winding 'Primary'", no article. Any other name throws.
+std::string describe_lead_for_people(const Coil& coil, const std::string& leadName);
+// An operating point named as the web shows it, for error messages a person reads: "operating point 'Full load'"
+// when it has a name, otherwise "operating point 2" (counted from 1). Not for findings: their "At operating point
+// N ('name'): " prefix is a contract with the web (ResultsAnalyzer::describe_operating_point).
+std::string describe_operating_point_for_people(const OperatingPoint& operatingPoint, size_t operatingPointIndex);
+// A winding named as the web shows it, for messages a person reads: "winding 'Primary'", or "winding 2"
+// (counted from 1) when it has no name.
+std::string describe_winding_for_people(const std::string& windingName, size_t windingIndex);
 
 } // namespace OpenMagnetics
 

@@ -23,7 +23,8 @@ endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /bigobj")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Ox")
+    # /Ox only in Release: in the global flags it also reached Debug, where it conflicts with /RTC1.
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /Ox")
     # Use /W3 instead of /W0 to catch potential issues; suppress only specific warnings if needed
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4996") # Suppress deprecation warnings
@@ -37,16 +38,36 @@ else ()
 
     # Maximum-speed optimized build. NOTE: deliberately NO -ffast-math — this is a numeric/physics
     # codebase whose results (and pinned characterization tests) depend on IEEE FP semantics, NaN/Inf
-    # handling and operation ordering, all of which -ffast-math breaks. -march=native tunes for the
-    # build machine's CPU (binaries are not portable to older CPUs); -funroll-loops + -O3 + NDEBUG.
-    # -march=native is x86/native-only; it is invalid for the wasm32 (Emscripten) target.
+    # handling and operation ordering, all of which -ffast-math breaks. -funroll-loops + -O3 + NDEBUG.
+    #
+    # Target CPU (ABT #1597): the default stays -march=native (tuned for the build machine; binaries
+    # are not portable to older CPUs), as before, and wasm32 (Emscripten) gets no -march.
+    # -DMKF_NATIVE_ARCH=OFF builds a portable baseline instead: -march=x86-64-v2 on x86-64
+    # (SSE4.2/POPCNT, no AVX/FMA), no -march on other architectures. The two can differ in the last
+    # bits of floating-point results (FMA contraction, vector widths). OFF is kept for when portable
+    # binaries are needed, but it has not been validated against the full test suite: on
+    # x86-64-v2 the stray-capacitance self-pair energy of an equipotential winding can come out as a
+    # rounding residue (5.6e-42 J) instead of exactly 0, which its exact-zero test rejects.
     if(EMSCRIPTEN)
-        set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -funroll-loops")
-        set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -funroll-loops")
+        set(_mkf_native_arch_default OFF)
     else()
-        set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -funroll-loops")
-        set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -funroll-loops")
+        set(_mkf_native_arch_default ON)
     endif()
+    option(MKF_NATIVE_ARCH "Optimise for the build machine's CPU (-march=native); binaries are not portable" ${_mkf_native_arch_default})
+    if(MKF_NATIVE_ARCH)
+        if(EMSCRIPTEN)
+            message(FATAL_ERROR "MKF_NATIVE_ARCH=ON is not valid for Emscripten/wasm32: -march=native has no wasm target.")
+        endif()
+        set(_mkf_arch_flags "-march=native")
+    elseif(NOT EMSCRIPTEN AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64)$"
+           AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        set(_mkf_arch_flags "-march=x86-64-v2")
+    else()
+        set(_mkf_arch_flags "")
+    endif()
+    message(STATUS "MKF target CPU flags (MKF_NATIVE_ARCH=${MKF_NATIVE_ARCH}): '${_mkf_arch_flags}'")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG ${_mkf_arch_flags} -funroll-loops")
+    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG ${_mkf_arch_flags} -funroll-loops")
 endif()
 
 
@@ -102,6 +123,56 @@ FetchContent_MakeAvailable(json)
 include_directories("${CMAKE_BINARY_DIR}/_deps/json-src/include/nlohmann/")
 include_directories("${CMAKE_BINARY_DIR}/_deps/json-src/include/")
 
+
+# simdjson (single-header amalgamation): parses the MAS databases into nlohmann::json (support/FastJsonParse.cpp).
+# Only its singleheader/simdjson.cpp is compiled, into MKF; its own CMake project is not configured.
+FetchContent_Declare(simdjson
+    GIT_REPOSITORY https://github.com/simdjson/simdjson.git
+    GIT_TAG  tags/v5.0.5
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR singleheader-not-a-cmake-project)
+FetchContent_MakeAvailable(simdjson)
+
+# mimalloc (Microsoft's allocator) as the process allocator of EXECUTABLES: a link-time swap, no MKF code calls it.
+# mkf_use_mimalloc(<executable>) links libmimalloc.so into that executable, which then lists it before libc, so the
+# dynamic linker binds the whole process's malloc/free/new/delete to it (libMKF.so included). It is never linked
+# into libMKF itself: a host that dlopen()s libMKF.so (a Python extension, ctypes, .NET P/Invoke) would then bind
+# libMKF's operator new/delete to mimalloc but malloc/free to the host's libc (measured with LD_DEBUG=bindings
+# under python3 ctypes), and memory allocated on one side and freed on the other crosses allocators. MKF's own
+# executables (MKF_tests, the tools) use it; a downstream executable built with MKF as a subproject (Henry,
+# MVB++) calls mkf_use_mimalloc(<its target>). PyOpenMagnetics and the WASM build compile MKF's sources with their
+# own CMake and do not see this option. Default ON for native Linux only: OFF for Emscripten (wasm has its own
+# allocator), Windows (an override needs mimalloc-redirect.dll loaded first) and macOS (its override is
+# malloc-zone/interpose based and is not validated here).
+if(NOT EMSCRIPTEN AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(_mkf_mimalloc_default ON)
+else()
+    set(_mkf_mimalloc_default OFF)
+endif()
+option(MKF_USE_MIMALLOC "Link mimalloc as the process allocator of the executables that call mkf_use_mimalloc()" ${_mkf_mimalloc_default})
+if(MKF_USE_MIMALLOC)
+    if(EMSCRIPTEN)
+        message(FATAL_ERROR "MKF_USE_MIMALLOC=ON is not valid for Emscripten/wasm32.")
+    endif()
+    set(MI_BUILD_SHARED ON CACHE BOOL "" FORCE)
+    set(MI_BUILD_STATIC OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(MI_OVERRIDE ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(mimalloc
+        GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+        GIT_TAG  tags/v3.6.0
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(mimalloc)
+endif()
+# The library file only, not the mimalloc target: its include directories would change the executable's compile
+# commands, and nothing includes mimalloc.h. A no-op when MKF_USE_MIMALLOC is OFF.
+function(mkf_use_mimalloc target)
+    if(MKF_USE_MIMALLOC)
+        add_dependencies(${target} mimalloc)
+        target_link_libraries(${target} PRIVATE $<TARGET_FILE:mimalloc>)
+    endif()
+endfunction()
 
 FetchContent_Declare(magic-enum
     GIT_REPOSITORY https://github.com/Neargye/magic_enum
@@ -256,6 +327,14 @@ FetchContent_MakeAvailable(rapidfuzz)
 # that disable them postdate it), which enable_language(Fortran) and break the Windows/MSVC
 # configure. SOURCE_SUBDIR points at a dir with no CMakeLists.txt, so MakeAvailable only
 # populates the sources (headers land in _deps/eigen-src, on the include path below).
+# Eigen 3.4.0 ignores EIGEN_BUILD_TESTING (it arrived after 3.4.0): its test/ and failtest/ trees are
+# gated only by the generic `option(BUILD_TESTING ... ON)`. Turn BUILD_TESTING off for Eigen ONLY and
+# put the user's value back afterwards, so the project's own BUILD_TESTING is not forced (ABT #1595).
+# A cache entry (not a normal variable) because Eigen's cmake_minimum_required(3.5) leaves CMP0077
+# unset, and then option() would discard a normal variable.
+if(DEFINED CACHE{BUILD_TESTING})
+    set(_mkf_saved_build_testing "${BUILD_TESTING}")
+endif()
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(eigen
     GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
@@ -263,6 +342,12 @@ FetchContent_Declare(eigen
     GIT_SHALLOW TRUE
     SOURCE_SUBDIR _headers_only_skip_eigen_cmake)
 FetchContent_MakeAvailable(eigen)
+if(DEFINED _mkf_saved_build_testing)
+    set(BUILD_TESTING "${_mkf_saved_build_testing}" CACHE BOOL "Build the testing tree." FORCE)
+    unset(_mkf_saved_build_testing)
+else()
+    unset(BUILD_TESTING CACHE)
+endif()
 include_directories("${CMAKE_BINARY_DIR}/_deps/eigen-src")
 
 
@@ -613,6 +698,10 @@ file(GLOB SOURCES CONFIGURE_DEPENDS
     "src/processors/*.cpp"
     "src/support/*.cpp")
 list(APPEND SOURCES "${CCI_GENERATED_CPP}")
+list(APPEND SOURCES "${simdjson_SOURCE_DIR}/singleheader/simdjson.cpp")
+# Only these two files see simdjson's header (no global include path, so no other file recompiles).
+set_source_files_properties("${simdjson_SOURCE_DIR}/singleheader/simdjson.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/support/FastJsonParse.cpp"
+    PROPERTIES INCLUDE_DIRECTORIES "${simdjson_SOURCE_DIR}/singleheader")
 
 # The only surviving src/converter_models/*.cpp is KirchhoffBridge.cpp — it #includes KirchhoffApi.hpp and
 # links libKirchhoffApi.so, so it can only be compiled when Kirchhoff is linked. Drop it otherwise (e.g. the
@@ -765,6 +854,7 @@ target_include_directories(MKF PUBLIC
 if(NOT EMSCRIPTEN)
     add_executable(mkf_material_validator EXCLUDE_FROM_ALL "tools/MaterialValidatorCli.cpp")
     target_link_libraries(mkf_material_validator PUBLIC MKF)
+    mkf_use_mimalloc(mkf_material_validator)
     target_include_directories(mkf_material_validator PUBLIC "${PROJECT_SOURCE_DIR}/src/")
 endif()
 
@@ -777,6 +867,7 @@ if(INCLUDE_MKF_TESTS)
     add_executable(MKF_tests ${ALL_TEST_SOURCES} "tests/TestingUtils.cpp")
     target_link_libraries(MKF_tests PRIVATE Catch2::Catch2WithMain)
     target_link_libraries(MKF_tests PUBLIC MKF)
+    mkf_use_mimalloc(MKF_tests)
     target_include_directories(MKF_tests PUBLIC "${PROJECT_SOURCE_DIR}/src/")
     # ABT #327: the same (partial, see the MKF target above) dangling-reference guard on the
     # test TUs (where three of the four originally-found sites lived). GNU-only.

@@ -1,4 +1,5 @@
 #include "support/CoilMesher.h"
+#include "support/MasAccess.h"
 #include "physical_models/Reluctance.h"
 #include "physical_models/WindingOhmicLosses.h"
 #include "processors/Inputs.h"
@@ -308,7 +309,7 @@ std::pair<Field, double> CoilMesher::generate_mesh_core_winding_window_grid(Magn
     }
     auto core = magnetic.get_core();
     if (!core.get_processed_description()) {
-        throw CoreNotProcessedException("Core winding window grid: the core has no processed description");
+        throw CoreNotProcessedException("needed to grid the winding window");
     }
     if (core.get_shape_family() == CoreShapeFamily::T) {
         throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Core winding window grid: toroidal windows are not rectangular");
@@ -542,9 +543,10 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
     for (auto harmonicIndex : commonHarmonicIndexes) {
         amplitudePerWindingPerHarmonic[harmonicIndex].assign(coil.get_functional_description().size(), 0.0);
         Field field;
-        for (auto excitation : operatingPoint.get_excitations_per_winding()) {
-            if (harmonicIndex < excitation.get_current()->get_harmonics().value().get_frequencies().size()) {
-                field.set_frequency(excitation.get_current()->get_harmonics().value().get_frequencies()[harmonicIndex]);
+        for (const auto& excitation : operatingPoint.get_excitations_per_winding()) {
+            const auto& frequencies = mas_access::harmonics_ref(*(mas_access::current_ref(excitation))).value().get_frequencies();
+            if (harmonicIndex < frequencies.size()) {
+                field.set_frequency(frequencies[harmonicIndex]);
                 break;
             }
         }
@@ -566,10 +568,12 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
     // fetching it per turn dominated this loop's cost.
     auto meshCore = magnetic.get_core();
     for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
-        auto turn = turns[turnIndex];
+        // Read in place: the turn and the winding's current were copied per turn; the mesher models only read
+        // the wire (its type), so they get the winding's wire itself.
+        const auto& turn = turns[turnIndex];
         int windingIndex = coil.get_winding_index_by_name(turn.get_winding());
-        auto wire = wirePerWinding[windingIndex];
-        auto excitationCurrent = operatingPoint.get_excitations_per_winding()[windingIndex].get_current();
+        auto& wire = wirePerWinding[windingIndex];
+        const auto& excitationCurrent = mas_access::current_ref(operatingPoint.get_excitations_per_winding()[windingIndex]);
         if (!excitationCurrent || !excitationCurrent->get_harmonics()) {
             throw InvalidInputException(ErrorCode::MISSING_DATA, "Current for winding " + std::to_string(windingIndex) + " is missing harmonics in Coil Mesher");
         }
@@ -602,7 +606,7 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
     std::vector<std::vector<double>> currentAmplitudePerHarmonicPerWinding;
     for (size_t harmonicIndex = 0; harmonicIndex < tempFieldPerHarmonic.size(); ++harmonicIndex){
         if (tempFieldPerHarmonic[harmonicIndex].get_data().size() > 0) {
-            fieldPerHarmonic.push_back(tempFieldPerHarmonic[harmonicIndex]);
+            fieldPerHarmonic.push_back(std::move(tempFieldPerHarmonic[harmonicIndex]));
             auto commonPosition = std::find(commonHarmonicIndexes.begin(), commonHarmonicIndexes.end(), harmonicIndex);
             if (commonPosition == commonHarmonicIndexes.end()) {
                 throw CalculationException(ErrorCode::CALCULATION_ERROR, "generate_mesh_inducing_coil: meshed harmonic " + std::to_string(harmonicIndex) +
@@ -733,7 +737,7 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(const
 
     double corePermeability = core.get_initial_permeability(defaults.ambientTemperature);
     if (!core.get_processed_description()) {
-        throw CoreNotProcessedException("Core is not processed");
+        throw CoreNotProcessedException();
     }
 
     auto processedDescription = core.get_processed_description().value();
@@ -1207,20 +1211,20 @@ std::vector<FieldPoint> CoilMesherWangModel::generate_mesh_inducing_turn(const T
 std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic magnetic, std::optional<OperatingPoint> operatingPoint) {
     auto core = magnetic.get_core();
     if (!core.get_processed_description()) {
-        throw CoreNotProcessedException("Core is not processed");
+        throw CoreNotProcessedException();
     }
     if (core.get_shape_family() == CoreShapeFamily::T) {
-        throw NotImplementedException("Neutral window field (ABT #1304): toroids have no rectangular window boundary");
+        throw NotImplementedException("Neutral window field: toroids have no rectangular window boundary");
     }
     auto processedDescription = core.get_processed_description().value();
     auto windingWindows = processedDescription.get_winding_windows();
     if (windingWindows.size() != 1) {
-        throw NotImplementedException("Neutral window field (ABT #1304): only single-window cores are described by this "
+        throw NotImplementedException("Neutral window field: only single-window cores are described by this "
                                       "frame; this core has " + std::to_string(windingWindows.size()) + " winding windows");
     }
     auto windingWindow = windingWindows[0];
     if (!windingWindow.get_width() || !windingWindow.get_height()) {
-        throw InvalidInputException(ErrorCode::MISSING_DATA, "Neutral window field (ABT #1304): the winding window has no width/height");
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Neutral window field: the winding window has no width/height");
     }
     auto columns = core.get_columns();
     size_t mainColumnIndex = core.get_main_column_index();
@@ -1240,11 +1244,11 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
     auto reluctanceOutput = reluctanceModel->get_core_reluctance(core, operatingPoint);
     const double totalReluctance = reluctanceOutput.get_core_reluctance();
     if (!reluctanceOutput.get_ungapped_core_reluctance()) {
-        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field (ABT #1304): the reluctance model returned no ferrite reluctance");
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field: the reluctance model returned no ferrite reluctance");
     }
     const double ferriteReluctance = reluctanceOutput.get_ungapped_core_reluctance().value();
     if (!(totalReluctance > 0) || !(ferriteReluctance >= 0)) {
-        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field (ABT #1304): non-positive core reluctance");
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field: non-positive core reluctance");
     }
 
     std::vector<WindowWallSheet> originals;
@@ -1252,7 +1256,7 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
     std::vector<AirGapReluctanceOutput> reluctancePerGap;
     if (!gapping.empty()) {
         if (!reluctanceOutput.get_reluctance_per_gap() || reluctanceOutput.get_reluctance_per_gap()->size() != gapping.size()) {
-            throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field (ABT #1304): the reluctance model did not return one reluctance per gap");
+            throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field: the reluctance model did not return one reluctance per gap");
         }
         reluctancePerGap = reluctanceOutput.get_reluctance_per_gap().value();
     }
@@ -1276,7 +1280,7 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
         }
     }
     if (anyLateralInX && anyLateralInZOnly) {
-        throw NotImplementedException("Neutral window field (ABT #1304) on a core with lateral limbs displaced both in x and only in z");
+        throw NotImplementedException("Neutral window field on a core with lateral limbs displaced both in x and only in z");
     }
     auto facesThisWindow = [&](double lateralX) {
         return anyLateralInZOnly ? lateralX == 0 : lateralX > 0;
@@ -1289,7 +1293,7 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
     double lateralReluctanceThisSide = 0;
     for (size_t gapIndex = 0; gapIndex < gapping.size(); ++gapIndex) {
         if (!gapping[gapIndex].get_coordinates()) {
-            throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Neutral window field (ABT #1304): a gap has no coordinates");
+            throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Neutral window field: a gap has no coordinates");
         }
         auto coordinates = gapping[gapIndex].get_coordinates().value();
         if (static_cast<size_t>(core.find_closest_column_index_by_coordinates(coordinates)) != mainColumnIndex) {
@@ -1301,7 +1305,7 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
     }
     const double lateralMmfFraction = inverseLateralReluctance > 0 ? (1 / inverseLateralReluctance) / totalReluctance : 0.0;
     if (lateralMmfFraction > 0 && !(lateralReluctanceThisSide > 0)) {
-        throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Neutral window field (ABT #1304): the core has lateral gaps but none on the lateral limb this window faces");
+        throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Neutral window field: the core has lateral gaps but none on the lateral limb this window faces");
     }
 
     // A gap's slot mouth on the window boundary: its axial extent, clipped to the wall it opens onto.
@@ -1309,7 +1313,7 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
         double yStart = std::max(y0, gapY - gapLength / 2);
         double yEnd = std::min(y1, gapY + gapLength / 2);
         if (!(yEnd > yStart)) {
-            throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Neutral window field (ABT #1304): a gap at y = " + std::to_string(gapY) +
+            throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Neutral window field: a gap at y = " + std::to_string(gapY) +
                                " opens nowhere onto the winding window (y in [" + std::to_string(y0) + ", " + std::to_string(y1) + "])");
         }
         originals.push_back({{wallX, yStart}, {wallX, yEnd}, current});
@@ -1337,7 +1341,7 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
     // it, this side's lateral limb and the two plates its area share.
     const double ferriteMmfFraction = 1 - gapMmfFractionThisWindow;
     if (ferriteMmfFraction < -1e-9) {
-        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field (ABT #1304): the gaps' MMF exceeds the winding's");
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field: the gaps' MMF exceeds the winding's");
     }
     if (ferriteMmfFraction > 1e-12) {
         double lateralAreaTotal = 0;
@@ -1355,7 +1359,7 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
         const double plateThickness = (processedDescription.get_height() - B) / 2;
         const double plateArea = processedDescription.get_depth() * plateThickness;
         if (!(mainArea > 0) || !(lateralAreaThisSide > 0) || !(lateralAreaTotal > 0) || !(plateArea > 0)) {
-            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Neutral window field (ABT #1304): the core's limb sections are not all positive");
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Neutral window field: the core's limb sections are not all positive");
         }
         const double sideFluxShare = lateralAreaThisSide / lateralAreaTotal;
         const double weightMain = B / mainArea;
@@ -1374,7 +1378,7 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
         sum += sheet.current;
     }
     if (std::abs(sum + 1) > 1e-9) {
-        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field (ABT #1304): the wall sources return " +
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field: the wall sources return " +
                                    std::to_string(-sum) + " of the winding MMF instead of all of it");
     }
 
@@ -1382,7 +1386,7 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
     // conductors, so conductors and wall sources are imaged identically.
     const int M = settings.get_magnetic_field_mirroring_dimension();
     if (M < 1) {
-        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Neutral window field (ABT #1304): needs the image lattice (mirroring dimension >= 1)");
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Neutral window field: needs the image lattice (mirroring dimension >= 1)");
     }
     const double corePermeability = core.get_initial_permeability(defaults.ambientTemperature);
     // Same extent as the conductors' lattice (CoilMesherCenterModel), so both are imaged identically.

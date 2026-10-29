@@ -1,7 +1,10 @@
 #include "physical_models/InitialPermeability.h"
+#include "support/MasAccess.h"
 #include "physical_models/AmplitudePermeability.h"
+#include "physical_models/CurveBuildScope.h"
 
 #include "support/Utils.h"
+#include "support/NumberFormat.h"
 
 #include <cmath>
 #include <filesystem>
@@ -19,6 +22,9 @@
 #include <algorithm>
 #include <vector>
 #include <cfloat>
+#include <array>
+#include <cstdint>
+#include <cstring>
 #include <magic_enum.hpp>
 #include "support/Exceptions.h"
 #include "support/Logger.h"
@@ -201,6 +207,90 @@ MagnetisationCurveCache& magnetisation_curve_cache() {
 }
 }
 
+namespace {
+// Loop-invariant hoist for one magnetisation-curve build (see CurveBuildScope.h): the interpolator key, and the Roshen
+// loop inputs, of the material at the curve's temperature. Saved and restored, so nesting and exceptions leave the
+// outer state intact.
+class CurveBuildScopeGuard {
+  public:
+    CurveBuildScopeGuard(const CoreMaterial& coreMaterial, double temperature, std::string interpolatorKey)
+        : _saved(std::move(curve_build::scope)) {
+        curve_build::scope = curve_build::Scope{&coreMaterial, temperature, std::move(interpolatorKey), std::nullopt, std::nullopt};
+    }
+    ~CurveBuildScopeGuard() { curve_build::scope = std::move(_saved); }
+    CurveBuildScopeGuard(const CurveBuildScopeGuard&) = delete;
+    CurveBuildScopeGuard& operator=(const CurveBuildScopeGuard&) = delete;
+
+  private:
+    curve_build::Scope _saved;
+};
+} // namespace
+
+namespace {
+void append_key_bits(std::string& key, double value) {
+    key.append(reinterpret_cast<const char*>(&value), sizeof(double));
+}
+
+void append_key_size(std::string& key, size_t value) {
+    key.append(reinterpret_cast<const char*>(&value), sizeof(size_t));
+}
+
+void append_key_optional(std::string& key, const std::optional<double>& value) {
+    key.push_back(value ? 1 : 0);
+    if (value) {
+        append_key_bits(key, value.value());
+    }
+}
+
+void append_key_point(std::string& key, const PermeabilityPoint& point) {
+    append_key_bits(key, point.get_value());
+    append_key_optional(key, mas_access::frequency_ref(point));
+    append_key_optional(key, mas_access::magnetic_field_dc_bias_ref(point));
+    append_key_optional(key, mas_access::magnetic_field_peak_ref(point));
+    append_key_optional(key, mas_access::magnetic_flux_density_peak_ref(point));
+    append_key_optional(key, mas_access::temperature_ref(point));
+    append_key_optional(key, mas_access::tolerance_ref(point));
+    key.push_back(mas_access::modifiers_ref(point) ? 1 : 0);
+    if (mas_access::modifiers_ref(point)) {
+        const std::string modifiers = json(mas_access::modifiers_ref(point).value()).dump();
+        append_key_size(key, modifiers.size());
+        key += modifiers;
+    }
+}
+
+// Everything the magnetisation curve is built from (see get_magnetisation_curve), length-prefixed so that no two
+// different inputs give one key.
+std::string magnetisation_curve_key(const CoreMaterial& coreMaterial, double temperature, std::optional<double> frequency) {
+    std::string key;
+    const auto& name = coreMaterial.get_name();
+    append_key_size(key, name.size());
+    key += name;
+    const auto& initial = coreMaterial.get_permeability().get_initial();
+    if (std::holds_alternative<PermeabilityPoint>(initial)) {
+        key.push_back('P');
+        append_key_point(key, std::get<PermeabilityPoint>(initial));
+    }
+    else {
+        const auto& points = std::get<std::vector<PermeabilityPoint>>(initial);
+        key.push_back('V');
+        append_key_size(key, points.size());
+        for (const auto& point : points) {
+            append_key_point(key, point);
+        }
+    }
+    const auto& saturation = coreMaterial.get_saturation();
+    append_key_size(key, saturation.size());
+    for (const auto& element : saturation) {
+        append_key_bits(key, element.get_magnetic_field());
+        append_key_bits(key, element.get_magnetic_flux_density());
+        append_key_bits(key, element.get_temperature());
+    }
+    append_key_bits(key, temperature);
+    append_key_optional(key, frequency);
+    return key;
+}
+} // namespace
+
 size_t InitialPermeability::get_magnetisation_curve_cache_size() {
     auto& cache = magnetisation_curve_cache();
     std::lock_guard<std::mutex> lock(cache.mutex);
@@ -210,12 +300,9 @@ size_t InitialPermeability::get_magnetisation_curve_cache_size() {
 std::shared_ptr<const InitialPermeability::MagnetisationCurve> InitialPermeability::get_magnetisation_curve(const CoreMaterial& coreMaterial, double temperature, std::optional<double> frequency) {
     // Keyed on the data the curve is built from, not the name alone (a custom material may reuse a catalogue
     // name): the initial permeability with its modifiers, and the saturation points that set Hsat.
-    json initialPermeabilityJson = std::visit([](const auto& initial) { return json(initial); }, coreMaterial.get_permeability().get_initial());
-    json saturationJson = json(coreMaterial.get_saturation());
-    std::ostringstream keyStream;
-    keyStream.precision(17);
-    keyStream << coreMaterial.get_name() << '|' << initialPermeabilityJson.dump() << '|' << saturationJson.dump() << '|' << temperature << '|' << (frequency ? frequency.value() : -1.0);
-    std::string key = keyStream.str();
+    // The key holds that data bit for bit (stricter than the json dump it replaced, which printed a NaN and an
+    // absent value alike as null); only a point's modifiers, a formula, go in as their json dump.
+    std::string key = magnetisation_curve_key(coreMaterial, temperature, frequency);
 
     auto& cache = magnetisation_curve_cache();
     {
@@ -233,10 +320,14 @@ std::shared_ptr<const InitialPermeability::MagnetisationCurve> InitialPermeabili
         throw InvalidInputException(ErrorCode::INVALID_INPUT, "Material " + coreMaterial.get_name() + " has no positive saturation field strength at " + std::to_string(temperature) + " C to build its magnetisation curve");
     }
     double vacuumPermeability = constants.vacuumPermeability;
+    CurveBuildScopeGuard scope(coreMaterial, temperature, interpolator_cache_key(coreMaterial));
     auto reversiblePermeabilityAt = [&](double fieldStrength) {
         return std::max(1.0, initialPermeability.get_initial_permeability_model_value(coreMaterial, temperature, fieldStrength, frequency));
     };
     auto curve = std::make_shared<MagnetisationCurve>();
+    curve->materialName = coreMaterial.get_name();
+    curve->saturationFluxDensity = Core::get_magnetic_flux_density_saturation(coreMaterial, temperature, false);
+    curve->paramagnetic = is_paramagnetic(coreMaterial, temperature);
     const double firstFieldStrength = 1e-6 * saturationFieldStrength;
     const double lastFieldStrength = 1000 * saturationFieldStrength;
     const double ratio = 1.008;
@@ -290,9 +381,9 @@ double InitialPermeability::get_magnetic_field_dc_bias_for_flux_density(const Co
     // one and go on, while a genuine INVALID_INPUT still stops them (ABT #1534).
     if (refuseAboveSaturation && biasFluxDensity > saturationFluxDensity) {
         throw SaturationException(
-            "The DC bias puts " + std::to_string(biasFluxDensity) + " T in material " + coreMaterial.get_name() +
-            ", above its saturation of " + std::to_string(saturationFluxDensity) + " T at " + std::to_string(temperature) +
-            " °C: no gap holds the target inductance at that bias, fewer turns or a larger core are needed");
+            "The DC bias puts " + format_significant(biasFluxDensity) + " T in " + coreMaterial.get_name() +
+            ", above its saturation flux density of " + format_significant(saturationFluxDensity) + " T at " + format_significant(temperature) +
+            " C: no gap holds the target inductance at that bias. Use fewer turns or a larger core");
     }
 
     auto curve = get_magnetisation_curve(coreMaterial, temperature, frequency);
@@ -376,6 +467,51 @@ std::pair<double, double> InitialPermeability::get_dc_operating_point_for_magnet
     double fraction = (magnetomotiveForce - loadLine(lower)) / (loadLine(upper) - loadLine(lower));
     return {fieldStrengths[lower] + fraction * (fieldStrengths[upper] - fieldStrengths[lower]),
             fluxDensities[lower] + fraction * (fluxDensities[upper] - fluxDensities[lower])};
+}
+
+std::pair<double, double> InitialPermeability::get_magnetomotive_force_for_flux_density(const MagnetisationCurve& curve, double fluxDensity, double effectiveLength, double effectiveArea, double gapReluctance) {
+    if (!(fluxDensity >= 0) || effectiveLength <= 0 || effectiveArea <= 0 || gapReluctance < 0) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "Inverse DC-bias load line needs a non-negative flux density and gap reluctance and positive core dimensions: B " + std::to_string(fluxDensity) +
+            " T, l_e " + std::to_string(effectiveLength) + " m, A_e " + std::to_string(effectiveArea) + " m2, R_gap " + std::to_string(gapReluctance) + " 1/H");
+    }
+    if (fluxDensity == 0) {
+        return {0, 0};
+    }
+    if (curve.paramagnetic) {
+        // mu_r = 1 at every H: the inverse is mu0's at any flux density, the table's end is only where it was
+        // sampled (1000 Hsat(T), a few A/m near the Curie point) (ABT #1942, Alf 2026-10-19).
+        double fieldStrength = fluxDensity / constants.vacuumPermeability;
+        return {fieldStrength, fieldStrength * effectiveLength + fluxDensity * effectiveArea * gapReluctance};
+    }
+    const auto& fieldStrengths = curve.fieldStrength;
+    const auto& fluxDensities = curve.fluxDensity;
+    if (fluxDensity > fluxDensities.back()) {
+        // No extrapolation past the table (1000 Hsat, Alf 2026-10-18): the curve says nothing there.
+        // The numbers as ResultsAnalyzer's findings print them (ABT #2001): these messages are the CORE_SATURATES
+        // finding's reason for a point past the curve at ambient (ABT #2052).
+        auto number = [](double value) {
+            return format_significant(value);
+        };
+        if (fluxDensity > curve.saturationFluxDensity) {
+            throw SaturationException(
+                "It would need a flux density of " + number(fluxDensity) + " T, beyond the end of the magnetisation curve of " +
+                curve.materialName + " (" + number(fluxDensities.back()) + " T at " + format_quantity(fieldStrengths.back(), "A/m") +
+                ", 1000 times its saturation field strength) and above its B_sat of " + number(curve.saturationFluxDensity) +
+                " T: the core is driven far past saturation");
+        }
+        throw MagnetisationCurveExhaustedException("The magnetisation curve of " + curve.materialName + " reaches only " +
+                                 number(fluxDensities.back()) + " T at " + format_quantity(fieldStrengths.back(), "A/m") + ", below the " +
+                                 number(fluxDensity) + " T needed, although that is under its B_sat of " +
+                                 number(curve.saturationFluxDensity) + " T: the DC-bias data of the material disagrees with its "
+                                 "saturation data. Choose another material, or report this material's data");
+    }
+    // B(H) is strictly increasing (mu_rev >= 1); the segment and its linear interpolation are the forward
+    // crossing's, so the two are exact inverses on the table.
+    size_t upper = std::lower_bound(fluxDensities.begin(), fluxDensities.end(), fluxDensity) - fluxDensities.begin();
+    size_t lower = upper - 1;
+    double fieldStrength = fieldStrengths[lower] + (fluxDensity - fluxDensities[lower]) / (fluxDensities[upper] - fluxDensities[lower]) * (fieldStrengths[upper] - fieldStrengths[lower]);
+    return {fieldStrength, fieldStrength * effectiveLength + fluxDensity * effectiveArea * gapReluctance};
 }
 
 double InitialPermeability::has_magnetic_field_dc_bias_dependency(const CoreMaterial& coreMaterial) {
@@ -931,6 +1067,23 @@ std::optional<double> InitialPermeability::get_paramagnetic_temperature(const Co
     return paramagneticTemperature;
 }
 
+bool InitialPermeability::is_paramagnetic(const CoreMaterial& coreMaterial, double temperature) {
+    const auto& initialPermeabilityData = coreMaterial.get_permeability().get_initial();
+    if (std::holds_alternative<PermeabilityPoint>(initialPermeabilityData)) {
+        const auto& point = std::get<PermeabilityPoint>(initialPermeabilityData);
+        if (point.get_value() == 1 && !point.get_modifiers()) {
+            return true;
+        }
+    }
+    // As get_initial_permeability_model_value: mu_i = 1 above the paramagnetic temperature.
+    auto curieTemperature = coreMaterial.get_curie_temperature();
+    if (!curieTemperature || temperature <= curieTemperature.value()) {
+        return false;
+    }
+    auto paramagneticTemperature = get_paramagnetic_temperature(coreMaterial);
+    return paramagneticTemperature && temperature > paramagneticTemperature.value();
+}
+
 std::optional<double> InitialPermeability::get_temperature_table_end(const CoreMaterial& coreMaterial) {
     if (!has_temperature_dependency(coreMaterial)) {
         return std::nullopt;
@@ -1002,8 +1155,113 @@ std::size_t InitialPermeability::hash_permeability(const Permeability& permeabil
     return seed;
 }
 
+namespace {
+// The hashed fields of one permeability point, bit for bit (a stricter equality than the hash's: +0 and -0 differ).
+struct HashedPermeabilityPoint {
+    std::array<std::uint64_t, 7> bits;
+    std::uint8_t engaged;
+    bool operator==(const HashedPermeabilityPoint&) const = default;
+};
+
+std::uint64_t double_bits(double value) {
+    std::uint64_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+// Disengaged when a point carries modifiers (their hash goes through a json dump; those keep the full path).
+std::optional<HashedPermeabilityPoint> hashed_fields(const PermeabilityPoint& point) {
+    if (mas_access::modifiers_ref(point)) {
+        return std::nullopt;
+    }
+    HashedPermeabilityPoint fields{};
+    fields.bits[0] = double_bits(point.get_value());
+    const std::optional<double>* optionals[] = {&mas_access::frequency_ref(point), &mas_access::temperature_ref(point),
+                                                &mas_access::magnetic_field_dc_bias_ref(point), &mas_access::magnetic_field_peak_ref(point),
+                                                &mas_access::magnetic_flux_density_peak_ref(point), &mas_access::tolerance_ref(point)};
+    for (size_t index = 0; index < 6; ++index) {
+        if (*optionals[index]) {
+            fields.engaged |= std::uint8_t(1u << index);
+            fields.bits[index + 1] = double_bits(optionals[index]->value());
+        }
+    }
+    return fields;
+}
+
+// The material's name and hashed fields, or nullopt when a point has modifiers.
+struct InterpolatorKeyInput {
+    std::string name;
+    bool single;
+    std::vector<HashedPermeabilityPoint> points;
+    bool operator==(const InterpolatorKeyInput&) const = default;
+};
+
+std::optional<InterpolatorKeyInput> interpolator_key_input(const CoreMaterial& coreMaterial) {
+    const auto& initial = coreMaterial.get_permeability().get_initial();
+    InterpolatorKeyInput input{coreMaterial.get_name(), std::holds_alternative<PermeabilityPoint>(initial), {}};
+    if (input.single) {
+        auto fields = hashed_fields(std::get<PermeabilityPoint>(initial));
+        if (!fields) {
+            return std::nullopt;
+        }
+        input.points.push_back(fields.value());
+        return input;
+    }
+    const auto& points = std::get<std::vector<PermeabilityPoint>>(initial);
+    input.points.reserve(points.size());
+    for (const auto& point : points) {
+        auto fields = hashed_fields(point);
+        if (!fields) {
+            return std::nullopt;
+        }
+        input.points.push_back(fields.value());
+    }
+    return input;
+}
+// interpolator_key_input(coreMaterial) == input, without building it.
+bool interpolator_key_input_matches(const InterpolatorKeyInput& input, const CoreMaterial& coreMaterial) {
+    const auto& initial = coreMaterial.get_permeability().get_initial();
+    if (input.single != std::holds_alternative<PermeabilityPoint>(initial) || input.name != coreMaterial.get_name()) {
+        return false;
+    }
+    auto matches = [](const HashedPermeabilityPoint& stored, const PermeabilityPoint& point) {
+        auto fields = hashed_fields(point);
+        return fields && fields.value() == stored;
+    };
+    if (input.single) {
+        return matches(input.points.front(), std::get<PermeabilityPoint>(initial));
+    }
+    const auto& points = std::get<std::vector<PermeabilityPoint>>(initial);
+    if (points.size() != input.points.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < points.size(); ++index) {
+        if (!matches(input.points[index], points[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+} // namespace
+
 std::string InitialPermeability::interpolator_cache_key(const CoreMaterial& coreMaterial) {
-    return coreMaterial.get_name() + "#" + std::to_string(hash_permeability(coreMaterial.get_permeability().get_initial()));
+    if (curve_build::scope.material == &coreMaterial) {
+        return curve_build::scope.interpolatorKey;
+    }
+    // A magnetisation curve asks for the key at each of its ~2600 points with the same material. Exact-input memo of
+    // the last material per thread: bit-equal hashed fields give the same hash, so the stored key is the one computed.
+    thread_local std::optional<InterpolatorKeyInput> lastInput;
+    thread_local std::string lastKey;
+    if (lastInput && interpolator_key_input_matches(lastInput.value(), coreMaterial)) {
+        return lastKey;
+    }
+    auto input = interpolator_key_input(coreMaterial);
+    std::string key = coreMaterial.get_name() + "#" + std::to_string(hash_permeability(coreMaterial.get_permeability().get_initial()));
+    if (input) {
+        lastInput = std::move(input);
+        lastKey = key;
+    }
+    return key;
 }
 
 double InitialPermeability::get_initial_permeability_temperature_dependent(const CoreMaterial& coreMaterial, double temperature) {
@@ -1011,7 +1269,20 @@ double InitialPermeability::get_initial_permeability_temperature_dependent(const
     double initialPermeabilityValue = 1;
     // The points are read by index; they are copied only to build the interpolator, once per material.
     const auto& allPoints = std::get<std::vector<PermeabilityPoint>>(coreMaterial.get_permeability().get_initial());
-    const auto temperatureIndexes = get_only_temperature_dependent_indexes(allPoints);
+    // Inside a magnetisation-curve build the indexes of the build's material are found once (CurveBuildScope.h).
+    std::vector<size_t> unscopedIndexes;
+    const std::vector<size_t>* temperatureIndexesPointer;
+    if (curve_build::scope.material == &coreMaterial) {
+        if (!curve_build::scope.temperatureIndexes) {
+            curve_build::scope.temperatureIndexes = get_only_temperature_dependent_indexes(allPoints);
+        }
+        temperatureIndexesPointer = &curve_build::scope.temperatureIndexes.value();
+    }
+    else {
+        unscopedIndexes = get_only_temperature_dependent_indexes(allPoints);
+        temperatureIndexesPointer = &unscopedIndexes;
+    }
+    const auto& temperatureIndexes = *temperatureIndexesPointer;
     if (temperatureIndexes.size() == 0) {
         throw InvalidInputException(ErrorCode::MISSING_DATA, "No temperature dependent points for material: " + coreMaterial.get_name());
     }
@@ -1076,7 +1347,12 @@ double InitialPermeability::get_initial_permeability_temperature_dependent(const
     if (temperature < tabulatedMinimum || temperature > tabulatedMaximum) {
         MaterialTemperatureOutOfRangeException outOfRange(coreMaterial.get_name(), temperature, tabulatedMinimum,
                                                           tabulatedMaximum, curieTemperature);
-        if (!material_data_extrapolation_allowed(outOfRange.what())) {
+        if (!material_data_extrapolation_allowed(
+                "Material " + coreMaterial.get_name() + ": its initial permeability is tabulated from " +
+                    format_significant(tabulatedMinimum) + " C to " + format_significant(tabulatedMaximum) +
+                    " C; outside that range the table is extrapolated",
+                "asked at " + format_significant(temperature) + " C, " +
+                    (temperature < tabulatedMinimum ? "below" : "above") + " that range")) {
             throw outOfRange;
         }
     }
@@ -1195,8 +1471,23 @@ double InitialPermeability::get_initial_permeability_magnetic_field_dc_bias_depe
         initialPermeabilityValue = std::get<double>(initialPermeabilityMagneticFieldDcBiasInterps[cacheKey]);
     }
     else {
-        auto value = std::get<tk::spline>(initialPermeabilityMagneticFieldDcBiasInterps[cacheKey])(magneticFieldDcBias);
-        initialPermeabilityValue = std::max(1., value);
+        const auto& interp = std::get<tk::spline>(initialPermeabilityMagneticFieldDcBiasInterps[cacheKey]);
+        double tableEnd = interp.get_x_max();
+        if (magneticFieldDcBias > tableEnd) {
+            // Past the last tabulated bias the core is taken as fully saturated: mu_r = 1, the vacuum
+            // value. The spline through the table is not a model of the material there, so it is not
+            // evaluated (it used to be, and its value floored to 1).
+            return 1;
+        }
+        initialPermeabilityValue = interp(magneticFieldDcBias);
+        if (!std::isfinite(initialPermeabilityValue) || initialPermeabilityValue < 1) {
+            throw MaterialException(ErrorCode::MATERIAL_INVALID_PROPERTY,
+                                    "Material " + coreMaterial.get_name() + ": initial permeability at a DC bias of " +
+                                    std::to_string(magneticFieldDcBias) + " A/m evaluates to " + std::to_string(initialPermeabilityValue) +
+                                    ", which is not a relative permeability (finite and at least 1); its mu(H_dc) table runs from " +
+                                    std::to_string(interp.get_x_min()) + " A/m to " + std::to_string(tableEnd) + " A/m",
+                                    coreMaterial.get_name());
+        }
     }
 
     if (std::isnan(initialPermeabilityValue)) {

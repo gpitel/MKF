@@ -9,6 +9,8 @@
 #include "processors/Inputs.h"
 #include "processors/MagneticSimulator.h"
 #include "processors/ResultsAnalyzer.h"
+#include "physical_models/MagnetizingInductance.h"
+#include "support/Exceptions.h"
 #include "physical_models/StrayCapacitance.h"
 #include <magic_enum.hpp>
 #include "TestingUtils.h"
@@ -1858,7 +1860,7 @@ TEST_CASE("Test_CoilAdviser_Random_11", "[adviser][coil-adviser][bug]") {
     }
 
     Logger::getInstance().disableCollector();
-    Logger::getInstance().enableCollector(LogLevel::WARNING);
+    Logger::getInstance().enableCollector(LogLevel::DEBUG);  // a coil rejected for saturation is a DEBUG trace
     Logger::getInstance().drainCollected();
     CoilAdviser coilAdviser;
     auto masMagneticsWithCoil = coilAdviser.get_advised_coil(masMagnetic, 2);
@@ -2229,7 +2231,7 @@ TEST_CASE("Test_SectionsAdviser_Web_2", "[adviser][coil-adviser][bug][smoke-test
 }
 
 TEST_CASE("Test_CoilAdviser_Web_3", "[adviser][coil-adviser][bug][smoke-test]") {
-    auto json_path_2049 = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "test_coiladviser_web_3_2049.json");
+    auto json_path_2049 = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "test_coiladviser_web_3_2049_migrated_voltage.json");
     std::ifstream json_file_2049(json_path_2049);
     OpenMagnetics::Mas mas(json::parse(json_file_2049));
 
@@ -2248,7 +2250,7 @@ TEST_CASE("Test_CoilAdviser_Web_3", "[adviser][coil-adviser][bug][smoke-test]") 
 }
 
 TEST_CASE("Test_CoilAdviser_Web_4", "[adviser][coil-adviser][bug][smoke-test]") {
-    auto json_path_2064 = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "test_coiladviser_web_4_2064.json");
+    auto json_path_2064 = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "test_coiladviser_web_4_2064_migrated_voltage.json");
     std::ifstream json_file_2064(json_path_2064);
     OpenMagnetics::Mas mas(json::parse(json_file_2064));
 
@@ -2280,7 +2282,7 @@ TEST_CASE("Test_CoilAdviser_Web_4", "[adviser][coil-adviser][bug][smoke-test]") 
 
 TEST_CASE("Test_CoilAdviser_Web_5", "[adviser][coil-adviser][bug][smoke-test]") {
     settings.reset();
-    auto json_path_2093 = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "test_coiladviser_web_5_2093.json");
+    auto json_path_2093 = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "test_coiladviser_web_5_2093_migrated_voltage.json");
     std::ifstream json_file_2093(json_path_2093);
     OpenMagnetics::Mas mas(json::parse(json_file_2093));
 
@@ -3135,7 +3137,10 @@ TEST_CASE("Test_CoilAdviser_Web_Default_Two_Winding_PQ2715", "[adviser][coil-adv
     // windings. The core adviser picks PQ 27/15 Fair-Rite 95, 13 + 13 turns, and "Advise all"
     // (calculate_advised_coil) answered "No coil found". 26 turns of a 2.9 A rms winding fit a
     // 4.55 x 4.59 mm window many times over. Same preparation as the web entry point.
-    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "default_two_winding_pq2715_no_coil_found.json");
+    // The voltages are the captured ones as the web migrates them on load today (the legacy
+    // -20.5 / +70.5 V default and the 0 / -100 V reflection become +-50 V, ABT #1719); the
+    // captured file keeps them for the up-front rejection test below.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "default_two_winding_pq2715_no_coil_found_migrated_voltage.json");
     std::ifstream file(path);
     REQUIRE(file.good());
     OpenMagnetics::Mas mas(json::parse(file));
@@ -3220,12 +3225,12 @@ TEST_CASE("Test_CoilAdviser_Unbalanced_Voltage_Rejected_Before_Winding", "[advis
     }
     settings.reset();
     INFO(message);
-    REQUIRE(message.find("Adviser inputs are invalid: operating point 0") != std::string::npos);
-    CHECK(message.find("winding 0 ('Primary')") != std::string::npos);
+    REQUIRE(message.find("Adviser inputs are invalid: operating point 'Op. Point No. 1'") != std::string::npos);
+    CHECK(message.find("primary winding 'Primary'") != std::string::npos);
     // The captured primary is -20.5 / +70.5 V at 50 % duty: a mean of +25 V.
-    auto meanPosition = message.find("not volt-second balanced (mean ");
+    auto meanPosition = message.find("not volt-second balanced: its mean of ");
     REQUIRE(meanPosition != std::string::npos);
-    double reportedMean = std::stod(message.substr(meanPosition + std::string("not volt-second balanced (mean ").size()));
+    double reportedMean = std::stod(message.substr(meanPosition + std::string("not volt-second balanced: its mean of ").size()));
     CHECK_THAT(reportedMean, Catch::Matchers::WithinAbs(25, 0.5));
 }
 
@@ -3518,8 +3523,8 @@ TEST_CASE("Test_CoilAdviser_Coils_Whose_Losses_Cannot_Be_Evaluated_Are_Dropped_F
     INFO(log);
     REQUIRE(masMagneticsWithCoil.size() == 1);
     CHECK(log.find("dropped from the loss ranking") != std::string::npos);
-    CHECK(log.find("(material 67, frequency 100000.000000 Hz)") != std::string::npos);
-    CHECK(log.find("Steinmetz loss coefficients are fitted over 2000000.000000 Hz to 20000000.000000 Hz") != std::string::npos);
+    CHECK(log.find("(material 67, frequency 100 kHz)") != std::string::npos);
+    CHECK(log.find("Steinmetz loss coefficients are fitted from 2 MHz to 20 MHz") != std::string::npos);
     CHECK(log.find("could be ranked by losses; returning them in winding order, unranked") != std::string::npos);
 }
 
@@ -3832,7 +3837,7 @@ TEST_CASE("Test_CoilAdviser_Web_Flyback_97_Advise_All_Coil_Stays_In_Its_Window",
         auto outside = OpenMagneticsTesting::turns_outside_winding_window(magnetic.get_mutable_coil());
         REQUIRE(!outside.empty());
         CHECK(outside.back().find("Secondary 0 parallel 1 turn 4") == 0);
-        CHECK_THROWS_WITH(simulate_like_the_web_builder(inputs, magnetic), Catch::Matchers::ContainsSubstring("overlaps its enclosure"));
+        CHECK_THROWS_WITH(simulate_like_the_web_builder(inputs, magnetic), Catch::Matchers::ContainsSubstring("the coil does not fit in its window"));
     }
 
     // The adviser's own coil fits (2 Secondary layers, 4.237 mm of the 4.25 mm window).
@@ -3889,5 +3894,176 @@ TEST_CASE("Test_CoilAdviser_Web_Flyback_97_Advise_All_Coil_Stays_In_Its_Window",
     to_json(stored, magnetic);
     OpenMagnetics::Magnetic reloaded(stored);
     CHECK_NOTHROW(simulate_like_the_web_builder(masMagneticsWithCoil[0].get_inputs(), reloaded));
+    settings.reset();
+}
+
+TEST_CASE("Test_CoilAdviser_Web_Flyback_97_Advise_All_Builder_Rewind_Stays_In_Its_Window", "[adviser][coil-adviser][coil][bug][abt-2116]") {
+    // ABT #2116: the web's flyback on material 97 (EQ 26/19/7, 0.18 mm gap), wire "Advise all", then the
+    // builder's re-wind of the advised coil. The adviser lays the Secondary's 5 turns x 2 parallels of
+    // 1.02 mm litz in 2 layers of 5 (2.04 mm), the Primary's 42 turns of 0.483 mm in 4 layers
+    // (1.932 mm): with the 0.1 mm insulation between them and the 0.1 mm wrap, 4.172 mm of the
+    // 4.25 mm window. The builder re-derives the split from the section widths (49/51) and re-winds.
+    // That split leaves the Secondary 2.0175 mm, short of its two layers, and try_rewind re-planned
+    // the window without the wrap that ABT #2110 carves out of the last section: the new split was
+    // 0.1 mm short, the whole-layer re-split read 4.150 mm for 4.172 mm, and the wind-even-if-not-fit
+    // re-wind laid the Secondary in 3 layers of 4 turns, filling 2.0, 0.84 mm past the window. The
+    // thermal network then refused it ('overlaps the core window edge by 0.942000 mm').
+    auto mas = load_web_advise_all("flyback_97_calculate_advised_coil.json");
+    CoilAdviser coilAdviser;
+    auto masMagneticsWithCoil = coilAdviser.get_advised_coil(mas, 1);
+    INFO(coilAdviser.get_last_no_results_reason().value_or("returned results"));
+    REQUIRE(masMagneticsWithCoil.size() == 1);
+    auto advisedCoil = masMagneticsWithCoil[0].get_magnetic().get_coil();
+
+    auto checkFits = [](OpenMagnetics::Coil& coil) {
+        REQUIRE(coil.get_sections_description());
+        const auto sections = coil.get_sections_description().value();
+        for (const auto& section : sections) {
+            if (section.get_type() != ElectricalType::CONDUCTION) {
+                continue;
+            }
+            INFO(section.get_name());
+            REQUIRE(section.get_filling_factor());
+            CHECK(section.get_filling_factor().value() <= 1);
+        }
+        for (const auto& turn : OpenMagneticsTesting::turns_outside_winding_window(coil)) {
+            INFO(turn);
+            CHECK(false);
+        }
+    };
+
+    // The adviser's own coil fits and simulates.
+    checkFits(advisedCoil);
+    CHECK_NOTHROW(simulate_like_the_web_builder(masMagneticsWithCoil[0].get_inputs(), masMagneticsWithCoil[0].get_magnetic()));
+
+    // The builder's split: whole percents of the advised sections' widths, largest remainder first
+    // (BasicCoilSelector). The case needs the 49/51 that leaves the Secondary short of its layers.
+    std::vector<double> widths(advisedCoil.get_functional_description().size(), 0);
+    const auto advisedSections = advisedCoil.get_sections_description().value();
+    for (const auto& section : advisedSections) {
+        if (section.get_type() == ElectricalType::CONDUCTION) {
+            widths[advisedCoil.get_winding_index_by_name(section.get_partial_windings()[0].get_winding())] += section.get_dimensions()[0];
+        }
+    }
+    const double totalWidth = widths[0] + widths[1];
+    std::vector<double> percents;
+    std::vector<std::pair<double, size_t>> remainders;
+    for (size_t windingIndex = 0; windingIndex < widths.size(); ++windingIndex) {
+        const double exact = widths[windingIndex] / totalWidth * 100;
+        percents.push_back(std::floor(exact));
+        remainders.push_back({exact - std::floor(exact), windingIndex});
+    }
+    std::sort(remainders.begin(), remainders.end(), std::greater<>());
+    for (size_t missing = 100 - size_t(percents[0] + percents[1]), k = 0; k < missing; ++k) {
+        percents[remainders[k].second] += 1;
+    }
+    REQUIRE(percents[0] == 49);
+    REQUIRE(percents[1] == 51);
+
+    // The re-wind as WebLibMKF wind_impl does it (see [abt-1896]).
+    settings.set_coil_wind_even_if_not_fit(true);
+    settings.set_coil_delimit_and_compact(true);
+    settings.set_coil_include_additional_coordinates(true);
+    OpenMagnetics::Coil coil;
+    coil.set_bobbin(advisedCoil.get_bobbin());
+    coil.set_functional_description(advisedCoil.get_functional_description());
+    coil.preload_margins({{0, 0}, {0, 0}});
+    coil.set_turns_alignment(CoilAlignment::CENTERED, "Primary section 0");
+    coil.set_turns_alignment(CoilAlignment::CENTERED, "Secondary 0 section 0");
+    coil.set_layers_orientation(WindingOrientation::OVERLAPPING, "Primary section 0");
+    coil.set_layers_orientation(WindingOrientation::OVERLAPPING, "Secondary 0 section 0");
+    coil.set_interlayer_insulation(0, std::nullopt, std::nullopt, false);
+    coil.set_intersection_insulation(0.0001, 1, std::nullopt, std::nullopt, false);
+    CHECK(coil.wind({percents[0] / 100, percents[1] / 100}, {0, 1}, 1));
+    REQUIRE(coil.get_turns_description());
+    coil.delimit_and_compact();
+    checkFits(coil);
+    CHECK(coil.get_layers_by_winding_index(1).size() == 2);
+
+    // The builder simulates the re-wound coil from its stored form; the thermal network takes it.
+    auto magnetic = masMagneticsWithCoil[0].get_magnetic();
+    magnetic.set_coil(coil);
+    json stored;
+    to_json(stored, magnetic);
+    OpenMagnetics::Magnetic reloaded(stored);
+    CHECK_NOTHROW(simulate_like_the_web_builder(masMagneticsWithCoil[0].get_inputs(), reloaded));
+    settings.reset();
+}
+
+TEST_CASE("Test_CoilAdviser_Rejects_A_Coil_Whose_Core_Saturates_Past_Its_Curve_Instead_Of_Failing_The_Advise",
+          "[adviser][coil-adviser][bug][abt-2052]") {
+    // ABT #2052: the web's flyback on material 97 (EQ 26/19/7, 0.2 mm gap, 42:5), wire "Advise all", with its primary
+    // carrying 20 times its volt-seconds: the same waveforms, voltages and currents, at a twentieth of the frequency.
+    // (Scaling the voltage instead is refused by IEC 60664-1 above 1 kV rms, before anything is wound.) Faraday's flux
+    // density for those volt-seconds lies past the end of 97's magnetisation curve and above B_sat, so the
+    // magnetizing model's inverse refuses it (SaturationException, CALCULATION_CORE_SATURATES; the web saw "6.28 T
+    // asked of material 97"). The loss ranking rethrew it and the whole advise failed. It is a verdict on the coil, as
+    // the ranking's saturation check is: each such coil is rejected with its reason, and the advise returns.
+    auto mas = load_web_advise_all("flyback_97_calculate_advised_coil.json");
+    {
+        // A new design built here from the fixture: the same magnetic and waveforms, at 100 kHz / 20.
+        const double slowdown = 20;
+        auto stretched = [slowdown](SignalDescriptor signal, double frequency) {
+            auto waveform = signal.get_waveform().value();
+            REQUIRE(waveform.get_time());
+            auto time = waveform.get_time().value();
+            for (auto& instant : time) {
+                instant *= slowdown;
+            }
+            waveform.set_time(time);
+            auto sampledWaveform = OpenMagnetics::Inputs::calculate_sampled_waveform(waveform, frequency);
+            signal.set_waveform(waveform);
+            signal.set_harmonics(OpenMagnetics::Inputs::calculate_harmonics_data(waveform, sampledWaveform, frequency));
+            auto processed = OpenMagnetics::Inputs::calculate_processed_data(signal, sampledWaveform, true);
+            processed.set_label(signal.get_processed()->get_label());
+            signal.set_processed(processed);
+            return signal;
+        };
+        auto operatingPoints = mas.get_inputs().get_operating_points();
+        REQUIRE(operatingPoints.size() == 1);
+        for (auto& excitation : operatingPoints[0].get_mutable_excitations_per_winding()) {
+            REQUIRE(excitation.get_frequency() == 100000);
+            REQUIRE(excitation.get_voltage());
+            REQUIRE(excitation.get_current());
+            REQUIRE(!excitation.get_magnetizing_current());
+            const double frequency = excitation.get_frequency() / slowdown;
+            excitation.set_frequency(frequency);
+            excitation.set_voltage(stretched(excitation.get_voltage().value(), frequency));
+            excitation.set_current(stretched(excitation.get_current().value(), frequency));
+        }
+        mas.get_mutable_inputs().set_operating_points(operatingPoints);
+    }
+    {
+        // The premise: the magnetizing model refuses the flux density of that voltage as past the curve, above B_sat.
+        auto operatingPoint = mas.get_inputs().get_operating_points()[0];
+        auto magnetic = mas.get_magnetic();
+        MagnetizingInductance magnetizingInductanceModel;
+        magnetizingInductanceModel.set_topology(mas.get_inputs().get_design_requirements().get_topology());
+        CHECK_THROWS_MATCHES(magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(magnetic, &operatingPoint),
+                             SaturationException,
+                             Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("beyond the end of the magnetisation curve") &&
+                                                             Catch::Matchers::ContainsSubstring("magnetisation curve of 97")));
+    }
+
+    // A coil rejected for saturation is a DEBUG trace, so the run is collected at DEBUG; read_log() only hands
+    // back WARNING and above. Restarting the collector drains it, so the assertions below see only this run.
+    Logger::getInstance().disableCollector();
+    Logger::getInstance().enableCollector(LogLevel::DEBUG);
+    CoilAdviser coilAdviser;
+    std::vector<OpenMagnetics::Mas> masMagneticsWithCoil;
+    REQUIRE_NOTHROW(masMagneticsWithCoil = coilAdviser.get_advised_coil(mas, 1));
+    std::string log;
+    for (const auto& record : Logger::getInstance().drainCollected()) {
+        log += record.message + "\n";
+    }
+    Logger::getInstance().disableCollector();
+    INFO(log);
+    INFO(coilAdviser.get_last_no_results_reason().value_or("returned results"));
+    CHECK(log.find("(material 97, ") != std::string::npos);
+    CHECK(log.find(") rejected: its core saturates: ") != std::string::npos);
+    CHECK(log.find("beyond the end of the magnetisation curve") != std::string::npos);
+    CHECK(log.find("ABT #") == std::string::npos);
+    // Not asserted: with every ranked coil rejected, the advise searches again beyond the wire limits; that search
+    // winds too few coils to rank, so they are not loss-evaluated and are returned as wound, saturating or not.
     settings.reset();
 }

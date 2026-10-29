@@ -25,10 +25,20 @@ namespace OpenMagnetics {
 // strength it read the material's permeability at, with the temperature and frequency of that reading.
 // ResultsAnalyzer::check_saturation asks the material's permeability model there whether it has collapsed
 // to the vacuum's (Alf, 2026-10-14: the second saturation criterion, main's old throw condition).
+// When the model read B on the magnetisation curve sample by sample (a unipolar DCM magnetizing current, ABT
+// #1942), its B peak sits on the curve and rises only on the vacuum slope past the knee, so B_sat alone does not
+// see a core driven past it: the point then also carries the peak field strength the curve gave, which
+// check_saturation holds against the material's H_sat (Alf, 2026-10-18). Empty on every other path.
 struct DcBiasPoint {
     double magneticFieldDcBias;
     double temperature;
     double frequency;
+    std::optional<double> peakMagneticFieldStrength;
+    // The DC solve found no operating point: its bracket closed on a jump of the biased permeability (a DC-bias
+    // table that ends in the step to the saturated mu_r = 1), not on a root, and the model took the saturated
+    // mu_r = 1. The bias above is the one at mu_r = 1, which need not lie past the knee; check_saturation flags
+    // the point saturated on this mark (Alf, 2026-10-24).
+    bool noDcOperatingPoint = false;
 };
 
 class MagnetizingInductance {
@@ -268,7 +278,7 @@ class MagnetizingInductance {
      * @brief Calculate peak magnetic flux density from a volt-second
      *        excursion (non-sinusoidal-safe).
      *
-     * Faraday's law: B_peak = max|∫V dt| / (N · A_e). Use this when the
+     * Faraday's law: B_peak = λ_pk / (N · A_e), λ_pk = half the peak-to-peak of ∫V dt. Use this when the
      * voltage waveform is non-sinusoidal (DAB square wave, CLLLC trapezoid,
      * …) — the sinusoidal `calculate_flux_density_peak_from_voltage`
      * underestimates B_peak by ~36 % on those because it assumes
@@ -277,8 +287,8 @@ class MagnetizingInductance {
      *
      * @param core            Core with effective area
      * @param numberTurns     Number of primary turns
-     * @param maxVoltSeconds  Peak excursion of the running ∫V dt integral,
-     *                        in volt-seconds
+     * @param maxVoltSeconds  Peak flux linkage (half the peak-to-peak of the
+     *                        running ∫V dt over a period), in volt-seconds
      * @return double         Peak magnetic flux density in Tesla, or 0 if
      *                        N or A_e is zero/missing
      */
@@ -296,7 +306,7 @@ class MagnetizingInductance {
      * smallest integer N that keeps B_peak ≤ B_max for the given V·s.
      *
      * @param core            Core with effective area
-     * @param maxVoltSeconds  Peak excursion of ∫V dt, in volt-seconds
+     * @param maxVoltSeconds  Peak flux linkage (half the peak-to-peak of ∫V dt), in volt-seconds
      * @param maxFluxDensity  Maximum allowed B_peak in Tesla (typically
      *                        defaults.maximumProportionMagneticFluxDensitySaturation
      *                        × B_sat at operating temperature)

@@ -1258,7 +1258,13 @@ TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_Two_Windings","[adviser][co
     // the 20 asked for, so the stacked search runs too and adds ETD 34 - 3C97 - Gapped 0.2 mm.
     // get_advised_core now MERGES both searches instead of returning only the stacked one,
     // which had culled the first search's 9 by its cost/size pre-loss cap and returned 1.
-    REQUIRE(masMagnetics.size() == 10);
+    // Re-pinned 2026-10-25, 10 -> 11 (Alf, ABT #1469 + ABT #2070): the design is now told a
+    // transformer from its waveforms (the secondary carries out the power the primary takes in),
+    // so the seeder sizes N = max(N_Phi, N_L), and N_Phi uses the PEAK flux linkage Vpk/w (the
+    // volt-seconds used to be its peak-to-peak, doubling N_Phi and ballooning the gap for 100 uH).
+    // Result: main's 10 plus ETD 34 - 3C97 - Gapped 0.5 mm, all at N = 20 (first search 9,
+    // stacked search 4, merged).
+    REQUIRE(masMagnetics.size() == 11);
 
     // Verify all results are non-toroidal (by name pattern) and have valid scores
     for (auto& [mas, scoring] : masMagnetics) {
@@ -2895,7 +2901,7 @@ TEST_CASE("Test_CoreAdviser_Flyback_From_Frontend_Inputs", "[adviser][core-advis
     // offset is a required field, a plain double the generated class leaves uninitialised: a
     // processed block built by hand must set it, or the flyback magnetizing current is built on
     // whatever the heap held (ABT #1755: 54 A instead of 2.3 A, 0 cores, only after some other
-    // tests had run). 0 is what Inputs' calculate_offset gives these labels and waveforms: the
+    // tests had run). 0 is what WaveformProcessor's calculate_offset gives these labels and waveforms: the
     // first sample for FLYBACK_PRIMARY, the last for FLYBACK_SECONDARY, 0 for RECTANGULAR.
     ProcessedWaveform currentProcessed;
     currentProcessed.set_label(WaveformLabel::FLYBACK_PRIMARY);
@@ -3656,7 +3662,7 @@ TEST_CASE("Test_CoreAdviser_RejectsWindingKillingGaps", "[adviser][core-adviser]
         if (gapping.empty()) {
             continue;  // ungapped / toroidal: no fringing concern
         }
-        double fringingFactor = reluctanceModel->get_gap_reluctance(gapping[0]).get_fringing_factor();
+        double fringingFactor = reluctanceModel->get_gap_reluctance(gapping[0], core.get_magnetic_flux_density_saturation(true)).get_fringing_factor();
         INFO("core=" << core.get_name().value_or("?")
              << " centralGap=" << gapping[0].get_length() * 1000.0 << "mm"
              << " fringingFactor=" << fringingFactor);
@@ -3801,6 +3807,7 @@ TEST_CASE("Test_CoreAdviser_Standard_Cores_Respect_Every_Axis_Of_Maximum_Dimensi
 // loss points only) is simply not evaluable.
 TEST_CASE("Test_Loss_Model_Frequency_Span_Judges_The_Model_That_Runs", "[adviser][core-adviser][abt-1456]") {
     settings.reset();
+    settings.set_allow_material_data_extrapolation(false);  // the default is on since Alf, 2026-10-25
     auto inputs = OpenMagneticsTesting::create_quick_test_inputs();  // 100 kHz
     for (std::string grade : {"2HM4", "75-Series 26"}) {
         INFO(grade);
@@ -3871,6 +3878,7 @@ TEST_CASE("Test_Loss_Model_Frequency_Span_Honours_An_Explicit_Model_Request", "[
 TEST_CASE("Test_CoreAdviser_Ferrite_Pool_Drops_MHz_Grades_Out_Of_Span_At_100kHz", "[adviser][core-adviser][abt-1456]") {
     settings.reset();
     clear_databases();
+    settings.set_allow_material_data_extrapolation(false);  // the default is on since Alf, 2026-10-25
     settings.set_preferred_core_material_ferrite_manufacturer("No such manufacturer (ABT #1456)");
 
     const std::vector<std::string> mhzGrades = {"TP5H", "KL9F", "DMR52W", "DMR51W", "KL7F", "KL11F", "DMR52", "P61", "P63"};
@@ -4264,9 +4272,15 @@ static std::map<CoreAdviser::CoreAdviserFilters, double> abt1875_weights() {
 
 TEST_CASE("Test_CoreAdviser_Seeding_Regaps_A_Turns_Solve_Refusal", "[adviser][core-adviser][abt-1875]") {
     // The 225 uH DCM flyback on 95 E 10/5.5/5, 4 stacks, at the 0.087 mm gap the standard-cores
-    // gapping gave it: the turns solve meets saturation at 20 turns (B peak 0.64 T above 0.478 T)
-    // and refuses. The seeder's saturation-aware re-gap raises N and re-solves the gap (IMPACT.md:
-    // 42 turns, 0.6 mm, B peak 0.30 T). Before ABT #1875 the refusal dropped the candidate first.
+    // gapping gave it: the turns solve meets saturation and refuses. The seeder's saturation-aware
+    // re-gap raises N and re-solves the gap. Before ABT #1875 the refusal dropped the candidate first.
+    // Premise moved by ABT #1942 (approved by Alf, 2026-10-18): it used to refuse at 20 turns on a
+    // 0.64 T B peak, which was the DC floor the small-signal superposition put under a current that
+    // comes back to zero (the re-gap then kept 42 turns, 0.6 mm, B peak 0.30 T). B now rises from zero
+    // each cycle (Faraday, the current read back on the curve) and the solve refuses at 32 turns: B
+    // peaks at 0.395 T, under B_sat 0.478 T at 40 C, but material 95's curve at 40 C carries that flux
+    // only at H = 23.2 kA/m, far past its H_sat of 397 A/m (the peak-H criterion of check_saturation).
+    // The re-gap keeps 97 turns at a B peak of 0.13 T.
     settings.reset();
     clear_databases();
     auto inputs = pre_process_inputs(load_abt1875_inputs("Test_Magnetizing_Current_Dcm_Flyback_Balanced.json"));
@@ -4278,6 +4292,7 @@ TEST_CASE("Test_CoreAdviser_Seeding_Regaps_A_Turns_Solve_Refusal", "[adviser][co
     // The refusal says at how many turns it refused, as a typed field.
     MagnetizingInductance magnetizingInductance;
     std::optional<int64_t> refusedTurns;
+    std::string refusal;
     {
         OpenMagnetics::Inputs solveInputs(inputs);
         try {
@@ -4286,10 +4301,11 @@ TEST_CASE("Test_CoreAdviser_Seeding_Regaps_A_Turns_Solve_Refusal", "[adviser][co
         }
         catch (const SaturationException& e) {
             refusedTurns = e.number_turns();
+            refusal = e.what();
         }
     }
     REQUIRE(refusedTurns);
-    INFO("refused at " << refusedTurns.value() << " turns");
+    INFO("refused at " << refusedTurns.value() << " turns: " << refusal);
 
     add_initial_turns_by_inductance(&magnetics, inputs);
     REQUIRE(magnetics.size() == 1);
@@ -4301,6 +4317,39 @@ TEST_CASE("Test_CoreAdviser_Seeding_Regaps_A_Turns_Solve_Refusal", "[adviser][co
     OpenMagnetics::Inputs checkInputs(inputs);
     auto [saturates, message] = magnetizingInductance.check_sizing_saturation(magnetic.get_core(), magnetic.get_coil(), numberTurns, &checkInputs);
     INFO(message);
+    CHECK_FALSE(saturates);
+    settings.reset();
+}
+
+TEST_CASE("Test_CoreAdviser_Seeding_Regaps_A_Current_Given_Without_A_Processed_Peak", "[adviser][core-adviser][abt-1883]") {
+    // The ABT #1875 refusal above, with the current's processed 'peak' removed (as inputs that give a
+    // peak-to-peak and an offset arrive). The seeder read the missing peak as 0 A, so its
+    // saturation-aware re-gap never ran and the refused candidate was dropped.
+    settings.reset();
+    clear_databases();
+    auto inputs = pre_process_inputs(load_abt1875_inputs("Test_Magnetizing_Current_Dcm_Flyback_Balanced.json"));
+    for (auto& operatingPoint : inputs.get_mutable_operating_points()) {
+        auto& excitation = operatingPoint.get_mutable_excitations_per_winding()[0];
+        auto current = excitation.get_current().value();
+        REQUIRE(current.get_processed());
+        REQUIRE(current.get_waveform());
+        auto processed = current.get_processed().value();
+        processed.set_peak(std::nullopt);
+        current.set_processed(processed);
+        excitation.set_current(current);
+    }
+    std::vector<OpenMagnetics::Core> cores = {OpenMagneticsTesting::get_quick_core("E 10/5.5/5", OpenMagneticsTesting::get_ground_gap(8.72791e-05), 4, "95")};
+    CoreAdviser coreAdviser;
+    auto magnetics = coreAdviser.create_magnetic_dataset(inputs, &cores, false);
+    REQUIRE(magnetics.size() == 1);
+    add_initial_turns_by_inductance(&magnetics, inputs);
+    REQUIRE(magnetics.size() == 1);
+    auto magnetic = magnetics[0].first;
+    int64_t numberTurns = magnetic.get_coil().get_functional_description()[0].get_number_turns();
+    OpenMagnetics::Inputs checkInputs(inputs);
+    MagnetizingInductance magnetizingInductance;
+    auto [saturates, message] = magnetizingInductance.check_sizing_saturation(magnetic.get_core(), magnetic.get_coil(), numberTurns, &checkInputs);
+    INFO("kept with " << numberTurns << " turns: " << message);
     CHECK_FALSE(saturates);
     settings.reset();
 }
@@ -4319,6 +4368,23 @@ TEST_CASE("Test_CoreAdviser_Temperature_Walk_Counts_Parts_Post_Processing_Keeps"
     coreAdviser.set_mode(CoreAdviser::CoreAdviserModes::STANDARD_CORES);
     auto results = coreAdviser.get_advised_core(inputs, abt1875_weights(), 10);
     CHECK(results.size() == 10);
+    settings.reset();
+}
+
+TEST_CASE("Test_MagneticAdviser_Huge_Losses_Ferrite_Energy_Cull_Keeps_Windable_Cores", "[adviser][core-adviser][abt-1891]") {
+    // huge_losses, MagneticAdviser, 5 asked. After ABT #1875 the rescued cheap ferrite cores that
+    // cannot store the inductor's energy outscored the cores that can in the pre-loss prune, so
+    // every core the MagneticAdviser wound failed its temperature and it returned nothing. The
+    // ferrite path's EnergyStored cull (ABT #1891) drops them before the prune; the gate run gave
+    // 4 designs (top 98 E 31/13/9, 2 stacks).
+    settings.reset();
+    clear_databases();
+    settings.set_coil_delimit_and_compact(true);
+    auto inputs = load_abt1875_inputs("huge_losses.json");
+    MagneticAdviser magneticAdviser;
+    auto results = magneticAdviser.get_advised_magnetic(inputs, 5);
+    INFO(results.size() << " designs");
+    CHECK(results.size() >= 3);
     settings.reset();
 }
 
@@ -4372,5 +4438,111 @@ TEST_CASE("Test_CoreAdviser_AreaProduct_First_Cull_Copies_Only_Kept_Survivors", 
     // Every survivor's scoring is still recorded, the dropped ones included.
     CHECK(keptScorings == allScorings);
     CHECK(source.size() == cores.size());
+    settings.reset();
+}
+
+// ABT #1469 guards: with no topology, the categorical choices read magnetic_role (here the storage
+// ratio from the voltages and currents), never the shape of the magnetizing-inductance tolerance.
+TEST_CASE("Test_CoreAdviser_Min_Only_Lm_Flyback_Without_Topology_Is_Gapped", "[adviser][core-adviser][abt-1469]") {
+    // The #1467 balanced DCM flyback (42:6, 100 kHz, no topology) asked for "at least 225 uH". A
+    // minimum-only magnetizing inductance used to read as a transformer's, so the gapping stage left
+    // the core ungapped; the flyback stores its energy in a gap.
+    settings.reset();
+    clear_databases();
+    auto inputs = load_abt1875_inputs("Test_Magnetizing_Current_Dcm_Flyback_Balanced.json");
+    REQUIRE_FALSE(inputs.get_design_requirements().get_topology());
+    MAS::DimensionWithTolerance minimumOnly;
+    minimumOnly.set_minimum(225e-6);
+    inputs.get_mutable_design_requirements().set_magnetizing_inductance(minimumOnly);
+    inputs = pre_process_inputs(inputs);
+    CHECK(magnetic_role(inputs).role == MagneticRole::STORING);
+
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(OpenMagneticsTesting::get_quick_core("E 25/13/7", OpenMagneticsTesting::get_residual_gap(), 1, "3C95"));
+    magnetic.set_coil(OpenMagnetics::Coil());
+    std::vector<std::pair<OpenMagnetics::Magnetic, double>> magneticsWithScoring{{magnetic, 1.0}};
+    CoreAdviser coreAdviser;
+    coreAdviser.add_gapping_standard_cores(&magneticsWithScoring, inputs);
+    REQUIRE(magneticsWithScoring.size() == 1);
+    auto core = magneticsWithScoring[0].first.get_core();
+    INFO(core.get_name().value_or("?"));
+    double largestGap = 0;
+    for (const auto& gap : core.get_functional_description().get_gapping()) {
+        largestGap = std::max(largestGap, gap.get_length());
+    }
+    CHECK(largestGap > 2 * constants.residualGap);
+    settings.reset();
+}
+
+TEST_CASE("Test_CoreAdviser_Dab_Advises_The_Same_With_Or_Without_Topology", "[adviser][core-adviser][abt-1469]") {
+    // The 1.5 kW 400 V / 48 V DAB (7.5:1, 490 uH +/-10 %, 200 kHz). Every converter-model output
+    // carries a nominal magnetizing inductance; without the topology that nominal used to read as an
+    // inductor's, so the saturation gate compared I_sat against the full primary load current. The
+    // role (and so the advise) must not depend on whether the topology was declared.
+    settings.reset();
+    clear_databases();
+    auto withoutTopology = load_abt1875_inputs("abt1469_dab_1k5w_400v_48v_transformer.json");
+    REQUIRE_FALSE(withoutTopology.get_design_requirements().get_topology());
+    auto withTopology = withoutTopology;
+    withTopology.get_mutable_design_requirements().set_topology(MAS::Topology::DUAL_ACTIVE_BRIDGE_CONVERTER);
+    CHECK(magnetic_role(withTopology).role == MagneticRole::TRANSFORMER);
+    CHECK(magnetic_role(withoutTopology).role == magnetic_role(withTopology).role);
+
+    auto advise = [](OpenMagnetics::Inputs inputs) {
+        settings.reset();
+        clear_databases();
+        CoreAdviser coreAdviser;
+        auto results = coreAdviser.get_advised_core(inputs, abt1875_weights(), 5);
+        std::vector<std::pair<std::string, std::vector<int64_t>>> designs;
+        for (auto& [mas, scoring] : results) {
+            std::vector<int64_t> turns;
+            for (const auto& winding : mas.get_magnetic().get_coil().get_functional_description()) {
+                turns.push_back(winding.get_number_turns());
+            }
+            double largestGap = 0;
+            for (const auto& gap : mas.get_magnetic().get_core().get_functional_description().get_gapping()) {
+                largestGap = std::max(largestGap, gap.get_length());
+            }
+            designs.push_back({mas.get_magnetic().get_core().get_name().value_or("?") + " largest gap " + std::to_string(largestGap * 1e3) + " mm", turns});
+        }
+        return designs;
+    };
+    auto withDesigns = advise(withTopology);
+    auto withoutDesigns = advise(withoutTopology);
+    for (size_t i = 0; i < std::max(withDesigns.size(), withoutDesigns.size()); ++i) {
+        INFO("with topology: " << (i < withDesigns.size() ? withDesigns[i].first + " N1 " + std::to_string(withDesigns[i].second[0]) : "-")
+             << " | without: " << (i < withoutDesigns.size() ? withoutDesigns[i].first + " N1 " + std::to_string(withoutDesigns[i].second[0]) : "-"));
+        CHECK(true);
+    }
+    REQUIRE_FALSE(withDesigns.empty());
+    CHECK(withDesigns == withoutDesigns);
+    settings.reset();
+}
+
+TEST_CASE("Test_CoreAdviser_Csv_Design_Without_Topology_Or_SubApplication_Advises", "[adviser][core-adviser][abt-1469]") {
+    // A design uploaded as waveforms (an 8:1, 30 uH, 570 kHz CSV import) declares neither a topology
+    // nor a subApplication. That is descriptive metadata: the adviser decides the role from the
+    // waveforms and advises.
+    settings.reset();
+    clear_databases();
+    auto inputs = load_abt1875_inputs("Error_inductance_with_Csv.json");
+    REQUIRE_FALSE(inputs.get_design_requirements().get_topology());
+    REQUIRE_FALSE(inputs.get_design_requirements().get_sub_application());
+    MagneticRoleDecision decision;
+    REQUIRE_NOTHROW(decision = magnetic_role(inputs));
+    INFO("role " << magic_enum::enum_name(decision.role) << " from " << magic_enum::enum_name(decision.tier));
+    CoreAdviser coreAdviser;
+    std::vector<std::pair<OpenMagnetics::Mas, double>> results;
+    REQUIRE_NOTHROW(results = coreAdviser.get_advised_core(inputs, abt1875_weights(), 5));
+    for (auto& [mas, scoring] : results) {
+        double largestGap = 0;
+        for (const auto& gap : mas.get_magnetic().get_core().get_functional_description().get_gapping()) {
+            largestGap = std::max(largestGap, gap.get_length());
+        }
+        INFO(mas.get_magnetic().get_core().get_name().value_or("?") << " N1 "
+             << mas.get_magnetic().get_coil().get_functional_description()[0].get_number_turns() << " largest gap " << largestGap * 1e3 << " mm");
+        CHECK(true);
+    }
+    CHECK_FALSE(results.empty());
     settings.reset();
 }

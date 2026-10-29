@@ -44,6 +44,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/benchmark/catch_benchmark.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "advisers/MagneticAdviser.h"
 #include "constructive_models/Mas.h"
@@ -809,14 +810,25 @@ TEST_CASE("MagneticAdviser web DMC whose switching ripple is resolved returns wo
 
     // Each switching cycle swings at its own instantaneous line bias (ABT #1764): with the permeability of the
     // line swing's peak (~104) for every cycle the ripple near the zero crossings was priced ~4x low, 1.74 W.
-    // Reference: the record split at its current's valleys, each cycle's ripple B = mu0 * mu(H of the cycle's
+    // Reference then: the record split at its current's valleys, each cycle's ripple B = mu0 * mu(H of the cycle's
     // mean current) * N * di / l_e on the material's DC-bias curve, Steinmetz per cycle at its own rate: 6.84 W
-    // (first-principles script on this magnetic, the ungapped T 48/23/19 MPP 300 with 30 + 30 turns).
-    REQUIRE(magnetic.get_core().get_shape_name() == "T 48/23/19");
-    REQUIRE(magnetic.get_core().get_material_name() == "MPP 300");
+    // (first-principles script on the then top pick, the ungapped T 48/23/19 MPP 300 with 30 + 30 turns).
+    // Re-pinned (Alf, 2026-10-24): since ABT #1786 the line swing's B is read on the material's B(H) curve, no
+    // longer linearly. MPP 300 with 30 + 30 turns peaks at 0.689 T there (0.354 T linear), 0.827 T with the 1.2
+    // saturation margin, above its B_sat of 0.8 T, so the adviser now picks the ungapped T 48/23/19 MPP 200 with
+    // 33 + 33 turns. 5.00 W is the simulator's core loss on that pick (solved core 65.0 C), not re-derived by the
+    // first-principles script.
+    // Re-pinned (Alf, 2026-10-25, ABT #1469): the saturation-current gate now compares I_sat with the
+    // choke's magnetizing current, which for a DMC is i_line + i_neutral: both windings magnetize the
+    // core (~10 A peak here). Main gated I_sat on one winding's current (~5 A), so the MPP 200 pick with
+    // 33 + 33 turns (I_sat 10.48 A at 100 C) no longer clears the margin. The adviser now picks the
+    // ungapped T 47/24/18.0 HF 160 (High Flux 160) with 38 + 38 turns: I_sat 22.18 A at 100 C, 9.04 W of core loss
+    // in the simulator, solved core 91.2 C. The design (inputs) is unchanged.
+    REQUIRE(magnetic.get_core().get_shape_name() == "T 47/24/18.0");
+    REQUIRE(magnetic.get_core().get_material_name() == "HF 160");
     REQUIRE(magnetic.get_core().get_functional_description().get_gapping().empty());
-    REQUIRE(magnetic.get_coil().get_functional_description()[0].get_number_turns() == 30);
-    CHECK_THAT(simulatedCoreLosses.get_core_losses(), Catch::Matchers::WithinRel(6.84, 0.05));
+    REQUIRE(magnetic.get_coil().get_functional_description()[0].get_number_turns() == 38);
+    CHECK_THAT(simulatedCoreLosses.get_core_losses(), Catch::Matchers::WithinRel(9.04, 0.05));
 
     // The operating point as stored (waveforms, no harmonics) is the same excitation as its processed
     // copy, so the sweep must price it the same (ABT #1764): it read 16.3 W against 1.74 W, because
@@ -856,6 +868,66 @@ TEST_CASE("MagneticAdviser web DMC whose switching ripple is resolved returns wo
              << lineFrequencyFluxDensityPeak << " T, saturation " << saturationFluxDensity << " T");
         CHECK(fluxDensityPeak < saturationFluxDensity);
         CHECK_THAT(fluxDensityPeak, Catch::Matchers::WithinRel(lineFrequencyFluxDensityPeak, 0.02));
+    }
+    settings.reset();
+    clear_databases();
+}
+
+static void strip_nulls_abt1942_adviser(nlohmann::json& value) {
+    if (value.is_array()) {
+        for (auto& element : value) {
+            strip_nulls_abt1942_adviser(element);
+        }
+        return;
+    }
+    if (!value.is_object()) {
+        return;
+    }
+    for (auto it = value.begin(); it != value.end();) {
+        if (it->is_null()) {
+            it = value.erase(it);
+        }
+        else {
+            strip_nulls_abt1942_adviser(*it);
+            ++it;
+        }
+    }
+}
+
+// ABT #1942 (Alf, 2026-10-22): a wound candidate one of whose operating points has no thermal operating point (here a
+// 95/97 ferrite core whose losses heat it towards its Curie point, where the magnetisation curve can no longer carry the
+// voltage's flux) gets no temperature from simulate (ABT #1876). The MagneticAdviser's temperature filter threw
+// "[MISSING_DATA] simulate() returned no temperature" and took the whole call with it; such a candidate is rejected,
+// recorded in get_failed_candidates with the solve's reason, and the search goes on.
+TEST_CASE("MagneticAdviser rejects a wound candidate with no thermal operating point instead of failing the call",
+          "[adviser][magnetic-adviser][abt-1942]") {
+    settings.reset();
+    clear_databases();
+    std::ifstream file(OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "catalogue_missing_turns.json"));
+    REQUIRE(file.good());
+    auto masJson = nlohmann::json::parse(file);
+    strip_nulls_abt1942_adviser(masJson);
+    OpenMagnetics::Inputs inputs(masJson.at("inputs"));
+
+    OpenMagnetics::MagneticAdviser adviser;
+    std::vector<std::pair<OpenMagnetics::Mas, double>> results;
+    REQUIRE_NOTHROW(results = adviser.get_advised_magnetic(inputs, 3));
+    CHECK(!results.empty());
+
+    const auto& failedCandidates = adviser.get_failed_candidates();
+    bool noThermalOperatingPointRecorded = false;
+    for (const auto& [reference, reason] : failedCandidates) {
+        INFO(reference << ": " << reason);
+        if (reason.find("no thermal operating point") != std::string::npos) {
+            noThermalOperatingPointRecorded = true;
+            CHECK_THAT(reason, Catch::Matchers::ContainsSubstring("No steady temperature"));
+        }
+    }
+    CHECK(noThermalOperatingPointRecorded);
+    for (const auto& [mas, scoring] : results) {
+        for (const auto& output : mas.get_outputs()) {
+            CHECK(output.get_temperature());
+        }
     }
     settings.reset();
     clear_databases();

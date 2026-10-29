@@ -13,6 +13,7 @@
 #include "processors/MagneticSimulator.h"
 #include "physical_models/Reluctance.h"
 #include "physical_models/InitialPermeability.h"
+#include "physical_models/AmplitudePermeability.h"
 #include "support/MaterialValidator.h"
 #include "TestingUtils.h"
 #include "Fixtures.h"
@@ -2007,7 +2008,8 @@ TEST_CASE("Test_IGSE_composite_waveform_low_excitation_frequency", "[physical-mo
     REQUIRE(volumetricLosses < refVolumetricLosses * 10);
     REQUIRE(volumetricLosses > 0);
 
-    // A ferrite fitted only from 25 kHz refuses the 60 Hz envelope rather than extrapolating it.
+    // A ferrite fitted only from 25 kHz refuses the 60 Hz envelope rather than extrapolating it (flag off).
+    settings.set_allow_material_data_extrapolation(false);  // the default is on since Alf, 2026-10-25
     Core core3C95 = OpenMagneticsTesting::get_quick_core(shapeName, json::array(), 1, "3C95");
     CHECK_THROWS_AS(coreLossesModel->get_core_losses(core3C95, excitation, temperature), MaterialFrequencyOutOfSpanException);
 }
@@ -2343,8 +2345,10 @@ TEST_CASE("Test_Methods", "[physical-model][core-losses][smoke-test]") {
     REQUIRE(methods.size() == 1);
     REQUIRE(methods[0] == "Proprietary");
     methods = CoreLossesModel::get_methods_string("A07");
-    REQUIRE(methods.size() == 1);
+    // The loss factor, and above small signal the loss factor plus the major loop's hysteresis (ABT #2006).
+    REQUIRE(methods.size() == 2);
     REQUIRE(methods[0] == "LossFactor");
+    REQUIRE(methods[1] == "LossFactorHysteresis");
 }
 
 TEST_CASE("Test_Manufacturer_Magnetics", "[physical-model][core-losses]") {
@@ -2875,6 +2879,8 @@ TEST_CASE("Test_CoreLosses_Model_Nanoperm_8000", "[physical-model][core-losses][
 TEST_CASE("Test_CoreLosses_Above_Curie_Temperature_Throws", "[physical-model][core-losses][smoke-test][abt-1485]") {
     // ABT #1485: a thermal loop that overshoots Curie (240 C on a badly wound first cut) read a
     // near-zero loss there. Above Curie the ferrite is paramagnetic; no loss model applies.
+    settings.reset();
+    settings.set_allow_material_data_extrapolation(false);  // the default is on since Alf, 2026-10-25
     Core core = OpenMagneticsTesting::get_quick_core("T 20/10/7", json::array(), 1, "PC95");
     double curieTemperature = core.resolve_material().get_curie_temperature().value();
     auto excitation = OperatingPointExcitation(json::parse(R"({"frequency": 200000, "magneticFluxDensity": {"processed": {"label": "Sinusoidal", "peak": 0.05, "peakToPeak": 0.1, "offset": 0}}})"));
@@ -2888,6 +2894,7 @@ TEST_CASE("Test_CoreLosses_Above_Curie_Temperature_Throws", "[physical-model][co
         CHECK(exception.code() == ErrorCode::MATERIAL_ABOVE_CURIE_TEMPERATURE);
         CHECK(exception.curie_temperature() == curieTemperature);
     }
+    settings.reset();
 }
 
 // ABT #1497 helpers: a 20-turn E 42/21/15 in `materialName` driven by the quick 100 kHz triangular
@@ -4400,6 +4407,129 @@ TEST_CASE("Test_Loss_Factor_Model_Throws_On_Missing_Peak_Instead_Of_Crashing", "
     settings.reset();
 }
 
+// ABT #2006: a loss factor tan(delta)/mu_i is small-signal data (B <= 0.25 mT, IEC 60401-3). MKF's default
+// cascade ran it at power flux for a material carrying only a loss factor: KM42B gave 0.19 W at 337 mT and
+// 200 kHz in 2 cm3, ranking it ahead of every power ferrite.
+static OperatingPointExcitation abt2006_sinusoidal_excitation(double frequency, double magneticFluxDensityAmplitude) {
+    json excitationJson;
+    excitationJson["frequency"] = frequency;
+    excitationJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+    excitationJson["magneticFluxDensity"]["processed"]["offset"] = 0;
+    excitationJson["magneticFluxDensity"]["processed"]["peak"] = magneticFluxDensityAmplitude;
+    excitationJson["magneticFluxDensity"]["processed"]["peakToPeak"] = 2 * magneticFluxDensityAmplitude;
+    MAS::ProcessedWaveform processed(excitationJson["magneticFluxDensity"]["processed"]);
+    json waveformJson;
+    to_json(waveformJson, OpenMagnetics::Inputs::create_waveform(processed, frequency));
+    excitationJson["magneticFluxDensity"]["waveform"] = waveformJson;
+    excitationJson["magnetizingCurrent"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+    excitationJson["magnetizingCurrent"]["processed"]["offset"] = 0;
+    excitationJson["magnetizingCurrent"]["processed"]["peak"] = 0.01;
+    excitationJson["magnetizingCurrent"]["processed"]["rms"] = 0.01 / sqrt(2);
+    return OperatingPointExcitation(excitationJson);
+}
+
+TEST_CASE("Test_Loss_Factor_Model_Throws_Above_Small_Signal_Flux", "[physical-model][core-losses][loss-factor][abt-2006]") {
+    settings.reset();
+    clear_databases();
+    settings.set_allow_material_data_extrapolation(false);  // the default is on since Alf, 2026-10-25
+    auto smallSignal = abt2006_sinusoidal_excitation(200000, 0.1e-3);
+    auto powerFlux = abt2006_sinusoidal_excitation(200000, 0.1);
+
+    // Within the definition the loss factor gives the loss, and the default cascade runs it.
+    auto core = OpenMagneticsTesting::get_quick_core("T 20/10/7", json::array(), 1, "KM42B");
+    CHECK(CoreLossesLossFactorModel().get_core_losses(core, smallSignal, 25).get_core_losses() > 0);
+    CHECK(CoreLosses().calculate_core_losses(core, smallSignal, 25).get_method_used() == "Loss Factor");
+
+    // At power flux the loss-factor model throws.
+    CHECK_THROWS_AS(CoreLossesLossFactorModel().get_core_losses(core, powerFlux, 25), LossFactorAboveSmallSignalFluxException);
+    try {
+        CoreLossesLossFactorModel().get_core_losses(core, powerFlux, 25);
+    }
+    catch (const LossFactorAboveSmallSignalFluxException& exception) {
+        CHECK(exception.code() == ErrorCode::MATERIAL_LOSS_FACTOR_ABOVE_SMALL_SIGNAL_FLUX);
+        CHECK(exception.material_name() == "KM42B");
+        CHECK_THAT(exception.magnetic_flux_density_amplitude(), Catch::Matchers::WithinAbs(0.1, 1e-12));
+        CHECK_THAT(exception.maximum_magnetic_flux_density(), Catch::Matchers::WithinAbs(0.25e-3, 1e-12));
+    }
+    // Settings::allowMaterialDataExtrapolation evaluates it there anyway.
+    settings.set_allow_material_data_extrapolation(true);
+    double lossFactorAlone = CoreLossesLossFactorModel().get_core_losses(core, powerFlux, 25).get_core_losses();
+    CHECK(lossFactorAlone > 0);
+    settings.reset();
+    settings.set_allow_material_data_extrapolation(false);  // the default is on since Alf, 2026-10-25
+
+    // There the cascade runs the loss factor plus the hysteresis of KM42B's own major loop, which is larger
+    // than the loss factor alone.
+    auto atPowerFlux = CoreLosses().calculate_core_losses(core, powerFlux, 25);
+    CHECK(atPowerFlux.get_method_used() == "Loss Factor + Hysteresis");
+    CHECK(atPowerFlux.get_core_losses() > lossFactorAlone);
+
+    // An explicit request is never passed over: asked for the loss factor at power flux, MKF says why not.
+    CoreLosses requested;
+    requested.set_core_losses_requested_model_name(CoreLossesModels::LOSS_FACTOR);
+    CHECK_THROWS_AS(requested.calculate_core_losses(core, powerFlux, 25), LossFactorAboveSmallSignalFluxException);
+    settings.reset();
+}
+
+TEST_CASE("Test_Loss_Factor_Hysteresis_Model_Adds_The_Major_Loop_Hysteresis_To_The_Loss_Factor", "[physical-model][core-losses][loss-factor][abt-2006]") {
+    settings.reset();
+    clear_databases();
+    // Fair-Rite 76, a CMC ferrite with only a loss factor, at the 5.7 mT median flux the CMC adviser runs it at.
+    double frequency = 100000;
+    double amplitude = 5.7e-3;
+    auto excitation = abt2006_sinusoidal_excitation(frequency, amplitude);
+    auto core = OpenMagneticsTesting::get_quick_core("T 20/10/7", json::array(), 1, "76");
+    auto material = core.resolve_material();
+    CoreLossesLossFactorHysteresisModel model;
+
+    // Linear term: pi f B^2 (tan(delta)/mu_i) / mu_0 for a sinusoid.
+    double expectedLinear = std::numbers::pi * frequency * amplitude * amplitude * CoreLossesLossFactorModel::get_loss_factor(material, frequency) / (4e-7 * std::numbers::pi);
+    double linear = model.get_linear_losses_density(material, excitation);
+    CHECK_THAT(linear, Catch::Matchers::WithinRel(expectedLinear, 0.01));
+    // Hysteresis term: the Roshen loop of the material's own coercive force, remanence and saturation.
+    double hysteresis = model.get_hysteresis_losses_density(material, excitation, 25);
+    CHECK_THAT(hysteresis, Catch::Matchers::WithinRel(CoreLossesRoshenModel().get_hysteresis_losses_density(CoreLossesRoshenModel::get_hysteresis_parameters(material, 25), excitation), 1e-12));
+    CHECK(hysteresis > 0);
+    CHECK_THAT(model.get_core_volumetric_losses(material, excitation, 25), Catch::Matchers::WithinRel(linear + hysteresis, 1e-12));
+
+    // The default cascade: the loss factor at small signal, the loss factor plus hysteresis above it.
+    CHECK(CoreLosses().calculate_core_losses(core, abt2006_sinusoidal_excitation(frequency, 0.1e-3), 25).get_method_used() == "Loss Factor");
+    auto losses = CoreLosses().calculate_core_losses(core, excitation, 25);
+    CHECK(losses.get_method_used() == "Loss Factor + Hysteresis");
+    CHECK_THAT(losses.get_volumetric_losses().value(), Catch::Matchers::WithinRel(linear + hysteresis, 1e-9));
+    settings.reset();
+}
+
+// ABT #2014: Roshen read a missing coercive force as NaN, dropping the hysteresis term, and reported the eddy-current
+// loss alone (R12KZ: exactly f^2 B^2). Its loop now comes from the resolvers of ABT #1951: R12KZ carries neither
+// coercive force nor remanence, so both are its class's flagged estimates, and the hysteresis loss is there.
+TEST_CASE("Test_Roshen_Loop_Of_A_Material_Without_Coercive_Force_Or_Remanence_Is_Its_Class_Estimate", "[physical-model][core-losses][abt-2014]") {
+    settings.reset();
+    clear_databases();
+    auto core = OpenMagneticsTesting::get_quick_core("T 20/10/7", json::array(), 1, "R12KZ");
+    auto material = core.resolve_material();
+    REQUIRE_FALSE(material.get_coercive_force());
+    REQUIRE_FALSE(material.get_remanence());
+    CHECK(resolve_core_material_coercive_force(material, 25).is_estimated());
+    CHECK(resolve_core_material_remanence(material, 25).is_estimated());
+    auto parameters = CoreLossesRoshenModel::get_hysteresis_parameters(material, 25);
+    CHECK(std::isfinite(parameters["coerciveForce"]));
+    CHECK(parameters["coerciveForce"] > 0);
+    CHECK(std::isfinite(parameters["remanence"]));
+    CHECK(parameters["remanence"] > 0);
+
+    auto excitation = abt2006_sinusoidal_excitation(200000, 0.1);
+    CoreLossesRoshenModel roshen;
+    double hysteresis = roshen.get_hysteresis_losses_density(parameters, excitation);
+    CHECK(hysteresis > 0);
+    // The whole Roshen loss is more than its eddy-current part, which was all it reported.
+    double total = roshen.get_core_losses(core, excitation, 25).get_volumetric_losses().value();
+    CHECK(total >= hysteresis);
+    // The default cascade passes over the loss factor at power flux to the loss factor plus hysteresis.
+    CHECK(CoreLosses().calculate_core_losses(core, excitation, 25).get_method_used() == "Loss Factor + Hysteresis");
+    settings.reset();
+}
+
 // ABT #1344: the Roshen classical eddy current term used the core's own bulk
 // cross-section unconditionally, which is the right length scale for a
 // sintered/solid material (ferrite, powder) but wrong by 2-3 orders of
@@ -4458,6 +4588,51 @@ TEST_CASE("Test_Roshen_Small_Minor_Loop_Keeps_Hysteresis", "[physical-model][cor
     auto high = roshen.get_core_losses(core, build_sinusoidal_flux_excitation(frequency, 0.076), temperature).get_core_losses();
     CHECK(low / high > 0.3);
     CHECK(low / high < 1);
+    settings.reset();
+}
+
+// A Roshen material under DC bias gets the same DPLE correction through both core-loss entry points:
+// calculate_core_losses applied it to every model, get_core_volumetric_losses (the path of the
+// semi-shielded and multi-material moulded cores) still exempted Roshen.
+TEST_CASE("Test_Roshen_DC_Bias_Correction_Same_Through_Both_Entry_Points", "[physical-model][core-losses][roshen-core-losses-model][abt-1224]") {
+    settings.reset();
+    clear_databases();
+    double frequency = 100000;
+    double temperature = 25;
+    double offset = 0.15;
+    Core core = OpenMagneticsTesting::get_quick_core("E 42/21/15", json::array(), 1, "DMR96");
+    auto material = core.resolve_material();
+    REQUIRE(InitialPermeability::has_magnetic_field_dc_bias_dependency(material));
+    auto unbiased = build_sinusoidal_flux_excitation(frequency, 0.05);
+    auto excitation = unbiased;
+    auto flux = excitation.get_magnetic_flux_density().value();
+    auto waveform = flux.get_waveform().value();
+    auto data = waveform.get_data();
+    for (auto& value : data) {
+        value += offset;
+    }
+    waveform.set_data(data);
+    flux.set_waveform(waveform);
+    auto processed = flux.get_processed().value();
+    processed.set_offset(offset);
+    processed.set_peak(offset + 0.05);
+    flux.set_processed(processed);
+    excitation.set_magnetic_flux_density(flux);
+
+    CoreLosses coreLosses;
+    coreLosses.set_core_losses_requested_model_name(CoreLossesModels::ROSHEN);
+    auto output = coreLosses.calculate_core_losses(core, excitation, temperature);
+    REQUIRE(output.get_method_used() == "Roshen");
+    // The two entry points price different geometries (the volumetric one on a reference ring), so
+    // what must agree is the bias step: biased over unbiased, through each entry point.
+    double coreBiased = output.get_core_losses();
+    double coreUnbiased = coreLosses.calculate_core_losses(core, unbiased, temperature).get_core_losses();
+    double materialBiased = coreLosses.get_core_volumetric_losses(material, excitation, temperature);
+    double materialUnbiased = coreLosses.get_core_volumetric_losses(material, unbiased, temperature);
+    REQUIRE(coreUnbiased > 0);
+    REQUIRE(materialUnbiased > 0);
+    INFO("bias step: calculate_core_losses " << coreBiased / coreUnbiased << ", get_core_volumetric_losses " << materialBiased / materialUnbiased);
+    CHECK_THAT(materialBiased / materialUnbiased, Catch::Matchers::WithinRel(coreBiased / coreUnbiased, 1e-6));
     settings.reset();
 }
 
@@ -4709,6 +4884,24 @@ TEST_CASE("Test_Material_Validator_Saturation_Above_Iron_Is_Impossible", "[mater
     CHECK_FALSE(verdict.valid);
 }
 
+TEST_CASE("Test_Material_Validator_Remanence_Above_Saturation_Is_Impossible", "[material-validator][remanence-saturation]") {
+    // Fair-Rite 95 held 0.8 T of remanence at 100 C (its loop shows ~800 gauss, 0.08 T) against 0.39 T of saturation.
+    settings.reset();
+    auto record = material_record("N87");
+    auto clean = MaterialValidator().validate(record);
+    INFO(describe(clean));
+    REQUIRE(count_findings(clean, "MAT_REMANENCE_SATURATION", MaterialFindingSeverity::IMPOSSIBLE) == 0);
+    REQUIRE(record.contains("remanence"));
+    REQUIRE(record.contains("saturation"));
+    record["remanence"][0]["magneticFluxDensity"] = 2 * record["saturation"][0]["magneticFluxDensity"].get<double>();
+    record["remanence"][0]["temperature"] = record["saturation"][0]["temperature"];
+    record["name"] = "N87 Br above Bs";
+    auto verdict = MaterialValidator().validate(record);
+    INFO(describe(verdict));
+    CHECK(count_findings(verdict, "MAT_REMANENCE_SATURATION", MaterialFindingSeverity::IMPOSSIBLE) == 1);
+    CHECK_FALSE(verdict.valid);
+}
+
 TEST_CASE("Test_Material_Validator_Curie_And_Permeability", "[material-validator]") {
     settings.reset();
     auto record = material_record("N87");
@@ -4821,6 +5014,7 @@ TEST_CASE("Test_Material_Validator_Loss_Not_Positive_Inside_Span", "[material-va
 TEST_CASE("Steinmetz coefficients outside the fitted span throw, below and above", "[physical-model][core-losses][abt-1456]") {
     settings.reset();
     clear_databases();
+    settings.set_allow_material_data_extrapolation(false);  // the default is on since Alf, 2026-10-25
 
     // TP5H: MAS fits 1-5 MHz only.
     auto [tp5hMinimum, tp5hMaximum] = CoreLossesModel::get_steinmetz_fitted_span("TP5H");
@@ -4903,6 +5097,7 @@ TEST_CASE("P63 is fitted from 300 kHz and matches ACME's 1 MHz point", "[physica
 TEST_CASE("Subcircuit core-loss network is fitted over the material's span", "[circuit][core-losses][export][abt-1456]") {
     settings.reset();
     clear_databases();
+    settings.set_allow_material_data_extrapolation(false);  // the default is on since Alf, 2026-10-25
 
     std::vector<int64_t> numberTurns = {20};
     for (std::string materialName : {"N87", "TP5H", "P63"}) {
@@ -4941,6 +5136,7 @@ TEST_CASE("Subcircuit core-loss network is fitted over the material's span", "[c
 TEST_CASE("Core-loss frequency sweep is clipped to the material's fitted span", "[sweeper][core-losses][abt-1456]") {
     settings.reset();
     clear_databases();
+    settings.set_allow_material_data_extrapolation(false);  // the default is on since Alf, 2026-10-25
     std::vector<int64_t> numberTurns = {20};
     auto magnetic = OpenMagnetics::magnetic_autocomplete(OpenMagneticsTesting::get_quick_magnetic(
         "E 42/21/15", OpenMagneticsTesting::get_ground_gap(0.001), numberTurns, 1, "P63"));
@@ -4992,13 +5188,97 @@ TEST_CASE("Core-loss frequency sweep carries the flyback's magnetizing DC", "[sw
         operatingPointJson["excitationsPerWinding"] = {primary, secondary};
         return OperatingPoint(operatingPointJson);
     };
-    auto biased = Sweeper::sweep_core_losses_over_frequency(magnetic, flyback(15, 17), Topology::FLYBACK_CONVERTER, 100000, 200000, 2);
+    // 9 -> 11 A biases the core inside DMR96's DC-bias table (it ends at 483.4 A/m): the DC is priced there.
+    auto biased = Sweeper::sweep_core_losses_over_frequency(magnetic, flyback(9, 11), Topology::FLYBACK_CONVERTER, 100000, 200000, 2);
     auto lightlyBiased = Sweeper::sweep_core_losses_over_frequency(magnetic, flyback(1, 3), Topology::FLYBACK_CONVERTER, 100000, 200000, 2);
     double biasedLosses = biased.get_y_points().front();
     double lightlyBiasedLosses = lightlyBiased.get_y_points().front();
-    INFO("core losses at 100 kHz: 15 -> 17 A " << biasedLosses << " W, 1 -> 3 A " << lightlyBiasedLosses << " W");
+    INFO("core losses at 100 kHz: 9 -> 11 A " << biasedLosses << " W, 1 -> 3 A " << lightlyBiasedLosses << " W");
     REQUIRE(lightlyBiasedLosses > 0);
     CHECK(biasedLosses > 1.05 * lightlyBiasedLosses);
+
+    // 15 -> 17 A drives the DC point past the end of the table, where the material is taken as saturated
+    // (mu_r = 1): both points are flagged and carry no loss.
+    auto saturated = Sweeper::sweep_core_losses_over_frequency(magnetic, flyback(15, 17), Topology::FLYBACK_CONVERTER, 100000, 200000, 2);
+    INFO("15 -> 17 A sweep title: " << saturated.get_title());
+    REQUIRE(saturated.get_saturated_points());
+    REQUIRE(saturated.get_saturated_points().value().size() == 2);
+    CHECK(saturated.get_saturated_points().value()[0]);
+    CHECK(saturated.get_saturated_points().value()[1]);
+    REQUIRE(saturated.get_y_points().size() == 2);
+    CHECK(std::isnan(saturated.get_y_points()[0]));
+    CHECK(std::isnan(saturated.get_y_points()[1]));
+    CHECK_THAT(saturated.get_title(), Catch::Matchers::ContainsSubstring("(core saturated at 2 of 2 points, "));
+}
+
+// The DC operating point of a biased core is the unsaturated fixed point when one exists. DMR96 tabulates
+// mu(H_dc) up to 483.4 A/m and is taken as saturated (mu_r = 1) past it, so on this flyback at 12 -> 14 A and
+// 100 kHz the DC solve has two fixed points: mu = 51.7 at 449 A/m, inside the table, and the saturated mu = 1 at
+// 5885 A/m. Plain iteration from the unbiased permeability stepped past the table end (647 A/m) in its first
+// move and settled on mu = 1, so the sweep reported a saturated core and no loss.
+TEST_CASE("Flyback DC operating point stays on the material's DC-bias table when a root lies there", "[sweeper][core-losses][magnetizing-inductance][abt-1809]") {
+    settings.reset();
+    clear_databases();
+    std::vector<int64_t> numberTurns = {20, 20};
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(OpenMagneticsTesting::get_quick_magnetic(
+        "E 42/21/15", OpenMagneticsTesting::get_ground_gap(0.001), numberTurns, 1, "DMR96"));
+    auto material = magnetic.get_core().resolve_material();
+    double tableEnd = 0;
+    for (const auto& point : InitialPermeability::get_only_magnetic_field_dc_bias_dependent_points(material)) {
+        tableEnd = std::max(tableEnd, point.get_magnetic_field_dc_bias().value());
+    }
+    REQUIRE_THAT(tableEnd, Catch::Matchers::WithinRel(483.4, 1e-3));
+
+    json operatingPointJson;
+    operatingPointJson["conditions"]["ambientTemperature"] = 25;
+    json primary;
+    primary["frequency"] = 100000;
+    primary["name"] = "Primary";
+    primary["current"]["waveform"]["time"] = {0, 5e-6, 5e-6, 1e-5};
+    primary["current"]["waveform"]["data"] = {12, 14, 0, 0};
+    primary["voltage"]["waveform"]["time"] = {0, 5e-6, 5e-6, 1e-5};
+    primary["voltage"]["waveform"]["data"] = {20, 20, -20, -20};
+    json secondary;
+    secondary["frequency"] = 100000;
+    secondary["name"] = "Secondary";
+    secondary["current"]["waveform"]["time"] = {0, 5e-6, 5e-6, 1e-5};
+    secondary["current"]["waveform"]["data"] = {0, 0, 14, 12};
+    secondary["voltage"]["waveform"]["time"] = {0, 5e-6, 5e-6, 1e-5};
+    secondary["voltage"]["waveform"]["data"] = {-20, -20, 20, 20};
+    operatingPointJson["excitationsPerWinding"] = {primary, secondary};
+    OperatingPoint operatingPoint(operatingPointJson);
+
+    MagnetizingInductance magnetizingInductanceModel;
+    magnetizingInductanceModel.set_topology(Topology::FLYBACK_CONVERTER);
+    auto swept = operatingPoint;
+    for (auto& excitation : swept.get_mutable_excitations_per_winding()) {
+        excitation.set_magnetizing_current(std::nullopt);
+        excitation.set_magnetic_flux_density(std::nullopt);
+    }
+    magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(magnetic, &swept);
+    auto dcBiasPoint = magnetizingInductanceModel.get_last_dc_bias_point();
+    REQUIRE(dcBiasPoint);
+    double fieldStrength = dcBiasPoint->magneticFieldDcBias;
+    INFO("DC operating point: " << fieldStrength << " A/m");
+    CHECK(fieldStrength > 0);
+    CHECK(fieldStrength < tableEnd);
+    // An unsaturated point: the table gives a permeability above the vacuum's there.
+    double tablePermeability = InitialPermeability::get_initial_permeability_model_value(material, 25.0, fieldStrength, 100000.0);
+    INFO("table permeability there: " << tablePermeability);
+    CHECK(tablePermeability > 1);
+
+    auto sweep = Sweeper::sweep_core_losses_over_frequency(magnetic, operatingPoint, Topology::FLYBACK_CONVERTER, 100000, 200000, 2);
+    REQUIRE(sweep.get_saturated_points());
+    CHECK_FALSE(sweep.get_saturated_points().value()[0]);
+    CHECK(std::isfinite(sweep.get_y_points()[0]));
+    CHECK(sweep.get_y_points()[0] > 0);
+
+    // At 200 kHz the same currents have no fixed point: F(mu) jumps from ~50 to the saturated 1 across mu = 26.1
+    // (the table end, 483.4 A/m), and F(1) = 59.9, so mu = 1 is no root either. The solve closes on the step, not
+    // on a root, and the core is saturated: the point is flagged and carries no loss.
+    REQUIRE(sweep.get_saturated_points().value().size() == 2);
+    CHECK(sweep.get_saturated_points().value()[1]);
+    CHECK(std::isnan(sweep.get_y_points()[1]));
 }
 
 // ABT #1602: the core-loss series resistance builds an equivalent winding N = sqrt(L * R). It used to
@@ -5241,6 +5521,7 @@ TEST_CASE("Core losses of a boost PFC line-cycle excitation are priced per switc
     }
 
     SECTION("A ferrite whose fit starts above the line frequency cannot price the envelope's loop") {
+        settings.set_allow_material_data_extrapolation(false);  // the default is on since Alf, 2026-10-25
         // 3C95's Steinmetz ranges start at 25 kHz: the switching cycles are in span, the 60 Hz envelope
         // is not, and an extrapolation of the fit is refused as everywhere else (ABT #1456).
         Core core = OpenMagneticsTesting::get_quick_core("PQ 20/20", json::array(), 1, "3C95");
@@ -5248,8 +5529,8 @@ TEST_CASE("Core losses of a boost PFC line-cycle excitation are priced per switc
         CHECK_THROWS_AS(model->get_core_losses(core, pfc.record, temperature), MaterialFrequencyOutOfSpanException);
         // The refusal is the envelope's, and names the material, its fitted span and the frequency asked.
         CHECK_THROWS_WITH(model->get_core_losses(core, pfc.record, temperature),
-                          Catch::Matchers::ContainsSubstring("3C95") && Catch::Matchers::ContainsSubstring("25000") &&
-                          Catch::Matchers::ContainsSubstring("3000000") && Catch::Matchers::ContainsSubstring("60.000000 Hz is below"));
+                          Catch::Matchers::ContainsSubstring("3C95") && Catch::Matchers::ContainsSubstring("25 kHz") &&
+                          Catch::Matchers::ContainsSubstring("3 MHz") && Catch::Matchers::ContainsSubstring("60 Hz is below"));
         auto record = CoreLossesModel::split_into_switching_cycles(pfc.record);
         REQUIRE(record.has_value());
         CHECK_THROWS_AS(model->compute_core_losses(core, record->envelope, temperature), MaterialFrequencyOutOfSpanException);
@@ -5445,6 +5726,7 @@ TEST_CASE("The line envelope's span check follows allowMaterialDataExtrapolation
     REQUIRE(record.has_value());
 
     SECTION("Off: the envelope throws") {
+        settings.set_allow_material_data_extrapolation(false);  // the default is on since Alf, 2026-10-25
         CHECK_THROWS_AS(model->get_core_losses(core, pfc.record, temperature), MaterialFrequencyOutOfSpanException);
     }
 
@@ -5469,7 +5751,7 @@ TEST_CASE("The line envelope's span check follows allowMaterialDataExtrapolation
         bool warned = false;
         for (const auto& logRecord : collected) {
             if (logRecord.moduleOfOrigin == kMaterialDataExtrapolationModule && logRecord.level == LogLevel::WARNING &&
-                logRecord.message.find("3C95") != std::string::npos && logRecord.message.find("60.000000 Hz") != std::string::npos) {
+                logRecord.message.find("3C95") != std::string::npos && logRecord.detail.find("60 Hz") != std::string::npos) {
                 warned = true;
             }
         }
@@ -5480,6 +5762,60 @@ TEST_CASE("The line envelope's span check follows allowMaterialDataExtrapolation
         settings.set_allow_material_data_extrapolation(true);
         MaterialDataExtrapolationBarrier barrier;
         CHECK_THROWS_AS(model->get_core_losses(core, pfc.record, temperature), MaterialFrequencyOutOfSpanException);
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_Loss_Factor_Interpolation_Stays_Between_Neighbouring_Points_Near_Resonance", "[physical-model][core-losses][loss-factor][loss-factor-interpolation]") {
+    // N4's loss factor climbs from 2.51 at 2.1135 MHz to 357 at 2.1441 MHz (its resonance), N10's from 8.14 at
+    // 3.0726 MHz to 426 at 3.1623 MHz. The cubic spline through those points swung below zero just before the
+    // jump (N4 -22.0 at 2.1 MHz, N10 -1.69 at 3.0 MHz), so a flyback's harmonics refused every N4/N10 core.
+    // Interpolated linearly in log-log, each value lies between its neighbouring points.
+    struct Probe { const char* material; double frequency; double below; double above; };
+    for (const auto& p : {Probe{"N4", 2.1e6, 0.6493, 2.5096}, Probe{"N10", 3.0e6, 2.2054, 8.1365}}) {
+        INFO(p.material);
+        auto material = find_core_material_by_name(p.material);
+        double lossFactor = CoreLossesLossFactorModel::get_loss_factor(material, p.frequency);
+        CHECK(lossFactor >= p.below * 0.999);
+        CHECK(lossFactor <= p.above * 1.001);
+    }
+    // At a data point it is the datum.
+    auto n4 = find_core_material_by_name("N4");
+    CHECK_THAT(CoreLossesLossFactorModel::get_loss_factor(n4, 2113489.0), Catch::Matchers::WithinRel(2.5096, 1e-3));
+}
+
+TEST_CASE("Test_Core_Losses_Renamed_Library_Material_Priced_By_Its_Own_Data", "[physical-model][core-losses][abt-1911]") {
+    // CoreLosses picks the loss model from the methods of the material it is handed, not from the
+    // library entry of the same name: a copy of a library material under a name the library does not
+    // know (a user's material, a renamed copy) is priced exactly like the library material. Before
+    // ABT #1911 it threw CORE_MATERIAL_NOT_FOUND. One material per loss-method family.
+    settings.reset();
+    clear_databases();
+    struct Case { std::string name; double frequency; double peak; double temperature; };
+    for (const auto& testCase : std::vector<Case>{{"3C94", 100000, 0.1, 100},
+                                                  {"DMR73", 100000, 0.1, 25},
+                                                  {"Kool Mµ 60", 50000, 0.05, 25},
+                                                  {"Mix 2", 50000, 0.05, 25}}) {
+        INFO(testCase.name);
+        auto library = find_core_material_by_name(testCase.name);
+        auto renamed = library;
+        renamed.set_name("Renamed copy of " + testCase.name);
+        REQUIRE_THROWS(find_core_material_by_name(renamed.get_name()));
+
+        auto excitation = build_sinusoidal_flux_excitation(testCase.frequency, testCase.peak);
+        CoreLosses coreLosses;
+        CHECK(coreLosses.get_core_losses_model(renamed, excitation) == coreLosses.get_core_losses_model(library, excitation));
+        double libraryLosses = coreLosses.get_core_volumetric_losses(library, excitation, testCase.temperature);
+        REQUIRE(libraryLosses > 0);
+        CHECK(coreLosses.get_core_volumetric_losses(renamed, excitation, testCase.temperature) == libraryLosses);
+
+        // The same on a core carrying the copy inline.
+        Core libraryCore = OpenMagneticsTesting::get_quick_core("T 40/24/16", json::array(), 1, testCase.name);
+        Core renamedCore = libraryCore;
+        renamedCore.get_mutable_functional_description().set_material(renamed);
+        double libraryCoreLosses = coreLosses.calculate_core_losses(libraryCore, excitation, testCase.temperature).get_core_losses();
+        REQUIRE(libraryCoreLosses > 0);
+        CHECK(coreLosses.calculate_core_losses(renamedCore, excitation, testCase.temperature).get_core_losses() == libraryCoreLosses);
     }
     settings.reset();
 }

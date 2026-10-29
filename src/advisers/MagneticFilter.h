@@ -40,6 +40,10 @@ class MagneticFilter {
         virtual ~MagneticFilter() = default;
         virtual std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr) = 0;
 
+        // Why the last evaluate_magnetic failed `magnetic` on a verdict a caller should report (the catalogue adviser
+        // lists it in get_failed_candidates), or nullopt. Empty for a filter that states no such reason.
+        virtual std::optional<std::string> get_last_rejection_reason() const { return std::nullopt; }
+
         // Whether this filter can judge `magnetic` at all. Most filters compute from the core and
         // coil, so a datasheet-only catalogue part (no construction, see Magnetic.h) is outside
         // anything they can say: the catalogue adviser then records NO score for that part and
@@ -238,8 +242,13 @@ class MagneticFilterEnergyStored : public MagneticFilter {
         std::map<std::string, std::string> _models;
         MagneticEnergy _magneticEnergy;
         double _requiredMagneticEnergy;
+        // ABT #1891: when set, a design that is not an inductor (its windings are voltage-driven) passes:
+        // its flux is the saturation filter's (Faraday) check, and 1/2 L I^2 of the spec's magnetizing
+        // inductance and current is not an energy it has to store.
+        bool _passVoltageDriven = false;
 
     public:
+        void set_pass_voltage_driven(bool value) { _passVoltageDriven = value; }
         MagneticFilterEnergyStored() {};
         MagneticFilterEnergyStored(Inputs inputs);
         MagneticFilterEnergyStored(Inputs inputs, std::map<std::string, std::string> models);
@@ -542,6 +551,11 @@ class MagneticFilterProximityFactor : public MagneticFilter {
  * standing off the former, which is not the layup the layout assumed. Below the heat-shock floor
  * it stays valid but scores worse, in proportion to how far short the bend falls.
  *
+ * ABT #2004 (Alf, 2026-10-22): an EDGEWISE bend of rectangular wire below the flexibility floor
+ * stays VALID, as real winding draws it: IEC 60317-0-2 Table 6 qualifies the coating, it is not a
+ * forming limit for edgewise winding. analyze_results reports it. IEC 60317-0-2 9 gives no edgewise
+ * heat-shock bend, so it adds nothing to the score. Round wire and flatwise rectangular bends below the floor stay invalid.
+ *
  * Wire types the standards do not cover (litz, foil, planar) are passed through untouched rather
  * than judged by a rule that was not written for them.
  */
@@ -722,10 +736,14 @@ class MagneticFilterImpedance : public MagneticFilter {
 };
 
 class MagneticFilterMagnetizingInductance : public MagneticFilter {
+    private:
+        std::optional<std::string> _lastRejectionReason;
     public:
         MagneticFilterMagnetizingInductance() {};
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
         bool applies_to(Magnetic* magnetic) const override;
+        // The saturation verdict (ResultsAnalyzer::check_saturation) that failed the last candidate, if one did.
+        std::optional<std::string> get_last_rejection_reason() const override { return _lastRejectionReason; }
 };
 
 /**

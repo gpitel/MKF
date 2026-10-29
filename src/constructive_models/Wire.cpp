@@ -144,10 +144,9 @@ namespace OpenMagnetics {
         }
 
         if (!get_material()) {
-            // ABT #114/A2: a silent copper default gives wrong resistivity (=> wrong
-            // ohmic/skin losses) for any wire that is really aluminium/etc. but simply
-            // omits its material tag. Fail loudly instead of substituting copper.
-            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Wire is missing material information");
+            // A wire that states no conductor material is copper: an accepted default (Alf,
+            // 2026-10-28), replacing the ABT #114/A2 refusal.
+            return find_wire_material_by_name("copper");
         }
 
         auto material = get_material().value();
@@ -193,8 +192,8 @@ namespace OpenMagnetics {
             return resolve_material(strand);
         }
         if (!wire.get_material()) {
-            // ABT #114/A2: no silent copper default (see resolve_material()).
-            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Wire is missing material information");
+            // No stated conductor material: copper (accepted default, see resolve_material()).
+            return find_wire_material_by_name("copper");
         }
 
         auto material = wire.get_material().value();
@@ -212,8 +211,8 @@ namespace OpenMagnetics {
 
     WireMaterial Wire::resolve_material(WireRound wire) {
         if (!wire.get_material()) {
-            // ABT #114/A2: no silent copper default (see resolve_material()).
-            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Wire is missing material information");
+            // No stated conductor material: copper (accepted default, see resolve_material()).
+            return find_wire_material_by_name("copper");
         }
 
         auto material = wire.get_material().value();
@@ -1161,9 +1160,16 @@ namespace OpenMagnetics {
                 auto coating = wire.resolve_coating();
                 auto strand = wire.resolve_strand();
                 auto strandCoating = resolve_coating(strand);
+                // A bundle that states no standard is built to its strand's: a litz of #38 AWG (NEMA)
+                // strands defaulted to IEC 60317 and its 1.28 bundle factor, 0.855 mm for 30 x #38 served
+                // where New England Wire's 38-gauge served bundles give 1.19-1.24 (RDR-648's PFC choke,
+                // 73 T in four layers on a PQ 26/25 former, did not wind).
                 auto standard = WireStandard::IEC_60317;
                 if (wire.get_standard()) {
                     standard = wire.get_standard().value();
+                }
+                else if (strand.get_standard()) {
+                    standard = strand.get_standard().value();
                 }
                 int64_t numberConductors = wire.get_number_conductors().value();
                 if (coating) {
@@ -1664,8 +1670,14 @@ namespace OpenMagnetics {
                                         "litz wire '" + wire.get_name().value_or("unnamed") + "' has no coating type: served or bare decides how far it may flatten");
         }
         switch (coating->get_type().value()) {
-            case InsulationWireCoatingType::SERVED: return 0.90;
-            case InsulationWireCoatingType::BARE: return 0.85;
+            // Alf, 2026-10-27: the floor is what built litz windings reach, not Elektrisola's free-air
+            // figures (-10 % served, -15-20 % bare). Power Integrations' published PFC chokes lay served
+            // litz at 0.72-0.78 x its round OD: DER-720 56 T of 40 x #38 in 7 layers of 8 on a PQ 32/20
+            // bobbin (0.78 radially), and 26 T of 200 x #42 and 30 T of 125 x #40 (published bundle OD
+            // 1.23 mm) in 3 layers on the same bobbin (0.72 and 0.74 along the layer). A bare bundle
+            // flattens at least as far as a served one, so it shares the floor.
+            case InsulationWireCoatingType::SERVED: return 0.72;
+            case InsulationWireCoatingType::BARE: return 0.72;
             default: return 1.0;   // taped or extruded insulation: no source says it flattens
         }
     }

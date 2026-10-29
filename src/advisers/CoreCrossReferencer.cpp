@@ -212,7 +212,7 @@ std::vector<std::pair<Core, double>> CoreCrossReferencer::MagneticCoreFilterEffe
     std::vector<double> newScoring;
     std::vector<std::pair<Core, double>> filteredCoresWithScoring;
     if (!referenceCore.get_processed_description()) {
-        throw CoreNotProcessedException("Core is not processed");
+        throw CoreNotProcessedException();
     }
     double referenceEffectiveArea = referenceCore.get_processed_description()->get_effective_parameters().get_effective_area();
     add_scored_value("Reference", CoreCrossReferencerFilters::EFFECTIVE_AREA, referenceEffectiveArea);
@@ -233,7 +233,7 @@ std::vector<std::pair<Core, double>> CoreCrossReferencer::MagneticCoreFilterEffe
             }
         }
         if (!core.get_processed_description()) {
-            throw CoreNotProcessedException("Core is not processed");
+            throw CoreNotProcessedException();
         }
         double effectiveArea = core.get_processed_description()->get_effective_parameters().get_effective_area();
 
@@ -386,7 +386,7 @@ std::pair<double, double> CoreCrossReferencer::MagneticCoreFilterCoreLosses::cal
             coil.set_functional_description({winding});
             magnetic.set_coil(coil);
             for (auto operatingPoint : inputs.get_operating_points()) {
-                magneticSimulator.set_topology(inputs.get_design_requirements().get_topology());
+                magneticSimulator.set_topology(magnetizing_model_topology(inputs));
                 auto coreLossesOutput = magneticSimulator.calculate_core_losses(operatingPoint, magnetic, nullptr, nullptr,
                                                                                 WindingLossesScope::FULL, NoThermalOperatingPointPolicy::THROW);
                 averageCoreLosses += coreLossesOutput.get_core_losses();
@@ -445,7 +445,7 @@ std::vector<std::pair<Core, double>> CoreCrossReferencer::MagneticCoreFilterCore
         logEntry("CoreCrossReferencer: reference core '" + referenceCore.get_name().value_or("?")
                      + "' has uncomputable core losses at " + std::to_string(temperature)
                      + " degC; skipping the loss dimension and cross-referencing on the remaining filters",
-                 "CoreCrossReferencer");
+                 "CoreCrossReferencer", 1);
         return *unfilteredCores;
     }
     auto referenceMaterialMagneticFluxDensitySaturationPeak = referenceCore.get_magnetic_flux_density_saturation(temperature, true);
@@ -743,6 +743,11 @@ std::vector<std::pair<Core, double>> CoreCrossReferencer::get_cross_referenced_c
 
     for (auto core : coreDatabase){
         if (referenceShapeName != core.get_shape_name() || referenceMaterialName != core.get_material_name()) {
+            if (_onlyManufacturer && !core.get_manufacturer_info()) {
+                // Was an unchecked ->get_name() on an empty optional (ABT #1616).
+                throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                                            "Core " + core.get_name().value_or("(unnamed)") + " in the cross-referencer database has no manufacturerInfo to filter by manufacturer " + _onlyManufacturer.value());
+            }
             if (!_onlyManufacturer || core.get_manufacturer_info()->get_name() == _onlyManufacturer.value()) {
                 if (!_onlyReferenceMaterial || referenceMaterialName == core.get_material_name()) {
                     if (!core.get_processed_description()) {
@@ -808,7 +813,7 @@ std::vector<std::pair<Core, double>> CoreCrossReferencer::apply_filters(std::vec
          [&](auto* r){ return filterEffectiveArea.filter_core(r, referenceCore, weights[F::EFFECTIVE_AREA], limit); }},
     };
 
-    auto rankedCores = run_cross_referencer_pipeline(*cores, steps, "Core Cross Referencer");
+    auto rankedCores = run_cross_referencer_pipeline(*cores, steps, "CoreCrossReferencer");
 
     // CORE_LOSSES is the most computationally costly filter, so it's
     // gated behind a 1.1× maximumNumberResults pre-prune and run as a
@@ -828,10 +833,10 @@ std::vector<std::pair<Core, double>> CoreCrossReferencer::apply_filters(std::vec
         &rankedCores, referenceCore, referenceNumberTurns, weights[F::IMPEDANCE], limit);
     logEntry("There are " + std::to_string(rankedCores.size())
                  + " after filtering by " + to_string(F::IMPEDANCE) + ".",
-             "Core Cross Referencer", 2);
+             "CoreCrossReferencer", 2);
     logEntry("There are " + std::to_string(rankedCores.size())
                  + " after filtering by " + to_string(F::CORE_LOSSES) + ".",
-             "Core Cross Referencer", 2);
+             "CoreCrossReferencer", 2);
 
     if (rankedCores.size() > maximumNumberResults) {
         rankedCores.resize(maximumNumberResults);

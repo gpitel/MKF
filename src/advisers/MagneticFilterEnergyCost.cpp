@@ -32,12 +32,14 @@ std::pair<bool, double> MagneticFilterEnergyStored::evaluate_magnetic(Magnetic* 
     double totalStorableMagneticEnergy = 0;
     // Phase 6 (perf): cache operating-points by const-ref.
     const auto& operatingPoints = inputs->get_operating_points();
+    // A transformer's core stores only its magnetizing energy, so the voltage-driven pass lets it through.
+    const bool voltageDrivenPass = _passVoltageDriven && is_transformer_role(*inputs);
     for (size_t operatingPointIndex = 0; operatingPointIndex < operatingPoints.size(); ++operatingPointIndex) {
         const auto& operatingPoint = operatingPoints[operatingPointIndex];
         double storableEnergy = _magneticEnergy.calculate_core_maximum_magnetic_energy(magnetic->get_core(), operatingPoint);
         totalStorableMagneticEnergy = std::max(totalStorableMagneticEnergy, storableEnergy);
 
-        if (totalStorableMagneticEnergy >= _requiredMagneticEnergy * defaults.coreAdviserThresholdValidity) {
+        if (voltageDrivenPass || totalStorableMagneticEnergy >= _requiredMagneticEnergy * defaults.coreAdviserThresholdValidity) {
             if (outputs != nullptr) {
                 while (outputs->size() < operatingPointIndex + 1) {
                     outputs->push_back(Outputs());
@@ -244,10 +246,8 @@ CostBreakdown MagneticFilterCost::calculate_cost(Magnetic& magnetic) const {
     if (price == basis.corePrice.end()) {
         return {std::nullopt, conductor, labour, "the COST filter has no price law for " + composition + " cores (" + material.get_name() + ")"};
     }
+    // Throws INVALID_CORE_MATERIAL_DATA when the material has no density (ABT #1565).
     double coreMass = core.get_mass();
-    if (std::isnan(coreMass)) {
-        throw InvalidInputException(ErrorCode::INVALID_CORE_MATERIAL_DATA, "core material " + material.get_name() + " has no density: its mass cannot be priced");
-    }
     return {price->second.coefficient * std::pow(coreMass, price->second.exponent), conductor, labour, ""};
 }
 

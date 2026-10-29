@@ -923,13 +923,17 @@ std::vector<double> StrayCapacitanceModel::preprocess_data_for_round_wires(Turn 
         }
     }
 
+    // Series stack: the layers folded so far act as ONE dielectric of their accumulated thickness, so
+    // each next layer combines with that thickness, not with the previous layer's alone.
+    double accumulatedThickness = 0;
     for (size_t index = 0; index < distancesThroughLayers.size(); ++index) {
         if (index == 0) {
             effectiveRelativePermittivityLayers = relativePermittivityLayers[index];
         }
         else {
-            effectiveRelativePermittivityLayers = get_effective_relative_permittivity(distancesThroughLayers[index - 1], effectiveRelativePermittivityLayers, distancesThroughLayers[index], relativePermittivityLayers[index]);
+            effectiveRelativePermittivityLayers = get_effective_relative_permittivity(accumulatedThickness, effectiveRelativePermittivityLayers, distancesThroughLayers[index], relativePermittivityLayers[index]);
         }
+        accumulatedThickness += distancesThroughLayers[index];
     }
     // The insulation layers are collected along the winding path, not the turns'
     // closest approach, so their summed thickness can exceed the actual
@@ -967,7 +971,11 @@ std::vector<double> StrayCapacitanceParallelPlateModel::preprocess_data_for_plan
 
     double distanceBetweenTurns = 0;
     double overlappingDimension = 0;
-    if (firstTurn.get_coordinates()[1] == secondTurn.get_coordinates()[1]) {
+    // Side by side when the turns share a row. Their y coordinates come out of different arithmetic, so
+    // "the same row" is equality up to rounding noise, far below any copper thickness: exact float
+    // equality sent side-by-side turns into the stacked branch on a last-bit difference.
+    double sameRowTolerance = 1e-3 * std::min(firstWire.get_maximum_conducting_height(), secondWire.get_maximum_conducting_height());
+    if (std::abs(firstTurn.get_coordinates()[1] - secondTurn.get_coordinates()[1]) <= sameRowTolerance) {
         distanceBetweenTurns = fabs(firstTurn.get_coordinates()[0] - secondTurn.get_coordinates()[0]);
         distanceBetweenTurns -= firstWire.get_maximum_conducting_width() / 2 + secondWire.get_maximum_conducting_width() / 2;
         conductingDimensionFirstWire = firstWire.get_maximum_conducting_height();
@@ -3020,13 +3028,13 @@ static double gap_relative_permittivity(Core& core, const std::vector<const Core
         throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
             "The " + describeCoreAndGap() + " is a spacer shimmed between the halves, but the core has"
             " no geometrical description, so the spacer and its insulationMaterial are missing. The gap"
-            " capacitance (ABT #1166) depends directly on that dielectric and it will not be assumed air");
+            " capacitance depends directly on that dielectric and it will not be assumed air");
     }
     auto spacers = core.get_spacers();
     if (spacers.empty()) {
         throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
             "The " + describeCoreAndGap() + " is a spacer shimmed between the halves, but the core's"
-            " geometrical description has no spacer element for it. The gap capacitance (ABT #1166)"
+            " geometrical description has no spacer element for it. The gap capacitance"
             " depends directly on the spacer's dielectric and it will not be assumed air");
     }
 
@@ -3037,7 +3045,7 @@ static double gap_relative_permittivity(Core& core, const std::vector<const Core
             throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
                 "A spacer in the geometrical description of the " + describeCoreAndGap() +
                 " declares no insulationMaterial, which core/spacer.json requires. The gap capacitance"
-                " (ABT #1166) depends directly on the spacer's relative permittivity and it will not be"
+                " depends directly on the spacer's relative permittivity and it will not be"
                 " guessed: record the spacer material");
         }
         auto materialUnion = spacer.get_insulation_material().value();
@@ -3047,14 +3055,14 @@ static double gap_relative_permittivity(Core& core, const std::vector<const Core
         if (!material.get_relative_permittivity()) {
             throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
                 "Spacer insulation material '" + material.get_name() + "' of the " + describeCoreAndGap() +
-                " has no relative permittivity in the database, so the gap capacitance (ABT #1166)"
+                " has no relative permittivity in the database, so the gap capacitance"
                 " cannot be computed");
         }
         double thisPermittivity = material.get_relative_permittivity().value();
         if (haveSpacer && thisPermittivity != relativePermittivity) {
             throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
                 "The spacers of the " + describeCoreAndGap() + " declare different insulation materials;"
-                " which dielectric the gap capacitance (ABT #1166) should use is ambiguous and will not be"
+                " which dielectric the gap capacitance should use is ambiguous and will not be"
                 " picked");
         }
         relativePermittivity = thisPermittivity;
@@ -3237,13 +3245,13 @@ StrayCapacitance::ThroughCoreGapSplit StrayCapacitance::core_gap_topology(
     if (!(totalArea > 0)) {
         throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
             "An all-legs-gapped core with side-by-side windings puts the gap in series with the"
-            " inter-winding path (ABT #1166), but at least one of its gaps carries no area: the"
+            " inter-winding path, but at least one of its gaps carries no area: the"
             " gap capacitance cannot be computed and will not be guessed");
     }
     if (!(shortestGap > 0)) {
         throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
             "An all-legs-gapped core with side-by-side windings puts the gap in series with the"
-            " inter-winding path (ABT #1166), but its gap length is not positive");
+            " inter-winding path, but its gap length is not positive");
     }
     // The gaps of the different columns are in PARALLEL between the two core bodies, so the
     // total gapped cross-section is what enters; the length is the one plane's thickness, and
@@ -3298,7 +3306,7 @@ static double through_core_split_core_energy(const std::vector<double>& turnCore
     }
     if (!(capacitanceFirstBody > 0) || !(capacitanceSecondBody > 0) || !(gapCapacitance > 0)) {
         throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
-            "The split-core through-core path (ABT #1166) needs a positive turn-to-core"
+            "The split-core through-core path needs a positive turn-to-core"
             " capacitance on each core body and a positive gap capacitance");
     }
     double determinant = capacitanceFirstBody * capacitanceSecondBody +

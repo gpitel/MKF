@@ -7,23 +7,220 @@
 #include <complex>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <limits>
+#include <list>
 #include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace MAS;
 
 namespace OpenMagnetics {
 
+namespace {
+// A quantity with an SI prefix and three significant figures, for messages ("20 us", "100 kHz"). Kept here
+// rather than taken from support/NumberFormat: Kirchhoff compiles this file without that one.
+std::string si_quantity(double value, const std::string& unit) {
+    static const std::pair<double, const char*> prefixes[] = {{1e9, "G"}, {1e6, "M"}, {1e3, "k"}, {1, ""}, {1e-3, "m"}, {1e-6, "u"}, {1e-9, "n"}, {1e-12, "p"}};
+    std::ostringstream text;
+    text << std::setprecision(3);
+    if (!std::isfinite(value) || value == 0) {
+        text << value << " " << unit;
+        return text.str();
+    }
+    for (const auto& [scale, prefix] : prefixes) {
+        if (std::fabs(value) >= scale * 0.9995) {
+            text << value / scale << " " << prefix << unit;
+            return text.str();
+        }
+    }
+    text << value / 1e-12 << " p" << unit;
+    return text.str();
+}
+} // namespace
+
+
 // Kept C++17-compatible (no <numbers>/std::lerp) so the Kirchhoff converter-model library, which builds
 // at C++17, can reuse this file; MKF (C++23) compiles it unchanged.
 namespace { constexpr double kWaveformPi = 3.14159265358979323846264338327950288; }
 static inline double kWaveformLerp(double a, double b, double t) { return a + t * (b - a); }
+
+// ---------------------------------------------------------------------------
+// Memos of the pure waveform-processing entry points (compress_waveform,
+// calculate_basic_processed_data, calculate_harmonics_data).
+//
+// A solve that iterates on one excitation hands these the very same samples
+// again and again: the turns solve on a line-cycle PFC record compresses the
+// same 16384-sample magnetizing current once per DC-bias evaluation, and
+// re-evaluates the same turn count several times, re-labelling and
+// re-transforming identical flux densities. Each memo returns the stored result
+// only for an input that is bit for bit the one it was computed from: every
+// field of the Waveform (data, time, number of periods, ancillary label) and
+// every other argument, compared bitwise (memcmp), so a -0.0 or a NaN payload
+// is a different key. These functions read nothing but their arguments, so that
+// key is everything their result depends on. Per thread (thread_local), bounded
+// in entries and bytes, most recent first; a throwing call stores nothing.
+// ---------------------------------------------------------------------------
+namespace {
+
+bool same_bits(const std::vector<double>& a, const std::vector<double>& b) {
+    return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(double)) == 0);
+}
+
+bool same_bits(double a, double b) {
+    return std::memcmp(&a, &b, sizeof(double)) == 0;
+}
+
+bool same_bits(const std::optional<double>& a, const std::optional<double>& b) {
+    return a.has_value() == b.has_value() && (!a || same_bits(*a, *b));
+}
+
+size_t waveform_bytes(const Waveform& waveform) {
+    return sizeof(Waveform) + waveform.get_data().size() * sizeof(double) +
+           (waveform.get_time() ? waveform.get_time()->size() * sizeof(double) : 0);
+}
+
+// The whole of a Waveform as a memo key.
+struct WaveformKey {
+    std::vector<double> data;
+    std::optional<std::vector<double>> time;
+    std::optional<int64_t> numberPeriods;
+    std::optional<WaveformLabel> ancillaryLabel;
+
+    explicit WaveformKey(const Waveform& waveform)
+        : data(waveform.get_data()), time(waveform.get_time()), numberPeriods(waveform.get_number_periods()),
+          ancillaryLabel(waveform.get_ancillary_label()) {}
+
+    bool matches(const Waveform& waveform) const {
+        if (numberPeriods != waveform.get_number_periods() || ancillaryLabel != waveform.get_ancillary_label()) {
+            return false;
+        }
+        // The data by reference first: it tells almost every miss apart. get_time() returns a copy.
+        if (!same_bits(data, waveform.get_data())) {
+            return false;
+        }
+        const auto otherTime = waveform.get_time();
+        return time.has_value() == otherTime.has_value() && (!time || same_bits(*time, *otherTime));
+    }
+
+    size_t bytes() const {
+        return sizeof(WaveformKey) + data.size() * sizeof(double) + (time ? time->size() * sizeof(double) : 0);
+    }
+};
+
+bool same_key(const std::optional<WaveformKey>& key, const std::optional<Waveform>& waveform) {
+    return key.has_value() == waveform.has_value() && (!key || key->matches(*waveform));
+}
+
+// Most-recent-first list of (arguments, result), indexed by a hash of the waveform's bits so that a memo of
+// thousands of entries (the switching cycles of a line-cycle record) finds an entry without scanning them all.
+// The hash only selects candidates: an entry is returned only when match() holds, the full bitwise comparison.
+// Entry needs: bytes, value; match() tells it is the call's.
+template <typename Entry>
+struct WaveformMemo {
+    size_t maximumEntries;
+    size_t maximumBytes;
+    std::list<std::pair<size_t, Entry>> entries;  // (hash, entry), most recent first
+    std::unordered_multimap<size_t, typename std::list<std::pair<size_t, Entry>>::iterator> index;
+    size_t bytes = 0;
+
+    WaveformMemo(size_t entriesBound, size_t bytesBound) : maximumEntries(entriesBound), maximumBytes(bytesBound) {}
+
+    template <typename Match>
+    const Entry* find(size_t hash, Match&& match) {
+        auto [first, last] = index.equal_range(hash);
+        for (auto candidate = first; candidate != last; ++candidate) {
+            if (match(candidate->second->second)) {
+                entries.splice(entries.begin(), entries, candidate->second);
+                return &entries.front().second;
+            }
+        }
+        return nullptr;
+    }
+
+    void insert(size_t hash, Entry entry) {
+        if (entry.bytes > maximumBytes) {
+            return;
+        }
+        bytes += entry.bytes;
+        entries.emplace_front(hash, std::move(entry));
+        index.emplace(hash, entries.begin());
+        while (entries.size() > maximumEntries || bytes > maximumBytes) {
+            auto oldest = std::prev(entries.end());
+            auto [first, last] = index.equal_range(oldest->first);
+            for (auto candidate = first; candidate != last; ++candidate) {
+                if (candidate->second == oldest) {
+                    index.erase(candidate);
+                    break;
+                }
+            }
+            bytes -= oldest->second.bytes;
+            entries.erase(oldest);
+        }
+    }
+};
+
+// A hash of a Waveform's data bits, for WaveformMemo's index only. (This file is also compiled by Kirchhoff against
+// its own MAS.hpp, which has no get_*_ref accessors.)
+size_t waveform_bits_hash(const Waveform& waveform) {
+    std::uint64_t hash = 0x9e3779b97f4a7c15ULL;
+    auto mix = [&hash](const std::vector<double>& values) {
+        hash ^= values.size() + 0x632be59bd9b4e019ULL + (hash << 6) + (hash >> 2);
+        // At most 256 evenly strided samples: the hash only picks candidates, and a 16k-sample record must not
+        // cost a full pass per lookup.
+        const size_t stride = values.size() > 256 ? values.size() / 256 : 1;
+        for (size_t index = 0; index < values.size(); index += stride) {
+            std::uint64_t bits;
+            std::memcpy(&bits, &values[index], sizeof(bits));
+            hash = (hash ^ bits) * 0x100000001b3ULL;
+            hash ^= hash >> 29;
+        }
+    };
+    mix(waveform.get_data());  // the data alone: get_time() returns a copy, and match() compares the time anyway
+    return static_cast<size_t>(hash);
+}
+
+struct CompressEntry {
+    WaveformKey waveform;
+    std::optional<double> frequency;
+    Waveform value;
+    size_t bytes;
+};
+
+struct BasicProcessedEntry {
+    WaveformKey waveform;
+    size_t numberPointsSampledWaveforms;
+    std::optional<WaveformKey> givenWaveform;
+    ProcessedWaveform value;
+    size_t bytes;
+};
+
+struct HarmonicsEntry {
+    WaveformKey waveform;
+    double frequency;
+    bool trimHarmonics;
+    double harmonicAmplitudeThreshold;
+    size_t numberPointsSampledWaveforms;
+    Harmonics value;
+    size_t bytes;
+};
+
+// Set while calculate_basic_processed_data compresses its own input: that input missed the basic memo,
+// so its compressed copy is not worth a second memo (storing it copied the record twice).
+thread_local bool compressMemoBypassed = false;
+
+// 16 MB per memo and thread: a few dozen 16k-sample line-cycle records, thousands of 128-sample periods.
+constexpr size_t kWaveformMemoBytes = size_t(16) << 20;
+// Entry bound of the memos that see every switching cycle of a line-cycle record (1077 for a 650 W PFC).
+constexpr size_t kWaveformMemoCycleEntries = 8192;
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Pure / shared helpers.
@@ -80,8 +277,14 @@ double roundFloat(double value, int64_t decimals = 9) {
     return round(value * pow(10, decimals)) / pow(10, decimals);
 }
 
+// The test on a size alone, for callers here that hold a waveform's data by reference (is_size_power_of_2 takes
+// the vector by value: a copy of every sample to read its size).
+static bool size_is_power_of_2(size_t size) {
+    return size > 0 && ((size & (size - 1)) == 0);
+}
+
 bool is_size_power_of_2(std::vector<double> data) {
-    return data.size() > 0 && ((data.size() & (data.size() - 1)) == 0);
+    return size_is_power_of_2(data.size());
 }
 
 size_t round_up_size_to_power_of_2(std::vector<double> data) {
@@ -215,7 +418,7 @@ void throw_if_label_reads_past_the_end(const Waveform& waveform, WaveformLabel l
                                 ": its label does not describe its data, so no offset or duty cycle can be read from it.");
 }
 
-double calculate_offset(Waveform waveform, WaveformLabel label) {
+double calculate_offset(const Waveform& waveform, WaveformLabel label) {
     throw_if_label_reads_past_the_end(waveform, label);
     switch (label) {
         case WaveformLabel::TRIANGULAR:
@@ -270,7 +473,7 @@ double calculate_offset(Waveform waveform, WaveformLabel label) {
 // Waveform-shape helpers (public; ported from Inputs).
 // ---------------------------------------------------------------------------
 
-bool WaveformProcessor::is_waveform_imported(Waveform waveform, size_t numberPointsSampledWaveforms) {
+bool WaveformProcessor::is_waveform_imported(const Waveform& waveform, size_t numberPointsSampledWaveforms) {
     if (!waveform.get_time()) {
         return false;
     }
@@ -279,19 +482,21 @@ bool WaveformProcessor::is_waveform_imported(Waveform waveform, size_t numberPoi
     }
 }
 
-bool WaveformProcessor::is_waveform_sampled(Waveform waveform, size_t numberPointsSampledWaveforms) {
+bool WaveformProcessor::is_waveform_sampled(const Waveform& waveform, size_t numberPointsSampledWaveforms) {
+    // get_time() returns the optional BY VALUE (a copy of the whole axis), so it is asked once: this is
+    // is_waveform_imported's test (a time axis, more samples than the sampler's) written out.
     if (!waveform.get_time()) {
         return false;
     }
-    else if (is_waveform_imported(waveform, numberPointsSampledWaveforms)) {
-        return is_size_power_of_2(waveform.get_data());
+    else if (waveform.get_data().size() > numberPointsSampledWaveforms) {
+        return size_is_power_of_2(waveform.get_data().size());
     }
     else {
         return waveform.get_data().size() == numberPointsSampledWaveforms;
     }
 }
 
-double WaveformProcessor::calculate_waveform_average(Waveform waveform) {
+double WaveformProcessor::calculate_waveform_average(const Waveform& waveform) {
     // get_time() returns the optional BY VALUE, so indexing it inside the loop copied the whole
     // time axis twice per sample: O(N^2), minutes for an imported waveform with a few hundred
     // thousand points. Take it once.
@@ -308,77 +513,96 @@ double WaveformProcessor::calculate_waveform_average(Waveform waveform) {
 }
 
 Waveform WaveformProcessor::compress_waveform(const Waveform& waveform, std::optional<double> frequency) {
-    Waveform compressedWaveform;
-    auto data = waveform.get_data();
-    if (data.size() < 2) {
-        return waveform;
-    }
-    auto time = waveform.get_time().value();
-    if (time.size() < 2) {
-        return waveform;
-    }
-    // An open axis is closed periodically with the first sample one step after the last. A closed
-    // axis already reaches t0 + T: closing it again made the result span T + dt (ABT #1467).
-    // Only an axis recognised as closed (it spans the period within the sampler's 0.1 %, and is
-    // nearer to it than its one-step extension) loses the closing point. An axis that spans
-    // something else is not judged here: compressing is not where a record is validated.
-    bool openAxis = true;
-    if (frequency) {
-        if (!std::isfinite(frequency.value()) || frequency.value() <= 0) {
-            throw std::invalid_argument("compress_waveform needs a positive excitation frequency to tell a closed time axis from an open one, got " + std::to_string(frequency.value()));
+    thread_local WaveformMemo<CompressEntry> memo{32, kWaveformMemoBytes};
+    const bool memoized = !compressMemoBypassed;
+    const size_t hash = memoized ? waveform_bits_hash(waveform) : 0;
+    if (memoized) {
+        if (auto hit = memo.find(hash, [&](const CompressEntry& entry) {
+                return same_bits(entry.frequency, frequency) && entry.waveform.matches(waveform);
+            })) {
+            return hit->value;
         }
-        const double expectedPeriod = 1.0 / frequency.value();
-        const double span = time.back() - time.front();
-        const double lastStep = time[time.size() - 1] - time[time.size() - 2];
-        const double closedError = std::fabs(span - expectedPeriod);
-        const double openError = std::fabs(span + lastStep - expectedPeriod);
-        openAxis = !(closedError <= 1e-3 * expectedPeriod && closedError <= openError);
     }
-    if (openAxis) {
-        data.push_back(data[0]);
-        time.push_back(time[time.size() - 1] + (time[time.size() - 1] - time[time.size() - 2]));
-    }
-    std::vector<double> compressedData;
-    std::vector<double> compressedTime;
-    double previousSlope = DBL_MAX;
-    for (size_t i = 0; i < data.size() - 1; ++i){
-        // FIXED: BUG-01 — Guard against division by zero on identical time points
-        double slope;
-        if (time[i + 1] == time[i]) {
-            slope = (data[i + 1] >= data[i]) ? DBL_MAX : -DBL_MAX;
-        } else {
-            slope = (data[i + 1] - data[i]) / (time[i + 1] - time[i]);
+    Waveform computed = [&]() -> Waveform {
+        Waveform compressedWaveform;
+        auto data = waveform.get_data();
+        if (data.size() < 2) {
+            return waveform;
         }
-
-        // Emit point if: (1) discontinuity, OR (2) slope changes significantly
-        bool isDiscontinuity = (slope == DBL_MAX || slope == -DBL_MAX);
-        bool previousWasDiscontinuity = (previousSlope == DBL_MAX || previousSlope == -DBL_MAX);
-
-        // Detect slope change: use relative change if possible, absolute if previous slope is near zero
-        bool slopeChanged = false;
-        if (!isDiscontinuity && !previousWasDiscontinuity) {
-            if (fabs(previousSlope) > 1e-9) {
-                // Non-zero previous slope: use relative change
-                slopeChanged = fabs((slope - previousSlope) / previousSlope) > 0.01;
-            } else {
-                // Previous slope near zero: use absolute change
-                slopeChanged = fabs(slope) > 1e-9;
+        auto time = waveform.get_time().value();
+        if (time.size() < 2) {
+            return waveform;
+        }
+        // An open axis is closed periodically with the first sample one step after the last. A closed
+        // axis already reaches t0 + T: closing it again made the result span T + dt (ABT #1467).
+        // Only an axis recognised as closed (it spans the period within the sampler's 0.1 %, and is
+        // nearer to it than its one-step extension) loses the closing point. An axis that spans
+        // something else is not judged here: compressing is not where a record is validated.
+        bool openAxis = true;
+        if (frequency) {
+            if (!std::isfinite(frequency.value()) || frequency.value() <= 0) {
+                throw std::invalid_argument("compress_waveform needs a positive excitation frequency to tell a closed time axis from an open one, got " + std::to_string(frequency.value()));
             }
+            const double expectedPeriod = 1.0 / frequency.value();
+            const double span = time.back() - time.front();
+            const double lastStep = time[time.size() - 1] - time[time.size() - 2];
+            const double closedError = std::fabs(span - expectedPeriod);
+            const double openError = std::fabs(span + lastStep - expectedPeriod);
+            openAxis = !(closedError <= 1e-3 * expectedPeriod && closedError <= openError);
         }
-        if (isDiscontinuity || previousWasDiscontinuity || slopeChanged) {
-            compressedData.push_back(data[i]);
-            compressedTime.push_back(time[i]);
+        if (openAxis) {
+            data.push_back(data[0]);
+            time.push_back(time[time.size() - 1] + (time[time.size() - 1] - time[time.size() - 2]));
         }
-        previousSlope = slope;
+        std::vector<double> compressedData;
+        std::vector<double> compressedTime;
+        double previousSlope = DBL_MAX;
+        for (size_t i = 0; i < data.size() - 1; ++i){
+            // FIXED: BUG-01 — Guard against division by zero on identical time points
+            double slope;
+            if (time[i + 1] == time[i]) {
+                slope = (data[i + 1] >= data[i]) ? DBL_MAX : -DBL_MAX;
+            } else {
+                slope = (data[i + 1] - data[i]) / (time[i + 1] - time[i]);
+            }
+
+            // Emit point if: (1) discontinuity, OR (2) slope changes significantly
+            bool isDiscontinuity = (slope == DBL_MAX || slope == -DBL_MAX);
+            bool previousWasDiscontinuity = (previousSlope == DBL_MAX || previousSlope == -DBL_MAX);
+
+            // Detect slope change: use relative change if possible, absolute if previous slope is near zero
+            bool slopeChanged = false;
+            if (!isDiscontinuity && !previousWasDiscontinuity) {
+                if (fabs(previousSlope) > 1e-9) {
+                    // Non-zero previous slope: use relative change
+                    slopeChanged = fabs((slope - previousSlope) / previousSlope) > 0.01;
+                } else {
+                    // Previous slope near zero: use absolute change
+                    slopeChanged = fabs(slope) > 1e-9;
+                }
+            }
+            if (isDiscontinuity || previousWasDiscontinuity || slopeChanged) {
+                compressedData.push_back(data[i]);
+                compressedTime.push_back(time[i]);
+            }
+            previousSlope = slope;
+        }
+        compressedData.push_back(data.back());
+        compressedTime.push_back(time.back());
+        compressedWaveform.set_data(compressedData);
+        compressedWaveform.set_time(compressedTime);
+        if (waveform.get_ancillary_label()) {
+            compressedWaveform.set_ancillary_label(waveform.get_ancillary_label().value());
+        }
+        return compressedWaveform;
+    }();
+    if (!memoized) {
+        return computed;
     }
-    compressedData.push_back(data.back());
-    compressedTime.push_back(time.back());
-    compressedWaveform.set_data(compressedData);
-    compressedWaveform.set_time(compressedTime);
-    if (waveform.get_ancillary_label()) {
-        compressedWaveform.set_ancillary_label(waveform.get_ancillary_label().value());
-    }
-    return compressedWaveform;
+    WaveformKey key(waveform);
+    size_t bytes = sizeof(CompressEntry) + key.bytes() + waveform_bytes(computed);
+    memo.insert(hash, CompressEntry{std::move(key), frequency, computed, bytes});
+    return computed;
 }
 
 // The fraction of the period a triangle spends rising: trough to peak.
@@ -475,7 +699,7 @@ static double measure_duty_cycle_from_samples(const Waveform& waveform) {
     return static_cast<double>(pointsOn) / static_cast<double>(data.size());
 }
 
-double WaveformProcessor::try_guess_duty_cycle(Waveform waveform, WaveformLabel label, double frequency, size_t numberPointsSampledWaveforms) {
+double WaveformProcessor::try_guess_duty_cycle(const Waveform& waveform, WaveformLabel label, double frequency, size_t numberPointsSampledWaveforms) {
     // This reads vertex indices off whatever it is handed, which may be a compressed copy of a
     // labelled waveform: those indices must exist. Whether the shape as given is the label's
     // is checked where the given waveform is known (calculate_basic_processed_data).
@@ -713,19 +937,85 @@ static WaveformLabel guess_sinusoidal_or_custom(const Waveform& waveform) {
     //
     // A signal with no fundamental has no phase to find and keeps zero; it is not
     // a sine either way, and the error test below is what says so.
+    // The angles, their sines and cosines, and the weights depend on the time axis alone (or, without one, on the
+    // number of points): a solve hands this the same axis under scaled data again and again. Exact-input memo of
+    // the last axis per thread, bit for bit; the sines of the phase-shifted angles are kept for the last phase too.
+    struct ReferenceSine {
+        bool useTime = false;
+        size_t numberPoints = 0;
+        size_t distinctPoints = 0;
+        double period = 0;
+        std::vector<double> time;
+        std::vector<double> angle, sine, cosine, weight;
+        bool hasShifted = false;
+        double phase = 0;
+        std::vector<double> shiftedSine;
+    };
+    // The last four axes (a solve alternates between a few: the current's, the flux density's, ...), most recent first.
+    thread_local std::vector<ReferenceSine> references;
+    auto sameBits = [](double a, double b) { return std::memcmp(&a, &b, sizeof(double)) == 0; };
+    auto isThisAxis = [&](const ReferenceSine& candidate) {
+        return candidate.numberPoints == numberPoints && candidate.useTime == useTime &&
+               candidate.distinctPoints == distinctPoints && sameBits(candidate.period, period) &&
+               (!useTime || (candidate.time.size() == timeOptional->size() &&
+                             std::memcmp(candidate.time.data(), timeOptional->data(), numberPoints * sizeof(double)) == 0));
+    };
+    auto found = std::find_if(references.begin(), references.end(), isThisAxis);
+    const bool sameAxis = found != references.end();
+    if (sameAxis) {
+        std::rotate(references.begin(), found, found + 1);
+    }
+    else {
+        if (references.size() == 4) {
+            references.pop_back();
+        }
+        references.insert(references.begin(), ReferenceSine{});
+    }
+    ReferenceSine& reference = references.front();
+    if (!sameAxis) {
+        reference.useTime = useTime;
+        reference.numberPoints = numberPoints;
+        reference.distinctPoints = distinctPoints;
+        reference.period = period;
+        if (useTime) {
+            reference.time = *timeOptional;
+        }
+        reference.angle.resize(numberPoints);
+        reference.sine.resize(distinctPoints);
+        reference.cosine.resize(distinctPoints);
+        reference.weight.resize(distinctPoints);
+        for (size_t i = 0; i < numberPoints; ++i) {
+            reference.angle[i] = angleAt(i);
+        }
+        for (size_t i = 0; i < distinctPoints; ++i) {
+            reference.weight[i] = weightAt(i);
+            reference.sine[i] = sin(reference.angle[i]);
+            reference.cosine[i] = cos(reference.angle[i]);
+        }
+    }
+
     double sinProjection = 0;
     double cosProjection = 0;
     for (size_t i = 0; i < distinctPoints; ++i) {
         double centered = data[i] - offset;
-        sinProjection += weightAt(i) * centered * sin(angleAt(i));
-        cosProjection += weightAt(i) * centered * cos(angleAt(i));
+        sinProjection += reference.weight[i] * centered * reference.sine[i];
+        cosProjection += reference.weight[i] * centered * reference.cosine[i];
     }
     double phase = (sinProjection == 0 && cosProjection == 0) ? 0 : atan2(cosProjection, sinProjection);
+
+    if (!reference.hasShifted || !sameBits(reference.phase, phase)) {
+        reference.shiftedSine.resize(numberPoints);
+        for (size_t i = 0; i < numberPoints; ++i) {
+            reference.shiftedSine[i] = sin(reference.angle[i] + phase);
+        }
+        reference.phase = phase;
+        reference.hasShifted = true;
+    }
 
     double error = 0;
     double area = 0;
     for (size_t i = 0; i < numberPoints; ++i) {
-        double calculatedData = (sin(angleAt(i) + phase) * peakToPeak / 2) + offset;
+        double calculatedData = (reference.shiftedSine[i] * peakToPeak / 2) + offset;
         area += fabs(data[i]);
         error += fabs(calculatedData - data[i]);
     }
@@ -765,14 +1055,14 @@ static WaveformLabel guess_sinusoidal_or_custom(const Waveform& waveform) {
     return WaveformLabel::CUSTOM;
 }
 
-WaveformLabel WaveformProcessor::try_guess_waveform_label(Waveform waveform, size_t numberPointsSampledWaveforms) {
+// try_guess_waveform_label once the vertex-test copy is known: compressedWaveform is
+// compress_waveform(waveform) when the waveform is sampled, the waveform itself otherwise. Split out so
+// calculate_basic_processed_data, which compresses the same waveform for its own reads, does not compress it twice.
+static WaveformLabel guess_waveform_label(const Waveform& waveform, const Waveform& compressedWaveform, size_t numberPointsSampledWaveforms) {
     if (waveform.get_ancillary_label()) {
         return waveform.get_ancillary_label().value();
     }
 
-    auto compressedWaveform = waveform;
-    if (is_waveform_sampled(waveform, numberPointsSampledWaveforms))
-        compressedWaveform = compress_waveform(waveform);
     double period = 0;
     if (compressedWaveform.get_time()) {
         period = compressedWaveform.get_time()->back() - compressedWaveform.get_time()->front();
@@ -911,6 +1201,16 @@ WaveformLabel WaveformProcessor::try_guess_waveform_label(Waveform waveform, siz
     else {
         return guess_sinusoidal_or_custom(waveform);
     }
+}
+
+WaveformLabel WaveformProcessor::try_guess_waveform_label(const Waveform& waveform, size_t numberPointsSampledWaveforms) {
+    if (waveform.get_ancillary_label()) {
+        return waveform.get_ancillary_label().value();
+    }
+    if (is_waveform_sampled(waveform, numberPointsSampledWaveforms)) {
+        return guess_waveform_label(waveform, compress_waveform(waveform), numberPointsSampledWaveforms);
+    }
+    return guess_waveform_label(waveform, waveform, numberPointsSampledWaveforms);
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,9 +1419,10 @@ bool WaveformProcessor::check_time_axis_spans_one_period(const std::vector<doubl
     const double openError = uniformAxis? std::fabs(period + lastStep - expectedPeriod) : std::numeric_limits<double>::infinity();
     if (closedError > tolerance && openError > tolerance) {
         std::ostringstream message;
-        message << std::setprecision(10) << "Waveform time axis spans " << period << " s (" << time.size() << " points from " << time.front()
-                << " s to " << time.back() << " s, last step " << lastStep << " s" << (uniformAxis? ", uniform" : "") << ") but the excitation period is "
-                << expectedPeriod << " s (" << frequency << " Hz): a waveform must be given over exactly one period, including the intervals where it is zero";
+        message << "A waveform covers " << si_quantity(period, "s") << " (" << time.size() << " points from "
+                << si_quantity(time.front(), "s") << " to " << si_quantity(time.back(), "s") << "), but the period of its excitation is "
+                << si_quantity(expectedPeriod, "s") << " (" << si_quantity(frequency, "Hz") << "): a waveform must cover exactly one "
+                << "period, including the intervals where it is zero. Give one period of the waveform, or correct the frequency";
         throw std::invalid_argument(message.str());
     }
     return openError < closedError;
@@ -1532,50 +1833,67 @@ bool WaveformProcessor::is_zero_harmonic(const FourierSeries& series, double lis
     return std::fabs(listedAmplitude) < zeroScale && std::abs(phasor) < zeroScale;
 }
 
-Harmonics WaveformProcessor::calculate_harmonics_data(Waveform waveform, double frequency, bool trimHarmonics, double harmonicAmplitudeThreshold, size_t numberPointsSampledWaveforms) {
-    bool isWaveformImported = is_waveform_imported(waveform, numberPointsSampledWaveforms);
-    Harmonics harmonics;
-
-    const auto series = calculate_fourier_series(waveform, frequency, numberPointsSampledWaveforms);
-    const auto& coefficients = series.coefficients;
-    if (!waveform.get_time()) {
-        // The plain DFT of the samples, harmonics 0..N/2-1 (amplitude expressions unchanged).
-        harmonics.get_mutable_amplitudes().push_back(std::abs(coefficients[0]));
-        for (size_t i = 1; i < coefficients.size(); ++i) {
-            harmonics.get_mutable_amplitudes().push_back(std::abs(2. * coefficients[i]));
-        }
-        for (size_t i = 0; i < coefficients.size(); ++i) {
-            harmonics.get_mutable_frequencies().push_back(frequency * i);
-        }
+Harmonics WaveformProcessor::calculate_harmonics_data(const Waveform& waveform, double frequency, bool trimHarmonics, double harmonicAmplitudeThreshold, size_t numberPointsSampledWaveforms) {
+    // Thousands of entries: a line-cycle record's switching cycles are transformed once per loss evaluation.
+    thread_local WaveformMemo<HarmonicsEntry> memo{kWaveformMemoCycleEntries, kWaveformMemoBytes};
+    const size_t hash = waveform_bits_hash(waveform);
+    if (auto hit = memo.find(hash, [&](const HarmonicsEntry& entry) {
+            return same_bits(entry.frequency, frequency) && entry.trimHarmonics == trimHarmonics &&
+                   same_bits(entry.harmonicAmplitudeThreshold, harmonicAmplitudeThreshold) &&
+                   entry.numberPointsSampledWaveforms == numberPointsSampledWaveforms && entry.waveform.matches(waveform);
+        })) {
+        return hit->value;
     }
-    else {
-        harmonics.get_mutable_amplitudes().push_back(std::abs(coefficients[0]));
-        harmonics.get_mutable_frequencies().push_back(0);
-        for (size_t k = 1; k < coefficients.size(); ++k) {
-            harmonics.get_mutable_amplitudes().push_back(2 * std::abs(coefficients[k]));
-            harmonics.get_mutable_frequencies().push_back(frequency * static_cast<double>(k));
-        }
-    }
+    Harmonics computed = [&]() -> Harmonics {
+        bool isWaveformImported = is_waveform_imported(waveform, numberPointsSampledWaveforms);
+        Harmonics harmonics;
 
-
-    if (isWaveformImported && trimHarmonics) {
-        auto mainHarmonicIndexes = get_main_harmonic_indexes(harmonics, harmonicAmplitudeThreshold);
-        Harmonics reducedHarmonics;
-        reducedHarmonics.get_mutable_amplitudes().push_back(harmonics.get_amplitudes()[0]);
-        reducedHarmonics.get_mutable_amplitudes().push_back(harmonics.get_amplitudes()[1]);
-        reducedHarmonics.get_mutable_frequencies().push_back(harmonics.get_frequencies()[0]);
-        reducedHarmonics.get_mutable_frequencies().push_back(harmonics.get_frequencies()[1]);
-        for (auto harmonicIndex : mainHarmonicIndexes) {
-            if (harmonicIndex == 0 || harmonicIndex == 1) {
-                continue;
+        const auto series = calculate_fourier_series(waveform, frequency, numberPointsSampledWaveforms);
+        const auto& coefficients = series.coefficients;
+        if (!waveform.get_time()) {
+            // The plain DFT of the samples, harmonics 0..N/2-1 (amplitude expressions unchanged).
+            harmonics.get_mutable_amplitudes().push_back(std::abs(coefficients[0]));
+            for (size_t i = 1; i < coefficients.size(); ++i) {
+                harmonics.get_mutable_amplitudes().push_back(std::abs(2. * coefficients[i]));
             }
-            reducedHarmonics.get_mutable_amplitudes().push_back(harmonics.get_amplitudes()[harmonicIndex]);
-            reducedHarmonics.get_mutable_frequencies().push_back(harmonics.get_frequencies()[harmonicIndex]);
+            for (size_t i = 0; i < coefficients.size(); ++i) {
+                harmonics.get_mutable_frequencies().push_back(frequency * i);
+            }
         }
-        harmonics = reducedHarmonics;
-    }
+        else {
+            harmonics.get_mutable_amplitudes().push_back(std::abs(coefficients[0]));
+            harmonics.get_mutable_frequencies().push_back(0);
+            for (size_t k = 1; k < coefficients.size(); ++k) {
+                harmonics.get_mutable_amplitudes().push_back(2 * std::abs(coefficients[k]));
+                harmonics.get_mutable_frequencies().push_back(frequency * static_cast<double>(k));
+            }
+        }
 
-    return harmonics;
+
+        if (isWaveformImported && trimHarmonics) {
+            auto mainHarmonicIndexes = get_main_harmonic_indexes(harmonics, harmonicAmplitudeThreshold);
+            Harmonics reducedHarmonics;
+            reducedHarmonics.get_mutable_amplitudes().push_back(harmonics.get_amplitudes()[0]);
+            reducedHarmonics.get_mutable_amplitudes().push_back(harmonics.get_amplitudes()[1]);
+            reducedHarmonics.get_mutable_frequencies().push_back(harmonics.get_frequencies()[0]);
+            reducedHarmonics.get_mutable_frequencies().push_back(harmonics.get_frequencies()[1]);
+            for (auto harmonicIndex : mainHarmonicIndexes) {
+                if (harmonicIndex == 0 || harmonicIndex == 1) {
+                    continue;
+                }
+                reducedHarmonics.get_mutable_amplitudes().push_back(harmonics.get_amplitudes()[harmonicIndex]);
+                reducedHarmonics.get_mutable_frequencies().push_back(harmonics.get_frequencies()[harmonicIndex]);
+            }
+            harmonics = reducedHarmonics;
+        }
+
+        return harmonics;
+    }();
+    WaveformKey key(waveform);
+    size_t bytes = sizeof(HarmonicsEntry) + key.bytes() +
+                   (computed.get_amplitudes().size() + computed.get_frequencies().size()) * sizeof(double);
+    memo.insert(hash, HarmonicsEntry{std::move(key), frequency, trimHarmonics, harmonicAmplitudeThreshold, numberPointsSampledWaveforms, computed, bytes});
+    return computed;
 }
 
 ProcessedWaveform WaveformProcessor::calculate_processed_data(SignalDescriptor excitation,
@@ -1591,90 +1909,116 @@ ProcessedWaveform WaveformProcessor::calculate_processed_data(SignalDescriptor e
                                     excitation.get_waveform());
 }
 
-ProcessedWaveform WaveformProcessor::calculate_basic_processed_data(Waveform waveform, size_t numberPointsSampledWaveforms, std::optional<Waveform> givenWaveform) {
-    ProcessedWaveform processed;
-    std::vector<double> dataToProcess;
-    auto sampledWaveform = waveform;
-    auto compressedWaveform = waveform;
+ProcessedWaveform WaveformProcessor::calculate_basic_processed_data(const Waveform& waveform, size_t numberPointsSampledWaveforms, const std::optional<Waveform>& givenWaveform) {
+    thread_local WaveformMemo<BasicProcessedEntry> memo{kWaveformMemoCycleEntries, kWaveformMemoBytes};
+    const size_t hash = waveform_bits_hash(waveform);
+    if (auto hit = memo.find(hash, [&](const BasicProcessedEntry& entry) {
+            return entry.numberPointsSampledWaveforms == numberPointsSampledWaveforms && entry.waveform.matches(waveform) &&
+                   same_key(entry.givenWaveform, givenWaveform);
+        })) {
+        return hit->value;
+    }
+    ProcessedWaveform computed = [&]() -> ProcessedWaveform {
+        ProcessedWaveform processed;
 
-    for (size_t i = 0; i < waveform.get_data().size(); ++i) {
-        if (std::isnan(waveform.get_data()[i])) {
-            throw std::invalid_argument("Waveform data contains NaN");
+        for (size_t i = 0; i < waveform.get_data().size(); ++i) {
+            if (std::isnan(waveform.get_data()[i])) {
+                throw std::invalid_argument("Waveform data contains NaN");
+            }
         }
+
+        // The waveform as given or, when it is sampled, its corners; read by reference, not copied.
+        const bool waveformIsSampled = is_waveform_sampled(waveform, numberPointsSampledWaveforms);
+        std::optional<Waveform> compressedCopy;
+        if (waveformIsSampled) {
+            compressMemoBypassed = true;
+        try {
+            compressedCopy = compress_waveform(waveform);
+        } catch (...) {
+            compressMemoBypassed = false;
+            throw;
+        }
+        compressMemoBypassed = false;
+        }
+        const Waveform& compressedWaveform = compressedCopy ? compressedCopy.value() : waveform;
+
+        WaveformLabel label;
+
+        // Hand over the RAW waveform, not the compressed one. try_guess_waveform_label
+        // compresses internally for the vertex tests, so those are unaffected, but its
+        // fall-through tolerance tests — sine and triangle — need the full samples.
+        // Compression deletes points precisely where the signal runs straight, which
+        // is where a non-sine keeps its harmonic content, and leaves a mesh whose
+        // spacing varies by two orders of magnitude. On that mesh a phase estimate
+        // lands 15 degrees out and a distortion measure calls four waveforms in five a
+        // sine. On the raw samples both are accurate.
+        //
+        // Analytical waveforms are unaffected either way: they are not sampled, so
+        // compress_waveform returns them unchanged.
+        label = guess_waveform_label(waveform, compressedWaveform, numberPointsSampledWaveforms);
+        processed.set_label(label);
+
+        if (waveformIsSampled) {
+            processed.set_average(std::accumulate(std::begin(waveform.get_data()), std::end(waveform.get_data()), 0.0) /
+                             waveform.get_data().size());
+        }
+        else {
+            // auto average = calculate_waveform_average(compressedWaveform);
+            // processed.set_average(average);
+        }
+
+        // ABT #1878 (Alf, 2026-10-16: check before sampling). The label names the shape of the
+        // waveform as its producer gave it, so that is the one held to the label's vertex layout,
+        // and the label's offset and duty are read off its vertices. A sampled or compressed copy
+        // is never held to the layout: a 0.5-duty bipolar rectangle with no dead time compresses
+        // from 10 vertices to 6 and is still one. When the given waveform is itself a sample, the
+        // label's reads come off its compressed copy, which only has to have the vertices read.
+        const Waveform& given = givenWaveform ? givenWaveform.value() : waveform;
+        const bool readGivenVertices = given.get_ancillary_label() && given.get_ancillary_label().value() == label &&
+                                       !is_waveform_sampled(given, numberPointsSampledWaveforms);
+        if (readGivenVertices) {
+            throw_if_waveform_cannot_be_its_label(given, label);
+        }
+        const Waveform& labelVertices = readGivenVertices ? given : compressedWaveform;
+        double offset = calculate_offset(labelVertices, label);
+        processed.set_offset(offset);
+
+        processed.set_peak_to_peak(*max_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end()) -
+                                   *min_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end()));
+
+        if (label == WaveformLabel::FLYBACK_PRIMARY ||
+            label == WaveformLabel::FLYBACK_SECONDARY) {
+            // A flyback waveform's peak-to-peak is its ramp: from the offset (the ramp's start, read off its
+            // vertices) to its maximum, as the synthesis above builds it (max = peakToPeak + offset). Its floor
+            // between ramps is not part of it. This was max - min - offset, which is the ramp only on a floor
+            // at 0: a flux density whose DC point lifted it onto a 0.27 T floor came out at -0.21 T, and iGSE
+            // raised that to a fractional power (ABT #1843).
+            processed.set_peak_to_peak(*max_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end()) - offset);
+        }
+
+        double positivePeak = *max_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end());
+        double negativePeak = *min_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end());
+        processed.set_peak(std::max(positivePeak, -negativePeak));
+        processed.set_positive_peak(positivePeak);
+        processed.set_negative_peak(negativePeak);
+
+        // The analytical labels read vertex indices, so they need the COMPRESSED
+        // waveform; the measured CUSTOM path wants the raw uniform samples, which
+        // compression would thin out.
+        processed.set_duty_cycle(label == WaveformLabel::CUSTOM
+            ? try_guess_duty_cycle(waveform, label, 0, numberPointsSampledWaveforms)
+            : try_guess_duty_cycle(labelVertices, label, 0, numberPointsSampledWaveforms));
+
+        return processed;
+    }();
+    WaveformKey key(waveform);
+    std::optional<WaveformKey> givenKey;
+    if (givenWaveform) {
+        givenKey.emplace(givenWaveform.value());
     }
-
-    if (is_waveform_sampled(waveform, numberPointsSampledWaveforms)) {
-        compressedWaveform = compress_waveform(waveform);
-    }
-
-    WaveformLabel label;
-
-    // Hand over the RAW waveform, not the compressed one. try_guess_waveform_label
-    // compresses internally for the vertex tests, so those are unaffected, but its
-    // fall-through tolerance tests — sine and triangle — need the full samples.
-    // Compression deletes points precisely where the signal runs straight, which
-    // is where a non-sine keeps its harmonic content, and leaves a mesh whose
-    // spacing varies by two orders of magnitude. On that mesh a phase estimate
-    // lands 15 degrees out and a distortion measure calls four waveforms in five a
-    // sine. On the raw samples both are accurate.
-    //
-    // Analytical waveforms are unaffected either way: they are not sampled, so
-    // compress_waveform returns them unchanged.
-    label = try_guess_waveform_label(waveform, numberPointsSampledWaveforms);
-    processed.set_label(label);
-
-    if (is_waveform_sampled(waveform, numberPointsSampledWaveforms)) {
-        processed.set_average(std::accumulate(std::begin(sampledWaveform.get_data()), std::end(sampledWaveform.get_data()), 0.0) /
-                         sampledWaveform.get_data().size());
-    }
-    else {
-        // auto average = calculate_waveform_average(compressedWaveform);
-        // processed.set_average(average);
-    }
-
-    // ABT #1878 (Alf, 2026-10-16: check before sampling). The label names the shape of the
-    // waveform as its producer gave it, so that is the one held to the label's vertex layout,
-    // and the label's offset and duty are read off its vertices. A sampled or compressed copy
-    // is never held to the layout: a 0.5-duty bipolar rectangle with no dead time compresses
-    // from 10 vertices to 6 and is still one. When the given waveform is itself a sample, the
-    // label's reads come off its compressed copy, which only has to have the vertices read.
-    const Waveform given = givenWaveform ? givenWaveform.value() : waveform;
-    const bool readGivenVertices = given.get_ancillary_label() && given.get_ancillary_label().value() == label &&
-                                   !is_waveform_sampled(given, numberPointsSampledWaveforms);
-    if (readGivenVertices) {
-        throw_if_waveform_cannot_be_its_label(given, label);
-    }
-    const Waveform& labelVertices = readGivenVertices ? given : compressedWaveform;
-    double offset = calculate_offset(labelVertices, label);
-    processed.set_offset(offset);
-
-    processed.set_peak_to_peak(*max_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end()) -
-                               *min_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end()));
-
-    if (label == WaveformLabel::FLYBACK_PRIMARY ||
-        label == WaveformLabel::FLYBACK_SECONDARY) {
-        // A flyback waveform's peak-to-peak is its ramp: from the offset (the ramp's start, read off its
-        // vertices) to its maximum, as the synthesis above builds it (max = peakToPeak + offset). Its floor
-        // between ramps is not part of it. This was max - min - offset, which is the ramp only on a floor
-        // at 0: a flux density whose DC point lifted it onto a 0.27 T floor came out at -0.21 T, and iGSE
-        // raised that to a fractional power (ABT #1843).
-        processed.set_peak_to_peak(*max_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end()) - offset);
-    }
-
-    double positivePeak = *max_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end());
-    double negativePeak = *min_element(compressedWaveform.get_data().begin(), compressedWaveform.get_data().end());
-    processed.set_peak(std::max(positivePeak, -negativePeak));
-    processed.set_positive_peak(positivePeak);
-    processed.set_negative_peak(negativePeak);
-
-    // The analytical labels read vertex indices, so they need the COMPRESSED
-    // waveform; the measured CUSTOM path wants the raw uniform samples, which
-    // compression would thin out.
-    processed.set_duty_cycle(label == WaveformLabel::CUSTOM
-        ? try_guess_duty_cycle(waveform, label, 0, numberPointsSampledWaveforms)
-        : try_guess_duty_cycle(labelVertices, label, 0, numberPointsSampledWaveforms));
-
-    return processed;
+    size_t bytes = sizeof(BasicProcessedEntry) + key.bytes() + (givenKey ? givenKey->bytes() : 0);
+    memo.insert(hash, BasicProcessedEntry{std::move(key), numberPointsSampledWaveforms, std::move(givenKey), computed, bytes});
+    return computed;
 }
 
 ProcessedWaveform WaveformProcessor::calculate_processed_data(Waveform waveform,

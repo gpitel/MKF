@@ -1,4 +1,5 @@
 #include "constructive_models/Core.h"
+#include "support/MasAccess.h"
 #include "constructive_models/MasMigration.h"
 #include "constructive_models/Wire.h"
 #include "physical_models/Resistivity.h"
@@ -8,6 +9,7 @@
 
 #include "json.hpp"
 #include "support/Utils.h"
+#include "support/NumberFormat.h"
 
 #include <algorithm>
 #include <cctype>
@@ -149,21 +151,21 @@ Core::Core(const CoreShape declaredShape, std::optional<CoreMaterial> material) 
 
 double Core::get_depth() const {
     if (!get_processed_description()) {
-        throw CoreNotProcessedException("Core is not processed");
+        throw CoreNotProcessedException();
     }
     return get_processed_description()->get_depth();
 }
 
 double Core::get_height() const {
     if (!get_processed_description()) {
-        throw CoreNotProcessedException("Core is not processed");
+        throw CoreNotProcessedException();
     }
     return get_processed_description()->get_height();
 }
 
 double Core::get_width() const {
     if (!get_processed_description()) {
-        throw CoreNotProcessedException("Core is not processed");
+        throw CoreNotProcessedException();
     }
     return get_processed_description()->get_width();
 }
@@ -176,7 +178,12 @@ double Core::get_mass() {
         process_data();
     }
     double density = get_density();
-    if (std::isnan(density)) return std::numeric_limits<double>::quiet_NaN();
+    if (std::isnan(density)) {
+        // A NaN mass let every caller that forgot to check compute NaN costs, masses and heat
+        // capacities (ABT #1565): no density, no mass.
+        throw InvalidInputException(ErrorCode::INVALID_CORE_MATERIAL_DATA,
+                                    "core material " + get_material_name() + " has no density: its mass is unknown");
+    }
 
     auto shapeFamily = get_shape_family();
     if (shapeFamily == CoreShapeFamily::T) {
@@ -191,29 +198,31 @@ double Core::get_mass() {
 }
 
 double Core::get_effective_length() const {
-    if (!get_processed_description()) {
-        throw CoreNotProcessedException("Core is not processed");
+    const auto processedDescription = get_processed_description();  // one copy: the MAS getter returns it by value
+    if (!processedDescription) {
+        throw CoreNotProcessedException();
     }
-    return get_processed_description()->get_effective_parameters().get_effective_length();
+    return processedDescription->get_effective_parameters().get_effective_length();
 }
 
 double Core::get_effective_area() const {
-    if (!get_processed_description()) {
-        throw CoreNotProcessedException("Core is not processed");
+    const auto processedDescription = get_processed_description();  // one copy: the MAS getter returns it by value
+    if (!processedDescription) {
+        throw CoreNotProcessedException();
     }
-    return get_processed_description()->get_effective_parameters().get_effective_area();
+    return processedDescription->get_effective_parameters().get_effective_area();
 }
 
 double Core::get_minimum_area() const {
     if (!get_processed_description()) {
-        throw CoreNotProcessedException("Core is not processed");
+        throw CoreNotProcessedException();
     }
     return get_processed_description()->get_effective_parameters().get_minimum_area();
 }
 
 double Core::get_effective_volume() const {
     if (!get_processed_description()) {
-        throw CoreNotProcessedException("Core is not processed");
+        throw CoreNotProcessedException();
     }
     return get_processed_description()->get_effective_parameters().get_effective_volume();
 }
@@ -241,6 +250,18 @@ double interp(std::vector<std::pair<double, double>> data, double temperature) {
         std::sort(data.begin(), data.end(), [](const std::pair<double, double>& b1, const std::pair<double, double>& b2) {
                 return b1.first < b2.first;
         });
+        // ABT #1951: two points at one temperature made the slope 0/0 and the result NaN. Saturation
+        // data no longer gets here with that (saturation_points_at_highest_field keeps one point per
+        // temperature). The same value twice is that value; two different values at one temperature
+        // (e.g. a remanence tabulated twice at 100 C) contradict each other: nothing to interpolate.
+        if (data[0].first == data[1].first) {
+            if (data[0].second != data[1].second) {
+                throw InvalidInputException(ErrorCode::INVALID_CORE_MATERIAL_DATA,
+                    "Two data points at the same temperature " + std::to_string(data[0].first) + " C with different values " +
+                    std::to_string(data[0].second) + " and " + std::to_string(data[1].second) + ": nothing to interpolate in temperature");
+            }
+            return data[0].second;
+        }
         result = data[0].second -
         (data[0].first - temperature) *
             (data[0].second - data[1].second) /
@@ -697,9 +718,8 @@ std::vector<ColumnElement> Core::find_columns_by_type(ColumnType columnType) {
     return foundColumns;
 }
 
-int Core::find_closest_column_index_by_coordinates(std::vector<double> coordinates) {
-    auto processedDescription = get_processed_description().value();
-    return find_closest_column_index_by_coordinates(processedDescription.get_columns(), coordinates);
+int Core::find_closest_column_index_by_coordinates(const std::vector<double>& coordinates) const {
+    return find_closest_column_index_by_coordinates(mas_access::processed_description_ref(*this).value().get_columns(), coordinates);
 }
 
 int Core::find_closest_column_index_by_coordinates(const std::vector<ColumnElement>& columns,
@@ -1344,6 +1364,31 @@ bool Core::process_gap() {
     auto processedDescription = get_processed_description().value();
     auto columns = processedDescription.get_columns();
 
+    // A subtractive gap of length 0 (Alf, 2026-10-28): in a two-piece set it is the set ungapped, its halves
+    // mating on ground faces, so it IS the residual gap every ground mating plane has (Constants::residualGap,
+    // as for a set whose data states no gap), with a warning; every model then sees a residual gap. Catalogue
+    // exports write ungapped parts this way. In any other core a zero-length ground gap describes nothing and is
+    // refused.
+    for (size_t gapIndex = 0; gapIndex < gapping.size(); ++gapIndex) {
+        auto& gap = gapping[gapIndex];
+        if (gap.get_type() != GapType::SUBTRACTIVE || gap.get_length() != 0) {
+            continue;
+        }
+        const std::string coreName = get_name() ? "'" + get_name().value() + "'" : "with shape " + resolve_shape().get_name().value_or("(unnamed)");
+        if (get_functional_description().get_type() != CoreType::TWO_PIECE_SET) {
+            throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Core " + coreName + ": gap " + std::to_string(gapIndex + 1) +
+                               " is a subtractive gap of length zero, which only a two-piece set can carry (as its ungapped "
+                               "halves mating); give the gap its ground length, or remove it");
+        }
+        const double residualGap = Constants().residualGap;
+        Logger::getInstance().warning("Core " + coreName + ": gap " + std::to_string(gapIndex + 1) + " is a subtractive gap of length zero; "
+                                      "the two-piece set is taken as ungapped, with the residual gap of its mating halves (" +
+                                      format_quantity(residualGap, "m") + ") there", "Core");
+        gap.set_type(GapType::RESIDUAL);
+        gap.set_length(residualGap);
+        get_mutable_functional_description().set_gapping(gapping);
+    }
+
     if (family == CoreShapeFamily::T && gapping.size() > 0 ) {
         throw GapException("Toroids cannot be gapped: " + std::to_string(gapping[0].get_length()));
     }
@@ -1473,6 +1518,12 @@ void Core::process_gap_or_throw() {
 // adviser candidate pool as much again, and the browser engine ran out of memory
 // (std::bad_alloc) the moment a design fell back to the manufacturer catalogue.
 CoreMaterial Core::resolve_material() {
+    if (std::holds_alternative<CoreMaterial>(get_functional_description().get_material())) {
+        // Already resolved and written back: return it as the path below would (one copy, not the
+        // three of copying the union in, the record out and storing the same record again).
+        _cachedResolvedMaterial.reset();
+        return std::get<CoreMaterial>(get_functional_description().get_material());
+    }
     auto material = resolve_material(get_functional_description().get_material());
     if (!std::holds_alternative<std::vector<MaterialElement>>(get_functional_description().get_material())) {
         get_mutable_functional_description().set_material(material);
@@ -1509,6 +1560,15 @@ CoreMaterial Core::resolve_material() const {
         _cachedResolvedMaterial = material;
     }
     return material;
+}
+
+const CoreMaterial& Core::resolve_material_unstored(std::optional<CoreMaterial>& storage) const {
+    const auto& material = get_functional_description().get_material();
+    if (std::holds_alternative<CoreMaterial>(material)) {
+        return std::get<CoreMaterial>(material);
+    }
+    storage = resolve_material(material);
+    return *storage;
 }
 
 CoreMaterial Core::resolve_material(CoreMaterialDataOrNameUnion coreMaterial) {
@@ -1757,7 +1817,7 @@ double Core::get_toroid_edge_radius() const {
             "bobbin-wound core's turns bend around the bobbin's column corner instead");
     }
     if (!get_processed_description()) {
-        throw CoreNotProcessedException("Core has not been processed yet");
+        throw CoreNotProcessedException();
     }
     // get_processed_description() hands the optional back BY VALUE and get_columns() returns a
     // reference INTO it, so the description has to be a named local: binding the column vector
@@ -2217,6 +2277,37 @@ static double interpolate_ferromagnetic_property_to_curie(const CoreMaterial& co
     return lastPoint.second * (curieTemperature - temperature) / (curieTemperature - lastPoint.first);
 }
 
+// ABT #1951 (Alf, 2026-10-18): a material may tabulate saturation at several field strengths at ONE
+// temperature (TDK prints Bs of its NiZn grades GT1, GT2, GT6, GT9, L5, L6, L8F and L9H at two
+// fields, e.g. 1.6 and 4 kA/m). Bsat is the value at the highest field strength and that field is
+// Hsat; the lower-field points stay in the material as curve data. Interpolating in temperature over
+// two points at one temperature was 0/0 and gave NaN. Two DIFFERENT flux densities at the same field
+// and temperature contradict each other: that throws.
+// Returns one (temperature, Bsat) or (temperature, Hsat) pair per tabulated temperature.
+static std::vector<std::pair<double, double>> saturation_points_at_highest_field(const CoreMaterial& coreMaterial, bool fluxDensity) {
+    std::map<double, std::pair<double, double>> highestFieldPointPerTemperature;  // temperature -> (H, B)
+    for (const auto& datum : coreMaterial.get_saturation()) {
+        const double temperature = datum.get_temperature();
+        const double field = datum.get_magnetic_field();
+        const double flux = datum.get_magnetic_flux_density();
+        auto it = highestFieldPointPerTemperature.find(temperature);
+        if (it == highestFieldPointPerTemperature.end() || field > it->second.first) {
+            highestFieldPointPerTemperature[temperature] = {field, flux};
+        }
+        else if (field == it->second.first && flux != it->second.second) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_MATERIAL_DATA,
+                "Core material " + coreMaterial.get_name() + " tabulates two different saturation flux densities, " +
+                std::to_string(it->second.second) + " T and " + std::to_string(flux) + " T, at the same field " +
+                std::to_string(field) + " A/m and temperature " + std::to_string(temperature) + " C");
+        }
+    }
+    std::vector<std::pair<double, double>> data;
+    for (const auto& [temperature, point] : highestFieldPointPerTemperature) {
+        data.push_back({temperature, fluxDensity ? point.second : point.first});
+    }
+    return data;
+}
+
 double Core::get_magnetic_flux_density_saturation(const CoreMaterial& coreMaterial, double temperature, bool proportion) {
     auto defaults = Defaults();
     const auto& saturationData = coreMaterial.get_saturation();
@@ -2228,9 +2319,7 @@ double Core::get_magnetic_flux_density_saturation(const CoreMaterial& coreMateri
         // (matches the H-sat sibling getter, FIX M-2).
         throw MaterialException(ErrorCode::MATERIAL_DATA_MISSING, "Missing saturation data in core material " + coreMaterial.get_name());
     }
-    for (auto& datum : saturationData) {
-        data.push_back(std::pair<double, double>{datum.get_temperature(), datum.get_magnetic_flux_density()});
-    }
+    data = saturation_points_at_highest_field(coreMaterial, true);
 
     double saturationMagneticFluxDensity = interp(data, temperature);
 
@@ -2260,9 +2349,7 @@ double Core::get_magnetic_field_strength_saturation(const CoreMaterial& coreMate
         throw InvalidInputException(ErrorCode::INVALID_CORE_MATERIAL_DATA, "Missing saturation data for magnetic field strength"); // FIX M-2
         // throw std::runtime_error("Missing saturation data in core material");
     }
-    for (auto& datum : saturationData) {
-        data.push_back(std::pair<double, double>{datum.get_temperature(), datum.get_magnetic_field()});
-    }
+    data = saturation_points_at_highest_field(coreMaterial, false);
 
     // ABT #1908 (Alf, 2026-10-17): past its last tabulated point the saturation field strength goes
     // linearly to zero at the Curie temperature, as remanence and coercive force do. Extrapolating the
@@ -2276,6 +2363,11 @@ double Core::get_magnetic_field_strength_saturation(const CoreMaterial& coreMate
 double Core::get_magnetic_field_strength_saturation(double temperature) {
     auto coreMaterial = resolve_material();
     return get_magnetic_field_strength_saturation(coreMaterial, temperature);
+}
+
+double Core::get_ferromagnetic_property_to_curie(const CoreMaterial& coreMaterial, const std::vector<std::pair<double, double>>& data,
+                                               double temperature, const std::string& propertyName) {
+    return interpolate_ferromagnetic_property_to_curie(coreMaterial, data, temperature, propertyName);
 }
 
 double Core::get_remanence(const CoreMaterial& coreMaterial, double temperature, bool returnZeroIfMissing) {
@@ -2408,7 +2500,7 @@ double Core::get_density() {
 
 std::vector<ColumnElement> Core::get_columns() const {
     if (!get_processed_description()) {
-        throw CoreNotProcessedException("Core is not processed");
+        throw CoreNotProcessedException();
     }
     return get_processed_description().value().get_columns();
 }
@@ -2433,7 +2525,7 @@ std::vector<WindingWindowElement> Core::get_winding_windows() const {
 
 size_t Core::get_main_column_index() const {
     if (!get_processed_description()) {
-        throw CoreNotProcessedException("Core is not processed");
+        throw CoreNotProcessedException();
     }
     auto columns = get_processed_description().value().get_columns();
     if (columns.empty()) {
@@ -2449,7 +2541,7 @@ size_t Core::get_main_column_index() const {
 
 size_t Core::get_winding_window_column_index(size_t windingWindowIndex) const {
     if (!get_processed_description()) {
-        throw CoreNotProcessedException("Core is not processed");
+        throw CoreNotProcessedException();
     }
     auto windingWindows = get_processed_description().value().get_winding_windows();
     if (windingWindowIndex >= windingWindows.size()) {

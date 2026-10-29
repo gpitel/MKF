@@ -35,7 +35,8 @@ struct SolvedLosses {
     CoreLossesOutput coreLosses;
     OperatingPointExcitation excitation;
     std::optional<WindingLossesOutput> windingLosses;
-    TemperatureOutput temperature;
+    // Empty when the solve built no thermal network (LossSolveWithoutThermalNetworkScope).
+    std::optional<TemperatureOutput> temperature;
     // The DC point of the magnetizing model at the solved core temperature (MagnetizingInductance::
     // get_last_dc_bias_point), for the saturation check's second criterion (ABT #1855). Empty when the
     // model ran no DC-bias fixed point, or magnetized a core held at its Curie temperature as paramagnetic.
@@ -43,6 +44,19 @@ struct SolvedLosses {
     // How many points the search for the loss loop's lowest stable fixed point evaluated (ABT #1840), each one
     // the losses and the thermal network at one temperature; 0 when the loop never reached the data ceiling.
     size_t lowestFixedPointSearchEvaluations = 0;
+};
+
+// ABT #2124 (Alf, 2026-10-28): in the catalogue search the LOSSES_NO_PROXIMITY filter computes the losses at
+// ambient with NO thermal network, as before ABT #838: while one of these exists on a thread, a one-pass loss solve
+// (Settings::get_simulator_loss_temperature_loop() false) returns its first iterate's losses and no temperature.
+// A loop solve ignores it. Thread-local depth, as CatalogueSearchOnePassScope.
+class LossSolveWithoutThermalNetworkScope {
+public:
+    LossSolveWithoutThermalNetworkScope();
+    ~LossSolveWithoutThermalNetworkScope();
+    LossSolveWithoutThermalNetworkScope(const LossSolveWithoutThermalNetworkScope&) = delete;
+    LossSolveWithoutThermalNetworkScope& operator=(const LossSolveWithoutThermalNetworkScope&) = delete;
+    static bool active();
 };
 
 // ABT #1876 (Alf, 2026-10-14): the losses of an operating point evaluated at its ambient temperature,
@@ -62,12 +76,20 @@ struct LossesAtAmbient {
 // The message is MKF's, with the loop's history. It carries the point's losses at ambient, which
 // MagneticSimulator::simulate publishes for that point (and no temperature); every other caller sees it
 // as the CalculationException it is. Any other error of the solve is not this exception.
+// The message says why in words a designer reads; the details carry the loop's numbers (its iterates'
+// losses and temperatures), for whoever has to look into it. what() gives both.
 class NoThermalOperatingPointException : public CalculationException {
   public:
-    NoThermalOperatingPointException(ErrorCode code, const std::string& message, LossesAtAmbient lossesAtAmbient)
-        : CalculationException(code, message), _lossesAtAmbient(std::move(lossesAtAmbient)) {}
+    NoThermalOperatingPointException(ErrorCode code, const std::string& summary, LossesAtAmbient lossesAtAmbient,
+                                     const std::string& details = "")
+        : CalculationException(code, details.empty() ? summary : summary + " Details: " + details),
+          _summary(summary), _details(details), _lossesAtAmbient(std::move(lossesAtAmbient)) {}
     const LossesAtAmbient& get_losses_at_ambient() const { return _lossesAtAmbient; }
+    const std::string& get_summary() const { return _summary; }
+    const std::string& get_details() const { return _details; }
   private:
+    std::string _summary;
+    std::string _details;
     LossesAtAmbient _lossesAtAmbient;
 };
 
@@ -161,9 +183,14 @@ class MagneticSimulator {
         // One output per operating point. A point with no thermal operating point
         // (NoThermalOperatingPointException, ABT #1876, Alf 2026-10-14) gets its core and winding losses
         // evaluated at ambient (LossesAtAmbient) and NO temperature output; the other points are simulated
-        // normally, and ResultsAnalyzer::analyze_results reports NO_THERMAL_OPERATING_POINT for it. Every
-        // other error still throws for the whole design. fastMode publishes no temperature for ANY point
+        // normally, and ResultsAnalyzer::analyze_results reports NO_THERMAL_OPERATING_POINT for it. A point whose
+        // flux density the magnetizing model cannot read on the magnetisation curve at its ambient temperature (past the
+        // curve's end: SaturationException, MagnetisationCurveExhaustedException; ABT #2052, Alf 2026-10-24) gets only
+        // its winding losses at ambient: no inductance, core losses or temperature output, and analyze_results reports
+        // CORE_SATURATES for it. Every other error still throws for the whole design. fastMode publishes no temperature for ANY point
         // (and skips the leakage inductance); analyze_results tells the two apart by solving again.
+        // Settings::simulatorLossTemperatureLoop off: each point's losses at its operating temperature and
+        // its temperature output from one pass of the network on them (see calculate_core_losses).
         Mas simulate(Mas mas, bool fastMode=false);
         Mas simulate(const Inputs& inputs, const Magnetic& magnetic, bool fastMode=false);
 
@@ -212,6 +239,11 @@ class MagneticSimulator {
         // operating point returns its losses at ambient and leaves `temperatureOutput` EMPTY (the public
         // per-point entry point, as simulate does per point); THROW (the advisers, ResultsAnalyzer) lets the
         // NoThermalOperatingPointException propagate.
+        // With Settings::simulatorLossTemperatureLoop off (never under an adviser, see
+        // Settings::get_simulator_loss_temperature_loop) there is no loop: the losses are evaluated once at
+        // the operating point's temperature, and `temperatureOutput` receives the network's hottest point
+        // for exactly those losses (the loop's first iterate). There is then no NoThermalOperatingPoint-
+        // Exception: a network that does not converge on those losses throws ThermalNetworkNotConvergedException.
         // K, both temperatures. 2 K (was 0.5 K; approved by Alf 2026-10-11): on the 522 solves of the
         // web9 magnetic adviser run it moves the hot spot by <= 0.57 K, the winding temperature by
         // <= 2 K and the total loss by <= 0.96%, and saves ~300 of 1775 iterations.
@@ -220,7 +252,9 @@ class MagneticSimulator {
         // ABT #1855: whether a solve held the core at its material's data ceiling (the losses drove it
         // there, solve_losses_at_operating_temperature): its core losses were evaluated within
         // kOperatingTemperatureTolerance below InitialPermeability::get_maximum_ferromagnetic_data_temperature
-        // and the network's maximum temperature lies above that ceiling. This overload knows only that
+        // and the network's maximum temperature lies above that ceiling, or more than that tolerance below the
+        // core losses' temperature (a core held paramagnetic at Curie loses ~nothing and the network comes back
+        // cold; a solved point's hottest temperature is never below its core's). This overload knows only that
         // mu_i(T) / Curie part (get_ferromagnetic_data_ceiling); the full ceiling the solve uses also depends
         // on the excitation (get_core_data_ceiling) and is judged by the overload below.
         static bool is_core_held_at_data_ceiling(const CoreMaterial& coreMaterial, double coreLossesTemperature,
@@ -240,10 +274,25 @@ class MagneticSimulator {
         // CoreDataCeilingSource names it. Every part is derived from the material's data.
         static std::optional<CoreDataCeiling> get_core_data_ceiling(const Core& core, const OperatingPointExcitation& excitation,
                                                                     double ambientTemperature, CoreLosses& coreLossesModel);
+        // ABT #2075 (Alf, 2026-10-26): simulate records on the core losses of a point with no thermal operating point
+        // why it has none. Their methodUsed is the loss model's, then kLossesAtAmbientMethodNote, then the
+        // NoThermalOperatingPointException's message. ResultsAnalyzer reads the reason here instead of solving again.
+        static constexpr const char* kLossesAtAmbientMethodNote = ", evaluated at the ambient temperature: ";
+        // Between the reason and its details (the loss loop's iterates) on the same methodUsed.
+        static constexpr const char* kNoThermalOperatingPointDetailsNote = " Details: ";
+        // The reason recorded on these core losses; none when they were solved at their thermal operating point.
+        static std::optional<std::string> get_no_thermal_operating_point_reason(const CoreLossesOutput& coreLosses);
+        // The details recorded with that reason (the loss loop's iterates); none when there are none.
+        static std::optional<std::string> get_no_thermal_operating_point_details(const CoreLossesOutput& coreLosses);
         // The DC point of the last calculate_core_losses' solve (SolvedLosses::dcBiasPoint).
         std::optional<DcBiasPoint> get_last_dc_bias_point() const { return _lastDcBiasPoint; }
         // SolvedLosses::lowestFixedPointSearchEvaluations of the last calculate_core_losses' solve (ABT #1840).
         size_t get_last_lowest_fixed_point_search_evaluations() const { return _lastLowestFixedPointSearchEvaluations; }
+        // How many loss solves ran on this thread with the loss <-> temperature loop (true) or in one pass (false):
+        // a count for the tests (ABT #2124, the catalogue filters run one pass, its final simulations the loop).
+        static size_t get_loss_solves(bool lossTemperatureLoop);
+        // How many of the one-pass solves built no thermal network (LossSolveWithoutThermalNetworkScope), on this thread.
+        static size_t get_loss_solves_without_thermal_network();
         CoreLossesOutput calculate_core_losses(OperatingPoint& operatingPoint, Magnetic magnetic,
                                                std::optional<WindingLossesOutput>* windingLossesOutput = nullptr,
                                                std::optional<TemperatureOutput>* temperatureOutput = nullptr,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "constructive_models/InsulationMaterial.h"
+#include "constructive_models/MasMigration.h"
 #include "processors/Inputs.h"
 #include "Defaults.h"
 #include "json.hpp"
@@ -122,7 +123,19 @@ class WireMagneticStrengthFieldOutput : public WindingWindowMagneticStrengthFiel
 
 
 class Wire : public MAS::Wire {
+    private:
+        static MAS::Wire migrated(json j) {
+            OpenMagnetics::compat::migrate_pre_1_0(j);
+            MAS::Wire wire;
+            MAS::from_json(j, wire);
+            return wire;
+        }
     public:
+        // A wire read straight from json goes through the legacy-form migration first, like every
+        // other json entry point (Core, Coil, Magnetic, Mas, Inputs). Without this constructor the
+        // json converted implicitly to MAS::Wire through the generated from_json and skipped it, so
+        // an old wire (e.g. a bare-number coating.thickness, ABT #1995) lost its data silently.
+        Wire(const json& j) : Wire(migrated(j)) {}
         Wire(MAS::Wire wire) {
             set_type(wire.get_type());
             if (wire.get_coating())
@@ -184,6 +197,11 @@ class Wire : public MAS::Wire {
 
         Wire() = default;
         virtual ~Wire() = default;
+        // Declared because the virtual destructor suppresses the implicit move: a std::move of a Wire copied it.
+        Wire(const Wire&) = default;
+        Wire(Wire&&) = default;
+        Wire& operator=(const Wire&) = default;
+        Wire& operator=(Wire&&) = default;
 
         static WireRound convert_from_wire_to_strand(Wire wire);
         static std::optional<InsulationWireCoating> resolve_coating(const Wire& wire);
@@ -352,9 +370,9 @@ class Wire : public MAS::Wire {
 
         // WOUND LITZ (ABT #1531). A litz bundle in a wound layer is no rigid circle of its free-air OD:
         // it flattens into an OVAL (a stadium: a rectangle with semicircular ends) of the bundle's
-        // area, its short side k x OD. Elektrisola (Litz Wire Info, "IV Example") gives how far: the
-        // processed OD reduced 10 % for a served bundle and 15-20 % for an unserved one, so k >= 0.90
-        // served and >= 0.85 bare. The winder sets the footprint; the outer width/height getters then
+        // area, its short side k x OD. How far: k >= 0.72, served or bare, the flattening Power
+        // Integrations' published litz chokes reach (Alf, 2026-10-27; Elektrisola's free-air figures,
+        // -10 % served and -15-20 % bare, are less than built windings show). The winder sets the footprint; the outer width/height getters then
         // return it, so every layout read sees the flattened turn. Conducting dimensions (the
         // strands) are unchanged. Not part of MAS: the turns carry it, as crossSectionalShape oval.
         static double minimum_litz_flattening(const Wire& wire);

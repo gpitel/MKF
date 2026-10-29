@@ -18,7 +18,7 @@
 #include "advisers/CoreAdviserInternal.h"
 #include "advisers/CoreMaterialCrossReferencer.h"
 #include "advisers/MagneticFilter.h"
-#include "advisers/MagneticFilterInternal.h"  // for is_energy_storing_topology()
+#include "advisers/MagneticFilterInternal.h"
 #include "constructive_models/Bobbin.h"
 #include "constructive_models/Insulation.h"
 #include "constructive_models/NumberTurns.h"
@@ -239,8 +239,9 @@ std::vector<std::pair<Magnetic, double>> CoreAdviser::create_magnetic_dataset(In
             // toroidal-only restriction only to CMC; for DMC and other suppression
             // topologies, honour the user's includeToroidalCores / includeConcentricCores
             // settings.
-            auto topology = inputs.get_design_requirements().get_topology();
-            bool isCommonModeChoke = topology.has_value() && topology.value() == MAS::Topology::COMMON_MODE_CHOKE;
+            // The declared role: the topology or the subApplication.
+            auto declaredRole = declared_magnetic_role(inputs);
+            bool isCommonModeChoke = declaredRole && declaredRole->role == MagneticRole::COMMON_MODE_CHOKE;
             if (isCommonModeChoke) {
                 if (core.get_type() != CoreType::TOROIDAL) {
                     continue;
@@ -350,8 +351,9 @@ std::vector<std::pair<Magnetic, double>> CoreAdviser::create_magnetic_dataset(In
         if (get_application() == MAS::MagneticApplication::INTERFERENCE_SUPPRESSION) {
             // See comment in create_magnetic_dataset(): only CMC requires toroidal-only;
             // DMC and other suppression topologies should honour user settings.
-            auto topology = inputs.get_design_requirements().get_topology();
-            bool isCommonModeChoke = topology.has_value() && topology.value() == MAS::Topology::COMMON_MODE_CHOKE;
+            // The declared role: the topology or the subApplication.
+            auto declaredRole = declared_magnetic_role(inputs);
+            bool isCommonModeChoke = declaredRole && declaredRole->role == MagneticRole::COMMON_MODE_CHOKE;
             if (isCommonModeChoke) {
                 if (core.get_type() != CoreType::TOROIDAL) {
                     continue;
@@ -540,14 +542,11 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
     // 1. Use topology if specified (most reliable)
     // 2. Fall back to inductance field heuristic (minimum-only = transformer)
     //
-    // Inductor vs transformer drives both the turn/gap sizing below and the
-    // saturation co-design. Use the single shared predicate (is_inductor, in
-    // MagneticFilterInternal.h) so this seeder, the saturation filter, the
-    // loss-sweep saturation cap, and the realism gate all agree on the
-    // classification — a coupled inductor (single isolation side) or an
-    // energy-storing / specific-Lm design is sized with the B-from-current path;
-    // a transformer (high-Lm, minimum-only) with the B-from-voltage path.
-    bool isTransformer = !is_inductor(inputs);
+    // The role (magnetic_role) decides only which branch sizes the candidate — the gap decision:
+    // a transformer is seeded from its volt-seconds and gapped only to a specific Lm; an
+    // energy-storing magnetic from its inductance with a saturation-aware re-gap. Both branches
+    // size against the magnetizing current, as the saturation filter gates.
+    bool isTransformer = is_transformer_role(inputs);
     
     // Pre-compute shared transformer values once (not per-core).
     // maxVoltSeconds is the peak V·s excursion over all OPs' primary
@@ -631,6 +630,24 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
                         ") for core " + core.get_name().value_or("?"));
                 }
                 initialNumberTurns = nFromSaturation;
+
+                // The magnetizing inductance needs turns too: the fewest that reach it on the
+                // ungapped core (the unbiased reluctance, from an Inputs with the design
+                // requirements only). N = max(N_flux, N_inductance); a nominal or maximum Lm is then
+                // met by the gap solved below at that N.
+                {
+                    const auto& lmRequirement = inputs.get_design_requirements().get_magnetizing_inductance();
+                    bool hasLm = (lmRequirement.get_minimum() && lmRequirement.get_minimum().value() > 0) ||
+                                 (lmRequirement.get_nominal() && lmRequirement.get_nominal().value() > 0) ||
+                                 (lmRequirement.get_maximum() && lmRequirement.get_maximum().value() > 0);
+                    if (hasLm) {
+                        Inputs lmOnlyInputs;
+                        lmOnlyInputs.set_design_requirements(inputs.get_design_requirements());
+                        double nFromInductance = magnetizingInductance.calculate_number_turns_from_gapping_and_inductance(
+                            core, (*magneticsWithScoring)[i].first.get_coil(), &lmOnlyInputs, DimensionalValues::MINIMUM);
+                        initialNumberTurns = std::max(initialNumberTurns, nFromInductance);
+                    }
+                }
 
                 // For resonant transformers with a specific Lm target
                 // (e.g. CLLLC, CLLC) we must size BOTH N and the gap so
@@ -761,14 +778,63 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
                 // hold the target L, so at fixed L isat rises ∝ N — until it clears the
                 // margin, and persist that exact (N, gap). Powder toroids (shape T) take
                 // no discrete gap and keep the seed.
-                if (is_inductor(inputs) && core.get_shape_family() != CoreShapeFamily::T && !inputs.get_operating_points().empty()) {
+                if (core.get_shape_family() != CoreShapeFamily::T && !inputs.get_operating_points().empty()) {
                     auto operatingPoint = inputsCopy.get_operating_point(0);
                     double peakCurrent = 0;
-                    for (auto& op : inputs.get_operating_points()) {
-                        auto exc = Inputs::get_primary_excitation(op);
-                        if (exc.get_current() && exc.get_current()->get_processed() && exc.get_current()->get_processed()->get_peak()) {
-                            peakCurrent = std::max(peakCurrent, std::abs(exc.get_current()->get_processed()->get_peak().value()));
+                    // With several windings the current that saturates the core is the magnetizing
+                    // current, never one winding's current. The re-gap holds the target inductance, so
+                    // it sizes against the magnetizing current at that inductance: the one the inputs
+                    // carry (Inputs::process derives it from the volt-seconds and the required
+                    // magnetizing inductance). Without it, the one the model stamps at the seeded turns
+                    // and gap. Not the model's at a seed the turns solve refused: there the core is
+                    // saturated, its inductance has collapsed and the Faraday current it gives is
+                    // several times the one at the target inductance. A single winding keeps reading
+                    // its own current below.
+                    const bool singleWinding = is_single_winding_design(inputs);
+                    if (!singleWinding) {
+                        Coil seededCoil = (*magneticsWithScoring)[i].first.get_coil();
+                        seededCoil.get_mutable_functional_description()[0].set_number_turns(static_cast<int64_t>(std::llround(initialNumberTurns)));
+                        for (const auto& op : inputs.get_operating_points()) {
+                            const auto& excitations = op.get_excitations_per_winding();
+                            bool carriesMagnetizingCurrent = !excitations.empty() && excitations[0].get_magnetizing_current();
+                            double operatingPointPeak = carriesMagnetizingCurrent ? stamped_magnetizing_current_peak(op)
+                                                                                  : model_magnetizing_current_peak(core, seededCoil, inputs, op);
+                            peakCurrent = std::max(peakCurrent, operatingPointPeak);
                         }
+                    }
+                    for (auto& op : inputs.get_operating_points()) {
+                        if (!singleWinding) {
+                            break;  // read from the model above
+                        }
+                        auto exc = Inputs::get_primary_excitation(op);
+                        if (!exc.get_current()) {
+                            continue;
+                        }
+                        // ABT #1883: a current given as peak-to-peak + offset (no 'peak') was read as a
+                        // peak of 0, so the re-gap never ran. Without a processed peak the peak is the
+                        // largest magnitude of the waveform: the given one, else the one the processed
+                        // description (label, peak-to-peak, offset, duty cycle) defines. A current with
+                        // none of these throws.
+                        const auto current = exc.get_current().value();
+                        auto largestMagnitude = [](const Waveform& waveform) {
+                            const auto& data = waveform.get_data();
+                            return std::max(std::abs(*std::max_element(data.begin(), data.end())), std::abs(*std::min_element(data.begin(), data.end())));
+                        };
+                        double operatingPointPeak;
+                        if (current.get_processed() && current.get_processed()->get_peak()) {
+                            operatingPointPeak = std::abs(current.get_processed()->get_peak().value());
+                        }
+                        else if (current.get_waveform() && !current.get_waveform()->get_data().empty()) {
+                            operatingPointPeak = largestMagnitude(current.get_waveform().value());
+                        }
+                        else if (current.get_processed() && current.get_processed()->get_peak_to_peak()) {
+                            operatingPointPeak = largestMagnitude(Inputs::create_waveform(current.get_processed().value(), exc.get_frequency()));
+                        }
+                        else {
+                            throw InvalidInputException(ErrorCode::MISSING_DATA,
+                                "Inductor seeding: the primary current has neither a peak, a waveform, nor a peak-to-peak to build one from");
+                        }
+                        peakCurrent = std::max(peakCurrent, operatingPointPeak);
                     }
                     // Derating (ABT #13): size against the gap-aware saturation
                     // current evaluated at the hot junction corner and with RAW

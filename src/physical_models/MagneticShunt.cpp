@@ -76,7 +76,7 @@ struct EColumns {
 
 EColumns resolve_e_columns(Core& core) {
     if (!core.get_processed_description()) {
-        throw CoreNotProcessedException("Magnetic shunt model needs a processed core");
+        throw CoreNotProcessedException("needed by the magnetic shunt model");
     }
     auto columns = core.get_columns();
     if (columns.size() != 3) {
@@ -545,7 +545,9 @@ void MagneticShuntModel::add_losses(MagneticShuntContribution& contribution, con
     if (points.size() < 2 || frequency < minimumFrequency || frequency > maximumFrequency) {
         return;
     }
-    double imaginaryPermeability = ComplexPermeability().get_complex_permeability(material, frequency).second;
+    // ABT #1866: keep where mu' and mu'' came from, so a consumer can see when an estimate is involved.
+    auto complexPermeability = ComplexPermeability().get_complex_permeability_with_source(material, frequency);
+    double imaginaryPermeability = complexPermeability.imaginary;
     double mu0 = Constants().vacuumPermeability;
     double omega = 2 * std::numbers::pi * frequency;
     // Li eq. (27), over the in-window volume of the sheet. The parts lying in a column gap carry the
@@ -560,6 +562,7 @@ void MagneticShuntModel::add_losses(MagneticShuntContribution& contribution, con
         losses += 0.5 * omega * mu0 * imaginaryPermeability * field * field * volume;
     }
     contribution.lossesPerAmpereSquared = losses;
+    contribution.lossesComplexPermeability = complexPermeability;
 }
 
 Core MagneticShuntModel::apply_shunts_to_gapping(Magnetic magnetic, double temperature, double frequency,

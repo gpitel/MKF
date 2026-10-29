@@ -1,8 +1,9 @@
 #include "advisers/CoreAdviser.h"
+#include "support/Utils.h"
 #include "support/StableSortByIndex.h"
 #include "advisers/CoreMaterialCrossReferencer.h"
 #include "advisers/MagneticFilter.h"
-#include "advisers/MagneticFilterInternal.h"  // for is_energy_storing_topology()
+#include "advisers/MagneticFilterInternal.h"
 #include "advisers/CoreAdviserInternal.h"      // log_stage/log_pruned, make_sinusoidal_excitation, CoreLossesModelPair
 #include "constructive_models/Bobbin.h"
 #include "physical_models/CoreTemperature.h"
@@ -254,7 +255,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
         }
         logEntry("STANDARD_CORES synthesis returned no candidates for this power design; "
                  "falling through to the AVAILABLE_CORES manufacturer catalogue "
-                 "(results are tagged to make the mode substitution explicit).", "CoreAdviser");
+                 "(results are tagged to make the mode substitution explicit).", "CoreAdviser", 1);
         if (coreDatabase.empty() && !LibraryContext::Scope::anyActive()) {
             load_cores();
         }
@@ -316,9 +317,9 @@ static void throw_if_inputs_are_not_processed(Inputs& inputs) {
             if (!excitation.get_current()) {
                 continue;  // a voltage-only excitation is completed later, from the inductance
             }
-            std::string where = "operating point " + std::to_string(operatingPointIndex) +
-                                ", winding " + std::to_string(windingIndex) +
-                                " ('" + excitation.get_name().value_or("<unnamed>") + "')";
+            std::string where = describe_operating_point_for_people(operatingPoints[operatingPointIndex], operatingPointIndex) +
+                                ", winding " + std::to_string(windingIndex + 1) +
+                                (excitation.get_name() ? " ('" + excitation.get_name().value() + "')" : std::string());
             auto missing = [&](const std::string& field) {
                 return InvalidInputException(ErrorCode::MISSING_DATA,
                     "CoreAdviser needs the processed current data for " + where + ", but " + field +
@@ -405,7 +406,7 @@ std::vector<std::pair<Mas, double>> CoreAdviser::get_advised_core(Inputs inputs,
             expand_magnetic_dataset_with_stacks(inputs, cores, &magnetics);
         }
 
-        logEntry("First attempt produced not enough results, so now we are searching again with " + std::to_string(magnetics.size()) + " magnetics, including up to " + std::to_string(defaults.coreAdviserMaximumNumberStacks) + " cores stacked when possible.", "CoreAdviser");
+        logEntry("First attempt produced not enough results, so now we are searching again with " + std::to_string(magnetics.size()) + " magnetics, including up to " + std::to_string(defaults.coreAdviserMaximumNumberStacks) + " cores stacked when possible.", "CoreAdviser", 2);
         // The stacked pool is up to coreAdviserMaximumNumberStacks times the single-core
         // one, so scale the score-cull by the same factor. This used to be the WHOLE pool
         // (maximumMagneticsAfterFiltering = magnetics.size()), which disabled the cull

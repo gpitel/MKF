@@ -336,6 +336,11 @@ OpenMagnetics::Inputs get_quick_insulation_inputs(DimensionWithTolerance altitud
     SignalDescriptor voltage;
     ProcessedWaveform processedVoltage;
 
+    // ABT #1762: label and offset are required plain members of the generated ProcessedWaveform;
+    // unset they carry whatever the heap held. Only rms and peak are specified here, so CUSTOM
+    // with no DC offset.
+    processedVoltage.set_label(WaveformLabel::CUSTOM);
+    processedVoltage.set_offset(0);
     processedVoltage.set_rms(maximumVoltageRms);
     processedVoltage.set_peak(maximumVoltagePeak);
     voltage.set_processed(processedVoltage);
@@ -967,7 +972,9 @@ OpenMagnetics::Mas mas_loader(const std::filesystem::path& path) {
         auto bobbinData = OpenMagnetics::Bobbin::create_quick_bobbin(magnetic.get_mutable_core(), false);
         to_json(magneticJson["coil"]["bobbin"], bobbinData);
     }
-    auto coil = OpenMagnetics::Coil(magneticJson["coil"]);
+    // No coil is built here on its own: the Magnetic above built (and, where needed, wound) its
+    // coil after giving it the core. A coil wound here without its core could not follow the core
+    // column, and was never used (same as Mas::from_file).
     std::vector<OpenMagnetics::Outputs> outputs;
     if (outputsJson != nullptr) {
         outputs = outputsJson.get<std::vector<OpenMagnetics::Outputs>>();

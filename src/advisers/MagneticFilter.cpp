@@ -19,6 +19,7 @@
 #include <algorithm>
 #include "support/Exceptions.h"
 #include "support/Logger.h"
+#include "processors/ResultsAnalyzer.h"
 
 namespace OpenMagnetics {
 
@@ -40,10 +41,6 @@ std::string inductance_flux_cache_key(const Magnetic& magnetic) {
 // finalize_losses_scoring, cached_or_compute_scoring) now live in
 // advisers/MagneticFilterInternal.h so future split-out filter .cpp files
 // can share them without duplicating code or losing the documentation.
-
-// Phase 5: is_energy_storing_topology() now lives as an `inline` function
-// in advisers/MagneticFilterInternal.h so the extracted physical/saturation
-// filter TU can share it without duplicating the topology switch.
 
 std::shared_ptr<MagneticFilter> MagneticFilter::factory(MagneticFilters filterName, std::optional<Inputs> inputs) {
     switch(filterName) {
@@ -429,7 +426,7 @@ std::optional<std::string> MagneticFilterLossModelFrequencySpan::material_not_ev
         if (!CoreLossesModel::evaluates_steinmetz_ranges(coreLossesModel.get())) {
             return std::nullopt;
         }
-        // Settings::allowMaterialDataExtrapolation (explicit opt-in): a frequency outside the span is
+        // Settings::allowMaterialDataExtrapolation (on by default, Alf 2026-10-25): a frequency outside the span is
         // evaluated by extrapolating the nearest fitted range, and get_steinmetz_coefficients logs a
         // WARNING for it when the losses are computed, so the span no longer bars the material. Its
         // data must still be well formed: get_steinmetz_fitted_span throws for missing range bounds.
@@ -520,6 +517,14 @@ std::pair<bool, double> MagneticFilterWindability::evaluate_magnetic(Magnetic* m
         return {true, 0.0};
     }
 
+    // A former that does not state its corner follows the column of the core it is wound on
+    // (the magnetic's own core, before any catalogue interpolation). For an EFD the corner is the
+    // chamfer leg q, which makes this judgement optimistic there (see
+    // Bobbin::get_core_column_corner_radius).
+    if (!bobbin.get_processed_description()->get_column_corner_radius() && magnetic->has_core() &&
+        magnetic->get_core().get_processed_description()) {
+        bobbin.set_column_corner_radius_from_core(magnetic->get_core());
+    }
     const double cornerRadius = bobbin.get_column_corner_radius();
     // Read the window off the processed description rather than through
     // Bobbin::get_winding_window_shape(), which throws when a bobbin carries no winding windows
@@ -582,8 +587,13 @@ std::pair<bool, double> MagneticFilterWindability::evaluate_magnetic(Magnetic* m
             continue;
         }
 
-        if (asLaid.verdict == BendVerdict::BELOW_FLEXIBILITY) {
+        if (asLaid.verdict == BendVerdict::BELOW_FLEXIBILITY && axis != BendAxis::EDGEWISE) {
             // Not windable: that wire cannot be bent around that former without cracking.
+            // ABT #2004 (Alf, 2026-10-22): an EDGEWISE bend of rectangular wire below the
+            // IEC 60317-0-2 Table 6 mandrel stays valid, exactly as real winding draws it
+            // (Coil::refuse_turns_bent_tighter_than_the_wire_allows): that table qualifies the
+            // coating, it is not a forming limit for edgewise winding. analyze_results reports it.
+            // (IEC 60317-0-2 9 gives no edgewise heat-shock bend, so the scoring below adds nothing.)
             valid = false;
         }
         // How far the bend falls short of the comfortable (heat-shock) radius, as a fraction of
@@ -651,7 +661,13 @@ std::pair<bool, double> MagneticFilterSolidInsulationRequirements::evaluate_wire
 
     if (wire.get_type() == WireType::LITZ) {
         auto strand = wire.resolve_strand();
-        coating = Wire::resolve_coating(strand).value();
+        auto strandCoating = Wire::resolve_coating(strand);
+        if (!strandCoating) {
+            // Was an unchecked .value(): a bare bad_optional_access escaped the adviser's error handling (ABT #1616).
+            throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA,
+                                        "Litz wire " + wire.get_name().value_or("(unnamed)") + " has a strand with no coating");
+        }
+        coating = strandCoating.value();
     }
 
     if (!coating.get_breakdown_voltage()) {
@@ -728,6 +744,7 @@ bool MagneticFilterMagnetizingInductance::applies_to(Magnetic* magnetic) const {
 std::pair<bool, double> MagneticFilterMagnetizingInductance::evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs) {
     bool valid = true;
     double scoring = 0;
+    _lastRejectionReason.reset();
 
     // If no inductance requirement is set (e.g. CMC/DMC with only impedance requirements),
     // this filter has nothing to check — pass with neutral score.
@@ -759,10 +776,11 @@ std::pair<bool, double> MagneticFilterMagnetizingInductance::evaluate_magnetic(M
     // so a topology-only check silently misses every web-generated CMC/DMC and the derived
     // Z/(2πf) inductance floor false-rejects the entire candidate set (ABT #236).
     {
-        auto topology = inputs->get_design_requirements().get_topology();
-        bool topologyIsSuppression = topology.has_value() &&
-            (topology.value() == MAS::Topology::COMMON_MODE_CHOKE ||
-             topology.value() == MAS::Topology::DIFFERENTIAL_MODE_CHOKE);
+        // The declared role: the topology, or the subApplication the wizards set.
+        auto declaredRole = declared_magnetic_role(*inputs);
+        bool topologyIsSuppression = declaredRole &&
+            (declaredRole->role == MagneticRole::COMMON_MODE_CHOKE ||
+             declaredRole->role == MagneticRole::DIFFERENTIAL_MODE_CHOKE);
         auto application = inputs->get_design_requirements().get_application();
         bool applicationIsSuppression = application.has_value() &&
             application.value() == "interferenceSuppression";
@@ -802,35 +820,26 @@ std::pair<bool, double> MagneticFilterMagnetizingInductance::evaluate_magnetic(M
         return {valid, scoring};
     }
 
-    // Transformer vs Inductor Detection
-    // ==================================
-    // Transformers: Use initial permeability without DC bias iteration
-    //   - Skip operating point to avoid feedback loop where magnetizing current causes permeability collapse
-    //   - Ungapped high-permeability ferrite will naturally exceed minimum inductance requirement
-    //
-    // Inductors/Energy-storing: Use full iterative calculation with DC bias
-    //   - Account for permeability rolloff with magnetizing current DC offset
-    //
-    // Classified by is_inductor, the predicate the turn seeder and the saturation filter use:
-    // a local copy of its tiers here let the gate judge a design by a different rule than
-    // the seeder that sized it.
-    bool isTransformer = !is_inductor(*inputs);
-
+    // The inductance at each operating point, with the DC bias of the magnetizing current the model
+    // stamps there, for every design: the model derives a transformer's magnetizing current from its
+    // volt-seconds at the inductance it evaluates (the flux they impose, ABT #1902/#1942), so no
+    // classification picks between a biased and an unbiased inductance.
     for (size_t operatingPointIndex = 0; operatingPointIndex < inputs->get_operating_points().size(); ++operatingPointIndex) {
         auto operatingPoint = inputs->get_operating_points()[operatingPointIndex];
         OpenMagnetics::MagnetizingInductance magnetizingInductanceModel("ZHANG");
 
-        // For transformers, calculate inductance without operating point to use initial permeability
-        MagnetizingInductanceOutput aux;
-        try {
-            if (isTransformer) {
-                aux = magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(
-                    magnetic->get_mutable_core(), magnetic->get_mutable_coil(), nullptr);
-            } else {
-                aux = magnetizingInductanceModel.calculate_inductance_from_number_turns_and_gapping(
-                    magnetic->get_mutable_core(), magnetic->get_mutable_coil(), &operatingPoint);
-            }
-        } catch (const std::exception& e) {
+        // ABT #2124 (Alf, 2026-10-28): a saturated part fails this filter on the verdict the other filters give
+        // (ResultsAnalyzer::check_saturation, ABT #1855), at the point's temperature with the model's DC point. It
+        // used to be failed by a caught SaturationException, which the model no longer throws since ABT #1855
+        // (mu_r = 1 past the knee), so fully saturated parts were scored on their air-core inductance.
+        auto [aux, magneticFluxDensity] = magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(
+            magnetic->get_mutable_core(), magnetic->get_mutable_coil(), &operatingPoint);
+        auto saturation = ResultsAnalyzer::check_saturation(magnetic->get_mutable_core().resolve_material(),
+            ResultsAnalyzer::get_peak_flux_density(magneticFluxDensity), operatingPoint.get_conditions().get_ambient_temperature(),
+            1.0, magnetizingInductanceModel.get_last_dc_bias_point());
+        if (saturation.saturates) {
+            _lastRejectionReason = saturation.message;
+            logEntry(std::string("Magnetizing inductance filter: rejecting candidate: ") + saturation.message, "MagneticFilter", 2);
             return {false, 0};
         }
         double magnetizingInductance = resolve_dimensional_values(aux.get_magnetizing_inductance());

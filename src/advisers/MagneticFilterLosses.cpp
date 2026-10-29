@@ -85,14 +85,18 @@ std::pair<bool, double> MagneticFilterCoreAndDcLosses::evaluate_magnetic(Magneti
 
     Coil coil = magnetic->get_coil();
 
-    // Energy-storing inductors saturate as turns rise: at a fixed gap isat ∝ 1/N
+    // A gapped core saturates as turns rise: at a fixed gap isat ∝ 1/N
     // (L ∝ N², isat = B_sat·N·A_e/L). The loss-minimising turn sweep below would
     // otherwise push N up (lower core loss) past the saturation-safe point — the
     // CoreAdviser's saturation-safe turn/gap sizing then gets silently undone and
     // the design saturates. Cap the sweep using the SAME
     // Magnetic::calculate_saturation_current the saturation filter and realism
-    // gate use, so the loss-optimal turn count we return still clears the margin.
-    bool isInductor = is_inductor(*inputs);
+    // gate use, against the same magnetizing current, so the loss-optimal turn
+    // count we return still clears the margin. A single winding's current is
+    // known before the model runs; with several windings the magnetizing current
+    // is the one the model stamps at each turn count (a Faraday-derived one moves
+    // with the inductance), so that cap runs after the model call.
+    const bool singleWinding = is_single_winding_design(*inputs);
     double saturationMargin = Settings::GetInstance().get_core_adviser_saturation_margin();
 
     for (size_t operatingPointIndex = 0; operatingPointIndex < inputs->get_operating_points().size(); ++operatingPointIndex) {
@@ -101,7 +105,7 @@ std::pair<bool, double> MagneticFilterCoreAndDcLosses::evaluate_magnetic(Magneti
         // filter's inductor gate (raw B_sat below).
         double temperature = saturation_derating_temperature(operatingPoint.get_conditions().get_ambient_temperature());
         OperatingPointExcitation excitation = operatingPoint.get_excitations_per_winding()[0];
-        double saturationPeakCurrent = (isInductor && excitation.get_current() && excitation.get_current()->get_processed()
+        double saturationPeakCurrent = (singleWinding && excitation.get_current() && excitation.get_current()->get_processed()
                                         && excitation.get_current()->get_processed()->get_peak())
                                        ? std::abs(excitation.get_current()->get_processed()->get_peak().value()) : 0.0;
         size_t numberTimeouts = 0;
@@ -148,7 +152,7 @@ std::pair<bool, double> MagneticFilterCoreAndDcLosses::evaluate_magnetic(Magneti
                 }
             }
 
-            _magnetizingInductance.set_topology(inputs->get_design_requirements().get_topology());
+            _magnetizingInductance.set_topology(magnetizing_model_topology(*inputs));
             // A turn count whose operating point saturates the core stops the sweep, which keeps the best
             // count it already evaluated, restored below; only when no count has worked yet is the candidate
             // rejected (ABT #1740). The verdict is the saturation check analyze_results makes, on the flux
@@ -167,6 +171,20 @@ std::pair<bool, double> MagneticFilterCoreAndDcLosses::evaluate_magnetic(Magneti
                     }
                     logEntry(std::string("Losses filter: turn sweep stops at ") + std::to_string(numberTurnsCombination[0]) +
                              " turns, which saturate: " + saturation.message, "CoreAdviser", 2);
+                    break;
+                }
+            }
+
+            // Saturation cap with several windings: the magnetizing current the model just stamped.
+            if (!singleWinding) {
+                double magnetizingCurrentPeak = stamped_magnetizing_current_peak(operatingPoint);
+                Magnetic saturationMagnetic = *magnetic;
+                saturationMagnetic.set_coil(coil);
+                double saturationCurrent = saturationMagnetic.calculate_saturation_current(temperature, /*proportion=*/false);
+                if (saturationCurrent < saturationMargin * magnetizingCurrentPeak) {
+                    coil.get_mutable_functional_description()[0].set_number_turns(previousNumberTurnsPrimary);
+                    settings.set_coil_delimit_and_compact(false);
+                    coil.fast_wind();
                     break;
                 }
             }
@@ -336,7 +354,7 @@ std::pair<bool, double> MagneticFilterCoreDcAndSkinLosses::evaluate_stand_in_wit
         auto operatingPoint = inputs->get_operating_point(operatingPointIndex);
         // The same hot corner the one-winding path evaluates at.
         double temperature = saturation_derating_temperature(operatingPoint.get_conditions().get_ambient_temperature());
-        _magnetizingInductance.set_topology(inputs->get_design_requirements().get_topology());
+        _magnetizingInductance.set_topology(magnetizing_model_topology(*inputs));
         auto [magnetizingInductance, magneticFluxDensity] = _magnetizingInductance.calculate_inductance_and_magnetic_flux_density(core, coil, &operatingPoint);
         (void) magnetizingInductance;
         OperatingPointExcitation excitation = operatingPoint.get_excitations_per_winding()[0];
@@ -419,14 +437,18 @@ std::pair<bool, double> MagneticFilterCoreDcAndSkinLosses::evaluate_magnetic(Mag
 
     Coil coil = magnetic->get_coil();
 
-    // Energy-storing inductors saturate as turns rise: at a fixed gap isat ∝ 1/N
+    // A gapped core saturates as turns rise: at a fixed gap isat ∝ 1/N
     // (L ∝ N², isat = B_sat·N·A_e/L). The loss-minimising turn sweep below would
     // otherwise push N up (lower core loss) past the saturation-safe point — the
     // CoreAdviser's saturation-safe turn/gap sizing then gets silently undone and
     // the design saturates. Cap the sweep using the SAME
     // Magnetic::calculate_saturation_current the saturation filter and realism
-    // gate use, so the loss-optimal turn count we return still clears the margin.
-    bool isInductor = is_inductor(*inputs);
+    // gate use, against the same magnetizing current, so the loss-optimal turn
+    // count we return still clears the margin. A single winding's current is
+    // known before the model runs; with several windings the magnetizing current
+    // is the one the model stamps at each turn count (a Faraday-derived one moves
+    // with the inductance), so that cap runs after the model call.
+    const bool singleWinding = is_single_winding_design(*inputs);
     double saturationMargin = Settings::GetInstance().get_core_adviser_saturation_margin();
 
     for (size_t operatingPointIndex = 0; operatingPointIndex < inputs->get_operating_points().size(); ++operatingPointIndex) {
@@ -435,7 +457,7 @@ std::pair<bool, double> MagneticFilterCoreDcAndSkinLosses::evaluate_magnetic(Mag
         // filter's inductor gate (raw B_sat below).
         double temperature = saturation_derating_temperature(operatingPoint.get_conditions().get_ambient_temperature());
         OperatingPointExcitation excitation = operatingPoint.get_excitations_per_winding()[0];
-        double saturationPeakCurrent = (isInductor && excitation.get_current() && excitation.get_current()->get_processed()
+        double saturationPeakCurrent = (singleWinding && excitation.get_current() && excitation.get_current()->get_processed()
                                         && excitation.get_current()->get_processed()->get_peak())
                                        ? std::abs(excitation.get_current()->get_processed()->get_peak().value()) : 0.0;
         size_t numberTimeouts = 0;
@@ -479,7 +501,7 @@ std::pair<bool, double> MagneticFilterCoreDcAndSkinLosses::evaluate_magnetic(Mag
                 }
             }
 
-            _magnetizingInductance.set_topology(inputs->get_design_requirements().get_topology());
+            _magnetizingInductance.set_topology(magnetizing_model_topology(*inputs));
             // A turn count whose operating point saturates the core stops the sweep, which keeps the best
             // count it already evaluated, restored below; only when no count has worked yet is the candidate
             // rejected (ABT #1740). The verdict is the saturation check analyze_results makes, on the flux
@@ -498,6 +520,20 @@ std::pair<bool, double> MagneticFilterCoreDcAndSkinLosses::evaluate_magnetic(Mag
                     }
                     logEntry(std::string("Losses filter: turn sweep stops at ") + std::to_string(numberTurnsCombination[0]) +
                              " turns, which saturate: " + saturation.message, "CoreAdviser", 2);
+                    break;
+                }
+            }
+
+            // Saturation cap with several windings: the magnetizing current the model just stamped.
+            if (!singleWinding) {
+                double magnetizingCurrentPeak = stamped_magnetizing_current_peak(operatingPoint);
+                Magnetic saturationMagnetic = *magnetic;
+                saturationMagnetic.set_coil(coil);
+                double saturationCurrent = saturationMagnetic.calculate_saturation_current(temperature, /*proportion=*/false);
+                if (saturationCurrent < saturationMargin * magnetizingCurrentPeak) {
+                    coil.get_mutable_functional_description()[0].set_number_turns(previousNumberTurnsPrimary);
+                    settings.set_coil_delimit_and_compact(false);
+                    coil.fast_wind();
                     break;
                 }
             }
@@ -619,7 +655,7 @@ MagneticFilterLosses::MagneticFilterLosses(std::map<std::string, std::string> mo
 
 std::pair<bool, double> MagneticFilterLosses::evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs) {
     double scoring = 0;
-    _magneticSimulator.set_topology(inputs->get_design_requirements().get_topology());
+    _magneticSimulator.set_topology(magnetizing_model_topology(*inputs));
 
     if (inputs->get_operating_points().size() > 0 && magnetic->get_mutable_coil().get_functional_description().size() != inputs->get_operating_points()[0].get_excitations_per_winding().size()) {
         return {false, 0.0};
@@ -677,7 +713,7 @@ MagneticFilterLossesNoProximity::MagneticFilterLossesNoProximity(std::map<std::s
 
 std::pair<bool, double> MagneticFilterLossesNoProximity::evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs) {
     double scoring = 0;
-    _magneticSimulator.set_topology(inputs->get_design_requirements().get_topology());
+    _magneticSimulator.set_topology(magnetizing_model_topology(*inputs));
 
     if (inputs->get_operating_points().size() > 0 && magnetic->get_mutable_coil().get_functional_description().size() != inputs->get_operating_points()[0].get_excitations_per_winding().size()) {
         return {false, 0.0};
@@ -687,9 +723,16 @@ std::pair<bool, double> MagneticFilterLossesNoProximity::evaluate_magnetic(Magne
         auto operatingPoint = inputs->get_operating_points()[operatingPointIndex];
         // ABT #838: DC + skin-effect winding losses (no proximity) and core losses from ONE
         // loss <-> temperature solve, each at the temperature their combined heat produces.
+        // ABT #2124 (Alf, 2026-10-28): in the catalogue search (one pass) the losses are taken at ambient with no
+        // thermal network, as before ABT #838; a part the network would refuse fails at the final simulation.
+        std::optional<LossSolveWithoutThermalNetworkScope> withoutThermalNetwork;
+        if (CatalogueSearchOnePassScope::active()) {
+            withoutThermalNetwork.emplace();
+        }
         std::optional<WindingLossesOutput> solvedWindingLosses;
         auto coreLosses = _magneticSimulator.calculate_core_losses(operatingPoint, *magnetic, &solvedWindingLosses, nullptr,
                                                                    WindingLossesScope::OHMIC_AND_SKIN_EFFECT, NoThermalOperatingPointPolicy::THROW);
+        withoutThermalNetwork.reset();
         // A core that saturates at the temperature its losses heat it to is not a candidate: the loss solve
         // gives its numbers (ABT #1855) and the verdict is the saturation check analyze_results makes, on the
         // solved flux density at the solved core temperature. The outputs keep this operating point's losses so
@@ -862,7 +905,8 @@ MagneticFilterInductorTurnsAndGapByLosses::MagneticFilterInductorTurnsAndGapByLo
 }
 
 bool MagneticFilterInductorTurnsAndGapByLosses::applies_to_design(const Inputs& inputs) {
-    if (!is_inductor(inputs) || inputs.get_operating_points().empty()) {
+    // An inductor-style (gapped, inductance-targeted) design: anything the role does not make a transformer.
+    if (inputs.get_operating_points().empty() || is_transformer_role(inputs)) {
         return false;
     }
     // Suppression chokes are sized by impedance, not by an inductance target and losses.
@@ -961,7 +1005,7 @@ std::pair<bool, double> MagneticFilterInductorTurnsAndGapByLosses::evaluate_magn
             }
         }
         else {
-            _magnetizingInductance.set_topology(inputs->get_design_requirements().get_topology());
+            _magnetizingInductance.set_topology(magnetizing_model_topology(*inputs));
             _magnetizingInductance.calculate_inductance_and_magnetic_flux_density(core, coil, &operatingPoint);
         }
         preparedOperatingPoints.push_back(operatingPoint);

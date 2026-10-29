@@ -1,4 +1,5 @@
 #pragma once
+#include "support/NumberFormat.h"
 #include "Constants.h"
 #include "Models.h"
 
@@ -14,6 +15,7 @@
 #include <numbers>
 #include <streambuf>
 #include <functional>
+#include <array>
 #include <optional>
 #include <vector>
 #include "support/Exceptions.h"
@@ -75,6 +77,9 @@ class CoreLossesModel {
     // Splits a record of many switching cycles (see SwitchingCyclesRecord); nullopt for a periodic
     // excitation, which the models evaluate as it is.
     static std::optional<SwitchingCyclesRecord> split_into_switching_cycles(const OperatingPointExcitation& excitation);
+    // The same split, shared and read-only: it is memoised (CoreLosses.cpp) and MKF's own callers read it in place
+    // (nullptr where split_into_switching_cycles gives nullopt).
+    static std::shared_ptr<const SwitchingCyclesRecord> split_into_switching_cycles_shared(const OperatingPointExcitation& excitation);
     // The record's losses: the time average of the cycles' losses, sum_k P_k T_k / sum_k T_k, plus the
     // losses of the envelope's own (line-frequency) loop. `evaluate` prices one periodic excitation.
     static CoreLossesOutput combine_switching_cycles(const SwitchingCyclesRecord& record,
@@ -97,17 +102,17 @@ class CoreLossesModel {
 
     // Entry points: a record of switching cycles is priced cycle by cycle (ABT #1636); a periodic
     // excitation goes straight to the model's compute_* evaluation.
-    CoreLossesOutput get_core_losses(const Core& core, OperatingPointExcitation excitation, double temperature);
-    double get_core_volumetric_losses(CoreMaterial coreMaterial, OperatingPointExcitation excitation, double temperature);
-    double get_core_mass_losses(CoreMaterial coreMaterial, OperatingPointExcitation excitation, double temperature);
+    CoreLossesOutput get_core_losses(const Core& core, const OperatingPointExcitation& excitation, double temperature);
+    double get_core_volumetric_losses(const CoreMaterial& coreMaterial, const OperatingPointExcitation& excitation, double temperature);
+    double get_core_mass_losses(const CoreMaterial& coreMaterial, const OperatingPointExcitation& excitation, double temperature);
     virtual CoreLossesOutput compute_core_losses(const Core& core,
-                                             OperatingPointExcitation excitation,
+                                             const OperatingPointExcitation& excitation,
                                              double temperature) = 0;
-    virtual double compute_core_volumetric_losses(CoreMaterial coreMaterial,
-                                             OperatingPointExcitation excitation,
+    virtual double compute_core_volumetric_losses(const CoreMaterial& coreMaterial,
+                                             const OperatingPointExcitation& excitation,
                                              double temperature) = 0;
-    virtual double compute_core_mass_losses(CoreMaterial coreMaterial,
-                                             OperatingPointExcitation excitation,
+    virtual double compute_core_mass_losses(const CoreMaterial& coreMaterial,
+                                             const OperatingPointExcitation& excitation,
                                              double temperature) = 0;
     virtual double get_frequency_from_core_losses(Core core,
                                                   SignalDescriptor magneticFluxDensity,
@@ -128,6 +133,13 @@ class CoreLossesModel {
     // is bounded by their span. The proprietary closed forms derive from the Steinmetz class but
     // evaluate the maker's own formula with no declared span (ABT #1456).
     static bool evaluates_steinmetz_ranges(const CoreLossesModel* model);
+    // The model's validity domain at an excitation: why it does not describe the material there, as the
+    // exception its evaluation throws, or nullptr when it does. Only the loss factor declares one: it is
+    // small-signal data (ABT #2006). The default cascade runs the first supported model valid at the
+    // excitation (CoreLosses::get_core_losses_model).
+    virtual std::exception_ptr not_valid_at(const CoreMaterial& coreMaterial, const OperatingPointExcitation& excitation) const {
+        return nullptr;
+    }
     static SteinmetzCoreLossesMethodRangeDatum get_steinmetz_coefficients(
         CoreMaterialDataOrNameUnion material,
         double frequency);
@@ -145,7 +157,7 @@ class CoreLossesModel {
                                              double temperature,
                                              double magnetizingInductance);
 
-    bool usesVolumetricLosses(CoreMaterial material) {
+    bool usesVolumetricLosses(const CoreMaterial& material) {
         if (material.get_volumetric_losses().size() != 0) {
             return true;
         }
@@ -157,20 +169,31 @@ class CoreLossesModel {
         }
     }
 
+    // The coefficients {ct0, ct1, ct2} of a range's temperature factor, each missing one at its schema default
+    // (ct0 = 1, ct1 = 0, ct2 = 0). Every reader of ct(T) takes them from here.
+    static std::array<double, 3> get_temperature_factor_coefficients(const SteinmetzCoreLossesMethodRangeDatum& steinmetzDatum) {
+        return {steinmetzDatum.get_ct0() ? steinmetzDatum.get_ct0().value() : 1.0,
+                steinmetzDatum.get_ct1() ? steinmetzDatum.get_ct1().value() : 0.0,
+                steinmetzDatum.get_ct2() ? steinmetzDatum.get_ct2().value() : 0.0};
+    }
+    // The temperatures (C) where the range's ct(T) is zero, ascending: none, one or two. Between and beyond
+    // them ct(T) keeps one sign, so they are where get_temperature_factor starts or stops refusing (ABT #1911).
+    static std::vector<double> get_temperature_factor_roots(const SteinmetzCoreLossesMethodRangeDatum& steinmetzDatum);
+
     // Steinmetz temperature factor ct(T) = ct2*T^2 - ct1*T + ct0 (ABT #1456). Each missing coefficient takes
     // its schema default (ct0 = 1, ct1 = 0, ct2 = 0; MAS schemas/magnetic/core/material.json), so a range
     // carrying only ct0/ct1 keeps its temperature dependence. A factor <= 0 is not a loss scale: throw.
     static double get_temperature_factor(const SteinmetzCoreLossesMethodRangeDatum& steinmetzDatum, double temperature) {
-        double ct0 = steinmetzDatum.get_ct0() ? steinmetzDatum.get_ct0().value() : 1.0;
-        double ct1 = steinmetzDatum.get_ct1() ? steinmetzDatum.get_ct1().value() : 0.0;
-        double ct2 = steinmetzDatum.get_ct2() ? steinmetzDatum.get_ct2().value() : 0.0;
+        auto [ct0, ct1, ct2] = get_temperature_factor_coefficients(steinmetzDatum);
         double scale = ct2 * pow(temperature, 2) - ct1 * temperature + ct0;
         if (!(scale > 0)) {
             throw CalculationException(ErrorCode::INVALID_LOSS_DATA,
-                "Steinmetz temperature factor ct(" + std::to_string(temperature) + " C) = " + std::to_string(scale) +
-                " <= 0 (ct0=" + std::to_string(ct0) + ", ct1=" + std::to_string(ct1) + ", ct2=" + std::to_string(ct2) +
-                ") for the range [" + std::to_string(steinmetzDatum.get_minimum_frequency().value_or(-1)) + ", " +
-                std::to_string(steinmetzDatum.get_maximum_frequency().value_or(-1)) + "] Hz");
+                "The core-loss data of the material is not valid at " + format_significant(temperature) + " C: its Steinmetz "
+                "temperature factor there is " + format_significant(scale) + ", and a loss factor must be positive (ct0 = " +
+                format_significant(ct0) + ", ct1 = " + format_significant(ct1) + ", ct2 = " + format_significant(ct2) + ", for " +
+                (steinmetzDatum.get_minimum_frequency() ? format_quantity(steinmetzDatum.get_minimum_frequency().value(), "Hz") : std::string("any frequency")) +
+                " to " + (steinmetzDatum.get_maximum_frequency() ? format_quantity(steinmetzDatum.get_maximum_frequency().value(), "Hz") : std::string("any frequency")) +
+                "). Lower the core temperature (fewer losses or better cooling), or choose another material");
         }
         return scale;
     }
@@ -272,13 +295,13 @@ class CoreLossesSteinmetzModel : public CoreLossesModel {
   public:
     CoreLossesSteinmetzModel() { _modelName = "Steinmetz"; }
     CoreLossesOutput compute_core_losses(const Core& core,
-                                     OperatingPointExcitation excitation,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature);
-    double compute_core_volumetric_losses(CoreMaterial coreMaterial,
-                                      OperatingPointExcitation excitation,
+    double compute_core_volumetric_losses(const CoreMaterial& coreMaterial,
+                                      const OperatingPointExcitation& excitation,
                                       double temperature);
-    double compute_core_mass_losses(CoreMaterial coreMaterial,
-                                      OperatingPointExcitation excitation,
+    double compute_core_mass_losses(const CoreMaterial& coreMaterial,
+                                      const OperatingPointExcitation& excitation,
                                       double temperature) {
         throw std::runtime_error("Mass losses is only valid for Proprietary models from Magnetec");
     }
@@ -300,11 +323,11 @@ class CoreLossesSteinmetzModel : public CoreLossesModel {
 class CoreLossesIGSEModel : public CoreLossesSteinmetzModel {
   public:
     CoreLossesIGSEModel() { _modelName = "iGSE"; }
-    double compute_core_volumetric_losses(CoreMaterial coreMaterial,
-                                     OperatingPointExcitation excitation,
+    double compute_core_volumetric_losses(const CoreMaterial& coreMaterial,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature);
-    double compute_core_mass_losses(CoreMaterial coreMaterial,
-                                      OperatingPointExcitation excitation,
+    double compute_core_mass_losses(const CoreMaterial& coreMaterial,
+                                      const OperatingPointExcitation& excitation,
                                       double temperature) {
         throw std::runtime_error("Mass losses is only valid for Proprietary models from Magnetec");
     }
@@ -368,11 +391,11 @@ class CoreLossesciGSEModel : public CoreLossesSteinmetzModel {
     
   public:
     CoreLossesciGSEModel() { _modelName = "ciGSE"; }
-    double compute_core_volumetric_losses(CoreMaterial coreMaterial,
-                                     OperatingPointExcitation excitation,
+    double compute_core_volumetric_losses(const CoreMaterial& coreMaterial,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature);
-    double compute_core_mass_losses(CoreMaterial coreMaterial,
-                                      OperatingPointExcitation excitation,
+    double compute_core_mass_losses(const CoreMaterial& coreMaterial,
+                                      const OperatingPointExcitation& excitation,
                                       double temperature) {
         throw std::runtime_error("Mass losses is only valid for Proprietary models from Magnetec");
     }
@@ -398,11 +421,11 @@ class CoreLossesciGSEModel : public CoreLossesSteinmetzModel {
 class CoreLossesBargModel : public CoreLossesSteinmetzModel {
   public:
     CoreLossesBargModel() { _modelName = "Barg"; }
-    double compute_core_volumetric_losses(CoreMaterial coreMaterial,
-                                     OperatingPointExcitation excitation,
+    double compute_core_volumetric_losses(const CoreMaterial& coreMaterial,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature);
-    double compute_core_mass_losses(CoreMaterial coreMaterial,
-                                      OperatingPointExcitation excitation,
+    double compute_core_mass_losses(const CoreMaterial& coreMaterial,
+                                      const OperatingPointExcitation& excitation,
                                       double temperature) {
         throw std::runtime_error("Mass losses is only valid for Proprietary models from Magnetec");
     }
@@ -428,13 +451,13 @@ class CoreLossesRoshenModel : public CoreLossesModel {
   public:
     CoreLossesRoshenModel() { _modelName = "Roshen"; }
     CoreLossesOutput compute_core_losses(const Core& core,
-                                     OperatingPointExcitation excitation,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature);
-    double compute_core_volumetric_losses(CoreMaterial coreMaterial,
-                                     OperatingPointExcitation excitation,
+    double compute_core_volumetric_losses(const CoreMaterial& coreMaterial,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature);
-    double compute_core_mass_losses(CoreMaterial coreMaterial,
-                                      OperatingPointExcitation excitation,
+    double compute_core_mass_losses(const CoreMaterial& coreMaterial,
+                                      const OperatingPointExcitation& excitation,
                                       double temperature) {
         throw std::runtime_error("Mass losses is only valid for Proprietary models from Magnetec");
     }
@@ -460,6 +483,12 @@ class CoreLossesRoshenModel : public CoreLossesModel {
     std::map<std::string, double> get_roshen_parameters(Core core,
                                                         OperatingPointExcitation excitation,
                                                         double temperature);
+    // The major-loop parameters get_hysteresis_losses_density reads (coercive force, remanence,
+    // saturation flux density and field strength) at `temperature`. Coercive force and remanence come from
+    // resolve_core_material_coercive_force / _remanence (ABT #1951): the material's own value, else a flagged
+    // class estimate, else they throw. Read raw, a missing one was NaN and the hysteresis loss silently zero
+    // (ABT #2014).
+    static std::map<std::string, double> get_hysteresis_parameters(const CoreMaterial& coreMaterial, double temperature);
 };
 
 // Based on Calculating Core Losses in Transformers for Arbitrary Magnetizing Currents A Comparison of Different
@@ -467,11 +496,11 @@ class CoreLossesRoshenModel : public CoreLossesModel {
 class CoreLossesAlbachModel : public CoreLossesSteinmetzModel {
   public:
     CoreLossesAlbachModel() { _modelName = "Albach"; }
-    double compute_core_volumetric_losses(CoreMaterial coreMaterial,
-                                     OperatingPointExcitation excitation,
+    double compute_core_volumetric_losses(const CoreMaterial& coreMaterial,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature);
-    double compute_core_mass_losses(CoreMaterial coreMaterial,
-                                      OperatingPointExcitation excitation,
+    double compute_core_mass_losses(const CoreMaterial& coreMaterial,
+                                      const OperatingPointExcitation& excitation,
                                       double temperature) {
         throw std::runtime_error("Mass losses is only valid for Proprietary models from Magnetec");
     }
@@ -494,11 +523,11 @@ class CoreLossesAlbachModel : public CoreLossesSteinmetzModel {
 class CoreLossesNSEModel : public CoreLossesSteinmetzModel {
   public:
     CoreLossesNSEModel() { _modelName = "NSE"; }
-    double compute_core_volumetric_losses(CoreMaterial coreMaterial,
-                                     OperatingPointExcitation excitation,
+    double compute_core_volumetric_losses(const CoreMaterial& coreMaterial,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature);
-    double compute_core_mass_losses(CoreMaterial coreMaterial,
-                                      OperatingPointExcitation excitation,
+    double compute_core_mass_losses(const CoreMaterial& coreMaterial,
+                                      const OperatingPointExcitation& excitation,
                                       double temperature) {
         throw std::runtime_error("Mass losses is only valid for Proprietary models from Magnetec");
     }
@@ -522,11 +551,11 @@ class CoreLossesNSEModel : public CoreLossesSteinmetzModel {
 class CoreLossesMSEModel : public CoreLossesSteinmetzModel {
   public:
     CoreLossesMSEModel() { _modelName = "MSE"; }
-    double compute_core_volumetric_losses(CoreMaterial coreMaterial,
-                                     OperatingPointExcitation excitation,
+    double compute_core_volumetric_losses(const CoreMaterial& coreMaterial,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature);
-    double compute_core_mass_losses(CoreMaterial coreMaterial,
-                                      OperatingPointExcitation excitation,
+    double compute_core_mass_losses(const CoreMaterial& coreMaterial,
+                                      const OperatingPointExcitation& excitation,
                                       double temperature) {
         throw std::runtime_error("Mass losses is only valid for Proprietary models from Magnetec");
     }
@@ -552,11 +581,11 @@ class CoreLossesMSEModel : public CoreLossesSteinmetzModel {
 class CoreLossesProprietaryModel : public CoreLossesSteinmetzModel {
   public:
     CoreLossesProprietaryModel() { _modelName = "Proprietary"; }
-    double compute_core_volumetric_losses(CoreMaterial coreMaterial,
-                                     OperatingPointExcitation excitation,
+    double compute_core_volumetric_losses(const CoreMaterial& coreMaterial,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature);
-    double compute_core_mass_losses(CoreMaterial coreMaterial,
-                                     OperatingPointExcitation excitation,
+    double compute_core_mass_losses(const CoreMaterial& coreMaterial,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature);
     double get_frequency_from_core_losses(Core core,
                                           SignalDescriptor magneticFluxDensity,
@@ -578,10 +607,10 @@ class CoreLossesLossFactorModel : public CoreLossesModel {
   public:
     CoreLossesLossFactorModel() { _modelName = "Loss Factor"; }
     CoreLossesOutput compute_core_losses(const Core& core,
-                                     OperatingPointExcitation excitation,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature);
-    double compute_core_volumetric_losses(CoreMaterial coreMaterial,
-                                     OperatingPointExcitation excitation,
+    double compute_core_volumetric_losses(const CoreMaterial& coreMaterial,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature) {
         // REFERENCE INDUCTANCE: the loss-factor formula needs the real
         // magnetizing inductance for ABSOLUTE losses (use the 4-argument
@@ -590,8 +619,8 @@ class CoreLossesLossFactorModel : public CoreLossesModel {
         // cross-referencer use case) — never treat it as physical W/m^3.
         return compute_core_volumetric_losses(coreMaterial, excitation, temperature, 1);
     }
-    double compute_core_mass_losses(CoreMaterial coreMaterial,
-                                      OperatingPointExcitation excitation,
+    double compute_core_mass_losses(const CoreMaterial& coreMaterial,
+                                      const OperatingPointExcitation& excitation,
                                       double temperature) {
         throw std::runtime_error("Mass losses is only valid for Proprietary models from Magnetec");
     }
@@ -601,10 +630,12 @@ class CoreLossesLossFactorModel : public CoreLossesModel {
                                              double temperature,
                                              double magnetizingInductance);
 
-    double compute_core_volumetric_losses(CoreMaterial coreMaterial,
-                                     OperatingPointExcitation excitation,
+    double compute_core_volumetric_losses(const CoreMaterial& coreMaterial,
+                                     const OperatingPointExcitation& excitation,
                                      double temperature,
                                      double magnetizingInductance);
+    // Above lossFactorMaximumMagneticFluxDensity of AC amplitude: LossFactorAboveSmallSignalFluxException.
+    std::exception_ptr not_valid_at(const CoreMaterial& coreMaterial, const OperatingPointExcitation& excitation) const override;
 
     double get_frequency_from_core_losses(Core core,
                                           SignalDescriptor magneticFluxDensity,
@@ -621,7 +652,37 @@ class CoreLossesLossFactorModel : public CoreLossesModel {
     }
 
     static double calculate_magnetizing_inductance_from_excitation(Core core, OperatingPointExcitation excitation, double temperature);
+    // The material's tan(delta)/mu_i at `frequency`, interpolated over its loss-factor points (the endpoint
+    // value outside their band, ABT #118).
+    static double get_loss_factor(const CoreMaterial& coreMaterial, double frequency);
 
+};
+
+// ABT #2006: the loss factor beyond small signal. tan(delta)/mu_i is measured at B <= 0.25 mT, where the
+// hysteresis loss is negligible, so it gives the linear (eddy-current and residual) loss, which scales with B^2
+// at any flux: per flux harmonic k, P_v = pi f_k B_k^2 (tan(delta)/mu_i)(f_k) / mu_0. The hysteresis loss
+// it leaves out grows faster with the flux; it is added from the material's own major loop (coercive force,
+// remanence, saturation) through the Roshen hysteresis loop. Needs loss-factor points; the loop's coercive
+// force and remanence are the material's own or its class's estimate (ABT #1951). Checked against the Steinmetz fits of 82 MAS ferrites that also carry complex permeability
+// (2026-10-23): model/Steinmetz median 1.16 at 5 mT, 1.02 at 20 mT, 1.25 at 100 mT; 45-67% within x2.
+class CoreLossesLossFactorHysteresisModel : public CoreLossesModel {
+  public:
+    CoreLossesLossFactorHysteresisModel() { _modelName = "Loss Factor + Hysteresis"; }
+    CoreLossesOutput compute_core_losses(const Core& core, const OperatingPointExcitation& excitation, double temperature);
+    double compute_core_volumetric_losses(const CoreMaterial& coreMaterial, const OperatingPointExcitation& excitation, double temperature);
+    double compute_core_mass_losses(const CoreMaterial& coreMaterial, const OperatingPointExcitation& excitation, double temperature) {
+        throw std::runtime_error("Mass losses is only valid for Proprietary models from Magnetec");
+    }
+    // The two terms, W/m^3.
+    double get_linear_losses_density(const CoreMaterial& coreMaterial, const OperatingPointExcitation& excitation);
+    double get_hysteresis_losses_density(const CoreMaterial& coreMaterial, const OperatingPointExcitation& excitation, double temperature);
+
+    double get_frequency_from_core_losses(Core core, SignalDescriptor magneticFluxDensity, double temperature, double coreLosses) {
+        return _get_frequency_from_core_losses(core, magneticFluxDensity, temperature, coreLosses);
+    }
+    SignalDescriptor get_magnetic_flux_density_from_core_losses(Core core, double frequency, double temperature, double coreLosses) {
+        return _get_magnetic_flux_density_from_core_losses(core, frequency, temperature, coreLosses);
+    }
 };
 
 class CoreLosses {
@@ -706,16 +767,28 @@ class CoreLosses {
     // name rather than silently priced at zero. Routed automatically from calculate_core_losses
     // for MOLDED cores whose material list resolves to more than one region.
     CoreLossesOutput calculate_molded_core_losses(Core core, OperatingPointExcitation excitation, double temperature);
+    // The model for a library material, looked up by name.
     std::shared_ptr<CoreLossesModel> get_core_losses_model(std::string materialName);
-    double get_core_volumetric_losses(CoreMaterial coreMaterial, OperatingPointExcitation excitation, double temperature);
+    // The model for `material`'s own loss data (its methods, CoreLossesModel::get_methods), whatever its
+    // name: a user's material or a renamed copy is not looked up in the library (ABT #1911).
+    std::shared_ptr<CoreLossesModel> get_core_losses_model(const CoreMaterial& material);
+    // The model run at `excitation`: as above, but the default cascade passes over a supported model that
+    // is not valid there (CoreLossesModel::not_valid_at) to the next one. When none is valid, the first
+    // supported model is returned, and its evaluation throws why (or, with allowMaterialDataExtrapolation,
+    // evaluates with a WARNING). An explicitly requested model is never passed over (ABT #2006).
+    std::shared_ptr<CoreLossesModel> get_core_losses_model(const CoreMaterial& material, const OperatingPointExcitation& excitation);
+    double get_core_volumetric_losses(const CoreMaterial& coreMaterial, const OperatingPointExcitation& excitation, double temperature);
     double get_core_losses_series_resistance(Core core, double frequency, double temperature, double magnetizingInductance);
 
   private:
+    // The first model of the cascade (or the requested one) among `availableMethodsForMaterial`;
+    // throws when none can run.
+    std::shared_ptr<CoreLossesModel> select_core_losses_model(const std::string& materialName, const std::vector<CoreLossesModels>& availableMethodsForMaterial);
     // ABT #1636: calculate_core_losses / get_core_volumetric_losses split a record of switching
     // cycles once; each cycle and the envelope are then one periodic loop, priced by these without
     // being split again (the models' compute_* evaluations, then the DC-bias correction).
-    CoreLossesOutput calculate_periodic_core_losses(Core core, OperatingPointExcitation excitation, double temperature);
-    double get_periodic_core_volumetric_losses(CoreMaterial coreMaterial, OperatingPointExcitation excitation, double temperature);
+    CoreLossesOutput calculate_periodic_core_losses(const Core& core, const OperatingPointExcitation& excitation, double temperature);
+    double get_periodic_core_volumetric_losses(const CoreMaterial& coreMaterial, const OperatingPointExcitation& excitation, double temperature);
 };
 
 } // namespace OpenMagnetics

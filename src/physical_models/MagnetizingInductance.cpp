@@ -1,4 +1,5 @@
 #include "physical_models/MagneticShunt.h"
+#include "support/MasAccess.h"
 #include "physical_models/MagnetizingInductance.h"
 
 #include "processors/Inputs.h"
@@ -319,7 +320,7 @@ double MagnetizingInductance::calculate_drum_ring_magnetizing_inductance(Core co
     double ferriteReluctance = (drumC1 / drumPermeability + ringC1 / ringPermeability) / vacuumPermeability;
 
     auto reluctanceModelForGaps = ReluctanceModel::factory(Defaults().reluctanceModelDefault);
-    auto clearanceOutput = reluctanceModelForGaps->get_gapping_reluctance(core);
+    auto clearanceOutput = reluctanceModelForGaps->get_gapping_reluctance(core, temperature);
     if (!clearanceOutput.get_gapping_reluctance()) {
         throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
             "drumRing core has no clearance gaps between drum and ring; its gapping must hold them");
@@ -424,10 +425,10 @@ double MagnetizingInductance::calculate_molded_magnetizing_inductance(Core core,
 // single-winding part. Processed data is computed from the waveform when it is absent.
 static std::optional<double> excitation_dc_current(const OperatingPointExcitation& excitation) {
     std::optional<SignalDescriptor> signal;
-    if (excitation.get_magnetizing_current()) {
+    if (mas_access::magnetizing_current_ref(excitation)) {
         signal = excitation.get_magnetizing_current();
     }
-    else if (excitation.get_current()) {
+    else if (mas_access::current_ref(excitation)) {
         signal = excitation.get_current();
     }
     if (!signal) {
@@ -453,20 +454,37 @@ static std::optional<double> excitation_dc_current(const OperatingPointExcitatio
 // inductance model and the gap solve read (ABT #1902): the gap solve used to take a magnetizing current
 // carried in with a voltage as it came, derived for some other inductance (a converter model's
 // minimum Lm), and read it against the reluctance of the target, which scaled B by their ratio.
-static bool stamp_magnetizing_current(OperatingPoint* operatingPoint, Core& core, Coil& coil, std::optional<Topology> topology,
-                                      double magnetizingInductance, double frequency) {
-    size_t numberWindings = coil.get_functional_description().size();
+// The stamp also says where the magnetizing current came from (ABT #1942): Faraday on the winding voltage
+// (calculate_magnetizing_current, so the flux is the volt-seconds' whatever the permeability) or the circuit's
+// currents (the winding current itself, an ampere-turn sum, a choke's line current: the MMF is imposed).
+struct MagnetizingCurrentStamp {
     bool biasFluxImposed = false;
-    OperatingPointExcitation excitation = Inputs::get_primary_excitation(*operatingPoint);
+    bool fromVoltage = false;
+};
+static MagnetizingCurrentStamp stamp_magnetizing_current(OperatingPoint* operatingPoint, Core& core, Coil& coil, std::optional<Topology> topology,
+                                                         double magnetizingInductance, double frequency) {
+    size_t numberWindings = coil.get_functional_description().size();
+    MagnetizingCurrentStamp stamp;
+    // The MAS getters return copies, so the primary excitation's presence tests are read once, and the
+    // excitation is copied only by the branches that edit it (nothing changes the operating point before them).
+    const OperatingPointExcitation& primaryExcitation = operatingPoint->get_excitations_per_winding()[0];
+    const bool hasMagnetizingCurrent = mas_access::magnetizing_current_ref(primaryExcitation).has_value();
+    const bool hasVoltage = mas_access::voltage_ref(primaryExcitation).has_value();
+    const bool hasCurrent = mas_access::current_ref(primaryExcitation).has_value();
 
-    // If the converter model already computed the magnetizing current
-    // (e.g. DMC summing all winding currents), respect it — don't overwrite.
-    // BUT: only honor a preset MC when there is no voltage. When voltage is
-    // present, re-derive MC from voltage (V = L * dI/dt) using the runtime-
-    // computed magnetizing inductance — otherwise stale preset MCs (e.g.
-    // generated against a slightly different reluctance) cause B to drift
-    // and downstream loss tests to fail.
-    if (excitation.get_magnetizing_current() && !excitation.get_voltage()) {
+    // Which excitation drives the core (Alf 2026-10-20, ABT #1814): a magnetic with more than one winding
+    // in the circuit derives its magnetizing current from the voltage; a single-winding inductor uses the
+    // current it is given. So a carried magnetizing current is honoured as it comes when there is no
+    // voltage to derive one from (a converter model's DMC sum, say), and, with a voltage, only on a
+    // single-winding inductor that carries no winding current (its given current is that magnetizing
+    // current; with a winding current the branch below makes that current the magnetizing current).
+    // With several windings a carried one is derived again from the voltage (V = L * dI/dt) at the
+    // inductance evaluated here, whoever stamped it: one made for another inductance (a converter
+    // model's minimum Lm, an earlier pass of this model round-tripped through JSON) scales B by the ratio
+    // of the two (ABT #1902).
+    bool singleWindingInductor = numberWindings == 1 && operatingPoint->get_excitations_per_winding().size() == 1;
+    if (hasMagnetizingCurrent && (!hasVoltage || (singleWindingInductor && !hasCurrent))) {
+        OperatingPointExcitation excitation = primaryExcitation;
         // Already set — skip derivation. But upstream callers
         // (MagneticField::get_magnetic_field_strength_gap and
         // siblings) persist a *compressed* magnetizing_current
@@ -477,10 +495,10 @@ static bool stamp_magnetizing_current(OperatingPoint* operatingPoint, Core& core
         // and the downstream FFT pipeline see a standardized
         // contract.
         auto presetMc = excitation.get_magnetizing_current().value();
-        if (presetMc.get_waveform()) {
+        if (mas_access::waveform_ref(presetMc)) {
             auto presetWaveform = presetMc.get_waveform().value();
             if (presetWaveform.get_data().size() > 0 && !is_size_power_of_2(presetWaveform.get_data())) {
-                if (!presetWaveform.get_time()) {
+                if (!mas_access::time_ref(presetWaveform)) {
                     auto stdMc = Inputs::standardize_waveform(presetMc, excitation.get_frequency());
                     presetWaveform = stdMc.get_waveform().value();
                 }
@@ -491,7 +509,7 @@ static bool stamp_magnetizing_current(OperatingPoint* operatingPoint, Core& core
                 excitation.set_magnetizing_current(presetMc);
                 operatingPoint->get_mutable_excitations_per_winding()[0] = excitation;
             }
-            else if (!presetMc.get_harmonics()) {
+            else if (!mas_access::harmonics_ref(presetMc)) {
                 // Waveform is already power-of-2 but harmonics are missing (e.g. loaded from JSON
                 // with harmonics:null). Compute them so downstream frequency-domain paths work.
                 // Also recompute processed to avoid stale fields from the loaded JSON.
@@ -510,7 +528,7 @@ static bool stamp_magnetizing_current(OperatingPoint* operatingPoint, Core& core
     // magnetizing current of every transformer at the core stage (a 228 W forward
     // transformer: 0.4-1.7 T and core temperatures of thousands of degrees instead
     // of 0.05-0.3 T from its volt-seconds), so the operating point decides.
-    else if (numberWindings == 1 && operatingPoint->get_excitations_per_winding().size() == 1 && excitation.get_current()) {
+    else if (singleWindingInductor && hasCurrent) {
         Inputs::set_current_as_magnetizing_current(operatingPoint);
     }
     // CMC check must come BEFORE is_multiport_inductor. CMCs
@@ -528,6 +546,7 @@ static bool stamp_magnetizing_current(OperatingPoint* operatingPoint, Core& core
     // so the topology must be checked before the CMC branch, which would replace the
     // line current with a triangle of its whole swing at the ripple frequency.
     else if (topology == Topology::DIFFERENTIAL_MODE_CHOKE && Inputs::can_be_differential_mode_choke(*operatingPoint, true)) {
+        OperatingPointExcitation excitation = primaryExcitation;
         auto magnetizingCurrent = Inputs::get_differential_mode_choke_magnetizing_current(*operatingPoint);
         excitation.set_magnetizing_current(magnetizingCurrent);
         operatingPoint->get_mutable_excitations_per_winding()[0] = excitation;
@@ -539,6 +558,7 @@ static bool stamp_magnetizing_current(OperatingPoint* operatingPoint, Core& core
                      ? std::optional<std::vector<IsolationSide>>()
                      : std::optional<std::vector<IsolationSide>>(coil.get_isolation_sides()))
              && core.get_type() == CoreType::TOROIDAL) {
+        OperatingPointExcitation excitation = primaryExcitation;
         auto magnetizingCurrent = Inputs::get_common_mode_choke_magnetizing_current(*operatingPoint);
         excitation.set_magnetizing_current(magnetizingCurrent);
         operatingPoint->get_mutable_excitations_per_winding()[0] = excitation;
@@ -553,20 +573,25 @@ static bool stamp_magnetizing_current(OperatingPoint* operatingPoint, Core& core
                  numberWindings < operatingPoint->get_excitations_per_winding().size()
                      ? std::optional<std::vector<IsolationSide>>()
                      : std::optional<std::vector<IsolationSide>>(coil.get_isolation_sides()))) {
+        OperatingPointExcitation excitation = primaryExcitation;
         auto magnetizingCurrent = Inputs::get_multiport_inductor_magnetizing_current(*operatingPoint, magnetizingInductance, coil.get_turns_ratios(),
             numberWindings < operatingPoint->get_excitations_per_winding().size()
                 ? std::optional<std::vector<IsolationSide>>()
                 : std::optional<std::vector<IsolationSide>>(coil.get_isolation_sides()));
+        stamp.fromVoltage = Inputs::is_multiport_inductor_magnetizing_current_from_voltage(excitation);
         excitation.set_magnetizing_current(magnetizingCurrent);
         operatingPoint->get_mutable_excitations_per_winding()[0] = excitation;
     }
-    else if (excitation.get_voltage()) {
-        auto voltage = operatingPoint->get_mutable_excitations_per_winding()[0].get_voltage().value();
-        auto sampledVoltageWaveform = Inputs::calculate_sampled_waveform(voltage.get_waveform().value(), frequency);
+    else if (hasVoltage) {
+        // Edited in place: only its magnetizing current changes, after everything that can throw (the copy of the
+        // whole excitation, written back over itself, was a copy of every waveform it carries).
+        auto& excitation = operatingPoint->get_mutable_excitations_per_winding()[0];
+        auto sampledVoltageWaveform = Inputs::calculate_sampled_waveform(mas_access::waveform_ref(mas_access::voltage_ref(excitation).value()).value(), frequency);
 
         auto turnsRatios = coil.get_turns_ratios();
         bool addOffset = Inputs::include_dc_offset_into_magnetizing_current(*operatingPoint, turnsRatios);
-        biasFluxImposed = !addOffset;
+        stamp.biasFluxImposed = !addOffset;
+        stamp.fromVoltage = true;
 
         auto magnetizingCurrent = Inputs::calculate_magnetizing_current(*operatingPoint, 0, magnetizingInductance, turnsRatios, false,
                                                                         sampledVoltageWaveform);
@@ -581,10 +606,9 @@ static bool stamp_magnetizing_current(OperatingPoint* operatingPoint, Core& core
         // no longer carries.
         magnetizingCurrent.set_processed(Inputs::calculate_processed_data(magnetizingCurrent, sampledMagnetizingCurrentWaveform, false));
 
-        excitation.set_magnetizing_current(magnetizingCurrent);
-        operatingPoint->get_mutable_excitations_per_winding()[0] = excitation;
+        excitation.set_magnetizing_current(std::move(magnetizingCurrent));
     }
-    return biasFluxImposed;
+    return stamp;
 }
 
 // ABT #362/#331: the drum-family paths below return early with their own inductance model, so
@@ -638,8 +662,8 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
     // away as "Waveform data contains NaN" (web builder, 2026-09-24). Say what is
     // missing instead.
     if (!core.get_processed_description()) {
-        throw CoreNotProcessedException("MagnetizingInductance: core '" + core.get_name().value_or("unnamed") +
-                                        "' has no processedDescription (effective parameters)");
+        throw CoreNotProcessedException("core '" + core.get_name().value_or("unnamed") +
+                                        "', needed for the magnetizing inductance");
     }
 
     // ABT #417: a drumRing core's two structural annular-clearance gaps are DERIVED
@@ -810,15 +834,27 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
         temperature = operatingPoint->get_conditions().get_ambient_temperature();
         if (operatingPoint->get_mutable_excitations_per_winding().size() > 0) {
             frequency = operatingPoint->get_mutable_excitations_per_winding()[0].get_frequency();
-            OperatingPointExcitation excitation = Inputs::get_primary_excitation(*operatingPoint);
-
-            if (excitation.get_current()) {
-                excitation.set_current(OpenMagnetics::Inputs::standardize_waveform(excitation.get_current().value(), frequency));
+            // Standardized in place: both computed first, so a throw leaves the operating point as it was.
+            auto& primaryExcitation = operatingPoint->get_mutable_excitations_per_winding()[0];
+            // A signal that already has a waveform with a time axis is returned by standardize_waveform exactly as
+            // it is, so it is neither copied nor stored back.
+            auto needsStandardizing = [](const std::optional<SignalDescriptor>& signal) {
+                return signal && !(mas_access::waveform_ref(*signal) && mas_access::time_ref(*(mas_access::waveform_ref(*signal))));
+            };
+            std::optional<SignalDescriptor> standardizedCurrent;
+            std::optional<SignalDescriptor> standardizedVoltage;
+            if (needsStandardizing(mas_access::current_ref(primaryExcitation))) {
+                standardizedCurrent = OpenMagnetics::Inputs::standardize_waveform(mas_access::current_ref(primaryExcitation).value(), frequency);
             }
-            if (excitation.get_voltage()) {
-                excitation.set_voltage(OpenMagnetics::Inputs::standardize_waveform(excitation.get_voltage().value(), frequency));
+            if (needsStandardizing(mas_access::voltage_ref(primaryExcitation))) {
+                standardizedVoltage = OpenMagnetics::Inputs::standardize_waveform(mas_access::voltage_ref(primaryExcitation).value(), frequency);
             }
-            operatingPoint->get_mutable_excitations_per_winding()[0] = excitation;
+            if (standardizedCurrent) {
+                primaryExcitation.set_current(std::move(standardizedCurrent));
+            }
+            if (standardizedVoltage) {
+                primaryExcitation.set_voltage(std::move(standardizedVoltage));
+            }
 
             Inputs::make_waveform_size_power_of_two(operatingPoint);
         }
@@ -841,34 +877,38 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
 
     if (operatingPoint) {
         if (operatingPoint->get_mutable_excitations_per_winding().size() > 0) {
-            OperatingPointExcitation excitation = Inputs::get_primary_excitation(*operatingPoint);
-            if (!excitation.get_voltage()) {
-                auto current = operatingPoint->get_mutable_excitations_per_winding()[0].get_current().value();
-                auto currentWaveform = current.get_waveform().value();
-                if (!is_size_power_of_2(currentWaveform.get_data())) {
+            // Presence read once (the MAS getters return copies); the edits below never change it.
+            const bool hasVoltage = mas_access::voltage_ref(operatingPoint->get_excitations_per_winding()[0]).has_value();
+            const bool hasCurrent = mas_access::current_ref(operatingPoint->get_excitations_per_winding()[0]).has_value();
+            const bool hasMagnetizingCurrent = mas_access::magnetizing_current_ref(operatingPoint->get_excitations_per_winding()[0]).has_value();
+            if (!hasVoltage) {
+                // Read in place; copied only when the current is resampled.
+                if (!is_size_power_of_2(mas_access::waveform_ref(mas_access::current_ref(operatingPoint->get_excitations_per_winding()[0]).value()).value().get_data())) {
+                    auto current = operatingPoint->get_mutable_excitations_per_winding()[0].get_current().value();
+                    auto currentWaveform = current.get_waveform().value();
                     auto currentSampledWaveform = Inputs::calculate_sampled_waveform(currentWaveform, frequency);
                     current.set_waveform(currentSampledWaveform);
                     operatingPoint->get_mutable_excitations_per_winding()[0].set_current(current);
                 }
             }
 
-            if (excitation.get_voltage()) {
-                auto aux = operatingPoint->get_mutable_excitations_per_winding()[0].get_voltage().value().get_waveform().value();
+            if (hasVoltage) {
+                const auto& aux = mas_access::waveform_ref(mas_access::voltage_ref(operatingPoint->get_excitations_per_winding()[0]).value()).value();
                 if (aux.get_data().size() > 0 && ((aux.get_data().size() & (aux.get_data().size() - 1)) != 0)) {
                     throw std::invalid_argument("voltage_data vector size is not a power of 2");
                 }
             }
-            if (excitation.get_current()) {
-                auto aux = operatingPoint->get_mutable_excitations_per_winding()[0].get_current().value().get_waveform().value();
+            if (hasCurrent) {
+                const auto& aux = mas_access::waveform_ref(mas_access::current_ref(operatingPoint->get_excitations_per_winding()[0]).value()).value();
                 if (aux.get_data().size() > 0 && ((aux.get_data().size() & (aux.get_data().size() - 1)) != 0)) {
                     throw std::invalid_argument("current_data vector size is not a power of 2");
                 }
             }
-            if (!excitation.get_voltage()) {
-                if (!excitation.get_magnetizing_current()) {
+            if (!hasVoltage) {
+                if (!hasMagnetizingCurrent) {
                     Inputs::set_current_as_magnetizing_current(operatingPoint);
                 }
-                auto aux = operatingPoint->get_mutable_excitations_per_winding()[0].get_magnetizing_current().value().get_waveform().value();
+                const auto& aux = mas_access::waveform_ref(mas_access::magnetizing_current_ref(operatingPoint->get_excitations_per_winding()[0]).value()).value();
                 if (aux.get_data().size() > 0 && ((aux.get_data().size() & (aux.get_data().size() - 1)) != 0)) {
                     throw std::invalid_argument("magnetizing_current_data vector size from current is not a power of 2");
                 }
@@ -903,24 +943,33 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
         // whose DC comes from its own volt-seconds fixes the flux (Faraday); everything else (a
         // current, or a DC set by the load currents) fixes the MMF.
         bool biasFluxImposed = false;
+        // The peak field strength of a B read on the magnetisation curve (the unipolar DCM path below), for the
+        // saturation check (DcBiasPoint::peakMagneticFieldStrength).
+        std::optional<double> curvePeakFieldStrength;
 
         if (operatingPoint) {
             if (operatingPoint->get_mutable_excitations_per_winding().size() > 0) {
-                OperatingPointExcitation excitation = Inputs::get_primary_excitation(*operatingPoint);
+                // The primary excitation's frequency: the stamp below replaces the excitation with a copy that keeps it.
+                const double excitationFrequency = operatingPoint->get_excitations_per_winding()[0].get_frequency();
 
-                biasFluxImposed = stamp_magnetizing_current(operatingPoint, core, coil, _topology, modifiedMagnetizingInductance, frequency);
+                auto stamp = stamp_magnetizing_current(operatingPoint, core, coil, _topology, modifiedMagnetizingInductance, frequency);
+                biasFluxImposed = stamp.biasFluxImposed;
 
-                auto aux = operatingPoint->get_mutable_excitations_per_winding()[0].get_magnetizing_current().value().get_waveform().value();
+                // The stamped magnetizing current, read once (the MAS getters return copies).
+                SignalDescriptor stampedMagnetizingCurrent = operatingPoint->get_excitations_per_winding()[0].get_magnetizing_current().value();
+                const Waveform& stampedMagnetizingCurrentWaveform = mas_access::waveform_ref(stampedMagnetizingCurrent).value();
+                const auto& aux = stampedMagnetizingCurrentWaveform;
                 if (aux.get_data().size() > 0 && ((aux.get_data().size() & (aux.get_data().size() - 1)) != 0)) {
                     throw std::invalid_argument("magnetizing_current_data vector size from voltage is not a power of 2 [size=" + std::to_string(aux.get_data().size()) + "]");
                 }
 
-                if (!operatingPoint->get_mutable_excitations_per_winding()[0].get_magnetizing_current()->get_waveform()->get_time()) {
-                    auto magnetizingCurrent = Inputs::standardize_waveform(operatingPoint->get_mutable_excitations_per_winding()[0].get_magnetizing_current().value(), excitation.get_frequency());
+                if (!mas_access::time_ref(stampedMagnetizingCurrentWaveform)) {
+                    auto magnetizingCurrent = Inputs::standardize_waveform(stampedMagnetizingCurrent, excitationFrequency);
                     operatingPoint->get_mutable_excitations_per_winding()[0].set_magnetizing_current(magnetizingCurrent);
+                    stampedMagnetizingCurrent = magnetizingCurrent;
                 }
 
-                auto magneticFlux = OpenMagnetics::MagneticField::calculate_magnetic_flux(operatingPoint->get_mutable_excitations_per_winding()[0].get_magnetizing_current().value(), currentTotalReluctance, numberTurnsPrimary, operatingPoint->get_mutable_excitations_per_winding()[0].get_frequency());
+                auto magneticFlux = OpenMagnetics::MagneticField::calculate_magnetic_flux(std::move(stampedMagnetizingCurrent), currentTotalReluctance, numberTurnsPrimary, operatingPoint->get_mutable_excitations_per_winding()[0].get_frequency());
                 auto magneticFluxDensity = OpenMagnetics::MagneticField::calculate_magnetic_flux_density(magneticFlux, effectiveArea);
                 result.second = magneticFluxDensity;
 
@@ -945,18 +994,18 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
                 // drove the solve into saturation. The harmonics come from the exact samples or knots (ABT #1460);
                 // the stored waveform may be compressed to its corners, whose trapezoid average is not exact, so it
                 // only gives the sign.
-                if (!magneticFluxDensity.get_harmonics()) {
+                if (!mas_access::harmonics_ref(magneticFluxDensity)) {
                     throw std::runtime_error("magneticFluxDensity has no harmonics — upstream magnetizing_current must provide a populated harmonics block (preset waveform missing harmonics?)");
                 }
-                auto fluxDensityWaveform = magneticFluxDensity.get_waveform().value();
-                if (!fluxDensityWaveform.get_time() || fluxDensityWaveform.get_data().size() < 2) {
+                const auto& fluxDensityWaveform = mas_access::waveform_ref(magneticFluxDensity).value();
+                if (!mas_access::time_ref(fluxDensityWaveform) || fluxDensityWaveform.get_data().size() < 2) {
                     throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
                         "Magnetizing inductance under DC bias: the flux density waveform needs a time axis and two points");
                 }
-                double fluxDensityDcMagnitude = magneticFluxDensity.get_harmonics().value().get_amplitudes()[0];
+                double fluxDensityDcMagnitude = mas_access::harmonics_ref(magneticFluxDensity).value().get_amplitudes()[0];
                 double fluxDensityAverage = std::copysign(fluxDensityDcMagnitude, Inputs::calculate_waveform_average(fluxDensityWaveform));
                 double bFieldDcBias = fluxDensityDcMagnitude;
-                auto fluxDensityHarmonics = magneticFluxDensity.get_harmonics().value();
+                const auto& fluxDensityHarmonics = mas_access::harmonics_ref(magneticFluxDensity).value();
                 if (fluxDensityHarmonics.get_frequencies()[1] < switchingFrequency) {
                     for (size_t i = 0; i < fluxDensityHarmonics.get_frequencies().size() - 1; ++i) {
                         if (fluxDensityHarmonics.get_frequencies()[i] >= switchingFrequency) {
@@ -982,10 +1031,127 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
                             " 1/H is below the ungapped core's " + std::to_string(ungappedCoreReluctance) + " 1/H");
                     }
                     double effectiveLength = core.get_processed_description()->get_effective_parameters().get_effective_length();
+                    lineCycleRecordUnderImposedMagnetomotiveForce = switchingFrequency > frequency;
+
+                    // ABT #1942: the small-signal superposition below (the DC point on the load line, the ripple
+                    // linear about it at mu_rev) holds while the magnetizing current rides on its bias and never
+                    // reaches zero: the core then swings a minor loop about the DC point (CCM, DC-biased chokes).
+                    // A current that comes back to zero (or through it) every cycle, a DCM flyback or inductor, takes
+                    // the core from 0 up its magnetisation curve and back each cycle: with ripple 2.5 times its
+                    // average the superposition put B on a DC floor at the load line of the average MMF, above the
+                    // curve's (an EL 25 Fair-Rite 78 inductor at 0 -> 5.73 A: 0.273 -> 0.537 T for the curve's
+                    // 0 -> 0.439 T). There B is read on the curve sample by sample, as each line-cycle record's cycle
+                    // reads its bias below: with the current imposed, B = B_LL(N i(t)) on the load line of the gaps;
+                    // with the current from the voltage, B is Faraday's, anchored where the magnetizing current is
+                    // zero (the dead time, Inputs::calculate_magnetizing_current_dc_anchor), and the magnetizing
+                    // current is read back from the same load line, N i(t) = H(B) l_e + B A_e R_gap. Only a DC bias
+                    // (no line-frequency swing, not a line-cycle record) takes this path; those keep theirs.
+                    // Unipolar only (Alf, 2026-10-18): a current that goes on through zero to the other polarity
+                    // (bipolar AC, a DC choke whose ripple crosses zero, a dead time that rings below zero) is not a
+                    // core starting from zero each cycle, and keeps today's path (its own model is ABT #1959). How far
+                    // past zero still counts as reaching it is the error the waveform's own construction can put there:
+                    //  - a magnetizing current integrated from the voltage (Faraday, stamp.fromVoltage) is continuous,
+                    //    and the trapezoid integration of a voltage edge that falls between two samples misplaces the
+                    //    flux linkage by at most |dv| dt / 2 <= max|v| dt, so the dead-time anchor can sit up to one
+                    //    sample's change of the current, max|i[k+1] - i[k]|, on the far side of zero (slow_simulation's
+                    //    flyback: -0.020 A against a 9.07 A step and a 281 A peak);
+                    //  - a current the circuit imposes is the given waveform's own samples, linear between its points, so
+                    //    it cannot go below its lowest point: only rounding can, n * eps * |i|max on n samples. Its steps
+                    //    are no measure here: a DCM inductor's current falls to zero in one sample (low_filling_inductor:
+                    //    a 5.73 A step), and such a step would admit a reversal as deep as the peak.
+                    // An excursion past that bound is resolved by the samples: it is a reversal.
+                    bool dcBias = bFieldDcBias == fluxDensityDcMagnitude;
+                    bool magnetizingCurrentReachesZero = false;
+                    SignalDescriptor sampledMagnetizingCurrent;
+                    if (dcBias && !lineCycleRecordUnderImposedMagnetomotiveForce) {
+                        // On the magnetizing current's own samples (the core-loss split reads B and i_m over the same
+                        // span), sampled first if it is stored as its corners only.
+                        sampledMagnetizingCurrent = operatingPoint->get_mutable_excitations_per_winding()[0].get_magnetizing_current().value();
+                        auto sampledCurrentWaveform = sampledMagnetizingCurrent.get_waveform().value();
+                        if (!Inputs::is_waveform_sampled(sampledCurrentWaveform)) {
+                            sampledCurrentWaveform = Inputs::calculate_sampled_waveform(sampledCurrentWaveform, frequency);
+                        }
+                        sampledMagnetizingCurrent.set_waveform(sampledCurrentWaveform);
+                        double polarity = Inputs::calculate_waveform_average(sampledCurrentWaveform) < 0 ? -1.0 : 1.0;
+                        const auto& currentData = sampledCurrentWaveform.get_data();
+                        if (currentData.size() < 2) {
+                            throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+                                "Magnetizing inductance under DC bias: the sampled magnetizing current needs two points, it has " +
+                                std::to_string(currentData.size()));
+                        }
+                        double reversalTolerance = 0;
+                        if (stamp.fromVoltage) {
+                            for (size_t index = 0; index < currentData.size(); ++index) {
+                                // The waveform is periodic: its last sample is followed by its first.
+                                reversalTolerance = std::max(reversalTolerance, fabs(currentData[(index + 1) % currentData.size()] - currentData[index]));
+                            }
+                        }
+                        else {
+                            double largestMagnitude = 0;
+                            for (auto current : currentData) {
+                                largestMagnitude = std::max(largestMagnitude, fabs(current));
+                            }
+                            reversalTolerance = currentData.size() * std::numeric_limits<double>::epsilon() * largestMagnitude;
+                        }
+                        double lowestPolarisedCurrent = polarity * *std::min_element(currentData.begin(), currentData.end(),
+                            [polarity](double a, double b) { return polarity * a < polarity * b; });
+                        magnetizingCurrentReachesZero = lowestPolarisedCurrent <= 0 && lowestPolarisedCurrent >= -reversalTolerance;
+                    }
+
+                    if (magnetizingCurrentReachesZero) {
+                        auto coreMaterial = core.resolve_material();
+                        // The caller's share keeps the cached curve alive for every sample (ABT #838).
+                        const auto magnetisationCurve = InitialPermeability::get_magnetisation_curve(coreMaterial, temperature, frequency);
+                        if (stamp.fromVoltage) {
+                            // Faraday's flux density (stored as its corners) on as many samples as the magnetizing current has.
+                            auto fluxDensityWaveformSampled = Inputs::calculate_sampled_waveform(magneticFluxDensity.get_waveform().value(), frequency,
+                                                                                                 sampledMagnetizingCurrent.get_waveform()->get_data().size());
+                            Waveform currentWaveform;
+                            currentWaveform.set_time(fluxDensityWaveformSampled.get_time());
+                            std::vector<double> currentData;
+                            double peakFieldStrength = 0;
+                            for (auto fluxDensity : fluxDensityWaveformSampled.get_data()) {
+                                auto [fieldStrength, magnetomotiveForce] = InitialPermeability::get_magnetomotive_force_for_flux_density(
+                                    *magnetisationCurve, fabs(fluxDensity), effectiveLength, effectiveArea, gapReluctance);
+                                peakFieldStrength = std::max(peakFieldStrength, fieldStrength);
+                                currentData.push_back(std::copysign(magnetomotiveForce, fluxDensity) / numberTurnsPrimary);
+                            }
+                            curvePeakFieldStrength = peakFieldStrength;
+                            currentWaveform.set_data(currentData);
+                            SignalDescriptor magnetizingCurrent;
+                            magnetizingCurrent.set_waveform(currentWaveform);
+                            magnetizingCurrent.set_harmonics(Inputs::calculate_harmonics_data(currentWaveform, frequency));
+                            magnetizingCurrent.set_processed(Inputs::calculate_processed_data(magnetizingCurrent, currentWaveform, false));
+                            operatingPoint->get_mutable_excitations_per_winding()[0].set_magnetizing_current(magnetizingCurrent);
+                            // The bias is the average MMF of that current.
+                            biasMagnetomotiveForce = numberTurnsPrimary * fabs(Inputs::calculate_waveform_average(currentWaveform));
+                        }
+                        else {
+                            auto currentWaveform = sampledMagnetizingCurrent.get_waveform().value();
+                            std::vector<double> fluxDensityData;
+                            double peakFieldStrength = 0;
+                            for (auto current : currentWaveform.get_data()) {
+                                double magnetomotiveForce = numberTurnsPrimary * current;
+                                auto [fieldStrength, fluxDensity] = InitialPermeability::get_dc_operating_point_for_magnetomotive_force(
+                                    *magnetisationCurve, fabs(magnetomotiveForce), effectiveLength, effectiveArea, gapReluctance);
+                                peakFieldStrength = std::max(peakFieldStrength, fieldStrength);
+                                fluxDensityData.push_back(std::copysign(fluxDensity, magnetomotiveForce));
+                            }
+                            curvePeakFieldStrength = peakFieldStrength;
+                            Waveform curveFluxDensityWaveform;
+                            curveFluxDensityWaveform.set_time(currentWaveform.get_time());
+                            curveFluxDensityWaveform.set_data(fluxDensityData);
+                            SignalDescriptor curveFluxDensity;
+                            curveFluxDensity.set_waveform(curveFluxDensityWaveform);
+                            curveFluxDensity.set_harmonics(Inputs::calculate_harmonics_data(curveFluxDensityWaveform, frequency));
+                            curveFluxDensity.set_processed(Inputs::calculate_basic_processed_data(curveFluxDensityWaveform));
+                            result.second = curveFluxDensity;
+                        }
+                    }
+
                     auto [loadLineFieldStrength, loadLineFluxDensity] = InitialPermeability::get_dc_operating_point_for_magnetomotive_force(
                         core.resolve_material(), biasMagnetomotiveForce, effectiveLength, effectiveArea, gapReluctance, temperature, frequency);
                     hFieldDcBias = loadLineFieldStrength;
-                    lineCycleRecordUnderImposedMagnetomotiveForce = switchingFrequency > frequency;
 
                     // The flux above is linear in mu_rev, the small-signal slope: right for the
                     // ripple, but its DC part is N*I_dc/(R(mu_rev)*A_e), which collapses towards zero
@@ -993,17 +1159,19 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
                     // density is the load line's B(H) on the magnetisation curve, so the offset is
                     // moved there. When the bias is a line-frequency swing rather than DC, the swing
                     // is left as computed.
-                    if (bFieldDcBias == fabs(fluxDensityAverage) && fluxDensityAverage != 0) {
+                    if (!magnetizingCurrentReachesZero && bFieldDcBias == fabs(fluxDensityAverage) && fluxDensityAverage != 0) {
                         double offsetShift = std::copysign(loadLineFluxDensity, fluxDensityAverage) - fluxDensityAverage;
                         auto shiftedWaveform = magneticFluxDensity.get_waveform().value();
                         for (auto& datum : shiftedWaveform.get_mutable_data()) {
                             datum += offsetShift;
                         }
-                        magneticFluxDensity.set_waveform(shiftedWaveform);
+                        // The processed data is computed from the shifted waveform before it is moved in.
+                        auto shiftedProcessed = Inputs::calculate_basic_processed_data(shiftedWaveform);
+                        magneticFluxDensity.set_waveform(std::move(shiftedWaveform));
                         auto shiftedHarmonics = magneticFluxDensity.get_harmonics().value();
                         shiftedHarmonics.get_mutable_amplitudes()[0] = loadLineFluxDensity;
-                        magneticFluxDensity.set_harmonics(shiftedHarmonics);
-                        magneticFluxDensity.set_processed(Inputs::calculate_basic_processed_data(shiftedWaveform));
+                        magneticFluxDensity.set_harmonics(std::move(shiftedHarmonics));
+                        magneticFluxDensity.set_processed(std::move(shiftedProcessed));
                         result.second = magneticFluxDensity;
                     }
                 }
@@ -1012,7 +1180,7 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
                 // has left the material's curve, and the loop below takes the saturated material's 1.
                 nextPermeability = initialPermeability.get_initial_permeability_model_value(core.resolve_material(), temperature, hFieldDcBias, frequency);
                 // The last evaluation is the converged one: the output above is built at its permeability.
-                _lastDcBiasPoint = DcBiasPoint{hFieldDcBias, temperature, frequency};
+                _lastDcBiasPoint = DcBiasPoint{hFieldDcBias, temperature, frequency, curvePeakFieldStrength};
             }
         }
         return nextPermeability;
@@ -1024,6 +1192,14 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
     double permeability = currentInitialPermeability;
     std::optional<double> permeabilityAboveRoot;   // F(mu) < mu
     std::optional<double> permeabilityBelowRoot;   // F(mu) > mu
+    // F(mu) / mu - 1 at the two ends of the bracket, to tell a root from a jump of F when the bracket closes.
+    double relativeResidualAboveRoot = 0;
+    double relativeResidualBelowRoot = 0;
+    // A bracket around a continuous root, closed to the tolerance in log(mu), leaves residuals of the order of
+    // |dlog F / dlog mu - 1| times the tolerance at its ends; both ends this far from F = mu (100 times the
+    // tolerance) mean the bracket closed on a jump of F, not on a root.
+    const double jumpRelativeResidual = 100 * biasConvergenceTolerance;
+    bool closedOnJump = false;
     bool biasConverged = false;
     for (size_t evaluation = 0; evaluation < maximumBiasEvaluations; ++evaluation) {
         double nextPermeability = biasedPermeability(permeability);
@@ -1052,13 +1228,16 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
         }
         if (residual < 0) {
             permeabilityAboveRoot = permeability;
+            relativeResidualAboveRoot = residual / permeability;
         }
         else {
             permeabilityBelowRoot = permeability;
+            relativeResidualBelowRoot = residual / permeability;
         }
         if (permeabilityAboveRoot && permeabilityBelowRoot) {
             if (fabs(log(permeabilityAboveRoot.value() / permeabilityBelowRoot.value())) <= biasConvergenceTolerance) {
                 biasConverged = true;
+                closedOnJump = fabs(relativeResidualAboveRoot) > jumpRelativeResidual && fabs(relativeResidualBelowRoot) > jumpRelativeResidual;
                 break;
             }
             permeability = sqrt(permeabilityAboveRoot.value() * permeabilityBelowRoot.value());
@@ -1073,6 +1252,88 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
             " evaluations (last permeability " + std::to_string(permeability) + ")");
     }
 
+    // The saturated state (mu = 1) is a fixed point whenever the bias it implies stays past the knee, but it can
+    // coexist with an unsaturated one: the bias MMF grows as mu falls (the magnetizing current of a lower inductance
+    // swings wider), and a material whose DC-bias table ends in a step to the saturated mu = 1 has two fixed points
+    // on either side of that step. Plain iteration from the unbiased permeability can step past the knee in one
+    // move and land on mu = 1 although a root inside the material's data exists (a flyback on DMR96 at 12 -> 14 A,
+    // 100 kHz: 647 A/m after the first step, then mu = 1 at 5885 A/m, while mu = 51.7 at 449 A/m, inside the
+    // table, is a fixed point too). The physical operating point is the unsaturated root the bias reaches from the
+    // unbiased state, the highest one below it. It is searched for between mu = 1 and the lowest permeability
+    // known to lie above the root, downwards in factors of 2; a sign change there is bisected, and accepted only
+    // if it is a root (F(mu) = mu within the tolerance), not the step itself. Without one the saturated core is
+    // the answer.
+    if (permeability <= 1 && currentInitialPermeabilityUnbiased > 1 && permeabilityAboveRoot && permeabilityAboveRoot.value() > 1) {
+        size_t evaluations = 0;
+        auto residualAt = [&](double candidate) {
+            if (++evaluations > maximumBiasEvaluations) {
+                throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+                    "Magnetizing inductance under DC bias: the search for an unsaturated operating point did not converge in " +
+                    std::to_string(maximumBiasEvaluations) + " evaluations");
+            }
+            double next = biasedPermeability(candidate);
+            if (!std::isfinite(next)) {
+                throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+                    "Magnetizing inductance under DC bias: the material's biased permeability at mu = " +
+                    std::to_string(candidate) + " is not finite (" + std::to_string(next) + ")");
+            }
+            return std::max(next, 1.0) - candidate;
+        };
+        double upper = permeabilityAboveRoot.value();   // F(upper) < upper
+        std::optional<double> unsaturatedRoot;
+        for (double candidate = upper / 2; candidate > 1 && !unsaturatedRoot; candidate /= 2) {
+            double residual = residualAt(candidate);
+            if (fabs(residual) <= biasConvergenceTolerance * candidate) {
+                unsaturatedRoot = candidate;
+                break;
+            }
+            if (residual < 0) {
+                upper = candidate;
+                continue;
+            }
+            // F(candidate) > candidate, F(upper) < upper: bisect in log(mu).
+            double lower = candidate;
+            while (fabs(log(upper / lower)) > biasConvergenceTolerance) {
+                double middle = sqrt(upper * lower);
+                double middleResidual = residualAt(middle);
+                if (fabs(middleResidual) <= biasConvergenceTolerance * middle) {
+                    unsaturatedRoot = middle;
+                    break;
+                }
+                if (middleResidual < 0) {
+                    upper = middle;
+                }
+                else {
+                    lower = middle;
+                }
+            }
+            // The bracket closed on a jump of F, not on a root: no unsaturated fixed point lies here or below
+            // it in this bracket. The search ends; the saturated core stays the answer.
+            break;
+        }
+        // The output (inductance, flux density, DC point) is that of the last evaluation: make it the answer's.
+        permeability = unsaturatedRoot ? unsaturatedRoot.value() : 1.0;
+        biasedPermeability(permeability);
+    }
+
+    // The bracket closed on a jump of F, not on a root: F(mu) > mu just below it and F(mu) < mu just above it,
+    // with no fixed point between (the step of a DC-bias table that ends where the material is taken as saturated:
+    // DMR96 on a flyback at 12 -> 14 A and 200 kHz, F = 50 just below mu = 26.1 and F = 1 just above it, and
+    // F(1) = 59.9, so the saturated mu = 1 is no fixed point either). The bias holds the core at the edge of its
+    // data, where the next increment of bias leaves it: no unsaturated operating point exists, and the core is
+    // taken as saturated, mu_r = 1. The output is built at it. The bias at mu_r = 1 can lie inside the table (F(1)
+    // = 59.9 above), where no criterion on the DC point sees the saturation, so the DC point carries the mark that
+    // no operating point exists, and ResultsAnalyzer::check_saturation flags the point on it.
+    if (closedOnJump && currentInitialPermeabilityUnbiased > 1) {
+        permeability = 1.0;
+        biasedPermeability(permeability);
+        if (!_lastDcBiasPoint) {
+            throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+                "Magnetizing inductance under DC bias: the DC solve found no operating point, but the evaluation at mu_r = 1 recorded no DC bias point");
+        }
+        _lastDcBiasPoint->noDcOperatingPoint = true;
+    }
+
     // A line-cycle record under an imposed MMF (a DMC or PFC choke carrying its line current with the switching
     // ripple): the permeability above is the one at the line swing's peak, the operating point that sets the
     // inductance the circuit can count on. The flux density each switching cycle actually swings is not: the
@@ -1082,16 +1343,23 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
     // bounded by the valleys of the magnetizing current, keeps the line flux density computed above (its mean),
     // and its ripple swings about it with the incremental permeability at the cycle's own line bias: the field
     // of its mean MMF on the same load line as the bias above.
+    // ABT #1786: the cycle's line flux density is that load line's B on the material's magnetisation curve, as the
+    // DC case reads its bias (Alf, 2026-10-18), not N i / (R(mu_peak) A_e): the curve's B(H) = mu0 * integral of
+    // mu_rev lies well above mu0 mu_rev(H) H at the line peak (the web DMC fixture's T 48/23/19 MPP 300 at 2381 A/m:
+    // 0.354 T linear). A line MMF past the load line at the curve's end (1000 times H_sat) has no B on the curve: it
+    // throws, as the inverse does (ABT #1942). The peak field strength, the load line's H at the record's largest
+    // MMF, goes to the saturation check against H_sat with the DC point (DcBiasPoint::peakMagneticFieldStrength).
     if (lineCycleRecordUnderImposedMagnetomotiveForce) {
         // The flux density is built on the magnetizing current's own samples: the core-loss split reads the two
         // records over the same span.
-        auto magnetizingCurrentWaveform = operatingPoint->get_mutable_excitations_per_winding()[0].get_magnetizing_current().value().get_waveform().value();
-        if (!magnetizingCurrentWaveform.get_time()) {
+        // Read in place: nothing below writes the operating point's magnetizing current.
+        const auto& magnetizingCurrentWaveform = mas_access::waveform_ref(mas_access::magnetizing_current_ref(operatingPoint->get_excitations_per_winding()[0]).value()).value();
+        if (!mas_access::time_ref(magnetizingCurrentWaveform)) {
             throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
                 "Magnetizing inductance of a line-cycle record: the magnetizing current has no time axis");
         }
-        auto time = magnetizingCurrentWaveform.get_time().value();
-        auto current = magnetizingCurrentWaveform.get_data();
+        const auto& time = mas_access::time_ref(magnetizingCurrentWaveform).value();
+        const auto& current = magnetizingCurrentWaveform.get_data();
         // The cycles are those of the magnetizing current. A model branch that drives the core with one switching
         // period instead of the record (the CMC branch's triangle of the line swing, for a caller that does not
         // name the topology) has no line cycle to bias its cycles with: its flux density stays as computed above.
@@ -1108,11 +1376,26 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
             std::vector<size_t> bounds = valleys.value();
             bounds.front() = 0;
             bounds.back() = current.size();
-            // The flux density above is linear in the magnetizing current through this reluctance, plus the offset
-            // the DC bias may have moved it by.
-            double currentAverage = Inputs::calculate_waveform_average(magnetizingCurrentWaveform);
-            double fluxDensityOffset = Inputs::calculate_waveform_average(result.second.get_waveform().value()) -
-                                       numberTurnsPrimary * currentAverage / (currentTotalReluctance * effectiveArea);
+            // The line load line, read on the curve; past the curve's end it throws.
+            double curveEndFieldStrength = magnetisationCurve->fieldStrength.back();
+            double curveEndFluxDensity = magnetisationCurve->fluxDensity.back();
+            double curveEndMagnetomotiveForce = curveEndFieldStrength * effectiveLength + curveEndFluxDensity * effectiveArea * gapReluctance;
+            auto lineLoadLine = [&](double magnetomotiveForce) {
+                if (fabs(magnetomotiveForce) > curveEndMagnetomotiveForce) {
+                    throw SaturationException(
+                        "The line-cycle MMF " + std::to_string(fabs(magnetomotiveForce)) + " A-turns on material " + magnetisationCurve->materialName +
+                        " lies past the load line at the end of its magnetisation curve, " + std::to_string(curveEndMagnetomotiveForce) +
+                        " A-turns (" + std::to_string(curveEndFluxDensity) + " T at " + std::to_string(curveEndFieldStrength) +
+                        " A/m, 1000 times its saturation field strength): the core is driven far past saturation, and its curve has no flux density for that MMF");
+                }
+                return InitialPermeability::get_dc_operating_point_for_magnetomotive_force(
+                    *magnetisationCurve, fabs(magnetomotiveForce), effectiveLength, effectiveArea, gapReluctance);
+            };
+            double largestCurrentMagnitude = 0;
+            for (auto sample : current) {
+                largestCurrentMagnitude = std::max(largestCurrentMagnitude, fabs(sample));
+            }
+            double peakFieldStrength = lineLoadLine(numberTurnsPrimary * largestCurrentMagnitude).first;
             std::vector<double> fluxDensityData(current.size());
             for (size_t cycleIndex = 0; cycleIndex + 1 < bounds.size(); ++cycleIndex) {
                 size_t first = bounds[cycleIndex];
@@ -1131,11 +1414,10 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
                     cycleCurrent = current[first];
                 }
                 double lineMagnetomotiveForce = numberTurnsPrimary * cycleCurrent;
-                double lineFieldStrength = InitialPermeability::get_dc_operating_point_for_magnetomotive_force(
-                    *magnetisationCurve, fabs(lineMagnetomotiveForce), effectiveLength, effectiveArea, gapReluctance).first;
+                auto [lineFieldStrength, lineFluxDensity] = lineLoadLine(lineMagnetomotiveForce);
                 double incrementalPermeability = initialPermeability.get_initial_permeability(coreMaterial, temperature, lineFieldStrength, frequency);
                 double incrementalReluctance = reluctanceModel->get_ungapped_core_reluctance(core, incrementalPermeability) + gapReluctance;
-                double cycleFluxDensity = lineMagnetomotiveForce / (currentTotalReluctance * effectiveArea) + fluxDensityOffset;
+                double cycleFluxDensity = std::copysign(lineFluxDensity, lineMagnetomotiveForce);
                 for (size_t sampleIndex = first; sampleIndex < end; ++sampleIndex) {
                     fluxDensityData[sampleIndex] = cycleFluxDensity +
                         numberTurnsPrimary * (current[sampleIndex] - cycleCurrent) / (incrementalReluctance * effectiveArea);
@@ -1143,12 +1425,17 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
             }
             Waveform fluxDensityWaveform;
             fluxDensityWaveform.set_time(time);
-            fluxDensityWaveform.set_data(fluxDensityData);
+            fluxDensityWaveform.set_data(std::move(fluxDensityData));
             SignalDescriptor magneticFluxDensity;
-            magneticFluxDensity.set_waveform(fluxDensityWaveform);
             magneticFluxDensity.set_harmonics(Inputs::calculate_harmonics_data(fluxDensityWaveform, frequency));
             magneticFluxDensity.set_processed(Inputs::calculate_basic_processed_data(fluxDensityWaveform));
-            result.second = magneticFluxDensity;
+            magneticFluxDensity.set_waveform(std::move(fluxDensityWaveform));
+            result.second = std::move(magneticFluxDensity);
+            if (!_lastDcBiasPoint) {
+                throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+                    "Magnetizing inductance of a line-cycle record: the DC-bias fixed point left no DC point to carry the peak field strength");
+            }
+            _lastDcBiasPoint->peakMagneticFieldStrength = peakFieldStrength;
         }
     }
 
@@ -1171,7 +1458,7 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
             // wrong reluctance for a lateral-driven leg and averages over the
             // effective area; saturation is checked in the actual column.
             if (operatingPoint && operatingPoint->get_mutable_excitations_per_winding().size() > 0 &&
-                operatingPoint->get_mutable_excitations_per_winding()[0].get_magnetizing_current()) {
+                mas_access::magnetizing_current_ref(operatingPoint->get_excitations_per_winding()[0])) {
                 auto columnIndexPerWinding = ReluctanceNetwork::resolve_winding_column_indexes(magneticForPlacement);
                 double drivenColumnArea = core.get_columns()[columnIndexPerWinding[0]].get_area();
                 double drivingPointReluctance = pow(numberTurnsPrimary, 2) / modifiedMagnetizingInductance;
@@ -1185,8 +1472,9 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
 
     if (operatingPoint) {
         if (operatingPoint->get_mutable_excitations_per_winding().size() > 0) {
-            OperatingPointExcitation excitation = Inputs::get_primary_excitation(*operatingPoint);
-            if (!excitation.get_voltage()) {
+            // The primary excitation is copied only when its induced voltage has to be computed.
+            if (!mas_access::voltage_ref(operatingPoint->get_excitations_per_winding()[0])) {
+                OperatingPointExcitation excitation = Inputs::get_primary_excitation(*operatingPoint);
                 operatingPoint->get_mutable_excitations_per_winding()[0].set_voltage(Inputs::calculate_induced_voltage(excitation, modifiedMagnetizingInductance));
             }
         }
@@ -1484,6 +1772,8 @@ double MagnetizingInductance::calculate_gap_from_saturation_constraint(Core core
     double gapLength = initialGap;
     const double gapStepFactor = 1.5;  // Increase gap by 50% per iteration
     const int maxIterations = 15;
+    double lastGapTried = gapLength;
+    double lastMagneticFluxDensityPeak = 0;
     
     for (int iteration = 0; iteration < maxIterations; ++iteration) {
         // Create core with current gap
@@ -1533,13 +1823,20 @@ double MagnetizingInductance::calculate_gap_from_saturation_constraint(Core core
         if (bPeak <= targetMagneticFluxDensity) {
             return gapLength;
         }
+        lastGapTried = gapLength;
+        lastMagneticFluxDensityPeak = bPeak;
         
         // Increase gap for next iteration
         gapLength *= gapStepFactor;
     }
     
-    // Return last calculated gap even if not converged
-    return gapLength;
+    // Not converged. This used to return the 16th gap, one that was never evaluated (ABT #1872).
+    throw CalculationException(ErrorCode::CALCULATION_DIVERGED,
+                               "calculate_gap_from_saturation_constraint: core " + core.get_name().value_or("(unnamed)") +
+                               " still reaches B = " + std::to_string(lastMagneticFluxDensityPeak) + " T above the target " +
+                               std::to_string(targetMagneticFluxDensity) + " T with a gap of " + std::to_string(lastGapTried) +
+                               " m after " + std::to_string(maxIterations) + " steps from the energy-based " +
+                               std::to_string(initialGap) + " m");
 }
 
 Core get_core_with_ground_gapping(Core core, double gapLength) {
@@ -1604,15 +1901,41 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
                                                                                                size_t decimals) {
     double frequency = Defaults().coreAdviserFrequencyReference;
     double temperature = Defaults().ambientTemperature;
-    OperatingPointExcitation excitation;
-    OperatingPoint operatingPoint;
+    // A primary with a current and no voltage: everything this function does to the operating point it also stores
+    // into inputs' first operating point (set_current_as_magnetizing_current, then the induced voltage), so it edits
+    // that operating point in place instead of a copy written back twice. Otherwise it works on a copy, which keeps
+    // the edits (the voltage path's stamped magnetizing current) out of inputs.
+    const bool editsInputsInPlace = inputs->get_operating_points().size() > 0 &&
+                                    !mas_access::voltage_ref(inputs->get_operating_points()[0].get_excitations_per_winding()[0]) &&
+                                    mas_access::current_ref(inputs->get_operating_points()[0].get_excitations_per_winding()[0]);
+    OperatingPoint copiedOperatingPoint;
+    OperatingPoint& operatingPoint = editsInputsInPlace ? inputs->get_mutable_operating_points()[0] : copiedOperatingPoint;
+    // What this function reads of the primary excitation, as it stood when read: whether it has a voltage, a
+    // current and a magnetizing current. The excitation itself is copied only where it is passed on
+    // (calculate_induced_voltage below), from the state it had when it was read.
+    bool excitationHasVoltage = false;
+    bool excitationHasCurrent = false;
+    bool excitationHasMagnetizingCurrent = false;
+    std::optional<OperatingPointExcitation> excitationAsRead;
+    auto read_primary_excitation = [&]() {
+        const auto& primary = operatingPoint.get_excitations_per_winding()[0];
+        excitationHasVoltage = mas_access::voltage_ref(primary).has_value();
+        excitationHasCurrent = mas_access::current_ref(primary).has_value();
+        excitationHasMagnetizingCurrent = mas_access::magnetizing_current_ref(primary).has_value();
+        excitationAsRead.reset();
+        if (!excitationHasVoltage && excitationHasCurrent) {
+            excitationAsRead = primary;  // calculate_induced_voltage reads it below
+        }
+    };
 
     auto constants = OpenMagnetics::Constants();
     if (inputs->get_operating_points().size() > 0) {
-        operatingPoint = inputs->get_operating_point(0);
-        excitation = Inputs::get_primary_excitation(operatingPoint);
+        if (!editsInputsInPlace) {
+            operatingPoint = inputs->get_operating_points()[0];
+        }
+        read_primary_excitation();
         temperature = operatingPoint.get_conditions().get_ambient_temperature();
-        frequency = operatingPoint.get_mutable_excitations_per_winding()[0].get_frequency();
+        frequency = operatingPoint.get_excitations_per_winding()[0].get_frequency();
     }
 
     double numberTurnsPrimary = coil.get_functional_description()[0].get_number_turns();
@@ -1640,19 +1963,22 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
 
     currentInitialPermeability = initialPermeability.get_initial_permeability(core.resolve_material(), temperature, std::nullopt, frequency);
 
-    if (!excitation.get_voltage() && excitation.get_current()) {
+    if (!excitationHasVoltage && excitationHasCurrent) {
         Inputs::set_current_as_magnetizing_current(&operatingPoint);
-        inputs->set_operating_point_by_index(operatingPoint, 0);
+        if (!editsInputsInPlace) {
+            inputs->set_operating_point_by_index(operatingPoint, 0);
+        }
     }
 
     // ABT #1902: a voltage fixes the flux by Faraday, and the magnetizing current at the target inductance is
-    // the one the inductance model derives from it for the gapped core (stamp_magnetizing_current, which honours a
-    // carried magnetizing current only without a voltage). A carried one was derived for another inductance (a
+    // the one the inductance model derives from it for the gapped core (stamp_magnetizing_current, which with a
+    // voltage honours a carried magnetizing current only on a single-winding inductor with no winding current,
+    // ABT #1814). A carried one was derived for another inductance (a
     // converter model's minimum Lm): read against the target's reluctance it scaled B by the ratio of the two
     // inductances (a forward transformer gapped to 364 uH, its current derived for 84.2 uH: 0.65 T for 0.15 T).
-    if (excitation.get_voltage()) {
+    if (excitationHasVoltage) {
         stamp_magnetizing_current(&operatingPoint, core, coil, _topology, desiredMagnetizingInductance, frequency);
-        excitation = Inputs::get_primary_excitation(operatingPoint);
+        read_primary_excitation();
     }
 
     // DC bias (ABT #1093). The flux density the target inductance imposes is known
@@ -1663,8 +1989,8 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
     // secant through the incremental curve; it diverges wherever |dµ/dH|·B/(µ0·µ²) > 1,
     // the knee of any ferrite, ran away to a saturated permeability, and the search then
     // clamped at the residual gap for any target above a few tens of µH.
-    if (excitation.get_magnetizing_current()) {
-        auto magneticFlux = OpenMagnetics::MagneticField::calculate_magnetic_flux(operatingPoint.get_mutable_excitations_per_winding()[0].get_magnetizing_current().value(), neededTotalReluctance, numberTurnsPrimary, operatingPoint.get_mutable_excitations_per_winding()[0].get_frequency());
+    if (excitationHasMagnetizingCurrent) {
+        auto magneticFlux = OpenMagnetics::MagneticField::calculate_magnetic_flux(mas_access::magnetizing_current_ref(operatingPoint.get_excitations_per_winding()[0]).value(), neededTotalReluctance, numberTurnsPrimary, operatingPoint.get_excitations_per_winding()[0].get_frequency());
         auto magneticFluxDensity = OpenMagnetics::MagneticField::calculate_magnetic_flux_density(magneticFlux, effectiveArea);
         double biasFluxDensity = fabs(magneticFluxDensity.get_processed().value().get_offset());
         auto material = core.resolve_material();
@@ -1672,7 +1998,7 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
         if (biasFluxDensity > 0) {
             double biasFieldStrength = InitialPermeability::get_magnetic_field_dc_bias_for_flux_density(material, biasFluxDensity, temperature, frequency);
             currentInitialPermeability = initialPermeability.get_initial_permeability(material, temperature, biasFieldStrength, frequency);
-            dcBiasPoint = DcBiasPoint{biasFieldStrength, temperature, frequency};
+            dcBiasPoint = DcBiasPoint{biasFieldStrength, temperature, frequency, std::nullopt};
         }
         // ABT #1855 (Alf, 2026-10-14): a design operation refuses a solution the saturation check flags
         // (either criterion), as the advisers reject such a candidate; only simulate gives numbers through
@@ -1690,9 +2016,11 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
         }
     }
 
-    if (!excitation.get_voltage() && excitation.get_current()) {
-        operatingPoint.get_mutable_excitations_per_winding()[0].set_voltage(Inputs::calculate_induced_voltage(excitation, desiredMagnetizingInductance));
-        inputs->set_operating_point_by_index(operatingPoint, 0);
+    if (!excitationHasVoltage && excitationHasCurrent) {
+        operatingPoint.get_mutable_excitations_per_winding()[0].set_voltage(Inputs::calculate_induced_voltage(excitationAsRead.value(), desiredMagnetizingInductance));
+        if (!editsInputsInPlace) {
+            inputs->set_operating_point_by_index(operatingPoint, 0);
+        }
     }
 
     double gapLength = constants.residualGap;
@@ -1704,6 +2032,34 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
     size_t numberDistributedGaps = 3;
     timeout = 100;
     Core gappedCore;
+
+    // ABT #2074: a ground or spacer gap is one slab in the winding column, so it can be no longer
+    // than the column. The search steps up 1 mm at a time with nothing bounding it, and past the
+    // column it built cores that Core refused ("gap of length 0.013005 m does not fit the winding
+    // column (column height 0.0128 m)"), thousands of times per Henry corpus run. Bound it here:
+    // when even a gap the full length of the column leaves the reluctance short of the target's,
+    // no gap of this core reaches the inductance, and that is said once, with the numbers.
+    std::optional<double> maximumGapLength;
+    if (gappingType == GappingType::GROUND || gappingType == GappingType::SPACER) {
+        // By value: get_processed_description() returns the optional by value, so a reference into it dangled at the end
+        // of this statement (ABT #2097: the WASM build read the freed vector as empty and dropped every candidate).
+        const auto columns = core.get_processed_description()->get_columns();
+        if (columns.empty()) {
+            throw CoreNotProcessedException("core '" + core.get_name().value_or("unnamed") + "' has no columns to gap");
+        }
+        maximumGapLength = columns[0].get_height();
+        Core longestGapCore = gappingType == GappingType::GROUND ? get_core_with_ground_gapping(core, maximumGapLength.value())
+                                                                 : get_core_with_spacer_gapping(core, maximumGapLength.value());
+        const double longestGapReluctance = reluctanceModel->get_core_reluctance(longestGapCore, currentInitialPermeability).get_core_reluctance();
+        if (longestGapReluctance < neededTotalReluctance) {
+            std::ostringstream reason;
+            reason << "No gap of core '" << core.get_name().value_or("unnamed") << "' brings " << numberTurnsPrimary
+                   << " turns down to " << desiredMagnetizingInductance * 1e6 << " uH: a gap the full "
+                   << maximumGapLength.value() * 1e3 << " mm of its winding column still gives "
+                   << pow(numberTurnsPrimary, 2) / longestGapReluctance * 1e6 << " uH";
+            throw GapException(reason.str());
+        }
+    }
 
     while (true) {
         reluctance = 0;
@@ -1720,7 +2076,7 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
             case GappingType::DISTRIBUTED:
                 while (numberDistributedGaps > 3) {
                     gappedCore = get_core_with_distributed_gapping(core, gapLength, numberDistributedGaps);
-                    fringingFactorOneGap = reluctanceModel->get_gap_reluctance(gappedCore.get_gapping()[0]).get_fringing_factor();
+                    fringingFactorOneGap = reluctanceModel->get_gap_reluctance(gappedCore.get_gapping()[0], gappedCore.get_magnetic_flux_density_saturation(temperature, true)).get_fringing_factor();
                     if (fringingFactorOneGap < constants.minimumDistributedFringingFactor &&
                         numberDistributedGaps > 1) {
                         gapLength *= numberDistributedGaps;
@@ -1733,7 +2089,7 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
                 }
                 while (true) {
                     gappedCore = get_core_with_distributed_gapping(core, gapLength, numberDistributedGaps);
-                    fringingFactorOneGap = reluctanceModel->get_gap_reluctance(gappedCore.get_gapping()[0]).get_fringing_factor();
+                    fringingFactorOneGap = reluctanceModel->get_gap_reluctance(gappedCore.get_gapping()[0], gappedCore.get_magnetic_flux_density_saturation(temperature, true)).get_fringing_factor();
                     if (fringingFactorOneGap > constants.maximumDistributedFringingFactor) {
                         gapLength *= numberDistributedGaps;
                         numberDistributedGaps += 2;
@@ -1765,6 +2121,10 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
             }
             if (increasingGap) {
                 gapLength += gapLengthModification;
+                if (maximumGapLength && gapLength > maximumGapLength.value()) {
+                    // The full column is known to reach the target (checked above): step back from it.
+                    gapLength = maximumGapLength.value();
+                }
             }
             else {
                 gapLength = std::max(constants.residualGap, gapLength - gapLengthModification);
@@ -1775,6 +2135,10 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
     }
 
     gapLength = std::max(constants.residualGap, roundFloat(gapLength, decimals));
+    if (maximumGapLength && gapLength > maximumGapLength.value()) {
+        // Rounding up past the column is rounding to a gap that does not exist: round down instead.
+        gapLength = std::floor(maximumGapLength.value() * pow(10, decimals)) / pow(10, decimals);
+    }
 
     switch (gappingType) {
         case GappingType::GROUND:
@@ -1869,7 +2233,7 @@ double MagnetizingInductance::calculate_flux_density_peak_from_volt_seconds(
     if (numberTurns <= 0 || effectiveArea <= 0 || maxVoltSeconds <= 0) {
         return 0.0;
     }
-    // Faraday's Law: V = N · A_e · dB/dt  →  B_peak = max|∫V dt| / (N · A_e).
+    // Faraday's Law: V = N · A_e · dB/dt  →  B_peak = λ_pk / (N · A_e), λ_pk = half the peak-to-peak of ∫V dt.
     // Works for arbitrary waveforms (DAB square, CLLLC trapezoid, ...);
     // does NOT assume sinusoidal.
     return maxVoltSeconds / (numberTurns * effectiveArea);

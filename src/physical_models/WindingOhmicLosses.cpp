@@ -1,3 +1,4 @@
+#include "support/NumberFormat.h"
 #include "physical_models/WindingOhmicLosses.h"
 #include "physical_models/MagneticField.h"
 #include "physical_models/Resistivity.h"
@@ -253,12 +254,14 @@ void check_parallel_branch(Coil& coil,
     auto found = turnCounts.find({windingIndex, parallelIndex});
     size_t turnsThisParallel = found == turnCounts.end() ? 0 : found->second;
     throw CoilException(ErrorCode::COIL_WINDING_ERROR,
-        "Winding '" + coil.get_functional_description()[windingIndex].get_name() + "' parallel " +
-        std::to_string(parallelIndex) + " has a series resistance of " + std::to_string(seriesResistance) +
-        " Ohm: " + std::to_string(turnsThisParallel) + " of its turns are in turnsDescription, while " +
-        "functionalDescription declares " + std::to_string(coil.get_number_turns(windingIndex)) +
-        " turns over " + std::to_string(coil.get_number_parallels(windingIndex)) +
-        " parallels. The coil must be re-wound before its losses can be computed.");
+        (coil.get_number_parallels(windingIndex) > 1 ? "Parallel " + std::to_string(parallelIndex + 1) + " of winding '"
+                                                       : std::string("Winding '")) +
+        coil.get_functional_description()[windingIndex].get_name() + "' has " +
+        (turnsThisParallel == 0 ? std::string("no wound turns") : std::to_string(turnsThisParallel) + " wound turns") +
+        " and a series resistance of " + format_quantity(seriesResistance, "Ohm") + ", while the winding is declared with " +
+        std::to_string(coil.get_number_turns(windingIndex)) + " turns over " + std::to_string(coil.get_number_parallels(windingIndex)) +
+        (coil.get_number_parallels(windingIndex) == 1 ? " parallel" : " parallels") + ", so its losses cannot be calculated. "
+        "Wind the coil again.");
 }
 
 }  // namespace
@@ -463,12 +466,12 @@ WindingLossesOutput WindingOhmicLosses::calculate_ohmic_losses(Coil coil, Operat
 
 WindingLossesOutput WindingOhmicLosses::apply_parallel_current_split(Coil coil, WindingLossesOutput windingLossesOutput, const ParallelCurrentSplit& parallelCurrentSplit, double temperature) {
     if (!coil.get_turns_description()) {
-        throw CoilNotProcessedException("Parallel current split losses (ABT #1314): the coil has no turns description");
+        throw CoilNotProcessedException("Parallel current split losses: the coil has no turns description");
     }
     const auto turns = coil.get_turns_description().value();
     if (!windingLossesOutput.get_winding_losses_per_turn() || !windingLossesOutput.get_winding_losses_per_winding() ||
         !windingLossesOutput.get_dc_resistance_per_turn() || !windingLossesOutput.get_current_divider_per_turn()) {
-        throw InvalidInputException(ErrorCode::MISSING_DATA, "Parallel current split losses (ABT #1314): the split needs the losses per turn and per winding, "
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Parallel current split losses: the split needs the losses per turn and per winding, "
                                     "the DC resistance per turn and the current divider per turn");
     }
     auto windingLossesPerTurn = windingLossesOutput.get_winding_losses_per_turn().value();
@@ -477,7 +480,7 @@ WindingLossesOutput WindingOhmicLosses::apply_parallel_current_split(Coil coil, 
     const auto currentDividerPerTurn = windingLossesOutput.get_current_divider_per_turn().value();
     if (windingLossesPerTurn.size() != turns.size() || dcResistancePerTurn.size() != turns.size() || currentDividerPerTurn.size() != turns.size() ||
         parallelCurrentSplit.strandPerTurn.size() != turns.size()) {
-        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Parallel current split losses (ABT #1314): the losses, resistances, dividers or split do not cover every turn");
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Parallel current split losses: the losses, resistances, dividers or split do not cover every turn");
     }
     const size_t numberWindings = coil.get_functional_description().size();
     const size_t numberFrequencies = parallelCurrentSplit.frequencies.size();
@@ -505,21 +508,40 @@ WindingLossesOutput WindingOhmicLosses::apply_parallel_current_split(Coil coil, 
     // Adds `lossPerFrequency` (indexed as the split's frequencies) to the AC element's entry for that harmonic: the entry at
     // any frequency the windings' lists give it. An element's list follows its winding's harmonics, which the operating
     // point's pruning can leave out of frequency order, so the entry is searched, not bisected.
+    // ParallelCurrentSplit::find_frequency_index of a harmonic frequency, searched once per distinct frequency value:
+    // every turn of a winding lists the same harmonics.
+    std::map<double, std::optional<size_t>> splitIndexPerFrequency;
+    auto split_index_of = [&](double frequency) {
+        auto found = splitIndexPerFrequency.find(frequency);
+        if (found == splitIndexPerFrequency.end()) {
+            found = splitIndexPerFrequency.emplace(frequency, parallelCurrentSplit.find_frequency_index(frequency)).first;
+        }
+        return found->second;
+    };
     auto add_to_harmonics = [&](LossElementPerHarmonic& element, const std::vector<double>& lossPerFrequency, const std::string& owner) {
         auto& harmonicFrequencies = element.get_mutable_harmonic_frequencies();
         auto& lossesPerHarmonic = element.get_mutable_losses_per_harmonic();
         if (harmonicFrequencies.size() != lossesPerHarmonic.size()) {
-            throw InvalidInputException(ErrorCode::INVALID_INPUT, "Parallel current split losses (ABT #1314): the AC losses of " + owner + " list " +
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "Parallel current split losses: the AC losses of " + owner + " list " +
                                         std::to_string(harmonicFrequencies.size()) + " frequencies for " + std::to_string(lossesPerHarmonic.size()) + " losses");
         }
         // Every solved harmonic gets its entry, whatever this strand's share of it: the turns of a winding are combined
         // into layers, sections and windings entry by entry, so they must all list the same harmonics. Entering only the
         // harmonics a strand had a non-zero excess at left the turns of one winding with lists of different lengths
         // (34 and 41 on a flyback candidate of the coil adviser), which the combination wrote past the end of (ABT #1759).
+        // The split index of each listed harmonic (none for a frequency that is not positive), looked up once per
+        // element and kept in step with the insertions below: the search for each split index then compares
+        // indices instead of searching the split's frequencies again for every harmonic.
+        std::vector<std::optional<size_t>> splitIndexPerHarmonic(harmonicFrequencies.size());
+        for (size_t harmonicIndex = 0; harmonicIndex < harmonicFrequencies.size(); ++harmonicIndex) {
+            if (harmonicFrequencies[harmonicIndex] > 0) {
+                splitIndexPerHarmonic[harmonicIndex] = split_index_of(harmonicFrequencies[harmonicIndex]);
+            }
+        }
         for (size_t splitIndex = 0; splitIndex < numberFrequencies; ++splitIndex) {
             std::optional<size_t> position;
             for (size_t harmonicIndex = 0; harmonicIndex < harmonicFrequencies.size() && !position; ++harmonicIndex) {
-                if (harmonicFrequencies[harmonicIndex] > 0 && parallelCurrentSplit.find_frequency_index(harmonicFrequencies[harmonicIndex]) == splitIndex) {
+                if (splitIndexPerHarmonic[harmonicIndex] == splitIndex) {
                     position = harmonicIndex;
                 }
             }
@@ -530,6 +552,8 @@ WindingLossesOutput WindingOhmicLosses::apply_parallel_current_split(Coil coil, 
                 position = static_cast<size_t>(after - harmonicFrequencies.begin());
                 harmonicFrequencies.insert(after, frequency);
                 lossesPerHarmonic.insert(lossesPerHarmonic.begin() + static_cast<std::ptrdiff_t>(position.value()), 0.0);
+                splitIndexPerHarmonic.insert(splitIndexPerHarmonic.begin() + static_cast<std::ptrdiff_t>(position.value()),
+                                             frequency > 0 ? split_index_of(frequency) : std::optional<size_t>());
             }
             lossesPerHarmonic.at(position.value()) += lossPerFrequency[splitIndex];
         }
@@ -542,7 +566,7 @@ WindingLossesOutput WindingOhmicLosses::apply_parallel_current_split(Coil coil, 
         }
         auto skinEffectLosses = windingLossesPerTurn[turnIndex].get_skin_effect_losses();
         if (!skinEffectLosses) {
-            throw InvalidInputException(ErrorCode::MISSING_DATA, "Parallel current split losses (ABT #1314): turn " + std::to_string(turnIndex) + " has no skin effect losses to charge the split to");
+            throw InvalidInputException(ErrorCode::MISSING_DATA, "Parallel current split losses: turn " + std::to_string(turnIndex) + " has no skin effect losses to charge the split to");
         }
         std::vector<double> excessLossPerFrequency(numberFrequencies);
         for (size_t splitIndex = 0; splitIndex < numberFrequencies; ++splitIndex) {
@@ -577,7 +601,7 @@ WindingLossesOutput WindingOhmicLosses::apply_parallel_current_split(Coil coil, 
         }
         auto skinEffectLosses = windingLossesPerWinding.at(windingIndex).get_skin_effect_losses();
         if (!skinEffectLosses) {
-            throw InvalidInputException(ErrorCode::MISSING_DATA, "Parallel current split losses (ABT #1314): winding " + std::to_string(windingIndex) +
+            throw InvalidInputException(ErrorCode::MISSING_DATA, "Parallel current split losses: winding " + std::to_string(windingIndex) +
                                         " has connection resistance but no connection skin effect losses to charge the split to");
         }
         add_to_harmonics(skinEffectLosses.value(), excessLossPerFrequency, "winding " + std::to_string(windingIndex) + " connections");

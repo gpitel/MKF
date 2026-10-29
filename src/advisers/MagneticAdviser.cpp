@@ -6,9 +6,10 @@
 #include <limits>
 #include "advisers/MagneticAdviser.h"
 #include "advisers/CoreAdviser.h"
-#include "advisers/MagneticFilterInternal.h"  // is_energy_storing_topology()
+#include "advisers/MagneticFilterInternal.h"  // magnetizing-current helpers, is_tagged_common_mode_choke()
 #include "physical_models/Impedance.h"
 #include "processors/MagneticSimulator.h"
+#include "processors/ResultsAnalyzer.h"
 #include "support/Painter.h"
 #include <magic_enum_utility.hpp>
 #include "support/Logger.h"
@@ -51,6 +52,33 @@ struct ConstraintsScope {
     ConstraintsScope& operator=(const ConstraintsScope&) = delete;
 };
 
+// ABT #2052: why a simulated candidate is rejected because simulate left an operating point without core losses: at
+// its ambient temperature that point's flux density lies past the end of the material's magnetisation curve
+// (ResultsAnalyzer's CORE_SATURATES finding, which throws when the missing core losses are not that case). None when
+// every point has its core losses.
+std::optional<std::string> reason_core_saturates_past_magnetisation_curve(const Mas& mas) {
+    const auto& outputs = mas.get_outputs();
+    const auto& operatingPoints = mas.get_inputs().get_operating_points();
+    for (size_t operatingPointIndex = 0; operatingPointIndex < outputs.size(); ++operatingPointIndex) {
+        if (outputs[operatingPointIndex].get_core_losses()) {
+            continue;
+        }
+        if (operatingPointIndex >= operatingPoints.size()) {
+            throw InvalidInputException(ErrorCode::MISSING_DATA,
+                "MagneticAdviser: simulate() returned output " + std::to_string(operatingPointIndex) + " for '" +
+                mas.get_magnetic().get_reference() + "', which has only " + std::to_string(operatingPoints.size()) + " operating points");
+        }
+        std::string reason = "core saturates";
+        for (const auto& finding : ResultsAnalyzer::analyze_flux_density_past_magnetisation_curve(
+                 mas.get_magnetic(), operatingPoints[operatingPointIndex], operatingPointIndex,
+                 mas.get_inputs().get_design_requirements().get_topology())) {
+            reason += ": " + finding.message;
+        }
+        return reason;
+    }
+    return std::nullopt;
+}
+
 // Outcome of processing one wound candidate through the full validation path.
 enum class WoundCandidateOutcome {
     Skipped,       // failed a guard/dedup/simulate/saturation check — drop, keep going
@@ -75,7 +103,8 @@ WoundCandidateOutcome process_wound_candidate(
     size_t globalCandidateCap,
     std::vector<std::pair<size_t, double>>& usedNumberSectionsAndMargin,
     std::vector<Mas>& masData,
-    size_t& processedCoils) {
+    size_t& processedCoils,
+    std::vector<std::pair<std::string, std::string>>& failedCandidates) {
 
     auto sectionsOpt = mas.get_magnetic().get_coil().get_sections_description();
     if (!sectionsOpt || sectionsOpt->empty()) {
@@ -122,6 +151,14 @@ WoundCandidateOutcome process_wound_candidate(
         logEntry(std::string("MagneticAdviser: skipping candidate, simulate failed: ") + e.what(), "MagneticAdviser", 2);
         return WoundCandidateOutcome::Skipped;
     }
+    // ABT #2052: simulate gives a point past the end of the magnetisation curve at ambient no core losses or
+    // temperature (until then it threw here, which skipped the candidate). Such a candidate is rejected and recorded.
+    if (auto saturates = reason_core_saturates_past_magnetisation_curve(mas)) {
+        logEntry("MagneticAdviser: dropping '" + mas.get_mutable_magnetic().get_reference() + "' - " + saturates.value(),
+                 "MagneticAdviser", 2);
+        failedCandidates.push_back({mas.get_mutable_magnetic().get_reference(), saturates.value()});
+        return WoundCandidateOutcome::Skipped;
+    }
 
     processedCoils++;
 
@@ -129,45 +166,51 @@ WoundCandidateOutcome process_wound_candidate(
     // scores (it discards the validity flag), and the CoreAdviser saturation
     // gate ran on the SEED turns — but the coil adviser / loss optimisation can
     // finalise a higher turn count, lowering the gap-aware saturation current
-    // below the margin. Drop inductor designs whose FINAL isat no longer clears
-    // margin * ipeak (the same identity downstream realism checks use).
-    // Transformers are excluded: their flux is voltage-driven and more turns
-    // LOWERS B.
+    // below the margin. Drop designs whose FINAL isat no longer clears
+    // margin * the peak magnetizing current (the same identity the saturation
+    // filter uses): on a single winding its own current, with several windings
+    // the magnetizing current the model stamps for the assembled magnetic (a
+    // transformer's volt-seconds current, never its load current).
     {
-        bool isInductor = is_inductor(mas.get_mutable_inputs());
-        if (isInductor) {
-            double saturationMargin = settings.get_core_adviser_saturation_margin();
-            bool saturates = false;
-            for (auto& op : mas.get_mutable_inputs().get_operating_points()) {
-                // A tagged common-mode choke is exempt here exactly as it is in
-                // MagneticFilterSaturation: its line current cancels in the core
-                // and MAS has no CM-noise-current requirement, so I_sat against
-                // the line (or ripple) current is not a saturation criterion —
-                // the impedance filter is its gate. Without this the gate dropped
-                // every wound CMC the CoreAdviser had let through (ABT #1369).
-                if (is_tagged_common_mode_choke(mas.get_mutable_inputs(), op)) {
-                    continue;
-                }
+        auto& gateInputs = mas.get_mutable_inputs();
+        const bool singleWinding = is_single_winding_design(gateInputs);
+        double saturationMargin = settings.get_core_adviser_saturation_margin();
+        bool saturates = false;
+        for (auto& op : gateInputs.get_operating_points()) {
+            // A tagged common-mode choke is exempt here exactly as it is in
+            // MagneticFilterSaturation: its line current cancels in the core
+            // and MAS has no CM-noise-current requirement, so I_sat against
+            // the line (or ripple) current is not a saturation criterion —
+            // the impedance filter is its gate. Without this the gate dropped
+            // every wound CMC the CoreAdviser had let through (ABT #1369).
+            if (is_tagged_common_mode_choke(gateInputs, op)) {
+                continue;
+            }
+            double currentPeak;
+            if (singleWinding) {
                 auto excitation = op.get_excitations_per_winding()[0];
                 if (!excitation.get_current() || !excitation.get_current()->get_processed()
                     || !excitation.get_current()->get_processed()->get_peak()) {
                     continue;
                 }
-                double currentPeak = excitation.get_current()->get_processed()->get_peak().value();
-                // Derating (ABT #13): hot junction corner + RAW B_sat, matching
-                // the saturation filter's inductor gate.
-                double temperature = saturation_derating_temperature(op.get_conditions().get_ambient_temperature());
-                double saturationCurrent = mas.get_mutable_magnetic().calculate_saturation_current(temperature, /*proportion=*/false);
-                if (saturationCurrent < saturationMargin * currentPeak) {
-                    saturates = true;
-                    break;
-                }
+                currentPeak = excitation.get_current()->get_processed()->get_peak().value();
             }
-            if (saturates) {
-                logEntry("MagneticAdviser: dropping '" + mas.get_mutable_magnetic().get_reference()
-                         + "' — final saturation current below margin", "MagneticAdviser", 2);
-                return WoundCandidateOutcome::Skipped;
+            else {
+                currentPeak = model_magnetizing_current_peak(mas.get_magnetic().get_core(), mas.get_magnetic().get_coil(), gateInputs, op);
             }
+            // Derating (ABT #13): hot junction corner + RAW B_sat, matching
+            // the saturation filter's gate.
+            double temperature = saturation_derating_temperature(op.get_conditions().get_ambient_temperature());
+            double saturationCurrent = mas.get_mutable_magnetic().calculate_saturation_current(temperature, /*proportion=*/false);
+            if (saturationCurrent < saturationMargin * currentPeak) {
+                saturates = true;
+                break;
+            }
+        }
+        if (saturates) {
+            logEntry("MagneticAdviser: dropping '" + mas.get_mutable_magnetic().get_reference()
+                     + "' — final saturation current below margin", "MagneticAdviser", 2);
+            return WoundCandidateOutcome::Skipped;
         }
     }
 
@@ -178,11 +221,32 @@ WoundCandidateOutcome process_wound_candidate(
     // let through can still exceed the limit once its winding losses are in.
     if (settings.get_core_adviser_enable_temperature_filter()) {
         const double maximumTemperature = resolve_maximum_design_temperature(mas.get_mutable_inputs());
-        for (const auto& output : mas.get_outputs()) {
+        const auto& outputs = mas.get_outputs();
+        for (size_t operatingPointIndex = 0; operatingPointIndex < outputs.size(); ++operatingPointIndex) {
+            const auto& output = outputs[operatingPointIndex];
             if (!output.get_temperature()) {
-                throw InvalidInputException(ErrorCode::MISSING_DATA,
-                    "MagneticAdviser: simulate() returned no temperature for '" + mas.get_mutable_magnetic().get_reference()
-                    + "', so the temperature filter cannot judge it");
+                // ABT #1942 / #1876: simulate gives no temperature to an operating point with no thermal operating
+                // point (e.g. a core heated past its Curie point that cannot carry the voltage's flux). Such a
+                // candidate cannot pass the temperature filter: it is rejected and recorded, the search goes on.
+                // analyze_missing_temperature reads the reason simulate recorded (ABT #2075) and THROWS when the
+                // missing temperature is not that case, so any other cause still fails loudly.
+                const auto& operatingPoints = mas.get_inputs().get_operating_points();
+                if (operatingPointIndex >= operatingPoints.size()) {
+                    throw InvalidInputException(ErrorCode::MISSING_DATA,
+                        "MagneticAdviser: simulate() returned output " + std::to_string(operatingPointIndex) + " for '"
+                        + mas.get_mutable_magnetic().get_reference() + "', which has only " + std::to_string(operatingPoints.size())
+                        + " operating points");
+                }
+                auto findings = ResultsAnalyzer::analyze_missing_temperature(operatingPoints[operatingPointIndex], output,
+                                                                             operatingPointIndex);
+                std::string reason = "temperature filter: no thermal operating point";
+                for (const auto& finding : findings) {
+                    reason += ": " + finding.message;
+                }
+                logEntry("MagneticAdviser: dropping '" + mas.get_mutable_magnetic().get_reference() + "' - " + reason,
+                         "MagneticAdviser", 2);
+                failedCandidates.push_back({mas.get_mutable_magnetic().get_reference(), reason});
+                return WoundCandidateOutcome::Skipped;
             }
             if (output.get_temperature()->get_maximum_temperature() > maximumTemperature) {
                 logEntry("MagneticAdviser: dropping '" + mas.get_mutable_magnetic().get_reference()
@@ -347,8 +411,20 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic_fast(I
     // candidate whose B_peak exceeds B_sat. That's the existing
     // fast-path contract — this step only narrows it physically.
     {
-        auto topology = inputs.get_design_requirements().get_topology();
-        if (is_energy_storing_topology(topology)) {
+        // The role decides (magnetic_role): an energy-storing magnetic or a choke (common- or
+        // differential-mode, whether the topology or only the subApplication tags it). A single-winding
+        // design keeps the behaviour it had when this drop read the topology alone (a storing or choke
+        // topology).
+        bool dropFerriteToroids;
+        if (is_single_winding_design(inputs)) {
+            auto topology = inputs.get_design_requirements().get_topology();
+            std::optional<MagneticRole> topologyRole = topology ? topology_magnetic_role(topology.value()) : std::nullopt;
+            dropFerriteToroids = topologyRole && topologyRole.value() != MagneticRole::TRANSFORMER;
+        }
+        else {
+            dropFerriteToroids = magnetic_role(inputs).role != MagneticRole::TRANSFORMER;
+        }
+        if (dropFerriteToroids) {
             std::vector<std::pair<Magnetic, double>> filtered;
             filtered.reserve(magneticsWithScoring.size());
             for (auto& entry : magneticsWithScoring) {
@@ -631,6 +707,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
     Inputs::check_adviser_inputs_volt_second_balance(inputs);
     clear_scoring();
     _failedScorings.clear();  // stale rejections would mis-rank the next run (ABT #801)
+    _failedCandidates.clear();  // this run's wound candidates the final gates reject (ABT #1942)
     load_filter_flow(filterFlow, inputs);
     std::vector<Mas> masData;
 
@@ -830,7 +907,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
             for (auto& masWithCoil : invalidCoilsOfOneCore) {
                 auto outcome = process_wound_candidate(
                     masWithCoil, magneticSimulator, settings, previousCoilIncludeAdditionalCoordinates,
-                    perCoreCoilCap, globalCandidateCap, usedNumberSectionsAndMargin, masData, processedCoils);
+                    perCoreCoilCap, globalCandidateCap, usedNumberSectionsAndMargin, masData, processedCoils, _failedCandidates);
                 if (outcome == WoundCandidateOutcome::GlobalCapHit) {
                     return;
                 }
@@ -898,7 +975,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
                 }
                 auto outcome = process_wound_candidate(
                     mas, magneticSimulator, settings, previousCoilIncludeAdditionalCoordinates,
-                    perCoreCoilCap, globalCandidateCap, usedNumberSectionsAndMargin, masData, processedCoils);
+                    perCoreCoilCap, globalCandidateCap, usedNumberSectionsAndMargin, masData, processedCoils, _failedCandidates);
                 if (outcome != WoundCandidateOutcome::Skipped) {
                     coreAccepted = true;
                 }
@@ -1021,7 +1098,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(Inputs
                     }
                     auto outcome = process_wound_candidate(
                         masWithCoil, magneticSimulator, settings, previousCoilIncludeAdditionalCoordinates,
-                        perCoreCoilCap, globalCandidateCap, usedNumberSectionsAndMargin, masData, processedCoils);
+                        perCoreCoilCap, globalCandidateCap, usedNumberSectionsAndMargin, masData, processedCoils, _failedCandidates);
                     if (outcome != WoundCandidateOutcome::Skipped) {
                         coreAccepted = true;
                     }
@@ -1181,6 +1258,16 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
             _measuredFrequencies[magnetic.get_reference()][filterEnum] = measuredFrequencies.value();
         }
     };
+    // A filter that failed a part on a stated verdict (e.g. MAGNETIZING_INDUCTANCE on saturation, ABT #2124) says why,
+    // and the part is listed in get_failed_candidates() with it.
+    auto recordRejectionReason = [this](MagneticFilters filterEnum, Magnetic& magnetic, bool valid) {
+        if (valid) {
+            return;
+        }
+        if (auto reason = _filters[filterEnum]->get_last_rejection_reason()) {
+            _failedCandidates.push_back({magnetic.get_reference(), std::string(magic_enum::enum_name(filterEnum)) + ": " + reason.value()});
+        }
+    };
     std::vector<MagneticFilterOperation> strictlyRequiredFilterFlow;
     std::vector<MagneticFilterOperation> nonStrictlyRequiredFilterFlow;
     std::vector<Mas> validMas;
@@ -1210,6 +1297,10 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
     static constexpr size_t kIdenticalThrowBailThreshold = 8;
     std::string previousThrowMessage;
     size_t identicalThrowStreak = 0;
+    // ABT #2124 (Alf, 2026-10-28): the catalogue search evaluates its losses in one pass (losses at the operating
+    // point's ambient temperature, the hottest point estimated once), the filters and the final simulation of the
+    // hits returned below alike (see CatalogueSearchOnePassScope in Settings.h).
+    CatalogueSearchOnePassScope catalogueSearchOnePass;
     for (size_t index = 0; index < catalogueMagneticsWithInputs.size(); ++index) {
         auto mas = catalogueMagneticsWithInputs[index];
         std::vector<Outputs> outputs;
@@ -1253,6 +1344,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
                 auto [valid, scoring] = _filters[filterEnum]->evaluate_magnetic(&magnetic, &inputs, &outputs);
                 add_scoring(magnetic.get_reference(), filterEnum, scoring);
                 recordJudgedFrequencies(filterEnum, magnetic, inputs);
+                recordRejectionReason(filterEnum, magnetic, valid);
                 if (strict) {
                     validMagnetic &= valid;
                     if (!valid) {
@@ -1342,6 +1434,7 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
                 auto [filterValid, scoring] = _filters[filterEnum]->evaluate_magnetic(&magnetic, &inputs, &outputs);
                 add_scoring(magnetic.get_reference(), filterEnum, scoring);
                 recordJudgedFrequencies(filterEnum, magnetic, inputs);
+                recordRejectionReason(filterEnum, magnetic, filterValid);
                 // A candidate this filter rejected must rank WORST for it, never
                 // best. evaluate_magnetic returns 0.0 on rejection (a sentinel, not
                 // a distance), and with invert=true 0.0 is the top score — so
@@ -1407,13 +1500,17 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
         sort(masMagneticsWithScoring.begin(), masMagneticsWithScoring.end(), [](std::pair<Mas, double>& b1, std::pair<Mas, double>& b2) {
             return b1.second > b2.second;
         });
-        if (masMagneticsWithScoring.size() > maximumNumberResults) {
-            masMagneticsWithScoring = std::vector<std::pair<Mas, double>>(masMagneticsWithScoring.begin(), masMagneticsWithScoring.end() - (masMagneticsWithScoring.size() - maximumNumberResults));
-        }
 
         if (_simulateResults) {
+            // ABT #2124 (Alf, 2026-10-28): the hits are taken in ranking order until there are
+            // maximumNumberResults of them. A candidate that fails its final simulation is reported in
+            // get_failed_candidates() with the reason, and the next-ranked candidate takes its place, so a
+            // failure no longer shortens the list while ranked candidates remain.
             std::vector<std::pair<Mas, double>> masMagneticsWithScoringSimulated;
             for (auto [mas, scoring] : masMagneticsWithScoring) {
+                if (masMagneticsWithScoringSimulated.size() >= maximumNumberResults) {
+                    break;
+                }
                 // A datasheet-only part has no construction to simulate. It is returned as
                 // ranked, without simulated outputs -- dropping it here would silently remove
                 // a part every filter just accepted.
@@ -1434,12 +1531,21 @@ std::vector<std::pair<Mas, double>> MagneticAdviser::get_advised_magnetic(std::v
                     _failedCandidates.push_back({mas.get_magnetic().get_reference(), std::string("final simulation: ") + e.what()});
                     continue;
                 }
+                // ABT #2052: a point past the end of the magnetisation curve no longer throws out of simulate.
+                if (auto saturates = reason_core_saturates_past_magnetisation_curve(mas)) {
+                    logEntry("MagneticAdviser: skipping final-simulate candidate: " + saturates.value(), "MagneticAdviser", 2);
+                    _failedCandidates.push_back({mas.get_magnetic().get_reference(), "final simulation: " + saturates.value()});
+                    continue;
+                }
                 masMagneticsWithScoringSimulated.push_back({mas, scoring});
             }
 
             return masMagneticsWithScoringSimulated;
         }
         else {
+            if (masMagneticsWithScoring.size() > maximumNumberResults) {
+                masMagneticsWithScoring = std::vector<std::pair<Mas, double>>(masMagneticsWithScoring.begin(), masMagneticsWithScoring.end() - (masMagneticsWithScoring.size() - maximumNumberResults));
+            }
             return masMagneticsWithScoring;
         }
 
@@ -1587,7 +1693,10 @@ void MagneticAdviser::preview_magnetic(Mas mas) {
     for (size_t operatingPointIndex = 0; operatingPointIndex < mas.get_outputs().size(); ++operatingPointIndex) {
         auto output = mas.get_outputs()[operatingPointIndex];
         text += "Operating Point: " + std::to_string(operatingPointIndex + 1) + "\n";
-        text += "\tMagnetizing Inductance: " + std::to_string(resolve_dimensional_values(output.get_inductance()->get_magnetizing_inductance().get_magnetizing_inductance())) + "\n";
+        // ABT #2052: a point past the end of the magnetisation curve has no inductance output.
+        if (output.get_inductance()) {
+            text += "\tMagnetizing Inductance: " + std::to_string(resolve_dimensional_values(output.get_inductance()->get_magnetizing_inductance().get_magnetizing_inductance())) + "\n";
+        }
         
         if (output.get_core_losses()) {
             auto coreLosses = output.get_core_losses().value();

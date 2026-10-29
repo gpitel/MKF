@@ -49,6 +49,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numbers>
 #include <cmrc/cmrc.hpp>
 #include <iomanip>
 #include <limits>
@@ -486,9 +487,12 @@ double Coil::lead_bend_radius(const Wire& wire, const std::optional<ConnectionSl
 
     // Physics of the wire: its insulation must survive the bend (IEC 60317-0-1 Table 6 /
     // IEC 60317-0-2 Table 6). A lead leaving for a pin turns in 3D, so a rectangular wire bends
-    // on both of its axes somewhere along the run and the tighter-limited one rules.
+    // on both of its axes somewhere along the run. Its FLATWISE limit rules the lead. Its EDGEWISE
+    // one does not (ABT #2012, Alf 2026-10-23, as for the turns in ABT #2004): the edgewise mandrel
+    // of Table 6 qualifies the coating, it is not a forming limit, so an edgewise lead bend below it
+    // is drawn and analyze_results reports it (Coil::judge_leads_against_wire_flexibility).
     std::vector<BendAxis> axes = wire.get_type() == WireType::RECTANGULAR
-                                     ? std::vector<BendAxis>{BendAxis::FLATWISE, BendAxis::EDGEWISE}
+                                     ? std::vector<BendAxis>{BendAxis::FLATWISE}
                                      : std::vector<BendAxis>{BendAxis::ROUND};
     for (auto axis : axes) {
         if (auto wireMinimum = WireBend::get_flexibility_bend_radius_if_standardised(wire, axis)) {
@@ -542,6 +546,37 @@ double Coil::lead_isotropic_bend_radius(const std::optional<ConnectionSleeve>& s
     return radius;
 }
 
+double Coil::lead_ramp_governing_radius(const Wire& leadWire, double isotropicRadius, double surfaceCurvature) {
+    const double inSurfaceCurvature2 = 1.0 / (isotropicRadius * isotropicRadius) - surfaceCurvature * surfaceCurvature;
+    if (!(inSurfaceCurvature2 > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "A ramp that must bend no tighter than " + std::to_string(isotropicRadius * 1e3) +
+            " mm cannot climb a surface of curvature " + std::to_string(surfaceCurvature) + " 1/m");
+    }
+    double inSurfaceRadius = 1.0 / std::sqrt(inSurfaceCurvature2);
+    // A rectangular wire's limits are per axis (IEC 60317-0-2 Table 6 tests flatwise and
+    // edgewise separately). The column's curvature bends the turn about the AXIAL axis:
+    // that is the turn's own bend, already wound, and the ramp does not add to it (on a
+    // cylinder the normal curvature of any direction is at most 1/rho). The S bends it
+    // about the RADIAL axis, with the axial dimension -- the wire's height in this frame
+    // (the ramp is only planned for non-contiguous layers) -- in the bend plane. So the S
+    // answers to that one axis's minimum alone, not to the tighter of the two (ABT #1481).
+    // ABT #2012: an EDGEWISE S answers to no Table 6 minimum -- that mandrel qualifies the
+    // coating, it is not a forming limit -- and analyze_results reports the lead instead.
+    if (leadWire.get_type() == WireType::RECTANGULAR &&
+        WireBend::axis_from_bend_plane_dimension(leadWire, false) != BendAxis::EDGEWISE) {
+        const auto inSurfaceAxis = WireBend::axis_from_bend_plane_dimension(leadWire, false);
+        if (auto axisMinimum = WireBend::get_flexibility_bend_radius_if_standardised(leadWire, inSurfaceAxis)) {
+            inSurfaceRadius = std::max(inSurfaceRadius, axisMinimum.value());
+        }
+    }
+    return inSurfaceRadius;
+}
+
+double Coil::lead_ramp_length(double stubHeight, double governingRadius) {
+    return std::numbers::pi * std::sqrt(stubHeight * governingRadius / 2);
+}
+
 int64_t Coil::pin_wrap_turns() {
     static const int64_t wrapTurns = [] {
         auto fs = cmrc::dfmData::get_filesystem();
@@ -589,7 +624,7 @@ std::vector<std::optional<double>> Coil::terminal_exit_slots(const std::vector<C
             throw InvalidInputException(ErrorCode::INVALID_INPUT,
                 "The terminal route of " + label_of(routes[index]) + " carries a planned bend radius of " +
                 std::to_string(routes[index].plannedBendRadius * 1e3) + " mm, below its coated radius " +
-                std::to_string(diameters[index] / 2 * 1e3) + " mm, so its lane cannot be planned for its bends (ABT #1705).");
+                std::to_string(diameters[index] / 2 * 1e3) + " mm, so its lane cannot be planned for its bends.");
         }
     }
     const double tolerance = 1e-9;
@@ -754,7 +789,7 @@ std::vector<std::optional<double>> Coil::terminal_exit_slots(const std::vector<C
                 if (!anchor) {
                     // The highest edge clears every pair by construction, so this is a defect here.
                     throw std::logic_error("terminal_exit_slots: no anchor clears the " + terminal_route_label(routes[members.front()]) +
-                                           " bundle, although the highest blocking edge should (ABT #1705).");
+                                           " bundle, although the highest blocking edge should.");
                 }
                 for (size_t position = 0; position < members.size(); ++position) {
                     const double x = anchor.value() + offsets[position];
@@ -799,14 +834,14 @@ void Coil::check_terminal_lanes(const std::vector<ConnectionRoute>& routes, cons
                        terminal_route_label(routes[j]) + " at x " + millimetres(slots[j].value()) + ": ";
             };
             if (gap < radii - tolerance && section < radii - tolerance) {
-                throw std::logic_error("Terminal lanes collide (ABT #1705): " + witness() + "their footprints along the connection face are " +
+                throw std::logic_error("Terminal lanes collide: " + witness() + "their footprints along the connection face are " +
                                        millimetres(gap) + " apart and their routes in the winding window " + millimetres(section) +
                                        ", both under the " + millimetres(radii) + " their coated radii need.");
             }
             if (realWinding && !same_bundle(routes[i], routes[j])) {
                 const auto [reach, requiredGap] = cross_bundle_clearance(routes[i], diameters[i], routes[j], diameters[j]);
                 if (section < reach - tolerance && gap < requiredGap - tolerance) {
-                    throw std::logic_error("Terminal lanes collide (ABT #1705): " + witness() + "the two leads belong to different bundles and their routes in the winding window come " +
+                    throw std::logic_error("Terminal lanes collide: " + witness() + "the two leads belong to different bundles and their routes in the winding window come " +
                                            millimetres(section) + " apart, within the " + millimetres(reach) +
                                            " their coated radii and bends reach, yet their footprints along the connection face stand only " +
                                            millimetres(gap) + " apart, under the " + millimetres(requiredGap) +
@@ -1801,7 +1836,7 @@ PinAssignmentResult Coil::assign_pins(const Bobbin& bobbin, const Core& core) {
         result.requiredCreepage = InsulationCoordinator().calculate_creepage_distance(inputs, false);
     }
     if (!core.get_processed_description()) {
-        throw CoreNotProcessedException("assign_pins needs the processed core for the through-core creepage path");
+        throw CoreNotProcessedException("needed for the creepage path through the core when placing pins");
     }
     const double halfWidth = core.get_width() / 2;
     // A toroid's pins are in the MVB++ toroid frame (ring axis Y, ring in XZ), while the processed core

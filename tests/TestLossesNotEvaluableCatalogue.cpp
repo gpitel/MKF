@@ -10,6 +10,7 @@
 //   - the adviser flags it, with the reason, in get_losses_not_evaluable().
 // =============================================================================
 
+#include <algorithm>
 #include <cmath>
 #include <set>
 #include <string>
@@ -23,6 +24,8 @@
 #include "constructive_models/Magnetic.h"
 #include "physical_models/CoreLosses.h"
 #include "processors/Inputs.h"
+#include "processors/MagneticSimulator.h"
+#include "physical_models/MagnetizingInductance.h"
 #include "support/Settings.h"
 #include "support/Utils.h"
 
@@ -48,6 +51,24 @@ OpenMagnetics::Magnetic catalogue_part(const std::string& reference, std::option
     if (material) {
         magnetic.get_mutable_core().get_mutable_functional_description().set_material(material.value());
     }
+    magnetic.get_mutable_coil().wind();
+    MagneticManufacturerInfo manufacturerInfo;
+    manufacturerInfo.set_name("Test Maker");
+    manufacturerInfo.set_reference(reference);
+    magnetic.set_manufacturer_info(manufacturerInfo);
+    return magnetic;
+}
+
+// A catalogue part on another core with another number of turns, wound the same way.
+OpenMagnetics::Magnetic catalogue_part_with(const std::string& reference, const std::string& shapeName, int64_t numberTurns) {
+    OpenMagneticsTesting::QuickMagneticConfig cfg;
+    cfg.numberTurns = {numberTurns};
+    cfg.numberParallels = {1};
+    cfg.coreShapeName = shapeName;
+    cfg.coreMaterialName = "3C97";
+    cfg.wireNames = {"Round 1.00 - Grade 1"};
+    cfg.numberStacks = 1;
+    auto magnetic = OpenMagneticsTesting::create_quick_test_magnetic(cfg);
     magnetic.get_mutable_coil().wind();
     MagneticManufacturerInfo manufacturerInfo;
     manufacturerInfo.set_name("Test Maker");
@@ -138,5 +159,127 @@ TEST_CASE("The catalogue adviser ranks a part whose core losses are not evaluabl
     std::vector<OpenMagnetics::Magnetic> normalOnly{catalogue_part("NORMAL-A"), catalogue_part("NORMAL-B")};
     REQUIRE_NOTHROW(adviser.get_advised_magnetic(inductor_inputs(), normalOnly, flow, 10, false));
     REQUIRE(adviser.get_losses_not_evaluable().empty());
+    settings.reset();
+}
+
+TEST_CASE("The catalogue adviser evaluates losses in one pass, its loss filter without a thermal network",
+          "[adviser][catalogue][loss-temperature-loop][cost]") {
+    // ABT #2124 (Alf, 2026-10-28): screening a catalogue ran the loss <-> temperature loop (ABT #838, with its
+    // lowest-stable-point search, ABT #1840) for every part, 20x slower than before it. The catalogue search runs one
+    // pass now, its filters and the final simulation of the hits alike (this test first asserted that the hits kept
+    // the loop; Alf then decided one pass for them too), and its LOSSES_NO_PROXIMITY filter builds no thermal network
+    // (losses at ambient, as before ABT #838).
+    settings.reset();
+    std::vector<OpenMagnetics::Magnetic> catalogue{catalogue_part("PART-A"), catalogue_part("PART-B")};
+    std::vector<MagneticFilterOperation> flow{
+        MagneticFilterOperation(MagneticFilters::LOSSES_NO_PROXIMITY, true, false, false, 1.0),
+    };
+    MagneticAdviser adviser(true);
+    const size_t onePassBefore = MagneticSimulator::get_loss_solves(false);
+    const size_t loopBefore = MagneticSimulator::get_loss_solves(true);
+    const size_t withoutNetworkBefore = MagneticSimulator::get_loss_solves_without_thermal_network();
+    std::vector<std::pair<OpenMagnetics::Mas, double>> results;
+    REQUIRE_NOTHROW(results = adviser.get_advised_magnetic(inductor_inputs(), catalogue, flow, 10, true));
+    const size_t onePass = MagneticSimulator::get_loss_solves(false) - onePassBefore;
+    const size_t loop = MagneticSimulator::get_loss_solves(true) - loopBefore;
+    const size_t withoutNetwork = MagneticSimulator::get_loss_solves_without_thermal_network() - withoutNetworkBefore;
+    INFO(onePass << " one-pass loss solves (" << withoutNetwork << " without a network), " << loop << " looped loss solves, "
+                 << results.size() << " hits");
+    REQUIRE(results.size() == 2);
+    for (auto& [mas, score] : results) {
+        REQUIRE(mas.get_outputs().size() == 1);
+        CHECK(mas.get_outputs()[0].get_core_losses());
+    }
+    // The filter stage: one pass per part, without a network; the final simulation: one pass per hit, with one.
+    CHECK(withoutNetwork == catalogue.size());
+    CHECK(onePass == catalogue.size() + results.size());
+    // Never the loop.
+    CHECK(loop == 0);
+    // Outside the catalogue search the advisers' forced loop is back.
+    CHECK_FALSE(CatalogueSearchOnePassScope::active());
+    CHECK(settings.get_simulator_loss_temperature_loop());
+    settings.reset();
+}
+
+TEST_CASE("The catalogue adviser refills its hits when a candidate fails its final simulation",
+          "[adviser][catalogue][refill]") {
+    // ABT #2124 (Alf, 2026-10-28): the adviser cut its ranking to the requested number of hits BEFORE the final
+    // simulation, so every hit that failed there shortened the list (a real 400-part slice returned 2 of 5). The
+    // next-ranked candidate takes a failed hit's place now, and the failure is still reported with its reason.
+    settings.reset();
+    auto overflowing = catalogue_part_with("OVERFLOWING", "E 25/13/7", 120);
+    std::vector<OpenMagnetics::Magnetic> catalogue{overflowing, catalogue_part("FITS-A"), catalogue_part("FITS-B"),
+                                                   catalogue_part("FITS-C")};
+    // Smallest volume first: the overflowing part on the smaller core ranks first.
+    std::vector<MagneticFilterOperation> flow{
+        MagneticFilterOperation(MagneticFilters::VOLUME, true, false, false, 1.0),
+    };
+    MagneticAdviser adviser(true);
+    std::vector<std::pair<OpenMagnetics::Mas, double>> results;
+    REQUIRE_NOTHROW(results = adviser.get_advised_magnetic(inductor_inputs(), catalogue, flow, 2, true));
+    std::string failures;
+    for (const auto& [reference, reason] : adviser.get_failed_candidates()) {
+        failures += "\n  " + reference + ": " + reason;
+    }
+    INFO("failed candidates:" << failures);
+    std::vector<std::string> references;
+    for (auto& [mas, score] : results) {
+        references.push_back(mas.get_magnetic().get_reference());
+    }
+    INFO("hits: " << references.size());
+    // The premise: the overflowing part ranks first and fails its final simulation.
+    const auto& failed = adviser.get_failed_candidates();
+    auto overflowingFailure = std::find_if(failed.begin(), failed.end(), [](const auto& entry) { return entry.first == "OVERFLOWING"; });
+    REQUIRE(overflowingFailure != failed.end());
+    REQUIRE_THAT(overflowingFailure->second, ContainsSubstring("final simulation"));
+    // Two hits were asked for and two fitting parts remain: two hits, the overflowing one not among them.
+    REQUIRE(results.size() == 2);
+    CHECK(std::find(references.begin(), references.end(), "OVERFLOWING") == references.end());
+    settings.reset();
+}
+
+TEST_CASE("The magnetizing inductance filter fails a saturated part on the saturation verdict, and the catalogue adviser says why",
+          "[adviser][catalogue][magnetizing-inductance][saturation]") {
+    // ABT #2124 (Alf, 2026-10-28): since ABT #1855 the magnetizing model gives a saturated core mu_r = 1 instead of
+    // throwing, and this filter, which failed a part only through that caught exception, scored fully saturated parts
+    // on their air-core inductance: 214-turn catalogue parts driven to H ~ 7500 A/m ranked first. It judges saturation
+    // through ResultsAnalyzer::check_saturation now, as the other filters do since ABT #1855.
+    settings.reset();
+    auto saturated = catalogue_part_with("SATURATED", "E 35", 60);
+    // 10 A of DC through 60 turns of an ungapped 3C97 E 35: far past the knee.
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(100e3, 100e-6, 25, WaveformLabel::TRIANGULAR, 0.4, 0.5, 10.0);
+    // The model itself gives numbers (simulate never judges) ...
+    auto operatingPoint = inputs.get_operating_points()[0];
+    MagnetizingInductance magnetizingInductanceModel("ZHANG");
+    MagnetizingInductanceOutput inductance;
+    REQUIRE_NOTHROW(inductance = magnetizingInductanceModel.calculate_inductance_and_magnetic_flux_density(
+                        saturated.get_mutable_core(), saturated.get_mutable_coil(), &operatingPoint).first);
+    CHECK(resolve_dimensional_values(inductance.get_magnetizing_inductance()) > 0);
+    // ... and the part saturates there (the premise of this test).
+    auto check = magnetizingInductanceModel.check_sizing_saturation(saturated.get_core(), saturated.get_coil(), 60, &inputs);
+    INFO("sizing saturation check: " << check.second);
+    REQUIRE(check.first);
+
+    MagneticFilterMagnetizingInductance filter;
+    auto [valid, scoring] = filter.evaluate_magnetic(&saturated, &inputs);
+    CHECK_FALSE(valid);
+    REQUIRE(filter.get_last_rejection_reason());
+    INFO(filter.get_last_rejection_reason().value());
+
+    std::vector<OpenMagnetics::Magnetic> catalogue{saturated, catalogue_part("FITS")};
+    std::vector<MagneticFilterOperation> flow{
+        MagneticFilterOperation(MagneticFilters::MAGNETIZING_INDUCTANCE, true, false, true, 1.0),
+    };
+    MagneticAdviser adviser(false);
+    std::vector<std::pair<OpenMagnetics::Mas, double>> results;
+    REQUIRE_NOTHROW(results = adviser.get_advised_magnetic(inputs, catalogue, flow, 10, true));
+    const auto& failed = adviser.get_failed_candidates();
+    auto saturatedFailure = std::find_if(failed.begin(), failed.end(), [](const auto& entry) { return entry.first == "SATURATED"; });
+    REQUIRE(saturatedFailure != failed.end());
+    CHECK_THAT(saturatedFailure->second, ContainsSubstring("MAGNETIZING_INDUCTANCE"));
+    CHECK_THAT(saturatedFailure->second, ContainsSubstring(filter.get_last_rejection_reason().value()));
+    for (auto& [mas, score] : results) {
+        CHECK(mas.get_magnetic().get_reference() != "SATURATED");
+    }
     settings.reset();
 }

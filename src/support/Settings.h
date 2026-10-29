@@ -147,6 +147,8 @@ class Settings
         std::string _painterColorMargin = "0xfff05b";
         std::string _painterColorSpacer = "0x3b3b3b";
         std::string _painterColorShunt = "0x6a5acd";
+        // Alf, 2026-10-25: copper of the drawn design that overlaps other copper (Coil::judge_copper_overlaps).
+        std::string _painterColorCopperOverlap = "0xff0000";
         std::string _painterColorLines = "0x010000";
         std::string _painterColorText = "0x000000";
         std::string _painterColorCurrentDensity = "0x0892D0";
@@ -233,16 +235,31 @@ class Settings
         // FALSE: skip that turn's conduction path to the enclosure, log an ERROR naming the turn
         // and the overlap, and solve the rest of the network.
         bool   _thermalNetworkStrictGeometry = true;
-        // Opt-in for debugging and prospecting, never a default. FALSE (default): using a core
-        // material outside its data throws, as it always has: a core-loss frequency outside the
-        // material's fitted Steinmetz span (or in a gap between its ranges), or a core-loss
-        // temperature at or above its Curie point. TRUE: the same model is evaluated there anyway
-        // (the nearest fitted range's coefficients carried past its edge) and every such use logs a
-        // WARNING naming the material, the quantity, the value and the range the data covers
-        // (module "MaterialDataExtrapolation"; enable the Logger collector to read them back).
-        // ABT #1652: advisers never extrapolate. While any adviser object exists the getter reads
-        // false whatever this holds (see MaterialDataExtrapolationBarrier below). Keep in sync with reset().
-        bool   _allowMaterialDataExtrapolation = false;
+        // Using a core material outside its data: a core-loss frequency outside the material's
+        // fitted Steinmetz span (or in a gap between its ranges), or a core-loss temperature at or
+        // above its Curie point. TRUE (default since Alf, 2026-10-25: "when the data comes from the
+        // MAS/user, we just extrapolate and throw a warning, not an error"): a design the user or a
+        // MAS file supplies is evaluated there anyway (the nearest fitted range's coefficients carried
+        // past its edge) and every such use logs a WARNING naming the material, the quantity, the
+        // value and the range the data covers (module "MaterialDataExtrapolation"; enable the Logger
+        // collector to read them back). FALSE: the same use throws (MaterialFrequencyOutOfSpanException).
+        // ABT #1652 (Alf, 2026-10-03): advisers NEVER extrapolate. While any adviser object exists the
+        // getter reads false whatever this holds (see MaterialDataExtrapolationBarrier below), so every
+        // adviser path still throws. Keep in sync with reset().
+        bool   _allowMaterialDataExtrapolation = true;
+        // What MagneticSimulator does with the loss <-> temperature coupling. TRUE (default): the losses
+        // are evaluated at the temperatures their own dissipation produces, by the fixed-point loop of
+        // MagneticSimulator::solve_losses_at_operating_temperature. FALSE (a user choice for simulate and
+        // the builder): ONE pass -- core losses, winding losses and every material parameter at the
+        // operating point's temperature (conditions.ambientTemperature), then the hottest point estimated
+        // once from those losses on the same thermal network and published as the temperature output,
+        // with no feedback into the losses (Alf, 2026-10-22). Advisers run the loop: while any adviser
+        // object exists the getter reads true whatever this holds (the adviser barrier below). The one
+        // exception (Alf, 2026-10-28, ABT #2124): the catalogue search (MagneticAdviser on a catalogue,
+        // calculate_advised_magnetics_from_cache) runs ONE pass, its filters and the final simulation of the
+        // hits it returns alike, inside a CatalogueSearchOnePassScope on the searching thread. Keep in sync
+        // with reset().
+        bool   _simulatorLossTemperatureLoop = true;
         GappingOptimizationStrategy _gappingStrategy = GappingOptimizationStrategy::SIMPLE;
 
 
@@ -503,6 +520,9 @@ class Settings
         std::string get_painter_color_shunt() const;
         void set_painter_color_shunt(std::string value);
 
+        std::string get_painter_color_copper_overlap() const;
+        void set_painter_color_copper_overlap(std::string value);
+
         std::string get_painter_color_lines() const;
         void set_painter_color_lines(std::string value);
 
@@ -633,6 +653,13 @@ class Settings
         bool   get_allow_material_data_extrapolation() const;
         void   set_allow_material_data_extrapolation(bool value);
 
+        // The EFFECTIVE value: false on a thread inside a CatalogueSearchOnePassScope (the catalogue
+        // search, Alf 2026-10-28); otherwise what the caller set, OR an adviser alive anywhere in
+        // the process (MaterialDataExtrapolationBarrier: advisers keep the loop). The setter stores the
+        // caller's choice untouched; it reads back once the advisers and scopes are gone.
+        bool   get_simulator_loss_temperature_loop() const;
+        void   set_simulator_loss_temperature_loop(bool value);
+
         GappingOptimizationStrategy get_gapping_strategy() const;
         void set_gapping_strategy(GappingOptimizationStrategy value);
 
@@ -666,7 +693,7 @@ class Settings
         void set_harmonic_amplitude_threshold(double value);
 
         std::vector<CoreLossesModels> get_core_losses_model_names() const;
-        // The default preference: `value` heads the PROPRIETARY/LOSS_FACTOR/STEINMETZ/ROSHEN cascade,
+        // The default preference: `value` heads the PROPRIETARY/LOSS_FACTOR/LOSS_FACTOR_HYSTERESIS/STEINMETZ/ROSHEN cascade,
         // and a material without it is evaluated with the next model it supports. Setting a
         // preference withdraws any explicit request.
         void set_core_losses_preferred_model_name(CoreLossesModels value);
@@ -744,8 +771,8 @@ class Settings
 
 
 // ABT #1652 (Alf, 2026-10-03): ADVISERS NEVER EXTRAPOLATE material data, whatever
-// Settings::allowMaterialDataExtrapolation says; only work the user does by hand may (the web turns the
-// flag on for it). Every adviser class (CoreAdviser, WireAdviser and so CoilAdviser, MagneticAdviser,
+// Settings::allowMaterialDataExtrapolation says; only work the user does by hand, or a MAS the user
+// supplies, may (the flag defaults on since Alf, 2026-10-25, and the web keeps it on). Every adviser class (CoreAdviser, WireAdviser and so CoilAdviser, MagneticAdviser,
 // CoreCrossReferencer, CoreMaterialCrossReferencer) holds one of these as its FIRST member, and while at
 // least one exists anywhere in the process Settings::get_allow_material_data_extrapolation() reads false.
 //
@@ -757,6 +784,10 @@ class Settings
 // CoilAdviser) would restore out of order, and a restore would overwrite a value the caller set
 // meanwhile. The cost: a hand simulation running on another thread while an adviser is alive does not
 // extrapolate either -- it throws MaterialFrequencyOutOfSpanException as it would with the flag off.
+//
+// The same count keeps advisers on the loss <-> temperature loop: while a barrier exists,
+// Settings::get_simulator_loss_temperature_loop() reads true whatever the caller set (a hand simulation on
+// another thread then also runs the loop).
 class MaterialDataExtrapolationBarrier {
 public:
     MaterialDataExtrapolationBarrier();
@@ -765,6 +796,28 @@ public:
     ~MaterialDataExtrapolationBarrier();
     // Number of barriers alive in the process (diagnostics and tests).
     static int active_count();
+};
+
+// ABT #2124 (Alf, 2026-10-28): the catalogue search evaluates its losses in ONE pass (the
+// simulatorLossTemperatureLoop = false semantics: losses at the operating point's ambient temperature, the hottest
+// point estimated once, no feedback), its filters and the final simulation of the hits it returns alike (Alf first
+// kept the loop for the hits, then decided one pass for them too, the same day). Its LOSSES_NO_PROXIMITY filter
+// builds no thermal network at all (MagneticSimulator's LossSolveWithoutThermalNetworkScope). Every other adviser
+// path (CoreAdviser, CoilAdviser, MagneticAdviser designing from scratch) keeps the forced loop, and material data
+// stays non-extrapolated in all of them (MaterialDataExtrapolationBarrier is untouched).
+// While one of these exists on a thread, Settings::get_simulator_loss_temperature_loop() reads false ON THAT
+// THREAD only. Why a thread-local depth and not the barrier's process-wide count or a SettingsGuard: the scope
+// must not reach a hand simulation or another adviser running on another thread (the barrier's count is
+// process-wide on purpose), and nested scopes and exceptions unwind it exactly; the catalogue search runs on
+// the searching thread.
+class CatalogueSearchOnePassScope {
+public:
+    CatalogueSearchOnePassScope();
+    ~CatalogueSearchOnePassScope();
+    CatalogueSearchOnePassScope(const CatalogueSearchOnePassScope&) = delete;
+    CatalogueSearchOnePassScope& operator=(const CatalogueSearchOnePassScope&) = delete;
+    // Whether the calling thread is inside one (diagnostics and tests).
+    static bool active();
 };
 
 // ARCH-002: RAII guard for exception-safe Settings mutations

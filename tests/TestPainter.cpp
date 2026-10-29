@@ -3553,6 +3553,111 @@ namespace {
         settings.reset();
     }
 
+    // ABT #2005: a painted wire's SVG frame is the wire's own canvas, centred on it: the drawn
+    // wire with a margin of 10 % of its larger side on every side, so a wide wire covers 1/1.2 of
+    // the width, with equal space left/right and top/bottom, and nothing drawn outside the frame.
+    // Before, the frame came from the svg library's autoscale, whose width |x1| + |x2| left an
+    // empty band right of a wire drawn at x > 0.
+    TEST_CASE("Test_Wire_Painter_Frame_Is_Centred_Wire_Canvas", "[support][painter][wire-painter][abt-2005]") {
+        clear_databases();
+        // The same painter settings as the web's plot_wire.
+        settings.set_painter_simple_litz(false);
+        settings.set_painter_advanced_litz(true);
+
+        auto numbersIn = [](const std::string& text) {
+            std::vector<double> values;
+            std::regex numberRegex(R"re(-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)re");
+            for (auto it = std::sregex_iterator(text.begin(), text.end(), numberRegex); it != std::sregex_iterator(); ++it) {
+                values.push_back(std::stod(it->str()));
+            }
+            return values;
+        };
+
+        for (const auto& wireName : {std::string("Rectangular 10x2.50 - Grade 1"),
+                                     std::string("Rectangular 2x0.80 - Grade 1"),
+                                     std::string("Round 0.80 - Grade 3"),
+                                     std::string("Litz TXXL07/28FXXX-2(MWXX)")}) {
+            INFO("Wire: " << wireName);
+            auto wire = find_wire_by_name(wireName);
+            Painter painter("");
+            painter.paint_wire(wire);
+            std::string svg = painter.export_svg();
+
+            double minX = std::numeric_limits<double>::max();
+            double maxX = std::numeric_limits<double>::lowest();
+            double minY = std::numeric_limits<double>::max();
+            double maxY = std::numeric_limits<double>::lowest();
+            size_t drawnElements = 0;
+
+            std::regex circleRegex(R"re(<circle[^>]*\bcx="([^"]+)"[^>]*\bcy="([^"]+)"[^>]*\br="([^"]+)")re");
+            for (auto it = std::sregex_iterator(svg.begin(), svg.end(), circleRegex); it != std::sregex_iterator(); ++it) {
+                double cx = std::stod((*it)[1].str());
+                double cy = std::stod((*it)[2].str());
+                double r = std::stod((*it)[3].str());
+                minX = std::min(minX, cx - r);
+                maxX = std::max(maxX, cx + r);
+                minY = std::min(minY, cy - r);
+                maxY = std::max(maxY, cy + r);
+                ++drawnElements;
+            }
+            std::regex polygonRegex(R"re(<polygon[^>]*\bpoints="([^"]+)")re");
+            for (auto it = std::sregex_iterator(svg.begin(), svg.end(), polygonRegex); it != std::sregex_iterator(); ++it) {
+                auto values = numbersIn((*it)[1].str());
+                REQUIRE(values.size() % 2 == 0);
+                for (size_t i = 0; i < values.size(); i += 2) {
+                    minX = std::min(minX, values[i]);
+                    maxX = std::max(maxX, values[i]);
+                    minY = std::min(minY, values[i + 1]);
+                    maxY = std::max(maxY, values[i + 1]);
+                }
+                ++drawnElements;
+            }
+            REQUIRE(drawnElements > 0);
+            // Every drawn shape is a circle or a polygon; anything else would escape this check.
+            CHECK(svg.find("<path") == std::string::npos);
+            CHECK(svg.find("<rect") == std::string::npos);
+            CHECK(svg.find("<line") == std::string::npos);
+
+            double maximumStrokeWidth = 0;
+            std::regex strokeRegex(R"re(stroke-width:\s*([0-9.eE+-]+))re");
+            for (auto it = std::sregex_iterator(svg.begin(), svg.end(), strokeRegex); it != std::sregex_iterator(); ++it) {
+                maximumStrokeWidth = std::max(maximumStrokeWidth, std::stod((*it)[1].str()));
+            }
+
+            std::smatch viewBoxMatch;
+            REQUIRE(std::regex_search(svg, viewBoxMatch, std::regex(R"re(viewBox="([^"]+)")re")));
+            auto viewBox = numbersIn(viewBoxMatch[1].str());
+            REQUIRE(viewBox.size() == 4);
+
+            double leftMargin = minX - viewBox[0];
+            double rightMargin = viewBox[0] + viewBox[2] - maxX;
+            double topMargin = minY - viewBox[1];
+            double bottomMargin = viewBox[1] + viewBox[3] - maxY;
+            double contentWidth = maxX - minX;
+            double contentHeight = maxY - minY;
+            double expectedMargin = 0.1 * std::max(contentWidth, contentHeight);
+            // Coordinates are printed with one decimal.
+            const double printTolerance = 0.16;
+
+            // Nothing drawn outside the frame, strokes included.
+            CHECK(leftMargin > maximumStrokeWidth / 2);
+            CHECK(rightMargin > maximumStrokeWidth / 2);
+            CHECK(topMargin > maximumStrokeWidth / 2);
+            CHECK(bottomMargin > maximumStrokeWidth / 2);
+            // Centred, with the canvas margin on every side.
+            CHECK_THAT(leftMargin, Catch::Matchers::WithinAbs(rightMargin, printTolerance));
+            CHECK_THAT(topMargin, Catch::Matchers::WithinAbs(bottomMargin, printTolerance));
+            CHECK_THAT(leftMargin, Catch::Matchers::WithinAbs(expectedMargin, printTolerance));
+            CHECK_THAT(topMargin, Catch::Matchers::WithinAbs(expectedMargin, printTolerance));
+            // The width and height attributes are the frame's, so the drawing keeps its scale.
+            std::smatch sizeMatch;
+            REQUIRE(std::regex_search(svg, sizeMatch, std::regex(R"re(<svg[^>]*\bheight="([^"]+)"[^>]*\bwidth="([^"]+)")re")));
+            CHECK_THAT(std::stod(sizeMatch[1].str()), Catch::Matchers::WithinAbs(viewBox[3], printTolerance));
+            CHECK_THAT(std::stod(sizeMatch[2].str()), Catch::Matchers::WithinAbs(viewBox[2], printTolerance));
+        }
+        settings.reset();
+    }
+
     TEST_CASE("Test_Wire_Painter_Litz_Simple_Bare", "[support][painter][wire-painter][smoke-test]") {
         clear_databases();
 
@@ -5696,6 +5801,71 @@ namespace {
         std::string svg((std::istreambuf_iterator<char>(svgFile)), std::istreambuf_iterator<char>());
         CHECK(std::regex_search(svg, std::regex("fill: ?#[0-9a-fA-F]{6}")));
         CHECK(svg.find("nan") == std::string::npos);
+        settings.reset();
+    }
+
+    // ABT #1343: the svg library writes <title>/<text> content verbatim, and turn names are built
+    // from the MAS winding names, so a winding named like markup produced live markup in every
+    // consumer that inserts the SVG. The Painter escapes every label it hands to the library.
+    TEST_CASE("Test_Painter_Escapes_Winding_Names", "[support][painter][abt-1343]") {
+        settings.reset();
+        const std::string hostileName = "<img src=x onerror=1>";
+        auto coil = OpenMagneticsTesting::get_quick_coil({6, 3}, {1, 1}, "ETD 34", 1, WindingOrientation::OVERLAPPING,
+                                                         WindingOrientation::OVERLAPPING, CoilAlignment::CENTERED,
+                                                         CoilAlignment::INNER_OR_TOP, {});
+        coil.get_mutable_functional_description()[0].set_name(hostileName);
+        REQUIRE(coil.wind());
+        auto core = OpenMagneticsTesting::get_quick_core("ETD 34", OpenMagneticsTesting::get_ground_gap(0.001), 1, "N87");
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(coil);
+
+        auto outFile = outputFilePath;
+        outFile.append("Test_Painter_Escapes_Winding_Names.svg");
+        std::filesystem::remove(outFile);
+        Painter painter(outFile);
+        painter.paint_core(magnetic);
+        painter.paint_bobbin(magnetic);
+        painter.paint_coil_turns(magnetic);
+        auto svg = painter.export_svg();
+
+        CHECK(svg.find("&lt;img src=x onerror=1&gt;") != std::string::npos);
+        CHECK(svg.find("<img") == std::string::npos);
+        settings.reset();
+    }
+
+    // ABT #2071 (Alf, 2026-10-25: a painter does not weld): copper of the drawn design that overlaps
+    // other copper is filled red, one polygon per overlap, from Coil::judge_copper_overlaps. Design:
+    // two turns of Round 0.4 on an E 25/13/7, the second station stated half its coated diameter down
+    // onto the first (the TestWireBendLayout TURNS_OVERLAP design).
+    TEST_CASE("Test_Painter_Paints_Overlapping_Copper_Red", "[support][painter][abt-2071]") {
+        settings.reset();
+        auto coil = OpenMagneticsTesting::get_quick_coil({2}, {1}, "E 25/13/7", 1, WindingOrientation::OVERLAPPING,
+                                                         WindingOrientation::OVERLAPPING, CoilAlignment::CENTERED,
+                                                         CoilAlignment::CENTERED, {find_wire_by_name("Round 0.4 - Grade 1")});
+        auto turns = coil.get_turns_description().value();
+        REQUIRE(turns.size() == 2);
+        const double diameter = turns[0].get_dimensions().value()[0];
+        turns[1].set_coordinates({turns[0].get_coordinates()[0], turns[0].get_coordinates()[1] + diameter / 2});
+        coil.set_turns_description(turns);
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(OpenMagneticsTesting::get_quick_core("E 25/13/7", OpenMagneticsTesting::get_ground_gap(0.001), 1, "N87"));
+        magnetic.set_coil(coil);
+
+        auto outFile = outputFilePath;
+        outFile.append("Test_Painter_Paints_Overlapping_Copper_Red.svg");
+        std::filesystem::remove(outFile);
+        Painter painter(outFile);
+        painter.paint_magnetic(magnetic);
+        const auto svg = painter.export_svg();
+        REQUIRE(std::filesystem::exists(outFile));
+        size_t red = 0;
+        for (size_t at = svg.find("class=\"copper_overlap\""); at != std::string::npos; at = svg.find("class=\"copper_overlap\"", at + 1)) {
+            ++red;
+        }
+        CHECK(red == 1);
+        CHECK(svg.find("&apos;" + turns[0].get_name() + "&apos; overlaps &apos;" + turns[1].get_name() + "&apos;") != std::string::npos);
+        CHECK(svg.find("#ff0000") != std::string::npos);
         settings.reset();
     }
 }  // namespace

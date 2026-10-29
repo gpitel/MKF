@@ -548,6 +548,56 @@ TEST_CASE("Test_Coil_Json_11", "[constructive-model][coil][bug][smoke-test]") {
     REQUIRE(bool(coil.get_turns_description()));
 }
 
+// ABT #1614: delimit_and_compact read turnsInLayer[0] of a conduction layer without checking that the
+// layer had any turns (an out-of-bounds read of an empty vector). A layer with no turns now throws.
+TEST_CASE("Test_Delimit_And_Compact_Throws_On_A_Conduction_Layer_Without_Turns", "[constructive-model][coil][abt-1614]") {
+    settings.reset();
+    // Two windings, so that emptying the first conduction layer still leaves turns and the throw
+    // comes from the emptied layer, not from a coil with no turns at all.
+    for (std::string shapeName : {"PQ 28/20", "T 20/10/7"}) {
+        DYNAMIC_SECTION(shapeName) {
+            auto coil = OpenMagneticsTesting::get_quick_coil({20, 20}, {1, 1}, shapeName, 1);
+            REQUIRE(coil.get_layers_description());
+            REQUIRE(coil.get_turns_description());
+            auto conductionLayers = coil.get_layers_description_conduction();
+            REQUIRE(conductionLayers.size() >= 2);
+            auto emptiedLayerName = conductionLayers[0].get_name();
+            std::vector<Turn> keptTurns;
+            auto turns = coil.get_turns_description().value();
+            for (auto& turn : turns) {
+                if (turn.get_layer().value() != emptiedLayerName) {
+                    keptTurns.push_back(turn);
+                }
+            }
+            REQUIRE(keptTurns.size() < turns.size());
+            REQUIRE(!keptTurns.empty());
+            coil.set_turns_description(keptTurns);
+            REQUIRE_THROWS_AS(coil.delimit_and_compact(), CoilNotProcessedException);
+        }
+    }
+    settings.reset();
+}
+
+// ABT #1627: preload_margins appended to the per-section margins instead of replacing them, so a
+// second preload landed after the first one's entries, at ordinals no section reads, and was ignored.
+TEST_CASE("Test_Preload_Margins_Twice_The_Second_Preload_Wins", "[constructive-model][coil][margin][abt-1627]") {
+    settings.reset();
+    settings.set_coil_wind_even_if_not_fit(true);
+    settings.set_coil_fill_sections_with_margin_tape(false);
+    auto coil = OpenMagneticsTesting::get_quick_coil({20}, {1}, "PQ 28/20", 1,
+                                                     WindingOrientation::OVERLAPPING, WindingOrientation::OVERLAPPING,
+                                                     CoilAlignment::CENTERED, CoilAlignment::CENTERED);
+    double firstMargin = 0.001;
+    double secondMargin = 0.002;
+    coil.preload_margins({{firstMargin, firstMargin}});
+    coil.preload_margins({{secondMargin, secondMargin}});
+    REQUIRE(coil.wind());
+    auto margin = OpenMagnetics::Coil::resolve_margin(coil.get_sections_description_conduction()[0]);
+    REQUIRE_THAT(margin[0], Catch::Matchers::WithinAbs(secondMargin, 1e-12));
+    REQUIRE_THAT(margin[1], Catch::Matchers::WithinAbs(secondMargin, 1e-12));
+    settings.reset();
+}
+
 TEST_CASE("Test_Add_Margin_Centered_No_Filling_Then_Filling_Horizontal_Centered", "[constructive-model][coil][margin][smoke-test]") {
     settings.reset();
     std::vector<int64_t> numberTurns = {47};
@@ -17691,13 +17741,18 @@ TEST_CASE("Test_Coil_Consecutive_Turns_Refuses_Zero_Slots", "[constructive-model
     REQUIRE(coil.wind_by_consecutive_turns(uint64_t(4), uint64_t(1), size_t(2)) == WindingStyle::WIND_BY_CONSECUTIVE_PARALLELS);
 }
 
-TEST_CASE("Test_Coil_Real_Winding_Section_That_Cannot_Hold_Its_Turns_Does_Not_Fit", "[coil][real-winding][bug][abt-1699]") {
+TEST_CASE("Test_Coil_Real_Winding_Section_That_Cannot_Hold_Its_Turns_Is_Wound_Past_The_Window", "[coil][real-winding][bug][abt-1699]") {
     // ABT #1699: a coil-adviser candidate on the web flyback core, stored as the web stores it and
     // rebuilt with real winding geometry. Once the connection corridors are blocked, a secondary
     // layer has no row left for every parallel, and the layer fill stopped there: 'Secondary 0
     // section 0' was laid out with 2 of its 9 turns and 'Secondary 0 section 1' with no layer at
     // all, and delimit_and_compact then threw "No layers in section" (COIL_NOT_PROCESSED). Turns a
     // section cannot hold are a wind that does not fit, named as such.
+    // ABT #2096 (Alf, 2026-10-26, assertion rewritten with his approval): the web's rebuild winds the
+    // stored sections as GIVEN, so the section that cannot close is laid out past the window instead
+    // of coming back without turns. 'Secondary 0 section 1' layer 1 has corridors on both edges, with
+    // the Secondary's own leads on both: it grows past the edge its own exit lead crosses, and its own
+    // leads there leave out over the grown copper ("put the terminal where the last wire is").
     auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/flyback_interleaved_candidate_stored.json");
     std::ifstream file(path);
     REQUIRE(file.good());
@@ -17713,12 +17768,37 @@ TEST_CASE("Test_Coil_Real_Winding_Section_That_Cannot_Hold_Its_Turns_Does_Not_Fi
     REQUIRE_NOTHROW(refusal = OpenMagnetics::real_winding_refusal(magnetic));
     REQUIRE(refusal);
     INFO(refusal.value());
-    CHECK(refusal->find("cannot hold its") != std::string::npos);
+    // Alf, 2026-10-27 (assertion rewritten with his approval): with the crossing stations counted per
+    // parallel, the section that really does not fit is 'Primary section 1' (it needs 3 layers); the
+    // Secondary sections no longer read as unable to hold their turns.
+    CHECK((refusal->find("section 'Primary section 1' needs 3 layers") != std::string::npos &&
+           refusal->find("cannot hold its") == std::string::npos));
 
-    // The web's rebuild of the same stored design: no throw, and no coil with turns missing.
+    // The web's rebuild of the same stored design: no throw, wound, and the turns outside the window
+    // reported.
     OpenMagnetics::Magnetic rebuilt;
     REQUIRE_NOTHROW(rebuilt = OpenMagneticsTesting::rebuild_with_real_winding_as_web(magnetic));
-    CHECK(!rebuilt.get_coil().get_turns_description());
+    auto& rebuiltCoil = rebuilt.get_mutable_coil();
+    REQUIRE(rebuiltCoil.get_turns_description());
+    REQUIRE_FALSE(rebuiltCoil.get_turns_description()->empty());
+    INFO(rebuiltCoil.get_last_fit_failure());
+    CHECK_FALSE(rebuiltCoil.judge_turns_outside_window().empty());
+    CHECK_THAT(rebuiltCoil.get_last_fit_failure(), Catch::Matchers::ContainsSubstring("outside window"));
+    const auto& grownOverOwnLeads = rebuiltCoil.get_layers_grown_over_own_leads();
+    // Alf, 2026-10-27 (assertion rewritten with his approval): what lies outside the window is reported
+    // by name, and no layer is grown over its own winding's leads.
+    const auto outsideTurns = rebuiltCoil.judge_turns_outside_window();
+    CHECK((!outsideTurns.empty() &&
+           rebuiltCoil.get_last_fit_failure().find(outsideTurns.front().turn) != std::string::npos &&
+           grownOverOwnLeads.empty()));
+    // The moved own leads run clear of the turns: no lead is drawn across a turn of its own winding.
+    for (const auto& overlap : rebuiltCoil.judge_copper_overlaps()) {
+        if (overlap.kind != OpenMagnetics::CopperOverlapKind::LEAD_TURN) {
+            continue;
+        }
+        INFO(overlap.first << " x " << overlap.second << ": " << overlap.overlap * 1e3 << " mm");
+        CHECK(overlap.firstWinding != overlap.secondWinding);
+    }
     settings.reset();
 }
 
@@ -17909,7 +17989,7 @@ TEST_CASE("Test_Wind_Flattens_Litz_Into_Ovals_Only_As_Far_As_The_Window_Needs", 
     settings.set_coil_try_rewind(false);
     auto litz = OpenMagnetics::Wire::create_quick_litz_wire(0.0001, 100);
     const double od = litz.get_maximum_outer_width();
-    REQUIRE(OpenMagnetics::Wire::minimum_litz_flattening(litz) == 0.90);
+    REQUIRE(OpenMagnetics::Wire::minimum_litz_flattening(litz) == 0.72);
     const double windowHeight = 10 * 0.95 * od * 1.0005;
     const double windowWidth = 1.2 * od;
     auto wind = [&](bool deformation) {
@@ -17943,4 +18023,119 @@ TEST_CASE("Test_Wind_Flattens_Litz_Into_Ovals_Only_As_Far_As_The_Window_Needs", 
         CHECK(std::abs(turn.get_coordinates()[1]) + shortSide / 2 <= windowHeight / 2 + 1e-9);
     }
     settings.reset();
+}
+
+namespace {
+    // Wound as Henry winds a published design: the bobbin MKF builds from the core, then the arrangement's
+    // pattern from the wires' proportions, with litz deformation on.
+    std::pair<bool, OpenMagnetics::Coil> wind_published_design(const std::string& fixture, std::vector<size_t> pattern) {
+        settings.reset();
+        settings.set_coil_litz_deformation(true);
+        auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), fixture);
+        std::ifstream file(path);
+        json magneticJson = json::parse(file);
+        OpenMagnetics::Magnetic magnetic(magneticJson);
+        OpenMagnetics::Coil coil;
+        coil.set_bobbin(OpenMagnetics::Bobbin::create_quick_bobbin(magnetic.get_core()));
+        coil.set_functional_description(magnetic.get_coil().get_functional_description());
+        OpenMagnetics::Coil seed;
+        seed.set_bobbin(coil.get_bobbin());
+        seed.set_functional_description(coil.get_functional_description());
+        const bool fits = coil.wind(seed.get_proportion_per_winding_based_on_wires(), pattern, 1);
+        return {fits, coil};
+    }
+}
+
+// ABT #2110: the insulation wrap after the last section sits on that section. It took its thickness from
+// no section, so the sections filled the window and a tight wind laid the wrap past it: on the published
+// 1.5 kW DAB transformer (E 35/18/10 x 2, 15 T of litz 260 x 0.071 mm, 2 T of 2 x litz 975 x 0.071 mm,
+// primary then secondary) the bundles flattened to k = 0.92 left Primary 3.076 + 0.025 + Secondary 2.978 +
+// wrap 0.025 = 6.104 mm in the 6.100 mm window, 4.5 um past it, which the thermal network refused.
+TEST_CASE("The insulation wrap after the last section stays inside the window (ABT #2110)", "[constructive-model][coil][litz][abt2110]") {
+    auto [fits, coil] = wind_published_design("abt2110_dab_1k5w_published_transformer.json", {0, 1});
+    REQUIRE(fits);
+    auto bobbin = coil.resolve_bobbin();
+    const auto window = bobbin.get_processed_description()->get_winding_windows()[0];
+    const double left = window.get_coordinates().value()[0] - window.get_width().value() / 2;
+    const double right = window.get_coordinates().value()[0] + window.get_width().value() / 2;
+    const auto sections = coil.get_sections_description().value();
+    bool wrapChecked = false;
+    for (const auto& section : sections) {
+        INFO(section.get_name() << ": [" << (section.get_coordinates()[0] - section.get_dimensions()[0] / 2) * 1e3 << ", "
+             << (section.get_coordinates()[0] + section.get_dimensions()[0] / 2) * 1e3 << "] mm in [" << left * 1e3 << ", " << right * 1e3 << "] mm");
+        CHECK(section.get_coordinates()[0] - section.get_dimensions()[0] / 2 >= left - 1e-9);
+        CHECK(section.get_coordinates()[0] + section.get_dimensions()[0] / 2 <= right + 1e-9);
+        wrapChecked = wrapChecked || (section.get_type() == ElectricalType::INSULATION && &section == &sections.back());
+    }
+    CHECK(wrapChecked);
+    settings.reset();
+}
+
+// Alf, 2026-10-27: served litz flattens as far as built windings show, k >= 0.72. Power Integrations' DER-720
+// choke (PQ 32/20, 56 T of 40 x #38 served litz) is wound in 7 layers of 8 turns; at the old 0.90 floor MKF
+// needed 7 layers 6.855 mm deep in a 5.567 mm window and refused it.
+TEST_CASE("A published served-litz PFC choke winds with its bundles flattened below 0.90 (DER-720)", "[constructive-model][coil][litz][litz-floor]") {
+    auto [fits, coil] = wind_published_design("der720_pfc_275w_litz_choke.json", {0});
+    INFO(coil.get_last_fit_failure());
+    REQUIRE(fits);
+    REQUIRE(coil.get_litz_flattening(0));
+    CHECK(coil.get_litz_flattening(0).value() < 0.90);
+    CHECK(coil.get_litz_flattening(0).value() >= 0.72 - 1e-9);
+    settings.reset();
+}
+
+// Alf, 2026-10-28: a coil's depth was its half-width PLUS the bobbin's width-to-depth difference (the turn coordinates
+// are taken from the centre of the column); DER-282's EFD 30/15/9 came out 19.66 mm deep for a part built into an
+// 11 mm-high product. A winding that fits its window reaches no further than the bobbin in any direction.
+TEST_CASE("A wound coil that fits its window is no larger than its bobbin in any direction", "[coil-box]") {
+    OpenMagneticsTesting::QuickMagneticConfig cfg;
+    cfg.numberTurns = {36};
+    cfg.numberParallels = {1};
+    cfg.coreShapeName = "EFD 30/15/9";
+    cfg.coreMaterialName = "3F3";
+    cfg.wireNames = {"Round 0.25 - Grade 1"};
+    auto magnetic = OpenMagneticsTesting::create_quick_test_magnetic(cfg);
+    auto& coil = magnetic.get_mutable_coil();
+    REQUIRE(coil.wind());
+    REQUIRE(coil.are_sections_and_layers_fitting());
+    auto bobbinBox = coil.resolve_bobbin().get_maximum_dimensions();
+    auto coilBox = coil.get_maximum_dimensions();
+    INFO("bobbin " << bobbinBox[0] << " x " << bobbinBox[1] << " x " << bobbinBox[2] << " m, coil " << coilBox[0] << " x " << coilBox[1] << " x " << coilBox[2] << " m");
+    for (size_t axis = 0; axis < 3; ++axis) CHECK(coilBox[axis] <= bobbinBox[axis] + 1e-9);
+}
+
+// Alf, 2026-10-28: windings wound together are dealt their turns as a winding deals its parallels. By consecutive
+// turns (the default, bifilar) turn 0 of each winding sits together; by consecutive parallels each winding's turns
+// sit together, one block after the other.
+TEST_CASE("Windings wound together alternate turn by turn, or sit in blocks by consecutive parallels", "[coil][wound-with-style]") {
+    auto wound_order = [](bool byConsecutiveParallels) {
+        auto coil = OpenMagneticsTesting::get_quick_coil({4, 4}, {1, 1}, "PQ 40/40", 1, WindingOrientation::OVERLAPPING,
+                                                         WindingOrientation::OVERLAPPING, CoilAlignment::CENTERED, CoilAlignment::CENTERED);
+        const std::string first = coil.get_functional_description()[0].get_name();
+        const std::string second = coil.get_functional_description()[1].get_name();
+        coil.get_mutable_functional_description()[0].set_wound_with(std::vector<std::string>{second});
+        coil.get_mutable_functional_description()[1].set_wound_with(std::vector<std::string>{first});
+        coil.get_mutable_functional_description()[0].set_isolation_side(MAS::IsolationSide::PRIMARY);
+        coil.get_mutable_functional_description()[1].set_isolation_side(MAS::IsolationSide::PRIMARY);
+        auto core = OpenMagneticsTesting::get_quick_core("PQ 40/40", json::parse("[]"), 1, "Dummy");
+        coil.set_bobbin(OpenMagnetics::Bobbin::create_quick_bobbin(core));
+        if (byConsecutiveParallels) {
+            coil.preload_winding_style_overrides({{first, WindingStyle::WIND_BY_CONSECUTIVE_PARALLELS},
+                                                  {second, WindingStyle::WIND_BY_CONSECUTIVE_PARALLELS}});
+        }
+        REQUIRE(coil.wind());
+        std::vector<std::string> order;
+        const auto turns = coil.get_turns_description().value();   // by value: the getter returns a temporary
+        for (const auto& turn : turns) order.push_back(turn.get_winding());
+        return order;
+    };
+    auto bifilar = wound_order(false);
+    INFO(json(bifilar).dump());
+    REQUIRE(bifilar.size() == 8);
+    for (size_t k = 1; k < bifilar.size(); ++k) CHECK(bifilar[k] != bifilar[k - 1]);
+    auto blocks = wound_order(true);
+    INFO(json(blocks).dump());
+    REQUIRE(blocks.size() == 8);
+    for (size_t k = 0; k < 4; ++k) CHECK(blocks[k] == "winding 0");
+    for (size_t k = 4; k < 8; ++k) CHECK(blocks[k] == "winding 1");
 }

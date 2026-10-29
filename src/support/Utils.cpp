@@ -1,4 +1,5 @@
 #include "constructive_models/MasMigration.h"
+#include "support/FastJsonParse.h"
 #include "physical_models/MagnetizingInductance.h"
 #include "processors/MagneticSimulator.h"
 #include "support/Utils.h"
@@ -26,6 +27,7 @@
 #include <magic_enum.hpp>
 #include <rapidfuzz/fuzz.hpp>
 #include "support/Exceptions.h"
+#include "support/NumberFormat.h"
 
 CMRC_DECLARE(data);
 
@@ -87,8 +89,8 @@ static void parse_ndjson(const std::string& database, Callback&& callback) {
         }
 #endif
         if (lineEnd > start) {
-            // nlohmann::json::parse accepts iterator pairs without copying.
-            json jf = json::parse(database.begin() + start, database.begin() + lineEnd);
+            // simdjson parses the line into the nlohmann::json tree json::parse builds (support/FastJsonParse.h).
+            json jf = OpenMagnetics::parse_json_fast(database.data() + start, lineEnd - start);
             OpenMagnetics::compat::migrate_pre_1_0(jf);
             callback(jf);
         }
@@ -125,7 +127,7 @@ void set_databases_frozen(bool frozen) {
 static void throw_if_databases_frozen(const char* operation) {
     if (databases_frozen()) {
         throw std::runtime_error(
-            std::string("ABT #113: '") + operation +
+            std::string("'") + operation +
             "' would mutate a shared catalog while databases are frozen (a parallel "
             "region is active). Call load_all_databases() BEFORE set_databases_frozen(true), "
             "and never lazy-load, reload, or clear catalogs from worker threads.");
@@ -186,7 +188,7 @@ void add_scoring(std::string name, MagneticFilters filter, double scoring) {
     // filter-level memo caches mask it afterwards, making the adviser's
     // verdict depend on call history.
     if (std::isnan(scoring)) {
-        logEntry("add_scoring: skipping NaN score for '" + name + "'", "Utils", 2);
+        logEntry("add_scoring: skipping NaN score for '" + name + "'", "AdviserScoring", 2);
         return;
     }
     if (scoring != -1) {
@@ -216,25 +218,30 @@ std::once_flag _readLogOnce;
 std::string read_log() {
     std::call_once(_readLogOnce, [] {
         _readLogSink = std::make_shared<StringSink>();
-        auto& logger = Logger::getInstance();
-        logger.addSink(_readLogSink);
-        // Stage/progress entries are logged at WARNING (logEntry verbosity 1);
-        // the default ERROR level would filter them out before any sink.
-        if (logger.getLevel() > LogLevel::WARNING) {
-            logger.setLevel(LogLevel::WARNING);
-        }
+        // read_log() hands back WARNING and above (logEntry verbosity 1 and 0): statements that
+        // something about the design or its data was dropped, relaxed or substituted. Run summaries
+        // (INFO, verbosity 2) and step/per-candidate traces (DEBUG, verbosity 3) stay out of it.
+        // WARNING is below the logger's default ERROR level, so the sink gets its own WARNING
+        // level: lowering the logger's level instead
+        // (as this did until ABT #1643) sent WARNING entries to the console and every other sink
+        // for the rest of the process, the first time anyone read the log.
+        Logger::getInstance().addSink(_readLogSink, LogLevel::WARNING);
     });
     auto contents = _readLogSink->getContents();
     _readLogSink->clear();
     return contents;
 }
 
-bool material_data_extrapolation_allowed(const std::string& what) {
+bool material_data_extrapolation_allowed(const std::string& summary, const std::string& detail) {
     if (!settings.get_allow_material_data_extrapolation()) {
         return false;
     }
-    Logger::getInstance().warning(what + " (extrapolated: allowMaterialDataExtrapolation is on)",
-                                  kMaterialDataExtrapolationModule);
+    if (summary.empty() || detail.empty()) {
+        throw std::invalid_argument("material_data_extrapolation_allowed needs a summary (material and the range its data "
+                                    "covers) and a detail (the value asked); got summary '" + summary + "', detail '" +
+                                    detail + "'");
+    }
+    Logger::getInstance().warning(summary, kMaterialDataExtrapolationModule, detail);
     return true;
 }
 
@@ -244,7 +251,7 @@ void logEntry(std::string entry, std::string module, uint8_t entryVerbosity) {
                    : (entryVerbosity == 1) ? LogLevel::WARNING
                    : (entryVerbosity == 2) ? LogLevel::INFO
                    : LogLevel::DEBUG;
-    logger.log(level, module.empty() ? "OpenMagnetics" : module, entry);
+    logger.log(level, module, entry);
 }
 
 // ABT #1328: with useOnlyCoresInStock set, the stock catalogue is the only acceptable answer. The
@@ -511,7 +518,7 @@ static void register_core_shape_aliases(const std::vector<std::pair<std::string,
             }
             summary += "'" + alias + "'";
         }
-        OM_WARNING_M("Utils", "Ignored " + std::to_string(shadowed.size()) + " core shape alias(es) that collide "
+        OM_WARNING_M("CoreCatalogue", "Ignored " + std::to_string(shadowed.size()) + " core shape alias(es) that collide "
                               "with the name of a different shape (" + summary + "). The name resolves to the shape "
                               "that owns it; the aliased shape is still reachable by its own name.");
     }
@@ -587,7 +594,7 @@ void load_core_shapes(bool withAliases, std::optional<std::string> fileToLoad) {
             summary += std::string(magic_enum::enum_name(family)) + " x" + std::to_string(count);
             total += count;
         }
-        OM_WARNING_M("Utils", "Left " + std::to_string(total) + " catalog shape(s) out of the database: no CorePiece "
+        OM_WARNING_M("CoreCatalogue", "Left " + std::to_string(total) + " catalog shape(s) out of the database: no CorePiece "
                               "geometry for their family (" + summary + "). Cores using them cannot be advised or "
                               "built until the family is implemented.");
     }
@@ -1333,7 +1340,7 @@ Wire find_wire_by_name(std::string name) {
         return wireDatabase[name];
     }
     else {
-        throw WireNotFoundException("wire not found: " + name);
+        throw WireNotFoundException(name);
     }
 }
 
@@ -1420,8 +1427,9 @@ Wire find_wire_by_dimension(double dimension, std::optional<WireType> wireType, 
     }
 
     if (!found) {
-        throw WireNotFoundException("no catalogue wire matches dimension " + std::to_string(dimension) +
-                                    " under the requested type, standard and coating filters");
+        throw WireNotFoundException(WireNotFoundException::Reason{}, "No catalogue wire has a dimension of " +
+                                    format_quantity(dimension, "m") + " with the requested type, standard and coating. "
+                                    "Choose another size, or relax the type, standard or coating");
     }
 
     double minimumOuterDimension = DBL_MAX;
@@ -2478,11 +2486,11 @@ double angle_to_wound_distance(double angle, double radius) {
     return 2 * sin(angle / 2 / 180 * std::numbers::pi) * radius;
 }
 
-bool is_size_power_of_2(std::vector<double> data) {
+bool is_size_power_of_2(const std::vector<double>& data) {
     return data.size() > 0 && ((data.size() & (data.size() - 1)) == 0);
 }
 
-size_t round_up_size_to_power_of_2(std::vector<double> data) {
+size_t round_up_size_to_power_of_2(const std::vector<double>& data) {
     return pow(2, ceil(log(data.size()) / log(2)));
 }
 
@@ -2793,7 +2801,7 @@ static void throw_if_a_winding_would_be_invented(const Magnetic& magnetic) {
         if (!invented.empty()) {
             invented += "; ";
         }
-        invented += "winding " + std::to_string(windingIndex) + " ('" + winding.get_name() + "'): ";
+        invented += describe_winding_for_people(winding.get_name(), windingIndex) + ": ";
         for (size_t lackIndex = 0; lackIndex < lacks.size(); ++lackIndex) {
             invented += (lackIndex == 0 ? "" : ", ") + lacks[lackIndex];
         }
@@ -2806,6 +2814,24 @@ static void throw_if_a_winding_would_be_invented(const Magnetic& magnetic) {
             "simulate = false to complete the geometry only.");
     }
 }
+
+namespace {
+// ABT #2052: the magnetizing inductance the given magnetizing-model call returns, or none when at the operating
+// point's ambient temperature its flux density lies past the end of the material's magnetisation curve
+// (SaturationException above B_sat, MagnetisationCurveExhaustedException below it). Any other error propagates.
+template <typename MagnetizingModelCall>
+std::optional<double> magnetizing_inductance_unless_past_magnetisation_curve(MagnetizingModelCall call) {
+    try {
+        return call().get_magnetizing_inductance().get_nominal().value();
+    }
+    catch (const SaturationException&) {
+        return std::nullopt;
+    }
+    catch (const MagnetisationCurveExhaustedException&) {
+        return std::nullopt;
+    }
+}
+} // namespace
 
 Mas mas_autocomplete(Mas mas, bool simulate, json configuration) {
 
@@ -2831,14 +2857,26 @@ Mas mas_autocomplete(Mas mas, bool simulate, json configuration) {
     MagnetizingInductance magnetizingInductanceObj;
     // Because Simulation may remove some processed data, and we are in no rush here
     for (size_t operatingPointIndex = 0; operatingPointIndex < mas.get_inputs().get_operating_points().size(); operatingPointIndex++) {
-        double magnetizingInductance = magnetizingInductanceObj.calculate_inductance_from_number_turns_and_gapping(mas.get_magnetic(), &mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex]).get_magnetizing_inductance().get_nominal().value();
+        // ABT #2052: a point whose flux density lies past the end of the magnetisation curve at its ambient temperature has
+        // no magnetizing inductance; it keeps its operating point as given (no magnetizing current is derived for it),
+        // and simulate / analyze_results report it (CORE_SATURATES). Autocomplete never refuses a design for it.
+        // The model stamps its iterate's magnetizing current on the operating point it is given before it reads the
+        // curve, so it works on a copy that replaces the point only when the model reads it.
+        OperatingPoint modelledOperatingPoint = mas.get_inputs().get_operating_points()[operatingPointIndex];
+        auto magnetizingInductance = magnetizing_inductance_unless_past_magnetisation_curve([&]() {
+            return magnetizingInductanceObj.calculate_inductance_from_number_turns_and_gapping(mas.get_magnetic(), &modelledOperatingPoint);
+        });
+        if (!magnetizingInductance) {
+            continue;
+        }
+        mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex] = modelledOperatingPoint;
         auto coilTurnsRatios = mas.get_magnetic().get_coil().get_turns_ratios();
-        mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex] = Inputs::process_operating_point(mas.get_inputs().get_operating_points()[operatingPointIndex], magnetizingInductance,
+        mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex] = Inputs::process_operating_point(mas.get_inputs().get_operating_points()[operatingPointIndex], magnetizingInductance.value(),
                                                                                                                      coilTurnsRatios, false, mas.get_magnetic().get_coil().get_isolation_sides());
         // The decision process_operating_point makes, compressed (ABT #1467).
         auto processedOperatingPoint = mas.get_inputs().get_operating_points()[operatingPointIndex];
         for (size_t windingIndex = 0; windingIndex < numberWindings; windingIndex++) {
-            auto magnetizingCurrent = Inputs::calculate_magnetizing_current(processedOperatingPoint, windingIndex, magnetizingInductance, coilTurnsRatios, true);
+            auto magnetizingCurrent = Inputs::calculate_magnetizing_current(processedOperatingPoint, windingIndex, magnetizingInductance.value(), coilTurnsRatios, true);
             auto processed = Inputs::calculate_processed_data(magnetizingCurrent.get_waveform().value(), mas.get_inputs().get_operating_points()[operatingPointIndex].get_excitations_per_winding()[windingIndex].get_frequency(), true);
             magnetizingCurrent.set_processed(processed);
             mas.get_mutable_inputs().get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].set_magnetizing_current(magnetizingCurrent);
@@ -2911,9 +2949,14 @@ Inputs inputs_autocomplete(Inputs inputs, std::optional<Magnetic> magnetic, json
     for (size_t operatingPointIndex = 0; operatingPointIndex <  inputs.get_operating_points().size(); operatingPointIndex++) {
         for (size_t windingIndex = 0; windingIndex < numberWindings; windingIndex++) {
             auto operatingPoint = inputs.get_operating_points()[operatingPointIndex];
-            double magnetizingInductance = 0;
+            std::optional<double> magnetizingInductance;
             if (magnetic) {
-                magnetizingInductance = magnetizingInductanceObj.calculate_inductance_from_number_turns_and_gapping(magnetic->get_core(), magnetic->get_coil(), &operatingPoint).get_magnetizing_inductance().get_nominal().value();
+                // ABT #2052: none for a point past the end of the magnetisation curve at its ambient temperature: that
+                // point gets no magnetizing current here (it is the core's flux that cannot be read), the rest of it is
+                // completed as for any other point.
+                magnetizingInductance = magnetizing_inductance_unless_past_magnetisation_curve([&]() {
+                    return magnetizingInductanceObj.calculate_inductance_from_number_turns_and_gapping(magnetic->get_core(), magnetic->get_coil(), &operatingPoint);
+                });
             }
             else {
                 magnetizingInductance = OpenMagnetics::resolve_dimensional_values(inputs.get_design_requirements().get_magnetizing_inductance());
@@ -2927,14 +2970,16 @@ Inputs inputs_autocomplete(Inputs inputs, std::optional<Magnetic> magnetic, json
             for (auto& turnsRatio : inputs.get_design_requirements().get_turns_ratios()) {
                 requiredTurnsRatios.push_back(resolve_dimensional_values(turnsRatio));
             }
-            auto magnetizingCurrent = Inputs::calculate_magnetizing_current(operatingPoint, windingIndex, magnetizingInductance, requiredTurnsRatios, true);
+            if (magnetizingInductance) {
+                auto magnetizingCurrent = Inputs::calculate_magnetizing_current(operatingPoint, windingIndex, magnetizingInductance.value(), requiredTurnsRatios, true);
 
-            if (excitation.get_voltage() && excitation.get_voltage()->get_processed() && excitation.get_voltage()->get_processed()->get_duty_cycle()) {
-                auto processed = magnetizingCurrent.get_processed().value();
-                processed.set_duty_cycle(excitation.get_voltage()->get_processed()->get_duty_cycle().value());
-                magnetizingCurrent.set_processed(processed);
+                if (excitation.get_voltage() && excitation.get_voltage()->get_processed() && excitation.get_voltage()->get_processed()->get_duty_cycle()) {
+                    auto processed = magnetizingCurrent.get_processed().value();
+                    processed.set_duty_cycle(excitation.get_voltage()->get_processed()->get_duty_cycle().value());
+                    magnetizingCurrent.set_processed(processed);
+                }
+                inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].set_magnetizing_current(magnetizingCurrent);
             }
-            inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding()[windingIndex].set_magnetizing_current(magnetizingCurrent);
 
             if (windingIndex == 0 && numberWindings == 2 && inputs.get_mutable_operating_points()[operatingPointIndex].get_mutable_excitations_per_winding().size() == 1) {
                 double turnRatioPrimary = 0;
@@ -3025,13 +3070,33 @@ bool wind_magnetic_coil_as_described(Magnetic& magnetic, json configuration, std
         magnetic.get_mutable_coil().set_interleaving_level(interleavingLevel);
     }
     if (configuration.contains("layersOrientation")) {
-        WindingOrientation layersOrientation = WindingOrientation::CONTIGUOUS;
-        to_json(configuration["layersOrientation"], layersOrientation);
+        // Read FROM the configuration: this was to_json(configuration[...], value), which writes the
+        // CONTIGUOUS seed into the configuration, so every requested orientation wound CONTIGUOUS.
+        const auto layersOrientation = configuration.at("layersOrientation").get<WindingOrientation>();
         magnetic.get_mutable_coil().set_layers_orientation(layersOrientation);
     }
+    // ABT #2071 (Alf, 2026-10-25): a stored design is wound with the layers orientation its sections
+    // state; the coil-wide default (OVERLAPPING) re-wound a stored CONTIGUOUS section OVERLAPPING. Only
+    // when the caller does not ask for an orientation itself, and only for THIS wind: the guard hands
+    // the coil back its own per-section orientations however the wind leaves. A coil without stored
+    // sections has nothing to preload and keeps the orientation the winder chooses.
+    struct LayersOrientationGuard {
+        Coil& coil;
+        std::optional<std::map<std::string, WindingOrientation>> before;
+        ~LayersOrientationGuard() {
+            if (before) {
+                coil.restore_layers_orientation_per_section(before.value());
+            }
+        }
+    } layersOrientationGuard{magnetic.get_mutable_coil(), std::nullopt};
+    if (!configuration.contains("layersOrientation")) {
+        layersOrientationGuard.before = magnetic.get_mutable_coil().preload_layers_orientation_from_stored_sections();
+    }
     if (configuration.contains("turnsAlignment")) {
-        CoilAlignment turnsAlignment = CoilAlignment::SPREAD;
-        to_json(configuration["turnsAlignment"], turnsAlignment);
+        // Read FROM the configuration, as layersOrientation above: this was to_json(configuration[...],
+        // value), which writes the SPREAD seed into the configuration, so every requested alignment
+        // wound SPREAD.
+        const auto turnsAlignment = configuration.at("turnsAlignment").get<CoilAlignment>();
         magnetic.get_mutable_coil().set_turns_alignment(turnsAlignment);
     }
     else {
@@ -3491,7 +3556,7 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optio
             if (magnetic.get_manufacturer_info() && magnetic.get_manufacturer_info()->get_reference()) {
                 reference = " of magnetic '" + magnetic.get_manufacturer_info()->get_reference().value() + "'";
             }
-            return "winding " + std::to_string(windingIndex) + " ('" + windingName + "')" + reference;
+            return describe_winding_for_people(windingName, windingIndex) + reference;
         };
 
         auto as_dimension = [](double value) {
@@ -3582,8 +3647,9 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optio
     if (!bobbin.get_processed_description()->get_mutable_winding_windows()[0].get_sections_orientation()) {
         auto processedDescription = bobbin.get_processed_description().value();
         if (configuration.contains("windingOrientation")) {
-            WindingOrientation windingOrientation = WindingOrientation::CONTIGUOUS;
-            to_json(configuration["windingOrientation"], windingOrientation);
+            // Read FROM the configuration: to_json(configuration[...], value) wrote the CONTIGUOUS
+            // seed into it, so every requested sections orientation wound CONTIGUOUS.
+            const auto windingOrientation = configuration.at("windingOrientation").get<WindingOrientation>();
             processedDescription.get_mutable_winding_windows()[0].set_sections_orientation(windingOrientation);
         }
         else if (magnetic.get_mutable_coil().is_edge_wound_coil()) {
@@ -3621,8 +3687,9 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optio
         }
 
         if (configuration.contains("sectionAlignment")) {
-            CoilAlignment coilAlignment = CoilAlignment::SPREAD;
-            to_json(configuration["sectionAlignment"], coilAlignment);
+            // Read FROM the configuration: to_json(configuration[...], value) wrote the SPREAD seed
+            // into it, so every requested sections alignment wound SPREAD.
+            const auto coilAlignment = configuration.at("sectionAlignment").get<CoilAlignment>();
             processedDescription.get_mutable_winding_windows()[0].set_sections_alignment(coilAlignment);
         }
         else {
@@ -3641,6 +3708,10 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optio
 
         bobbin.set_processed_description(processedDescription);
     }
+    // A catalogue former that does not state its column corner gets the one its bore follows:
+    // the core column's corner carried out by the wall (Bobbin::set_column_corner_radius_from_core).
+    // A declared corner is kept.
+    bobbin.set_column_corner_radius_from_core(magnetic.get_mutable_core());
     magnetic.get_mutable_coil().set_bobbin(bobbin);
     // Multi-column winding support: give the coil the core columns so turn lengths
     // around non-main columns can be computed when placement uses non-main windows.
@@ -3691,6 +3762,14 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optio
     const bool layoutIsStated = coilToComplete.get_sections_description() || coilToComplete.get_layers_description() ||
                                 (coilToComplete.get_turns_description() && !coilToComplete.get_turns_description()->empty());
     if (magnetic_coil_needs_winding(magnetic)) {
+        // ABT #2096 (Alf, 2026-10-26): a stated layout is GIVEN, so its wind may, as a last resort,
+        // overflow the window along the turn axis where a planned one is refused (see
+        // Coil::preload_layout_is_given). Only for this wind: the guard ends it however it leaves.
+        coilToComplete.preload_layout_is_given(layoutIsStated);
+        struct LayoutGivenGuard {
+            Magnetic& magnetic;
+            ~LayoutGivenGuard() { magnetic.get_mutable_coil().clear_layout_is_given(); }
+        } layoutGivenGuard{magnetic};
         const bool wound = wind_magnetic_coil_as_described(magnetic, configuration, inputs);
         if (!wound) {
             auto& coil = magnetic.get_mutable_coil();
@@ -3703,7 +3782,7 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optio
             if (!layoutIsStated) {
                 throw CoilException(ErrorCode::COIL_WINDING_ERROR, "Autocomplete could not wind this magnetic: " + what);
             }
-            OM_WARNING_M("Utils", "The stated winding layout is laid out as stated, but " + what);
+            OM_WARNING_M("WindingLayout", "The stated winding layout is laid out as stated, but " + what);
         }
     }
     else if (layoutIsStated) {
@@ -3715,7 +3794,7 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optio
                              coil.are_sections_and_layers_fitting();
         if (!inside || !fitting) {
             const std::string reason = !inside ? outsideReason : coil.get_last_fit_failure();
-            OM_WARNING_M("Utils", std::string("The stated winding layout is kept as stated, but it does not fit its window") +
+            OM_WARNING_M("WindingLayout", std::string("The stated winding layout is kept as stated, but it does not fit its window") +
                                   (reason.empty() ? std::string(" (its sections or layers overflow)") : ": " + reason));
         }
     }
@@ -4133,6 +4212,75 @@ Inputs get_defaults_inputs(OpenMagnetics::Magnetic magnetic) {
     inputs.set_design_requirements(designRequirements);
     inputs.set_operating_points({operatingPoint});
     return inputs;
+}
+
+std::string describe_turn_for_people(const Coil& coil, size_t turnIndex) {
+    if (!coil.get_turns_description()) {
+        throw CoilNotProcessedException("the coil has no turns to name turn " + std::to_string(turnIndex + 1) + " by");
+    }
+    const auto turns = coil.get_turns_description().value();   // bound: never index a temporary
+    if (turnIndex >= turns.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "The coil has " + std::to_string(turns.size()) +
+                                    " turns, so it has no turn " + std::to_string(turnIndex + 1));
+    }
+    const auto& turn = turns[turnIndex];
+    size_t position = 0;
+    for (size_t index = 0; index <= turnIndex; ++index) {
+        if (turns[index].get_winding() == turn.get_winding() && turns[index].get_parallel() == turn.get_parallel()) {
+            ++position;
+        }
+    }
+    std::string description = "turn " + std::to_string(position);
+    const auto& windings = coil.get_functional_description();
+    auto winding = std::find_if(windings.begin(), windings.end(),
+                                [&](const auto& candidate) { return candidate.get_name() == turn.get_winding(); });
+    if (winding == windings.end()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Turn " + std::to_string(turnIndex + 1) + " of the coil belongs to winding '" +
+                                    turn.get_winding() + "', which the coil does not have");
+    }
+    if (winding->get_number_parallels() > 1) {
+        description += " of parallel " + std::to_string(turn.get_parallel() + 1);
+    }
+    return description + " of winding '" + turn.get_winding() + "'";
+}
+
+std::string describe_turn_for_people(const Coil& coil, const std::string& turnName) {
+    if (!coil.get_turns_description()) {
+        throw CoilNotProcessedException("the coil has no turns to name turn '" + turnName + "' by");
+    }
+    const auto turns = coil.get_turns_description().value();
+    for (size_t index = 0; index < turns.size(); ++index) {
+        if (turns[index].get_name() == turnName) {
+            return describe_turn_for_people(coil, index);
+        }
+    }
+    throw InvalidInputException(ErrorCode::INVALID_INPUT, "The coil has no turn named '" + turnName + "'");
+}
+
+std::string describe_lead_for_people(const Coil& coil, const std::string& leadName) {
+    for (const std::string kind : {"entrance", "exit"}) {
+        const std::string prefix = kind + " lead of '";
+        if (leadName.size() > prefix.size() + 1 && leadName.compare(0, prefix.size(), prefix) == 0 && leadName.back() == '\'') {
+            const std::string turnName = leadName.substr(prefix.size(), leadName.size() - prefix.size() - 1);
+            return kind + " lead of " + describe_turn_for_people(coil, turnName);
+        }
+    }
+    throw InvalidInputException(ErrorCode::INVALID_INPUT, "'" + leadName + "' is not a lead's name: a lead is named "
+                                "\"entrance lead of '<turn>'\" or \"exit lead of '<turn>'\"");
+}
+
+std::string describe_operating_point_for_people(const OperatingPoint& operatingPoint, size_t operatingPointIndex) {
+    if (operatingPoint.get_name() && !operatingPoint.get_name()->empty()) {
+        return "operating point '" + operatingPoint.get_name().value() + "'";
+    }
+    return "operating point " + std::to_string(operatingPointIndex + 1);
+}
+
+std::string describe_winding_for_people(const std::string& windingName, size_t windingIndex) {
+    if (!windingName.empty()) {
+        return "winding '" + windingName + "'";
+    }
+    return "winding " + std::to_string(windingIndex + 1);
 }
 
 } // namespace OpenMagnetics

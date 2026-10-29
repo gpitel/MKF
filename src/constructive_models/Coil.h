@@ -7,6 +7,7 @@
 #include "processors/Inputs.h"
 #include "constructive_models/Wire.h"
 #include "constructive_models/Bobbin.h"
+#include "physical_models/WireBend.h"
 #include "json.hpp"
 
 #include <MAS.hpp>
@@ -200,6 +201,12 @@ struct ConnectionReservedSpace {
     // (compute_connection_blocked_slots_per_layer) derives each crossed layer's freed slots from the
     // DEEPEST run crossing it. 0 = not an edge-routed run (radial exits, stubs, Z diagonals).
     double edgeDepth = 0;
+    // The depth, from the stack's base, at which the edge-row allocator stacked the row this run
+    // lies in: 0 for a row flush at the edge (it meets no other row radially), else the bottom of
+    // the deepest row it meets. Taken before the ABT #844 snap moves a flush row onto its turn, so
+    // it says where the ALLOCATOR put the row, not where the snap drew it. Set on the edge run of a
+    // terminal lead and of an edge continuation; empty on every other rectangle.
+    std::optional<double> edgeRowStackDepth;
     // ABT #685: the CLASSIFICATION this rectangle belongs to (see ConnectionKind), and the two
     // turns it connects. Several rectangles make up one route (a stub, an edge run, a second
     // stub), and they are grouped back into that route by (winding, parallel, fromTurn, toTurn).
@@ -244,9 +251,57 @@ struct ConnectionRideLevel {
 // CLOCKWISE seen from +Y: from the crossing on the -Z face a turn runs towards -X, round the -X-Z
 // corner, along the -X face towards +Z, ..., along the +X face towards -Z and back to the crossing.
 // So the entrance leaves along the -X face and the exit along the +X face.
+// One turn found across a terminal lead's drawn straight: where it meets the lead's line, the two
+// heights there and by how much their copper overlaps axially (half heights summed minus the gap).
+struct LeadTurnCollision {
+    std::string turnName;
+    double distanceOut = 0;   // |z| of the meeting point, in the TangentDeparture frame [m]
+    double leadHeight = 0;    // the lead's y there [m]
+    double turnHeight = 0;    // the turn's pitch-true y there [m]
+    double overlap = 0;       // (lead height + turn height) / 2 - |leadHeight - turnHeight| [m], > 0
+};
+
+// Alf, 2026-10-25 (draw and report): a condition of a tangent terminal lead that MKF does not model.
+// The lead is still drawn, on the best route the geometry MKF has gives it (each condition says which),
+// and analyze_results reports the condition with its numbers (LEAD_ROUTE_NOT_MODELLED). Real winding
+// does not refuse the coil for it.
+enum class TangentLeadCondition {
+    // A dragback lane rides `rideHeight` over the connection face at the lead's radius: it displaces
+    // that face and lengthens the lateral face by as much in a consumer that draws the ride. The lead
+    // leaves where the UNRIDDEN lateral face straight ends -- the frame every turn length and the clash
+    // check are charged in -- along the lateral face's own line.
+    DRAGBACK_RIDE,
+    // The turn is wound on a lateral column whose axis lies `columnAxisX` from the main one. The lead is
+    // drawn in that column's own frame (x from its axis) with the main column's winding sense,
+    // clockwise seen from +Y; the sense of a lateral column's turns is not modelled.
+    LATERAL_COLUMN,
+    // The lead is assigned to pin `pinName`. Its pin run starts where the tangent lead ends, on the
+    // window border at the lead's own x, and is planned as a level run from there: the lead's climb
+    // (its pitch slope) is not carried into the run.
+    PIN_RUN,
+    // The revolution the departure shortens, `revolutionFrom` -> `revolutionTo`, changes layer, so its
+    // stations carry no pitch of a helix: the lead is drawn level at its station's height.
+    LAYER_CHANGING_REVOLUTION,
+    // The conductor has no other station (a one-turn winding): there is no pitch to climb, the lead is
+    // drawn level at the station's height, and the entrance and exit both shorten that one turn.
+    SINGLE_REVOLUTION,
+};
+
+struct TangentLeadUnmodelled {
+    TangentLeadCondition condition = TangentLeadCondition::DRAGBACK_RIDE;
+    double rideHeight = 0;     // DRAGBACK_RIDE [m]
+    double columnAxisX = 0;    // LATERAL_COLUMN [m]
+    std::optional<std::string> pinName;   // PIN_RUN: the pin's name, when it has one
+    std::string revolutionFrom;   // LAYER_CHANGING_REVOLUTION
+    std::string revolutionTo;     // LAYER_CHANGING_REVOLUTION
+};
+
 struct TangentDeparture {
     // The lateral face the lead continues: -1 = the -X face (entrance), +1 = the +X face (exit).
     int face = 0;
+    // The connection face's half straight at this turn's standoff, from its midpoint to where its
+    // corner begins: the room the radial lead's bend did not fit in (route.plannedBendRadius > it).
+    double connectionFaceHalfStraight = 0;
     // Distance along that face, from the face's midpoint (z = 0) towards the connection face, to the
     // end of its straight -- where the corner would begin, and where the lead leaves: the face's
     // half straight at this turn's standoff, columnDepth + standoff - the turn's bend radius.
@@ -268,6 +323,61 @@ struct TangentDeparture {
     double turnLengthRemoved = 0;
     // The turn whose revolution was shortened (the one that carries its length).
     std::string shortenedTurn;
+    // Every other turn that winds its corner across this lead's straight, closer than their half
+    // heights (Alf, 2026-10-24: a lead that cannot be routed without a collision is still drawn along
+    // this route, and analyze_results reports the collision; real winding does not refuse it).
+    std::vector<LeadTurnCollision> collisions;
+    // What of this lead's route MKF does not model (see TangentLeadCondition), in the order found.
+    // Empty for a lead drawn on a route MKF models in full.
+    std::vector<TangentLeadUnmodelled> unmodelled;
+};
+
+// Alf, 2026-10-25 (draw and report; ABT #2071): copper of the drawn design that overlaps other copper,
+// in the winding-window section (the frame turns and connection reserved spaces are in). Never a
+// refusal: the design is drawn as wound and routed, analyze_results reports each kind, and the Painter
+// draws `region` in red (a consumer that welds, like MVB++'s CAD, fuses it instead).
+enum class CopperOverlapKind {
+    TURN_TURN,   // two turn stations' outlines (coating included) overlap
+    LEAD_TURN,   // a terminal lead is drawn across a turn
+    LEAD_LEAD,   // two terminal leads are drawn through each other
+};
+
+struct CopperOverlap {
+    CopperOverlapKind kind = CopperOverlapKind::TURN_TURN;
+    std::string first;           // a turn's name, or a lead's ("entrance lead of '<turn>'")
+    std::string firstWinding;
+    std::string second;          // the turn or lead it overlaps
+    std::string secondWinding;
+    // The depth the two outlines interpenetrate: the least distance one would have to move for them
+    // only to touch [m], > 0. For a tangent lead across a turn: LeadTurnCollision::overlap.
+    double overlap = 0;
+    // LEAD_TURN only: the lead leaves tangentially, and the collision is its TangentDeparture's (the
+    // turn's corner meets the lead's straight out on the connection face, LeadTurnCollision).
+    bool tangentLead = false;
+    // The overlapping copper as a closed polygon {x, y} in the section, in order: exact for straight
+    // outlines, round ones sampled along their arcs. For a tangent lead, the lead's own radial band
+    // across the axial band in which the two coppers overlap.
+    std::vector<std::vector<double>> region;
+};
+
+// Alf, 2026-10-25 (draw and report; ABT #2071): a turn station whose copper lies outside the winding
+// window it is wound in -- in the ferrite or past the former. Never a refusal: the design is drawn as
+// wound, analyze_results reports it (TURNS_OUTSIDE_WINDOW), and the Painter draws `regions` in red.
+// Judged in the winding-window section against the bobbin's rectangular winding windows (the same
+// envelope are_turns_inside_winding_window tests), from the turn's own outline (its dimensions, shape
+// and rotation): exact, no padding. A turn that only touches a window side is inside.
+struct TurnOutsideWindow {
+    std::string turn;
+    std::string winding;
+    // The window the turn belongs to: the one it overruns least (a multi-column coil has several).
+    size_t windowIndex = 0;
+    // How far the turn's copper reaches past that window [m], > 0: the largest of its four overruns.
+    double overrun = 0;
+    // Which side that largest overrun is past.
+    enum class Side { OUTER, INNER, TOP, BOTTOM } side = Side::OUTER;
+    // The copper outside the window as closed polygons {x, y} in the section (one per side it crosses):
+    // exact for straight outlines, round ones sampled along their arcs.
+    std::vector<std::vector<std::vector<double>>> regions;
 };
 
 // ABT #1907 (Alf, 2026-10-18): a FOIL end that leaves through the END FACE (connections[].exit:
@@ -308,6 +418,27 @@ struct AxialLead {
     double alongFace = 0;
     // The lead's copper length: from attachFrom to end.
     double length = 0;
+    // ABT #1907 (Alf, 2026-10-19): the WELD STRIP that joins lead and sheet, like the solder/weld
+    // seam along a real foil tab. Tangent copper touches along a line only, which carries no
+    // current, so the strip is the copper that makes lead and sheet ONE conductor. A consumer
+    // draws it as a rectangular bar fused to both coppers; its numbers are these, never its own.
+    //   - Layer axis: from the sheet's centre (layerFrom, half-way through the sheet's copper) to
+    //     the lead's centreline (layerTo = layerAxis). It therefore crosses the sheet's outer face
+    //     and the tangent line, so its faces cut both coppers across instead of touching them.
+    //   - Along the face: centred on the lead's centreline (alongFace), `width` wide: the chord of
+    //     the lead's copper circle at half a radius from the sheet face, sqrt(3)/2 of the lead's
+    //     conducting diameter. Its side faces meet the lead's surface at 30 degrees, half a radius
+    //     off the sheet, never tangentially, and the strip stays inside the lead's own column (it
+    //     is narrower than the lead's outer diameter, so it lies on this parallel's sheet only).
+    //   - Turn axis: the attach, from attachFrom to attachTo (from = attachFrom, to = attachTo).
+    // The wind is refused when the strip cannot be laid this way (see Coil.cpp addTerminalLead).
+    struct WeldStrip {
+        double layerFrom = 0;
+        double layerTo = 0;
+        double width = 0;
+        double from = 0;
+        double to = 0;
+    } weld;
 };
 
 // ABT #685: one connection of one conductor, as MKF drew it — the record MVB++ realises in 3D and
@@ -534,6 +665,45 @@ struct WoundColumnFrame {
     double cornerRadius = 0;
 };
 
+// ABT #1290 / #2004: one winding whose drawn corners fall below its wire's FLEXIBILITY radius
+// (IEC 60317-0-1 / -0-2 Table 6 read through IEC 60851-3 5.1.1), reported at its worst corner --
+// the one furthest short of the wire's own limit.
+struct WindingBendBelowFlexibility {
+    std::string windingName;
+    std::string turnName;            // the winding's worst corner
+    double bendRadius = 0;           // drawn centreline radius at that corner [m]
+    double formerCornerRadius = 0;   // the former's corner it bends around [m]
+    double standoff = 0;             // the turn's standoff from the former's face [m]
+    WoundCorner asLaid;              // WireBend::evaluate of the drawn radius
+    BendAxis axis = BendAxis::ROUND; // ROUND, FLATWISE or EDGEWISE, as the coil lays the wire
+    Wire wire;
+    size_t numberTightCorners = 0;   // turns of this winding bent below the limit
+};
+
+// ABT #2012: one terminal lead of rectangular wire planned (and drawn) at a bend radius below its
+// wire's EDGEWISE FLEXIBILITY radius (IEC 60317-0-2 Table 6). A lead turns in 3D, so it bends on both
+// axes somewhere along its run; its FLATWISE limit is planned for, its edgewise one is not.
+struct LeadBendBelowFlexibility {
+    std::string leadName;            // "entrance lead of '<turn>'" / "exit lead of '<turn>'"
+    double plannedBendRadius = 0;    // the centreline radius its corners are planned for [m]
+    WoundCorner asLaid;              // WireBend::evaluate of that radius, EDGEWISE
+    Wire wire;                       // the lead's own wire (its lead conductor, else the winding's)
+};
+
+struct WindingLeadsBelowFlexibility {
+    std::string windingName;
+    std::vector<LeadBendBelowFlexibility> leads;
+};
+
+// Every corner of a real-winding layout judged against its wire's FLEXIBILITY radius.
+struct CoilBendJudgement {
+    size_t numberTurns = 0;
+    size_t numberCornersJudged = 0;
+    // The smallest drawn / limit ratio over every judged corner; empty when none was judged.
+    std::optional<double> tightestRatioJudged;
+    std::vector<WindingBendBelowFlexibility> windingsBelowFlexibility;
+};
+
 class Coil : public MAS::Coil {
     private:
         std::map<std::pair<size_t, size_t>, Section> _insulationSections;
@@ -626,6 +796,53 @@ class Coil : public MAS::Coil {
         // (the ABT #650 gate declined). Consumers that require blocked geometry — the 3D
         // ConductorBuilder above all — must ASK instead of discovering it as a collision.
         bool _realWindingBlockingApplied = false;
+        // ABT #2071 (Alf, 2026-10-26): the blocking now running lays out a wind whose IDEAL layout does
+        // not fit. Its blocked layout overflows the window rather than being refused (see
+        // wind_by_rectangular_layers for the rule).
+        bool _blockingAnUnfitWind = false;
+        // ABT #2096 (Alf, 2026-10-26): TURN-AXIS OVERFLOW OF A GIVEN LAYOUT, as a last resort. A layout
+        // is given when the design states it (magnetic_autocomplete preloads that, see
+        // preload_layout_is_given) or when the caller asks to wind even if it does not fit (Settings
+        // coilWindEvenIfNotFit, the web's manual wind). A layout MKF plans (advisers, searches) never
+        // overflows: the ABT #1890 refusal of a layer that holds only its own closing station stays
+        // the signal its search reads. wind() winds every layout as before; only when a given layout
+        // ends in that refusal does it wind again with _overflowGivenLayout on, which grows the
+        // starved layers past the window as an unfit wind's are.
+        bool _layoutGivenPreload = false;
+        bool _overflowGivenLayout = false;
+        // The last wind was allowed to overflow (is_turn_axis_overflow_allowed when it ran). Read by the
+        // lead router: only such a layout's exit leaves out over the copper (see get_connection_reserved_spaces).
+        bool _woundWithOverflowAllowed = false;
+        // The last blocked fill refused a layer that holds only its own closing station (ABT #1890).
+        bool _closingStationRefused = false;
+        // ABT #2096: the layers of an overflowing given layout that had connection corridors on both
+        // edges, crossed only by other windings' leads, and were grown past one of them over those
+        // leads (drawn as laid, the lead-turn overlaps reported by judge_copper_overlaps).
+        std::vector<std::string> _layersGrownOverOtherLeads;
+        // ABT #2096: the layers of an overflowing given layout that had this winding's own leads on
+        // both edges and were grown past the edge its own exit lead crosses; the own leads on that
+        // edge leave out over the grown copper (see get_connection_reserved_spaces).
+        std::vector<std::string> _layersGrownOverOwnLeads;
+        // ABT #2071/#2096: the layers that the blocked fill grew ALONG THE TURN AXIS, past
+        // the window, keyed by layer name: how many turn slots each was given beyond the ones the
+        // window holds. Written by wind_by_rectangular_layers (cleared at each fill), read by
+        // align_blocked_layer_turns, which extends the layer's span past the window by that much.
+        std::map<std::string, uint64_t> _turnAxisOverflowSlotsPerLayer;
+        // Alf (2026-10-27, "Layer 0 like the others"): the first layers of a section that the fill
+        // grew to the share of its grown later layers. Such a layer is crossed by no corridor; it
+        // keeps the edge its first wound turn starts at inside the window and grows past the other
+        // one, so its closing station is the copper pushed out (align_blocked_layer_turns).
+        std::set<std::string> _turnAxisOverflowFromStartLayers;
+        // ABT #2096: why the first of those layers could not close inside the window, with the
+        // numbers; cleared with the map at each fill, merged into _lastFitFailure by wind().
+        std::string _turnAxisOverflowReason;
+        // ABT #2107 (refill until it settles): per section, the fewest layers the refill in wind() found
+        // the section to need (a fill with fewer did not fit under the corridors it drew itself). Only
+        // ever raised during one wind, cleared at its start; wind_by_rectangular_layers keeps that many.
+        // Each minimum is stored with the section's physical turn count it was measured at (first =
+        // layers, second = turns): it holds only for that many turns, so the refill drops it when a
+        // re-split hands the section fewer.
+        std::map<std::string, std::pair<size_t, size_t>> _refillMinimumLayersPerSection;
         // ABT #1290 follow-up: the bend radius each turn's LENGTH was charged for, keyed by the
         // turn's final name. Written where the length is written, re-keyed when
         // name_turns_by_beginning renames the stations, cleared at the start of every wind.
@@ -650,7 +867,12 @@ class Coil : public MAS::Coil {
         // row was allocated on in the previous blocking iteration. The winding's first
         // section/layer starts winding FROM that edge, so the entrance connects to the turn
         // adjacent to its own row (stage-2's arrival-edge rule extended to terminals).
-        std::map<std::string, bool> _terminalEntranceAtTop;
+        // Keyed per (winding, parallel): each CONDUCTOR CHAIN keeps its own edge. A chain is led by
+        // the lowest parallel present in a layer, so an N-filar winding (every layer holds parallel
+        // 0) has the one chain it always had, while a parallel wound alone in its own section (the
+        // web flyback's Secondary parallel 1) starts its first layer at ITS entrance edge, not at
+        // parallel 0's.
+        std::map<std::pair<std::string, int64_t>, bool> _terminalEntranceAtTop;
         // ABT #430: the room each layer ACTUALLY surrendered to those leads, in metres along its turn
         // axis, as applied by wind_by_rectangular_layers (blocked slots * the layer's own wire, after
         // the one-slot-minimum cap). The layer's extent — and so its filling factor — already excludes
@@ -728,6 +950,13 @@ class Coil : public MAS::Coil {
         // a real-winding wind). A station is a cross-section, not a turn, so the winding-style
         // choice must not see it -- see get_number_turns_for_winding_style.
         std::vector<size_t> _realWindingStationsPerWinding;
+        // The stations each PARALLEL needs: one per layer that parallel itself spans. Parallels of one
+        // winding may live in different sections with different layer counts (an interleaved
+        // P-S-P-S flyback lays Secondary parallel 0 in one section and parallel 1 in another), so the
+        // stations are counted per parallel. The winding's numberTurns carries the largest of them
+        // (_realWindingStationsPerWinding); get_number_turns(windingIndex, parallelIndex) gives each
+        // parallel its own count. Empty outside a real-winding wind.
+        std::vector<std::vector<size_t>> _realWindingStationsPerParallel;
         Bobbin _bobbin;
         BobbinDataOrNameUnion bobbin;
         // MAS coil.bobbin ARRAY form (Convention A: element i is mounted on
@@ -806,16 +1035,6 @@ class Coil : public MAS::Coil {
         // each lateral winding the outer side of its own — halve and anchor each
         // wound group accordingly so they can never claim overlapping space.
         void split_shared_window_groups(std::vector<Group>& groups, const std::vector<WindingWindowElement>& windingWindows);
-        // ABT #1290 (Alf, 2026-09-20): under REAL WINDING, refuse a layout that draws a corner
-        // tighter than the wire itself can be bent. The limit is the wire's own, from its
-        // requirement standard (WireBend / IEC 60317-0-1 Table 6 for round copper, -0-2 Table 6
-        // for rectangular) -- never a constant. A turn laid against a rectangular former bends
-        // around exactly the radius get_turn_length_in_frame charges it for, former corner plus
-        // standoff, so that is the radius judged. Throws UnwindableBendException naming the
-        // winding, the turn, the drawn radius, the wire's limit and the criterion; per the
-        // no-fallbacks rule it never clamps the radius up to the floor and never drops the turn.
-        // Ideal winding is untouched: the classic 2D layout is a separate contract.
-        void refuse_turns_bent_tighter_than_the_wire_allows();
         // ABT #1424: sibling parallels' radial layer links (drawn in the connection plane from each
         // departure station to the arrival station) must keep their centrelines one coated OD apart,
         // the invariant ABT #1401 enforces for wraps. Throws, naming the pair, when they do not.
@@ -836,6 +1055,73 @@ class Coil : public MAS::Coil {
         // other windows resolve their column edge against the core columns
         // provided via set_core_columns (throws if those are missing).
         WoundColumnFrame get_wound_column_frame_for_section(const std::string& sectionName);
+        // ABT #1290 / #2004: judge every corner of the REAL-WINDING layout against its wire's own
+        // FLEXIBILITY radius (WireBend), per winding. The one judgement both consumers read:
+        // refuse_turns_bent_tighter_than_the_wire_allows refuses round and flatwise bends below
+        // it, and ResultsAnalyzer reports edgewise ones (Alf, 2026-10-22). Empty with the flag
+        // off, on planar, dummy and round-window coils, and for wires the standards do not cover.
+        CoilBendJudgement judge_corners_against_wire_flexibility();
+        // ABT #2012: the terminal leads of the REAL-WINDING layout whose planned bend radius is below
+        // their rectangular wire's EDGEWISE flexibility radius, per winding (in route order). Never a
+        // refusal: ResultsAnalyzer reports them with the winding's edgewise finding. Empty for an
+        // ideal layout, which plans no lead bends.
+        std::vector<WindingLeadsBelowFlexibility> judge_leads_against_wire_flexibility();
+        // The terminal leads of the REAL-WINDING layout that are drawn across other turns (a tangent
+        // departure whose straight another turn's corner crosses), each with the turns it hits. Never
+        // a refusal: the lead is drawn along its route and ResultsAnalyzer reports the collision.
+        // Empty for an ideal layout.
+        struct LeadCollisionJudgement {
+            std::string windingName;
+            std::string leadName;   // "entrance lead of '<turn>'" / "exit lead of '<turn>'"
+            std::vector<LeadTurnCollision> collisions;
+        };
+        std::vector<LeadCollisionJudgement> judge_lead_collisions();
+        // Alf, 2026-10-25: the terminal leads of the REAL-WINDING layout drawn on a tangent route MKF
+        // does not model in full (TangentLeadCondition), each with its conditions. Never a refusal:
+        // ResultsAnalyzer reports them. Empty for an ideal layout.
+        struct UnmodelledLeadJudgement {
+            std::string windingName;
+            std::string leadName;   // "entrance lead of '<turn>'" / "exit lead of '<turn>'"
+            double plannedBendRadius = 0;
+            double connectionFaceHalfStraight = 0;
+            std::vector<TangentLeadUnmodelled> conditions;
+        };
+        std::vector<UnmodelledLeadJudgement> judge_unmodelled_tangent_leads();
+        // Alf, 2026-10-25 (ABT #2071): every place the drawn design's copper overlaps other copper in
+        // the winding-window section -- turn stations overlapping each other (a wind that does not fit
+        // its window still produces its turns), terminal leads drawn across turns (a tangent lead's
+        // collisions, and a radial lead's reserved run over a turn's outline), and terminal leads
+        // drawn through each other. ONE source for ResultsAnalyzer's findings and the Painter's red
+        // overlaps. A turn is drawn with the cross-section it stores, or, storing no shape or no
+        // dimensions, with its winding's wire's (ABT #2109: a round or litz wire's outer diameter, a
+        // rectangular, planar or foil wire's outer width and height). Throws when neither gives it;
+        // turn_outlines_unknown_reason says so first.
+        std::vector<CopperOverlap> judge_copper_overlaps();
+        // Alf, 2026-10-27 (ABT #2109): why the turns' outlines judge_copper_overlaps and
+        // judge_turns_outside_window draw with are unknown -- a turn that stores no cross-section and
+        // whose wire does not give it either (the turn, its winding, the wire and what it lacks) --
+        // or nullopt when every turn's outline is known. analyze_results reports it as ONE finding
+        // (TURN_OUTLINES_NOT_EVALUABLE) instead of judging the overlaps.
+        std::optional<std::string> turn_outlines_unknown_reason();
+        // Alf, 2026-10-25 (ABT #2071): every turn station of the drawn coil whose copper lies outside the
+        // rectangular winding window it belongs to, with how far and on which side (TurnOutsideWindow).
+        // ONE source for ResultsAnalyzer's TURNS_OUTSIDE_WINDOW finding and the Painter's red copper.
+        // Empty for a coil without turns, and for round (toroidal) windows, which block angularly and
+        // are judged by the toroidal fill, as in are_turns_inside_winding_window. Turns are drawn as in
+        // judge_copper_overlaps; throws when a turn's outline is unknown, or the bobbin lacks its windows.
+        std::vector<TurnOutsideWindow> judge_turns_outside_window();
+        // ABT #1290 (Alf, 2026-09-20): under REAL WINDING, refuse a layout that draws a corner
+        // tighter than the wire itself can be bent. ABT #2004 (Alf, 2026-10-22): an EDGEWISE bend
+        // of rectangular wire is not refused -- IEC 60317-0-2 Table 6 qualifies the coating, it is
+        // not a forming limit for edgewise winding -- and analyze_results warns about it instead. The limit is the wire's own, from its
+        // requirement standard (WireBend / IEC 60317-0-1 Table 6 for round copper, -0-2 Table 6
+        // for rectangular) -- never a constant. A turn laid against a rectangular former bends
+        // around exactly the radius get_turn_length_in_frame charges it for, former corner plus
+        // standoff, so that is the radius judged. Throws UnwindableBendException naming the
+        // winding, the turn, the drawn radius, the wire's limit and the criterion; per the
+        // no-fallbacks rule it never clamps the radius up to the floor and never drops the turn.
+        // Ideal winding is untouched: the classic 2D layout is a separate contract.
+        void refuse_turns_bent_tighter_than_the_wire_allows();
         // Length of one turn at radial position turnX wrapped around the given
         // column frame; nullopt when the geometry is invalid (negative length),
         // matching the winder's historical soft-failure.
@@ -868,6 +1154,13 @@ class Coil : public MAS::Coil {
         // (e.g. the painter framing a margin rectangle, ABT #227.7) need this same
         // resolution, not just Coil's own internal winding/placement machinery.
         size_t resolve_section_winding_window_index(const Section& section) const;
+        // ABT #1346: the winder's rule for the sense a winding is wound around its column. Every group
+        // is wound in the +x winding frame with its turns CLOCKWISE; apply_group_window_sides mirrors
+        // a section whose window sits on the negative-x side into place, which winds it the opposite
+        // way (COUNTER_CLOCKWISE). The one rule both the winder and the reluctance network's MMF sign
+        // read. Throws when the window has no coordinates.
+        static bool is_mirrored_winding_window(const WindingWindowElement& windingWindow);
+        static TurnOrientation get_turn_orientation_in_winding_window(const WindingWindowElement& windingWindow);
         // Distribute windings across the bobbin's winding windows. Creates one
         // Group per winding window in the bobbin and assigns windings to
         // groups per the provided indices. The outer vector size MUST equal
@@ -944,9 +1237,22 @@ class Coil : public MAS::Coil {
                        CoilAlignment turnsAlignment = CoilAlignment::CENTERED,
                        CoilAlignment sectionAlignment = CoilAlignment::INNER_OR_TOP);
         Coil(const MAS::Coil coil);
+        // Builds the coil without winding it, so the caller can give it its core
+        // (set_core_columns / set_core_geometry) first and then call wind_as_described(): a coil
+        // wound before it knows its core cannot follow the core column with its bobbin's bore
+        // (Magnetic(const MAS::Magnetic) builds its coil this way).
+        Coil(const MAS::Coil coil, bool windInConstructor);
+        // The wind Coil(const MAS::Coil) makes in its constructor: only when the coil does not
+        // already carry its sections, layers and (fitting) turns.
+        void wind_as_described();
         Coil(json j, bool windInConstructor);
         Coil() = default;
         virtual ~Coil() = default;
+        // Declared because the virtual destructor suppresses the implicit move: a std::move of a Coil copied it.
+        Coil(const Coil&) = default;
+        Coil(Coil&&) = default;
+        Coil& operator=(const Coil&) = default;
+        Coil& operator=(Coil&&) = default;
         bool fast_wind();
         bool unwind();
         bool wind();
@@ -1040,6 +1346,17 @@ class Coil : public MAS::Coil {
         // (disjoint sets) are one parallel after another (WIND_BY_CONSECUTIVE_TURNS). A mix of the
         // two is neither, and is left to the heuristic. Overrides already preloaded win.
         void preload_winding_style_overrides_from_stored_sections();
+        // ABT #2071 (Alf, 2026-10-25): a STORED design is re-wound with the layers orientation each of
+        // its conduction sections states (sections[].layersOrientation), not the coil-wide default: a
+        // stored CONTIGUOUS section came back OVERLAPPING. Keyed by the name the wind gives the section
+        // ("<winding> section <k>", k counting that winding's sections, as magnetic_autocomplete's
+        // stated rects are); a section of several windings has no such name and is not preloaded.
+        // Per-section orientations already set win. Returns the map as it was before, for the caller
+        // to restore once its wind is done (the orientations belong to THAT re-wind).
+        std::map<std::string, WindingOrientation> preload_layers_orientation_from_stored_sections();
+        void restore_layers_orientation_per_section(std::map<std::string, WindingOrientation> perSection) {
+            _layersOrientationPerSection = std::move(perSection);
+        }
         // ABT #1487 (R5, Alf 2026-09-29): MKF sizes sections by need when it CREATES a design, but a
         // STORED design's section heights (a customer may have corrected them) are kept when
         // magnetic_autocomplete re-winds it for real winding. Records, by section name, the stored
@@ -1051,6 +1368,19 @@ class Coil : public MAS::Coil {
         // Transient, like preload_margins; clear_stored_section_heights ends it.
         void preload_stored_section_heights_from_sections();
         void clear_stored_section_heights() { _storedSectionHeights.clear(); }
+        // ABT #2096: the layout about to be wound is GIVEN (stated in the design), so a wind that can
+        // only end in the closing-station refusal may overflow the window along the turn axis instead
+        // (see _overflowGivenLayout). Transient, like preload_stored_section_heights_from_sections:
+        // magnetic_autocomplete sets it around its wind and clears it however the wind leaves.
+        void preload_layout_is_given(bool given) { _layoutGivenPreload = given; }
+        void clear_layout_is_given() { _layoutGivenPreload = false; }
+        // Whether this wind may overflow along the turn axis: a given layout, or Settings
+        // coilWindEvenIfNotFit (the caller asks to see a layout that does not fit).
+        bool is_turn_axis_overflow_allowed() const;
+        // The layers grown over other windings' lead corridors by the last wind (ABT #2096).
+        const std::vector<std::string>& get_layers_grown_over_other_leads() const { return _layersGrownOverOtherLeads; }
+        // The layers grown past the edge their own exit lead crosses by the last wind (ABT #2096).
+        const std::vector<std::string>& get_layers_grown_over_own_leads() const { return _layersGrownOverOwnLeads; }
         const std::map<std::string, double>& get_stored_section_heights() const { return _storedSectionHeights; }
         std::optional<WindingStyle> get_winding_style_override(size_t windingIndex) const;
         std::vector<std::pair<size_t, double>> get_ordered_sections(double spaceForSections, std::vector<double> proportionPerWinding, std::vector<size_t> pattern, size_t repetitions=1);
@@ -1208,6 +1538,7 @@ class Coil : public MAS::Coil {
         // leads run (top edge for top-crossing leads, bottom for bottom) and no window space is wasted
         // with an empty gap on the unblocked side. Real winding geometry only.
         void align_blocked_layer_turns();
+        void recharge_turns_moved_since(std::vector<Turn>& turns, const std::vector<Turn>& before);
         // ABT #1401: re-lay every real-winding overlapping round/litz layer at the pitch its wraps
         // need at the radius the layer FINALLY sits at. The winder derives the helical pitch from
         // the turn length at the radius it winds the layer at, and delimit_and_compact then moves
@@ -1220,7 +1551,8 @@ class Coil : public MAS::Coil {
         // layer (a permutation of stations within each bundle). Run on every real-winding layout.
         void keep_parallel_order_in_every_layer(std::vector<Turn>& turns, const std::vector<Layer>& layers);
         // ABT #1422: a radial step (U layer link, or an inter-section return laid as one step) and a
-        // sibling's wrap beside one of its ends: the minimum centreline distance, as drawn.
+        // sibling's wrap beside one of its ends: the minimum centreline distance, as drawn -- against
+        // the wrap's true path round the column (ABT #969), not its tangent at the crossing.
         struct RadialStepClearance {
             size_t stepFrom = 0, stepTo = 0;   // the step's two stations (turn indices)
             size_t stepEnd = 0;                // the end whose layer holds the sibling
@@ -1266,6 +1598,11 @@ class Coil : public MAS::Coil {
 
         std::vector<uint64_t> get_number_turns() const;
         uint64_t get_number_turns(size_t windingIndex) const;
+        // Physical cross-sections of ONE parallel of the winding: its declared turns plus the crossing
+        // stations of that parallel's own layers while a real-winding wind is in progress; equal to
+        // get_number_turns(windingIndex) otherwise.
+        uint64_t get_number_turns(size_t windingIndex, size_t parallelIndex) const;
+        std::vector<uint64_t> get_number_turns_per_parallel(size_t windingIndex) const;
         // The declared (electrical) turn count, without the real-winding crossing stations a wind
         // in progress has added: what the winding-style choice is made on (ABT #1487).
         uint64_t get_number_turns_for_winding_style(size_t windingIndex) const;
@@ -1424,6 +1761,19 @@ class Coil : public MAS::Coil {
         /// which of the wire's axes a bend is about takes that axis's minimum separately.
         static double lead_isotropic_bend_radius(const std::optional<ConnectionSleeve>& sleeve, double sweptRadius,
                                                  bool realWinding);
+        /// The radius Rg a terminal lead's S ramp (ConnectionRoute::rampLength) is planned at. The S
+        /// lies ON the turn's surface, so what bends alike on every axis, `isotropicRadius`, sees the
+        /// S combined with the surface's own curvature across it, `surfaceCurvature` (1/rho on a round
+        /// or oblong column, 0 on a flat face): 1/Rg^2 = 1/isotropicRadius^2 - surfaceCurvature^2.
+        /// A rectangular wire's own minimum is per axis, and the S bends it about the RADIAL axis
+        /// only, with the wire's height in the bend plane, so Rg is raised to THAT axis's minimum
+        /// alone, never to the tighter of both (ABT #1481). A round wire's minimum is already in
+        /// `isotropicRadius`. Throws when the surface is curved tighter than `isotropicRadius`.
+        static double lead_ramp_governing_radius(const Wire& leadWire, double isotropicRadius, double surfaceCurvature);
+        /// The extent S, along the turn, of the cosine S ramp y = h (1 - cos(pi s / S)) / 2 that
+        /// climbs `stubHeight` h: its curvature peaks at h pi^2 / (2 S^2), which is 1/Rg at
+        /// S = pi sqrt(h Rg / 2), Rg = `governingRadius` (lead_ramp_governing_radius).
+        static double lead_ramp_length(double stubHeight, double governingRadius);
         /// RFC 0013 R4's wrap turns per wire end, from src/data/dfm_rules.json.
         static int64_t pin_wrap_turns();
         /// How much deeper the front face lies than MKF's radial coordinate: 0 for a round column,
@@ -1656,6 +2006,10 @@ class Coil : public MAS::Coil {
         // loses real-winding blocking can say WHY instead of just not doing it. Diagnostic text
         // only — never a control input.
         std::string _lastFitFailure;
+        // Set by get_proportion_per_winding_for_whole_layers when the whole layers every section
+        // needs do not fit side by side in the window, with the numbers; cleared at the start of
+        // each wind. A wind that fails says this first, because no split of the window helps then.
+        std::string _wholeLayerShortfall;
         // ABT #1487 (owner decision, Alf 2026-09-29): what a real-winding layout of axially stacked
         // sections overflowed, instead of refusing it -- outside series links laid beyond the room
         // the core leaves them (keyed by link), stored section heights grown past what their

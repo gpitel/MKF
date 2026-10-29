@@ -88,8 +88,7 @@ struct LossesFromSimulation {
     double coreLosses = 0.0;
     double windingLosses = 0.0;
     double ambientTemperature = 25.0;
-    std::optional<WindingLossesOutput> windingLossesOutput;
-    bool simulationSucceeded = false;
+    std::optional<WindingLossesOutput> windingLossesOutput;  // always engaged on return (missing output throws)
 };
 
 LossesFromSimulation getLossesFromSimulation(const OpenMagnetics::Magnetic& magnetic, 
@@ -111,18 +110,17 @@ LossesFromSimulation getLossesFromSimulation(const OpenMagnetics::Magnetic& magn
     }
     auto outputs = simulatedMas.get_outputs()[0];
 
-    // Get core losses
-    if (outputs.get_core_losses()) {
-        result.coreLosses = resolve_dimensional_values(outputs.get_core_losses()->get_core_losses());
+    // A simulation output without core or winding losses fails the test: a thermal result on
+    // zero losses would pass its checks while measuring nothing.
+    if (!outputs.get_core_losses()) {
+        throw std::runtime_error("getLossesFromSimulation: MagneticSimulator output has no core losses");
     }
-
-    // Get winding losses
-    if (outputs.get_winding_losses()) {
-        result.windingLosses = resolve_dimensional_values(outputs.get_winding_losses()->get_winding_losses());
-        result.windingLossesOutput = outputs.get_winding_losses();
+    if (!outputs.get_winding_losses()) {
+        throw std::runtime_error("getLossesFromSimulation: MagneticSimulator output has no winding losses");
     }
-
-    result.simulationSucceeded = true;
+    result.coreLosses = resolve_dimensional_values(outputs.get_core_losses()->get_core_losses());
+    result.windingLosses = resolve_dimensional_values(outputs.get_winding_losses()->get_winding_losses());
+    result.windingLossesOutput = outputs.get_winding_losses();
 
     // Get ambient temperature from operating point
     if (!inputs.get_operating_points().empty()) {
@@ -187,17 +185,7 @@ void applySimulatedLosses(TemperatureConfig& config,
     
     // Get real losses from simulation
     auto losses = getLossesFromSimulation(magnetic, inputs);
-    
-    if (!losses.simulationSucceeded) {
-        throw std::runtime_error("Magnetic simulation failed - cannot calculate temperatures without real losses. "
-                                 "Ensure the magnetic component has valid core, coil, and operating points.");
-    }
-    
-    if (!losses.windingLossesOutput.has_value()) {
-        throw std::runtime_error("WindingLossesOutput missing from simulation results. "
-                                 "Cannot calculate temperatures without per-turn loss distribution.");
-    }
-    
+
     config.coreLosses = losses.coreLosses;
     config.windingLosses = losses.windingLosses;
     config.windingLossesOutput = losses.windingLossesOutput.value();
@@ -238,7 +226,6 @@ TEST_CASE("Temperature: Toroidal Core T20 Ten Turns", "[temperature][round-windi
 
     TemperatureConfig config;
     config.ambientTemperature = 25.0;
-    config.coreLosses = 0.3;  // Fallback if simulation fails
     config.plotSchematic = true;
     config.schematicOutputPath = (getOutputDir() / "thermal_schematic_Toroid_T20_10_turns.svg").string();
     
@@ -246,15 +233,9 @@ TEST_CASE("Temperature: Toroidal Core T20 Ten Turns", "[temperature][round-windi
     // A tenth of the saturation current: a small rise in this small ungapped toroid
     auto inputs = createInputsForMagnetic(magnetic, 100000.0, config.ambientTemperature, 0.1);
     auto losses = getLossesFromSimulation(magnetic, inputs);
-    if (losses.simulationSucceeded) {
-        config.coreLosses = losses.coreLosses;
-        config.windingLosses = losses.windingLosses;
-        if (losses.windingLossesOutput.has_value()) {
-            config.windingLossesOutput = losses.windingLossesOutput.value();
-        } else {
-            applySimulatedLosses(config, magnetic);
-        }
-    }
+    config.coreLosses = losses.coreLosses;
+    config.windingLosses = losses.windingLosses;
+    config.windingLossesOutput = losses.windingLossesOutput.value();
     
     Temperature temp(magnetic, config);
     auto result = temp.calculateTemperatures();
@@ -508,22 +489,15 @@ TEST_CASE("Temperature: ETD Core", "[temperature][smoke-test]") {
 
     TemperatureConfig config;
     config.ambientTemperature = 25.0;
-    config.coreLosses = 0.5;  // Fallback
     config.plotSchematic = false;
     
     // Use real simulation for losses
     // Use lower current (0.1A) to avoid extreme core losses in ungapped E core
     auto inputs = createInputsForMagnetic(magnetic, 100000.0, config.ambientTemperature, 0.1);
     auto losses = getLossesFromSimulation(magnetic, inputs);
-    if (losses.simulationSucceeded) {
-        config.coreLosses = losses.coreLosses;
-        config.windingLosses = losses.windingLosses;
-        if (losses.windingLossesOutput.has_value()) {
-            config.windingLossesOutput = losses.windingLossesOutput.value();
-        }
-    } else {
-        applySimulatedLosses(config, magnetic);
-    }
+    config.coreLosses = losses.coreLosses;
+    config.windingLosses = losses.windingLosses;
+    config.windingLossesOutput = losses.windingLossesOutput.value();
     
     Temperature temp(magnetic, config);
     auto result = temp.calculateTemperatures();
@@ -561,7 +535,6 @@ TEST_CASE("Temperature: E Core", "[temperature][smoke-test]") {
 
     TemperatureConfig config;
     config.ambientTemperature = 25.0;
-    config.coreLosses = 0.8;  // Fallback
     config.plotSchematic = true;
     config.schematicOutputPath = (getOutputDir() / "thermal_schematic_E_Core_42_21_15.svg").string();
     
@@ -570,15 +543,9 @@ TEST_CASE("Temperature: E Core", "[temperature][smoke-test]") {
     auto losses = getLossesFromSimulation(magnetic, inputs);
     
     
-    if (losses.simulationSucceeded) {
-        config.coreLosses = losses.coreLosses;
-        config.windingLosses = losses.windingLosses;
-        if (losses.windingLossesOutput.has_value()) {
-            config.windingLossesOutput = losses.windingLossesOutput.value();
-        }
-    } else {
-        applySimulatedLosses(config, magnetic);
-    }
+    config.coreLosses = losses.coreLosses;
+    config.windingLosses = losses.windingLosses;
+    config.windingLossesOutput = losses.windingLossesOutput.value();
     
     Temperature temp(magnetic, config);
     auto result = temp.calculateTemperatures();
@@ -938,21 +905,14 @@ TEST_CASE("Temperature: Node Access", "[temperature][smoke-test]") {
 
     TemperatureConfig config;
     config.ambientTemperature = 25.0;
-    config.coreLosses = 0.3;
     // Use lower current (0.1A) to avoid extreme core losses in ungapped toroid
     auto inputs = createInputsForMagnetic(magnetic, 100000.0, config.ambientTemperature, 0.1);
     auto losses = getLossesFromSimulation(magnetic, inputs);
     
     
-    if (losses.simulationSucceeded) {
-        config.coreLosses = losses.coreLosses;
-        config.windingLosses = losses.windingLosses;
-        if (losses.windingLossesOutput.has_value()) {
-            config.windingLossesOutput = losses.windingLossesOutput.value();
-        }
-    } else {
-        applySimulatedLosses(config, magnetic);
-    }
+    config.coreLosses = losses.coreLosses;
+    config.windingLosses = losses.windingLosses;
+    config.windingLossesOutput = losses.windingLossesOutput.value();
     config.plotSchematic = false;
     
     Temperature temp(magnetic, config);
@@ -3131,6 +3091,135 @@ TEST_CASE("Temperature: Cold Plate Cooling", "[temperature][cooling][smoke-test]
     REQUIRE(result.converged);
 }
 
+// The cold plate's interface resistance is the supplied interface_thermal_resistance whether or not
+// an interface_thickness is given (thickness is not used): without a thickness it used to be dropped
+// for the 0.5 K/W default, while the heatsink path already read the resistance alone.
+TEST_CASE("Temperature: cold plate reads the interface resistance without a thickness", "[temperature][cooling][abt-1611]") {
+    auto jsonPath = OpenMagneticsTesting::get_test_data_path(
+        std::source_location::current(), "toroidal_inductor_round_wire_multilayer.json");
+    auto mas = OpenMagneticsTesting::mas_loader(jsonPath);
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+    auto inputs = OpenMagnetics::inputs_autocomplete(mas.get_inputs(), magnetic);
+    auto losses = getLossesFromSimulation(magnetic, inputs);
+    auto coldPlateResistances = [&](bool withThickness) {
+        TemperatureConfig config;
+        config.ambientTemperature = losses.ambientTemperature;
+        config.coreLosses = losses.coreLosses;
+        REQUIRE(losses.windingLossesOutput.has_value());
+        config.windingLosses = losses.windingLosses;
+        config.windingLossesOutput = losses.windingLossesOutput.value();
+        MAS::Cooling coldPlateCooling;
+        coldPlateCooling.set_maximum_temperature(40.0);
+        coldPlateCooling.set_interface_thermal_resistance(3e-4);
+        if (withThickness) {
+            coldPlateCooling.set_interface_thickness(0.0002);
+        }
+        { MAS::Dimensions d; d.set_width(0.06); d.set_height(0.06); d.set_depth(0.01); coldPlateCooling.set_dimensions(d); }
+        config.masCooling = coldPlateCooling;
+        Temperature temperature(magnetic, config);
+        temperature.calculateTemperatures();
+        std::optional<size_t> coldPlateIndex;
+        for (size_t index = 0; index < temperature.getNodes().size(); ++index) {
+            if (temperature.getNodes()[index].name == "ColdPlate") {
+                coldPlateIndex = index;
+            }
+        }
+        REQUIRE(coldPlateIndex);
+        std::vector<double> resistances;
+        for (const auto& resistance : temperature.getResistances()) {
+            if (resistance.nodeToId == coldPlateIndex.value()) {
+                resistances.push_back(resistance.resistance);
+            }
+        }
+        return resistances;
+    };
+    auto withThickness = coldPlateResistances(true);
+    auto withoutThickness = coldPlateResistances(false);
+    REQUIRE(!withThickness.empty());
+    REQUIRE(withThickness.size() == withoutThickness.size());
+    for (size_t index = 0; index < withThickness.size(); ++index) {
+        INFO("contact " << index << ": " << withThickness[index] << " K/W with a thickness, " << withoutThickness[index] << " K/W without");
+        CHECK_THAT(withoutThickness[index], Catch::Matchers::WithinRel(withThickness[index], 1e-12));
+    }
+}
+
+// ABT #1611 (Alf 2026-10-24): only the face touching the plate conducts into it, and a plate or a
+// heatsink without its interface resistance is an error, not a silent 0.5 K/W.
+TEST_CASE("Temperature: a cold plate conducts through the face touching it, and needs its interface resistance", "[temperature][cooling][abt-1611]") {
+    auto jsonPath = OpenMagneticsTesting::get_test_data_path(
+        std::source_location::current(), "toroidal_inductor_round_wire_multilayer.json");
+    auto mas = OpenMagneticsTesting::mas_loader(jsonPath);
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+    auto inputs = OpenMagnetics::inputs_autocomplete(mas.get_inputs(), magnetic);
+    auto losses = getLossesFromSimulation(magnetic, inputs);
+    auto configWith = [&](const MAS::Cooling& cooling) {
+        TemperatureConfig config;
+        config.ambientTemperature = losses.ambientTemperature;
+        config.coreLosses = losses.coreLosses;
+        REQUIRE(losses.windingLossesOutput.has_value());
+        config.windingLosses = losses.windingLosses;
+        config.windingLossesOutput = losses.windingLossesOutput.value();
+        config.masCooling = cooling;
+        return config;
+    };
+    const double areaSpecificResistance = 3e-4;
+    MAS::Cooling coldPlateCooling;
+    coldPlateCooling.set_maximum_temperature(40.0);
+    coldPlateCooling.set_interface_thermal_resistance(areaSpecificResistance);
+    { MAS::Dimensions d; d.set_width(0.06); d.set_height(0.06); d.set_depth(0.01); coldPlateCooling.set_dimensions(d); }
+
+    Temperature temperature(magnetic, configWith(coldPlateCooling));
+    temperature.calculateTemperatures();
+    const auto& nodes = temperature.getNodes();
+    std::optional<size_t> coldPlateIndex;
+    for (size_t index = 0; index < nodes.size(); ++index) {
+        if (nodes[index].name == "ColdPlate") {
+            coldPlateIndex = index;
+        }
+    }
+    REQUIRE(coldPlateIndex);
+    size_t contacts = 0;
+    for (const auto& resistance : temperature.getResistances()) {
+        if (resistance.nodeToId != coldPlateIndex.value()) {
+            continue;
+        }
+        const auto& segment = nodes[resistance.nodeFromId];
+        REQUIRE(segment.part == ThermalNodePartType::CORE_TOROIDAL_SEGMENT);
+        REQUIRE(segment.physicalCoordinates[1] < 0);  // a bottom segment: its outer face looks at the plate
+        double outerFaceArea = segment.getQuadrant(ThermalNodeFace::RADIAL_OUTER)->surfaceArea;
+        INFO(segment.name << ": " << resistance.resistance << " K/W, outer face " << outerFaceArea << " m2, all faces " << segment.getTotalSurfaceArea() << " m2");
+        CHECK_THAT(resistance.resistance, Catch::Matchers::WithinRel(areaSpecificResistance / outerFaceArea, 1e-12));
+        ++contacts;
+    }
+    REQUIRE(contacts > 0);
+
+    MAS::Cooling withoutInterface = coldPlateCooling;
+    withoutInterface.set_interface_thermal_resistance(std::nullopt);
+    REQUIRE_THROWS_WITH(Temperature(magnetic, configWith(withoutInterface)).calculateTemperatures(),
+                        Catch::Matchers::ContainsSubstring("interfaceThermalResistance"));
+}
+
+TEST_CASE("Temperature: a heatsink without its interface resistance throws", "[temperature][cooling][abt-1611]") {
+    auto jsonPath = OpenMagneticsTesting::get_test_data_path(
+        std::source_location::current(), "concentric_round_wire_simple.json");
+    auto mas = OpenMagneticsTesting::mas_loader(jsonPath);
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+    auto inputs = OpenMagnetics::inputs_autocomplete(mas.get_inputs(), magnetic);
+    auto losses = getLossesFromSimulation(magnetic, inputs);
+    TemperatureConfig config;
+    config.ambientTemperature = losses.ambientTemperature;
+    config.coreLosses = losses.coreLosses;
+    REQUIRE(losses.windingLossesOutput.has_value());
+    config.windingLosses = losses.windingLosses;
+    config.windingLossesOutput = losses.windingLossesOutput.value();
+    MAS::Cooling heatsinkCooling;
+    heatsinkCooling.set_thermal_resistance(2.5);
+    { MAS::Dimensions d; d.set_width(0.05); d.set_height(0.05); d.set_depth(0.02); heatsinkCooling.set_dimensions(d); }
+    config.masCooling = heatsinkCooling;
+    REQUIRE_THROWS_WITH(Temperature(magnetic, config).calculateTemperatures(),
+                        Catch::Matchers::ContainsSubstring("interfaceThermalResistance"));
+}
+
 TEST_CASE("Temperature: Cooling Utils Type Detection", "[temperature][cooling][smoke-test]") {
     using namespace OpenMagnetics;
     
@@ -3239,10 +3328,11 @@ TEST_CASE("Temperature: 220kW Transformer", "[temperature][transformer][smoke-te
         INFO(OpenMagnetics::to_string(finding.code) << ": " << finding.message);
         if (finding.code == OpenMagnetics::ResultFindingCode::NO_THERMAL_OPERATING_POINT) {
             ++runawayFindings;
-            CHECK_THAT(finding.message, Catch::Matchers::ContainsSubstring("No thermal operating point: the winding runs away"));
-            CHECK_THAT(finding.message, Catch::Matchers::ContainsSubstring("dT_turn/dT_w"));
-            CHECK_THAT(finding.message, Catch::Matchers::ContainsSubstring("History:"));
-            CHECK_THAT(finding.message, Catch::Matchers::ContainsSubstring("Pcu="));
+            CHECK_THAT(finding.message, Catch::Matchers::ContainsSubstring("No steady temperature: the winding runs away"));
+            REQUIRE(finding.details);
+            CHECK_THAT(finding.details.value(), Catch::Matchers::ContainsSubstring("dT_turn/dT_w"));
+            CHECK_THAT(finding.details.value(), Catch::Matchers::ContainsSubstring("History:"));
+            CHECK_THAT(finding.details.value(), Catch::Matchers::ContainsSubstring("Pcu="));
         }
     }
     CHECK(runawayFindings == simulated.get_outputs().size());
@@ -3891,7 +3981,6 @@ TEST_CASE("Temperature: BuckInductor T134_77_27 from MAS file", "[temperature][c
 
     // Run the electromagnetic simulation to get losses
     auto losses = getLossesFromSimulation(magnetic, inputs);
-    REQUIRE(losses.simulationSucceeded);
     REQUIRE(losses.windingLossesOutput.has_value());
 
     TemperatureConfig config;
@@ -4679,6 +4768,14 @@ TEST_CASE("Temperature: an insulation material is found under its MAS name", "[t
                  Catch::Matchers::WithinAbs(0.15, 1e-12));
 }
 
+// ABT #569: a conduction resistance with no conductivity or no area returned an in-band 1e9 K/W.
+TEST_CASE("Temperature: a conduction resistance without conductivity or area throws", "[temperature][abt-569]") {
+    REQUIRE_THAT(ThermalResistance::calculateConductionResistance(1e-3, 0.2, 1e-4), Catch::Matchers::WithinRel(50.0, 1e-12));
+    REQUIRE_THROWS_AS(ThermalResistance::calculateConductionResistance(1e-3, 0.0, 1e-4), InvalidInputException);
+    REQUIRE_THROWS_AS(ThermalResistance::calculateConductionResistance(1e-3, 0.2, 0.0), InvalidInputException);
+    REQUIRE_THROWS_AS(ThermalResistance::calculateConductionResistance(1e-3, -0.2, 1e-4), InvalidInputException);
+}
+
 // ============================================================================
 // ABT #1753: a core material's heat conductivity — the MAS value, or a flagged estimate (class,
 // family, all sourced materials); absence never throws, malformed data does
@@ -4698,17 +4795,17 @@ CoreMaterial core_material_without_heat_conductivity(MaterialType type, std::opt
     return material;
 }
 
-// Resolves a renamed copy (the WARNING is logged once per material) and returns the warnings.
+// Resolves a renamed copy (the provenance note is logged once per material, at INFO) and returns the notes.
 std::vector<std::string> estimate_warnings(CoreMaterial material, const std::string& probeName) {
     material.set_name(probeName);
     Logger::getInstance().disableCollector();
-    Logger::getInstance().enableCollector(LogLevel::WARNING);
+    Logger::getInstance().enableCollector(LogLevel::INFO);
     resolve_core_material_heat_conductivity(material);
     auto collected = Logger::getInstance().drainCollected();
     Logger::getInstance().disableCollector();
     std::vector<std::string> messages;
     for (const auto& record : collected) {
-        if (record.level == LogLevel::WARNING && record.message.find(probeName) != std::string::npos) {
+        if (record.level == LogLevel::INFO && record.message.find(probeName) != std::string::npos) {
             messages.push_back(record.message);
         }
     }
@@ -4877,6 +4974,62 @@ TEST_CASE("Core heat conductivity: a class with no sourced member gets its famil
     auto warnings = estimate_warnings(material, "FeSiCr powder (family warning probe)");
     REQUIRE(warnings.size() == 1);
     CHECK(warnings[0].find("tier FAMILY") != std::string::npos);
+}
+
+TEST_CASE("Core heat conductivity: a provenance note is logged once per kind and material, at INFO", "[temperature][thermal][smoke-test]") {
+    // Where a conductivity came from is a note about the data, not a warning about the design: it is
+    // logged at INFO, once per (kind of note, material) per session, and never at WARNING.
+    const std::string probeName = "MPP 14 (provenance note probe)";
+    auto unsourced = find_core_material_by_name("MPP 14");
+    REQUIRE(unsourced.get_heat_conductivity());
+    REQUIRE_FALSE(has_sourced_heat_conductivity(unsourced));
+    unsourced.set_name(probeName);
+    // The same material (manufacturer + name) without its MAS value: a different kind of note.
+    auto estimated = unsourced;
+    estimated.set_heat_conductivity(std::nullopt);
+    estimated.set_provenance(std::nullopt);
+
+    Logger::getInstance().disableCollector();
+    Logger::getInstance().enableCollector(LogLevel::INFO);
+    resolve_core_material_heat_conductivity(unsourced);
+    resolve_core_material_heat_conductivity(unsourced);
+    resolve_core_material_heat_conductivity(estimated);
+    resolve_core_material_heat_conductivity(estimated);
+    auto collected = Logger::getInstance().drainCollected();
+    Logger::getInstance().disableCollector();
+
+    size_t unsourcedNotes = 0;
+    size_t estimatedNotes = 0;
+    for (const auto& record : collected) {
+        if (record.message.find(probeName) == std::string::npos) {
+            continue;
+        }
+        INFO(record.message);
+        CHECK(record.level == LogLevel::INFO);
+        CHECK(record.moduleOfOrigin == "Material data");
+        CHECK(record.count == 1);
+        if (record.message.find("UNSOURCED") != std::string::npos) {
+            unsourcedNotes += record.count;
+        }
+        if (record.message.find("ESTIMATED") != std::string::npos) {
+            estimatedNotes += record.count;
+        }
+    }
+    CHECK(unsourcedNotes == 1);
+    CHECK(estimatedNotes == 1);
+
+    // Nothing about the probe reaches a WARNING collector (both notes were already given, and they
+    // are INFO anyway): a fresh probe name shows the level, not the deduplication.
+    const std::string warningProbe = "MPP 14 (provenance warning-level probe)";
+    auto fresh = find_core_material_by_name("MPP 14");
+    fresh.set_name(warningProbe);
+    Logger::getInstance().enableCollector(LogLevel::WARNING);
+    resolve_core_material_heat_conductivity(fresh);
+    auto warnings = Logger::getInstance().drainCollected();
+    Logger::getInstance().disableCollector();
+    for (const auto& record : warnings) {
+        CHECK(record.message.find(warningProbe) == std::string::npos);
+    }
 }
 
 TEST_CASE("Core heat conductivity: a proprietary or missing composition falls to its material type, then to all sourced materials", "[temperature][thermal][smoke-test]") {
@@ -5089,7 +5242,7 @@ TEST_CASE("Temperature: ABT 1454 a coil that does not fit its window throws unle
 
     REQUIRE(settings.get_thermal_network_strict_geometry());
     REQUIRE_THROWS_WITH(abt1454MaximumTemperatureAtFixedLoss(magnetic, 0.3, 0.3),
-                        Catch::Matchers::ContainsSubstring("overlaps its enclosure"));
+                        Catch::Matchers::ContainsSubstring("the coil does not fit in its window"));
 
     SettingsGuard<bool> lenient(Settings::GetInstance(), &Settings::get_thermal_network_strict_geometry,
                                 &Settings::set_thermal_network_strict_geometry, false);

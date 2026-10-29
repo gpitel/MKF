@@ -6,17 +6,20 @@
 #include "constructive_models/Core.h"
 #include "constructive_models/Magnetic.h"
 #include "constructive_models/Mas.h"
+#include "processors/ResultsAnalyzer.h"
 #include "support/Logger.h"
 #include "support/Painter.h"
 #include "support/Utils.h"
 #include "support/Settings.h"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <map>
 #include <fstream>
 #include <set>
 #include <optional>
@@ -944,8 +947,77 @@ TEST_CASE("magnetic_autocomplete throws COIL_WINDING_ERROR for a winding that do
 
 namespace {
 
+// ABT #2073: a winding refused because its copper does not fit must say so, with the numbers, before the
+// position of the first turn that escapes. Returns the COIL_WINDING_ERROR text of autocompleting the design.
+std::string autocomplete_refusal(const json& core, const json& functionalDescription) {
+    json coil = {{"bobbin", "Basic"}, {"functionalDescription", functionalDescription}};
+    try {
+        OpenMagnetics::magnetic_autocomplete(OpenMagnetics::Magnetic(json{{"core", core}, {"coil", coil}}));
+    }
+    catch (const OpenMagnetics::OpenMagneticsException& e) {
+        CHECK(e.code() == OpenMagnetics::ErrorCode::COIL_WINDING_ERROR);
+        return e.what();
+    }
+    return "";
+}
+
+json ungapped_core(const std::string& shape, const std::string& material) {
+    return {{"name", shape + " " + material},
+            {"functionalDescription", {{"type", "two-piece set"}, {"shape", shape}, {"material", material},
+                                       {"gapping", json::array()}, {"numberStacks", 1}}}};
+}
+
+}  // namespace
+
+// Bartecka, Klos, Paska (Energies 2024, 17, 55): RM 14, 10 turns of Litz 180x0.1 and 4 of Litz 400x0.1, round
+// bundles. The primary needs two 1.932 mm layers and the secondary one 2.880 mm layer, 6.744 mm side by side, and the
+// RM 14 former is 6.0 mm across: no split of the window holds them, and the refusal used to name only a turn
+// 635 um past the window, which read like a winder that never tried a second layer.
+TEST_CASE("Autocomplete refusal names the whole layers that do not fit side by side (ABT #2073)",
+          "[constructive-model][coil][magnetic-autocomplete][abt2073]") {
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    settings.reset();
+    json functionalDescription = json::array();
+    functionalDescription.push_back({{"name", "Primary"}, {"numberTurns", 10}, {"numberParallels", 1}, {"isolationSide", "primary"},
+                                     {"wire", "Litz 180x0.1 - Grade 1 - Unserved"}});
+    functionalDescription.push_back({{"name", "Secondary"}, {"numberTurns", 4}, {"numberParallels", 1}, {"isolationSide", "secondary"},
+                                     {"wire", {{"name", "Litz 400x0.1 bare"}, {"type", "litz"}, {"strand", "Round 0.1 - Grade 1"},
+                                               {"numberConductors", 400}, {"coating", {{"type", "bare"}}}}}});
+    const std::string what = autocomplete_refusal(ungapped_core("RM 14", "N97"), functionalDescription);
+    INFO(what);
+    CHECK(what.find("the whole layers of the windings need") != std::string::npos);
+    CHECK(what.find("it gives 6.000 mm") != std::string::npos);
+    CHECK(what.find("Primary section 0: 2 layers of up to 9 turns, 3.864 mm") != std::string::npos);
+    CHECK(what.find("as laid out, Primary parallel 0 turn 0") != std::string::npos);
+    settings.reset();
+}
+
+// Power Integrations DER-984: PQ 32/20 with 26 turns of served Litz 200x#42, one winding. Its turns need more layers
+// than the section is across, so wind_by_rectangular_layers crams the rest along the column; the refusal says how many
+// layers the turns need and how many fit.
+TEST_CASE("Autocomplete refusal of a single winding names the layers its turns need (ABT #2073)",
+          "[constructive-model][coil][magnetic-autocomplete][abt2073]") {
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    settings.reset();
+    // 30 T, the first count of this wire that does not fit this core. The 26 T of DER-720 (its published build,
+    // three layers on this bobbin) was refused here only while the bundle of NEMA #42 strands was sized with
+    // IEC 60317's factor; sized by its strand's standard it winds (Alf, 2026-10-28: fixture to 30 T).
+    json functionalDescription = json::array();
+    functionalDescription.push_back({{"name", "Boost inductor"}, {"numberTurns", 30}, {"numberParallels", 1}, {"isolationSide", "primary"},
+                                     {"wire", {{"name", "Litz 200x#42 served"}, {"type", "litz"}, {"strand", "Round 42.0 - Single Build"},
+                                               {"numberConductors", 200}, {"coating", {{"type", "served"}, {"numberLayers", 1}}}}}});
+    const std::string what = autocomplete_refusal(ungapped_core("PQ 32/20", "PC95"), functionalDescription);
+    INFO(what);
+    CHECK(what.find("section 'Boost inductor section 0' needs") != std::string::npos);
+    CHECK(what.find("room for") != std::string::npos);
+    CHECK(what.find("as laid out, Boost inductor parallel 0 turn 0") != std::string::npos);
+    settings.reset();
+}
+
+namespace {
+
 // Autocompletes `name` with the log collector on and returns the magnetic and every WARNING the
-// Utils module logged on the way.
+// stated-layout check (module "Winding layout") logged on the way.
 std::pair<OpenMagnetics::Magnetic, std::vector<std::string>> autocomplete_collecting_warnings(const std::string& name,
                                                                                             bool freshWind) {
     auto& logger = OpenMagnetics::Logger::getInstance();
@@ -961,7 +1033,7 @@ std::pair<OpenMagnetics::Magnetic, std::vector<std::string>> autocomplete_collec
         throw;
     }
     for (const auto& record : logger.drainCollected()) {
-        if (record.level == OpenMagnetics::LogLevel::WARNING && record.moduleOfOrigin == "Utils") {
+        if (record.level == OpenMagnetics::LogLevel::WARNING && record.moduleOfOrigin == "Winding layout") {
             warnings.push_back(record.message);
         }
     }
@@ -1007,6 +1079,190 @@ TEST_CASE("magnetic_autocomplete lays an unfit stated layout out in full and war
         CHECK(turnsLaidOut == turnsStated);
         CHECK_FALSE((coil.are_turns_inside_winding_window() && coil.are_sections_and_layers_fitting()));
     }
+    settings.reset();
+}
+
+// ABT #2071 (Alf, 2026-10-26): an unfit wind whose blocked fill cannot close OVERFLOWS ALONG THE TURN
+// AXIS. bug_capacitance_error (EL 18, 11 turns of 0.935 mm litz, stated sections, real winding): a
+// 2.8 mm layer holds 2 stations, the entrance lead's radial corridor takes 1 of them in every layer it
+// crosses and the other is that layer's closing station, so no layer the winding spills into holds a
+// turn. Those layers grow taller than the window instead, at the wire's pitch and clear of the
+// corridor, to 3 stations each (corridor + closing station + the 2 turns a layer of this window
+// holds): the fill closes in the 6 layers the ideal wind needs, blocking applied, every stated turn
+// laid out, and the copper past the window's top reported as TURNS_OUTSIDE_WINDOW.
+TEST_CASE("Real winding: an unfit wind whose layers cannot close beside the lead corridor grows them past the window",
+          "[constructive-model][coil][real-winding][magnetic-autocomplete][abt-2071]") {
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto [magnetic, warnings] = autocomplete_collecting_warnings("bug_capacitance_error.json", /*freshWind=*/true);
+    for (const auto& warning : warnings) {
+        UNSCOPED_INFO(warning);
+    }
+    auto& coil = magnetic.get_mutable_coil();
+    REQUIRE(coil.get_turns_description());
+    CHECK(coil.is_real_winding_blocking_applied());
+    CHECK_FALSE(coil.get_connection_reserved_spaces().empty());
+
+    const auto laidOut = coil.get_turns_description().value();
+    size_t turnsLaidOut = std::count_if(laidOut.begin(), laidOut.end(),
+                                        [](const auto& turn) { return turn.get_length() > 0; });
+    size_t turnsStated = 0;
+    for (const auto& winding : coil.get_functional_description()) {
+        turnsStated += winding.get_number_turns() * winding.get_number_parallels();
+    }
+    CHECK(turnsStated == 11);
+    CHECK(turnsLaidOut == turnsStated);
+
+    // 6 layers, as the ideal wind needs: one station per layer plus the 11 turns = 17 stations, layer
+    // 0 (no corridor, no closing station) with 2 and every other layer with 3, one more than the
+    // window holds.
+    size_t conductionLayers = 0;
+    std::map<std::string, size_t> stationsPerLayer;
+    const auto layersLaidOut = coil.get_layers_description().value();
+    for (const auto& layer : layersLaidOut) {
+        if (layer.get_type() == MAS::ElectricalType::CONDUCTION) {
+            ++conductionLayers;
+        }
+    }
+    for (const auto& turn : laidOut) {
+        REQUIRE(turn.get_layer());
+        stationsPerLayer[turn.get_layer().value()]++;
+    }
+    CHECK(conductionLayers == 6);
+    CHECK(laidOut.size() == 17);
+    size_t grownLayers = 0;
+    for (const auto& [layerName, stations] : stationsPerLayer) {
+        INFO(layerName << ": " << stations << " stations");
+        CHECK(stations <= 3);
+        grownLayers += stations == 3 ? 1 : 0;
+    }
+    CHECK(grownLayers == 5);
+
+    // Exact geometry: no two stations overlap, and the copper past the window is reported, on its
+    // top (the layers grew past the edge the corridor does not cross).
+    CHECK(coil.judge_copper_overlaps().empty());
+    const auto outside = coil.judge_turns_outside_window();
+    CHECK(std::any_of(outside.begin(), outside.end(), [](const OpenMagnetics::TurnOutsideWindow& turn) {
+        return turn.side == OpenMagnetics::TurnOutsideWindow::Side::TOP;
+    }));
+    OpenMagnetics::Mas mas;
+    mas.set_magnetic(magnetic);
+    size_t outsideReported = 0;
+    for (const auto& finding : OpenMagnetics::ResultsAnalyzer::analyze_results(mas)) {
+        outsideReported += finding.code == OpenMagnetics::ResultFindingCode::TURNS_OUTSIDE_WINDOW ? 1 : 0;
+    }
+    CHECK(outsideReported == 1);
+    settings.reset();
+}
+
+// ABT #2096 (Alf, 2026-10-26): turn-axis overflow is a LAST RESORT for a GIVEN layout. Under coating squish
+// with horizontal overflow (MVB_ALLOW_SQUISH=1) the ideal wind of bug_capacitance_error counts as fitting,
+// so the blocked fill refused its section ("cannot hold its 11 turns ... only its own closing station")
+// and autocomplete warned and kept a layout without the stated turns. Its sections are STATED, so that
+// refusal now ends in a second wind whose starved layers grow past the window: every stated turn is laid
+// out, the copper past the window is reported, and no lead runs over a turn.
+TEST_CASE("Real winding under squish: a stated layout whose layers cannot close beside the lead corridor grows past the window",
+          "[constructive-model][coil][real-winding][magnetic-autocomplete][abt-2096]") {
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    settings.set_coil_allow_coating_squish(true);
+    settings.set_coil_allow_horizontal_overflow(true);
+    OpenMagnetics::Magnetic magnetic;
+    REQUIRE_NOTHROW(magnetic = autocomplete_stored_design("bug_capacitance_error.json", /*freshWind=*/true));
+    auto& coil = magnetic.get_mutable_coil();
+    REQUIRE(coil.get_turns_description());
+    CHECK(coil.is_real_winding_blocking_applied());
+    INFO(coil.get_last_fit_failure());
+    CHECK_THAT(coil.get_last_fit_failure(), Catch::Matchers::ContainsSubstring("turn slots taller than the window"));
+    const auto laidOut = coil.get_turns_description().value();
+    size_t turnsLaidOut = std::count_if(laidOut.begin(), laidOut.end(),
+                                        [](const auto& turn) { return turn.get_length() > 0; });
+    CHECK(turnsLaidOut == 11);
+    CHECK(coil.judge_copper_overlaps().empty());
+    CHECK_FALSE(coil.judge_turns_outside_window().empty());
+    OpenMagnetics::Mas mas;
+    mas.set_magnetic(magnetic);
+    size_t outsideReported = 0;
+    for (const auto& finding : OpenMagnetics::ResultsAnalyzer::analyze_results(mas)) {
+        outsideReported += finding.code == OpenMagnetics::ResultFindingCode::TURNS_OUTSIDE_WINDOW ? 1 : 0;
+    }
+    CHECK(outsideReported == 1);
+    settings.reset();
+}
+
+// Alf (2026-10-27, "Layer 0 like the others"): on that last-resort wind of a stated layout, layer 0 is sized
+// like the grown layers after it. The 2.8 mm window holds 2 rows of the 0.935 mm litz (3 rows = 2.8048 mm);
+// the grown layers hold 2 turns plus their closing station, and layer 0 used to keep the window's 2 slots,
+// i.e. turn 0 plus its closing station. Now it takes 2 turns too and pushes its closing station out past the
+// window, reported like the others'. 11 turns: layers 0-4 carry 2 each, the last layer the 1 left.
+TEST_CASE("Real winding under squish: an overflowing stated layout fills its first layer like the grown ones",
+          "[constructive-model][coil][real-winding][magnetic-autocomplete][abt-2096]") {
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    settings.set_coil_allow_coating_squish(true);
+    settings.set_coil_allow_horizontal_overflow(true);
+    OpenMagnetics::Magnetic magnetic;
+    REQUIRE_NOTHROW(magnetic = autocomplete_stored_design("bug_capacitance_error.json", /*freshWind=*/true));
+    auto& coil = magnetic.get_mutable_coil();
+    REQUIRE(coil.get_turns_description());
+    REQUIRE(coil.get_layers_description());
+    INFO(coil.get_last_fit_failure());
+    const auto turns = coil.get_turns_description().value();
+    const auto layers = coil.get_layers_description().value();
+    std::vector<std::string> conductionLayers;
+    for (const auto& layer : layers) {
+        if (layer.get_type() == MAS::ElectricalType::CONDUCTION) {
+            conductionLayers.push_back(layer.get_name());
+        }
+    }
+    REQUIRE(conductionLayers.size() == 6);
+    std::vector<size_t> copperPerLayer;
+    for (const auto& layerName : conductionLayers) {
+        copperPerLayer.push_back(size_t(std::count_if(turns.begin(), turns.end(), [&](const auto& turn) {
+            return turn.get_layer() && turn.get_layer().value() == layerName && turn.get_length() > 0;
+        })));
+    }
+    CHECK(copperPerLayer == std::vector<size_t>{2, 2, 2, 2, 2, 1});
+    // Layer 0's closing station is pushed out past the window and reported.
+    const auto outside = coil.judge_turns_outside_window();
+    size_t layer0Outside = 0;
+    for (const auto& finding : outside) {
+        for (const auto& turn : turns) {
+            if (turn.get_name() == finding.turn && turn.get_layer() && turn.get_layer().value() == conductionLayers[0]) {
+                layer0Outside++;
+            }
+        }
+    }
+    CHECK(layer0Outside > 0);
+    CHECK(coil.judge_copper_overlaps().empty());
+    settings.reset();
+}
+
+// ABT #2096 (Alf, 2026-10-26): a layout MKF PLANS never overflows. The same design with its sections dropped,
+// under the same squish: the blocked fill refuses the section as one whose layer holds only its own closing
+// station, and autocomplete throws that reason, as a planned layout that does not fit always has.
+TEST_CASE("Real winding under squish: a planned layout whose layers cannot close is refused, not overflowed",
+          "[constructive-model][coil][real-winding][magnetic-autocomplete][abt-2096]") {
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    settings.reset();
+    settings.set_coil_use_real_winding_geometry(true);
+    settings.set_coil_allow_coating_squish(true);
+    settings.set_coil_allow_horizontal_overflow(true);
+    bool threw = false;
+    try {
+        autocomplete_stored_design("bug_capacitance_error.json", /*freshWind=*/true, /*dropSections=*/true);
+    }
+    catch (const OpenMagnetics::OpenMagneticsException& e) {
+        threw = true;
+        INFO(e.what());
+        CHECK(e.code() == OpenMagnetics::ErrorCode::COIL_WINDING_ERROR);
+        CHECK_THAT(std::string(e.what()), Catch::Matchers::ContainsSubstring("only its own closing station"));
+        CHECK_THAT(std::string(e.what()), !Catch::Matchers::ContainsSubstring("taller than the window"));
+    }
+    CHECK(threw);
     settings.reset();
 }
 
@@ -1227,7 +1483,7 @@ TEST_CASE("Real winding: a foil end's lead conductor named outside the wire data
         message = e.what();
     }
     INFO(message);
-    CHECK(message.find("lead conductor of winding") != std::string::npos);
+    CHECK(message.find("lead of winding") != std::string::npos);
     CHECK(message.find("No such lead wire") != std::string::npos);
     OpenMagnetics::Settings::GetInstance().reset();
 }
@@ -1403,6 +1659,35 @@ TEST_CASE("Real winding: a foil end's axial lead lies on the sheet and leaves pa
             CHECK_THAT(waypoint[0], Catch::Matchers::WithinAbs(axial.layerAxis, 1e-12));
         }
         alongFaceByEnd[route.kind][route.parallel] = axial.alongFace;
+        // The weld strip (Alf, 2026-10-19): the copper that makes lead and sheet one conductor.
+        // Sized by MKF's rule: sheet centre to lead centreline, sqrt(3)/2 of the lead's copper
+        // diameter wide, along the whole attach.
+        const auto& weld = axial.weld;
+        INFO("weld: layer " << weld.layerFrom * 1e3 << " -> " << weld.layerTo * 1e3 << " mm, width " << weld.width * 1e3
+                            << " mm, turn axis " << weld.from * 1e3 << " -> " << weld.to * 1e3 << " mm");
+        CHECK_THAT(weld.layerFrom, Catch::Matchers::WithinAbs(sheetX, 1e-9));
+        CHECK_THAT(weld.layerTo, Catch::Matchers::WithinAbs(axial.layerAxis, 1e-12));
+        CHECK_THAT(weld.width, Catch::Matchers::WithinAbs(std::sqrt(3.0) / 2 * leadCopper, 1e-9));
+        CHECK_THAT(weld.from, Catch::Matchers::WithinAbs(axial.attachFrom, 1e-12));
+        CHECK_THAT(weld.to, Catch::Matchers::WithinAbs(axial.attachTo, 1e-12));
+        // It lies ACROSS the contact line (the sheet's outer face, at the lead's centreline) ...
+        const double contactLayer = sheetX + sheetThickness / 2;
+        CHECK(weld.layerFrom < contactLayer - 1e-6);
+        CHECK(weld.layerTo > contactLayer + 1e-6);
+        // ... inside the sheet's copper and the lead's copper on the layer axis ...
+        CHECK(weld.layerFrom >= sheetX - sheetThickness / 2 - 1e-12);
+        CHECK(weld.layerTo <= axial.layerAxis + leadCopper / 2 + 1e-12);
+        // ... on this parallel's own sheet along the face, inside the lead's own column ...
+        CHECK(axial.alongFace - weld.width / 2 >= double(route.parallel) * leadOuter - 1e-9);
+        CHECK(weld.width < leadCopper);
+        // ... and within the sheet's height and the lead's extent on the turn axis.
+        const double weldLow = std::min(weld.from, weld.to);
+        const double weldHigh = std::max(weld.from, weld.to);
+        CHECK(weldHigh - weldLow > 0);
+        CHECK(weldLow >= sheetY - sheetHeight / 2 - 1e-9);
+        CHECK(weldHigh <= sheetY + sheetHeight / 2 + 1e-9);
+        CHECK(weldLow >= std::min(axial.attachFrom, axial.end) - 1e-12);
+        CHECK(weldHigh <= std::max(axial.attachFrom, axial.end) + 1e-12);
         // The reserved run starts at the sheet's edge: it never lies inside the sheet's copper.
         size_t reserved = 0;
         for (const auto& space : spaces) {
@@ -1423,6 +1708,253 @@ TEST_CASE("Real winding: a foil end's axial lead lies on the sheet and leaves pa
         for (const auto& [parallel, alongFace] : byParallel) {
             CHECK_THAT(alongFace, Catch::Matchers::WithinAbs((double(parallel) + 0.5) * leadOuter, 1e-9));
         }
+    }
+    settings.reset();
+}
+
+// ABT #2107 (2026-10-27): the crossing stations are counted per PARALLEL. The web's interleaved flyback
+// lays Secondary 0 (5 turns x 2 parallels) as parallel 0 in one section and parallel 1 in another, with
+// different layer counts. Counted per winding, every parallel was charged the stations of the parallel
+// with the most layers: the one with fewer layers carried the surplus as copper never stated (7 copper
+// turns for its 5) or was spread over layers of one turn each to hold it. Each parallel must carry exactly
+// its stated turns of copper, and exactly one length-free station per layer it spans.
+TEST_CASE("Real winding: every parallel carries its stated turns and one station per layer of its own (web flyback)",
+          "[constructive-model][coil][real-winding][abt-2107]") {
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(),
+                                                          "web_adviser_flows/flyback_interleaved_candidate_stored.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    auto stored = json::parse(file).at("magnetic");
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    settings.reset();
+    settings.set_coil_delimit_and_compact(true);
+    settings.set_coil_try_rewind(true);
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(OpenMagnetics::Core(stored.at("core")));
+    magnetic.set_coil(OpenMagnetics::Coil(stored.at("coil"), false));
+    OpenMagnetics::Magnetic rebuilt;
+    REQUIRE_NOTHROW(rebuilt = OpenMagneticsTesting::rebuild_with_real_winding_as_web(magnetic));
+    auto& coil = rebuilt.get_mutable_coil();
+    REQUIRE(coil.get_turns_description());
+    const auto turns = coil.get_turns_description().value();
+    std::map<std::pair<std::string, int64_t>, size_t> copperPerParallel;
+    std::map<std::pair<std::string, int64_t>, size_t> stationsPerParallel;
+    std::map<std::pair<std::string, int64_t>, std::set<std::string>> layersPerParallel;
+    for (const auto& turn : turns) {
+        REQUIRE(turn.get_layer());
+        const auto key = std::make_pair(turn.get_winding(), turn.get_parallel());
+        (turn.get_length() > 0 ? copperPerParallel : stationsPerParallel)[key]++;
+        layersPerParallel[key].insert(turn.get_layer().value());
+    }
+    size_t parallelsChecked = 0;
+    for (const auto& winding : coil.get_functional_description()) {
+        for (int64_t parallel = 0; parallel < winding.get_number_parallels(); ++parallel) {
+            const auto key = std::make_pair(winding.get_name(), parallel);
+            INFO(winding.get_name() << " parallel " << parallel << ": " << copperPerParallel[key] << " copper turns, "
+                 << stationsPerParallel[key] << " stations over " << layersPerParallel[key].size() << " layers");
+            CHECK(copperPerParallel[key] == size_t(winding.get_number_turns()));
+            CHECK(stationsPerParallel[key] == layersPerParallel[key].size());
+            ++parallelsChecked;
+        }
+    }
+    // Primary (1 parallel) and Secondary 0 (2 parallels, one per section).
+    CHECK(parallelsChecked == 3);
+    settings.reset();
+}
+
+// Refill campaign, bug 2 (2026-10-27): an edge row stacks under another only where their runs MEET radially.
+// The allocator used to open every new row under the deepest row of its edge. In the web's interleaved
+// flyback the Primary's section 0 -> section 1 continuation runs along the top edge over Secondary section 0
+// only, while the Secondary entrance runs along the same edge from Secondary section 1 out to the border:
+// radially disjoint, yet the continuation was laid a whole litz height (0.879 mm) down, under the Secondary
+// row, and Secondary section 0 lost a slot to a corridor no wire occupied. Two disjoint runs share a depth:
+// both lie flush at the edge, so their outer sides coincide.
+TEST_CASE("Real winding: radially disjoint edge runs share a depth (web flyback)",
+          "[constructive-model][coil][real-winding][edge-rows][abt-2107]") {
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(),
+                                                          "web_adviser_flows/flyback_interleaved_candidate_stored.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    auto stored = json::parse(file).at("magnetic");
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    settings.reset();
+    settings.set_coil_delimit_and_compact(true);
+    settings.set_coil_try_rewind(true);
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(OpenMagnetics::Core(stored.at("core")));
+    magnetic.set_coil(OpenMagnetics::Coil(stored.at("coil"), false));
+    OpenMagnetics::Magnetic rebuilt;
+    REQUIRE_NOTHROW(rebuilt = OpenMagneticsTesting::rebuild_with_real_winding_as_web(magnetic));
+    auto& coil = rebuilt.get_mutable_coil();
+    REQUIRE(coil.get_turns_description());
+    const auto bobbin = coil.resolve_bobbin();
+    const auto windingWindows = bobbin.get_processed_description().value().get_winding_windows();
+    const double windowCenterY = windingWindows[0].get_coordinates().value()[1];
+    const auto wires = coil.get_wires();
+
+    // The edge run of a route: its longest level segment (constant turn axis), as the coated radial span,
+    // the run's centre height and its coated height.
+    struct Run { std::string label; std::string winding; OpenMagnetics::ConnectionKind kind; std::string fromTurn; std::string toTurn;
+                 double lo; double hi; double y; double height; };
+    std::vector<Run> runs;
+    const auto layout = coil.get_connection_layout();
+    for (const auto& route : layout.routes) {
+        if (route.kind != OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE &&
+            route.kind != OpenMagnetics::ConnectionKind::TERMINAL_EXIT &&
+            route.kind != OpenMagnetics::ConnectionKind::EDGE_CONTINUATION) {
+            continue;
+        }
+        double bestLength = 0, lo = 0, hi = 0, y = 0;
+        for (size_t i = 1; i < route.waypoints.size(); ++i) {
+            const auto& a = route.waypoints[i - 1];
+            const auto& b = route.waypoints[i];
+            if (std::abs(a[1] - b[1]) > 1e-12) continue;
+            if (std::abs(a[0] - b[0]) > bestLength) {
+                bestLength = std::abs(a[0] - b[0]);
+                lo = std::min(a[0], b[0]);
+                hi = std::max(a[0], b[0]);
+                y = a[1];
+            }
+        }
+        if (bestLength == 0) continue;
+        const auto& wire = wires[coil.get_winding_index_by_name(route.winding)];
+        const double width = wire.get_maximum_outer_width();
+        const double height = route.sleeveOuterDiameter ? std::max(wire.get_maximum_outer_height(), route.sleeveOuterDiameter.value())
+                                                        : wire.get_maximum_outer_height();
+        runs.push_back({route.winding + " " + route.fromTurn + "->" + route.toTurn, route.winding, route.kind,
+                        route.fromTurn, route.toTurn, lo - width / 2, hi + width / 2, y, height});
+    }
+    const Run* continuation = nullptr;
+    const Run* secondaryEntrance = nullptr;
+    for (const auto& run : runs) {
+        if (run.y <= windowCenterY) continue;   // the top edge
+        if (run.winding == "Primary" && run.kind == OpenMagnetics::ConnectionKind::EDGE_CONTINUATION) continuation = &run;
+        if (run.winding == "Secondary 0" && run.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE) secondaryEntrance = &run;
+    }
+    // Premise: both runs lie on the top edge, and nothing on that edge meets the continuation radially.
+    REQUIRE(continuation != nullptr);
+    REQUIRE(secondaryEntrance != nullptr);
+    for (const auto& run : runs) {
+        if (run.y <= windowCenterY || &run == continuation) continue;
+        INFO(continuation->label << " [" << continuation->lo * 1e3 << ", " << continuation->hi * 1e3 << "] mm vs "
+             << run.label << " [" << run.lo * 1e3 << ", " << run.hi * 1e3 << "] mm");
+        REQUIRE((continuation->hi <= run.lo + 1e-12 || run.hi <= continuation->lo + 1e-12));
+    }
+    // Both flush at the edge: the row allocator stacked both rows at depth 0 (Alf, 2026-10-27, assertion
+    // rewritten with his approval: the allocator's depth, not the drawn faces, which the ABT #844 snap of
+    // a flush row onto its turn moves by nanometres).
+    auto allocatorDepthOf = [&](const Run& run) {
+        std::vector<double> depths;
+        for (const auto& space : coil.get_connection_reserved_spaces()) {
+            if (space.winding == run.winding && space.kind == run.kind && space.fromTurn == run.fromTurn &&
+                space.toTurn == run.toTurn && space.edgeRowStackDepth) {
+                depths.push_back(space.edgeRowStackDepth.value());
+            }
+        }
+        return depths;
+    };
+    const auto continuationDepths = allocatorDepthOf(*continuation);
+    const auto entranceDepths = allocatorDepthOf(*secondaryEntrance);
+    REQUIRE(continuationDepths.size() == 1);
+    REQUIRE_FALSE(entranceDepths.empty());
+    INFO("allocator depth: continuation " << continuationDepths[0] * 1e3 << " mm, Secondary entrance " << entranceDepths[0] * 1e3 << " mm");
+    CHECK(continuationDepths[0] == 0.0);
+    for (const double depth : entranceDepths) {
+        CHECK(depth == 0.0);
+    }
+    settings.reset();
+}
+
+TEST_CASE("Real winding: every parallel's entrance lead leaves by the edge its own first layer starts at (web flyback)",
+          "[constructive-model][coil][real-winding][entrance-edge][abt-2107]") {
+    // The web flyback interleaves Primary / Secondary / Primary / Secondary, and the Secondary's two parallels
+    // live in DIFFERENT sections: parallel 0 in Secondary section 0, parallel 1 alone in Secondary section 1.
+    // The edge a conductor's first layer starts winding from is fed back from its own entrance row; when that
+    // feedback was kept per WINDING (parallel 0's), parallel 1's first layer was wound from the bottom while its
+    // entrance row sat on the top edge, so the entrance lead ran up through its own turn 0_ending.
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(),
+                                                          "web_adviser_flows/flyback_interleaved_candidate_stored.json");
+    std::ifstream file(path);
+    REQUIRE(file.good());
+    auto stored = json::parse(file).at("magnetic");
+    auto& settings = OpenMagnetics::Settings::GetInstance();
+    settings.reset();
+    settings.set_coil_delimit_and_compact(true);
+    settings.set_coil_try_rewind(true);
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(OpenMagnetics::Core(stored.at("core")));
+    magnetic.set_coil(OpenMagnetics::Coil(stored.at("coil"), false));
+    OpenMagnetics::Magnetic rebuilt;
+    REQUIRE_NOTHROW(rebuilt = OpenMagneticsTesting::rebuild_with_real_winding_as_web(magnetic));
+    auto& coil = rebuilt.get_mutable_coil();
+    REQUIRE(coil.get_turns_description());
+    const auto turns = coil.get_turns_description().value();
+    std::map<std::string, MAS::Turn> turnByName;
+    for (const auto& turn : turns) {
+        turnByName.emplace(turn.get_name(), turn);
+    }
+
+    // Premise: Secondary 0 parallel 1 is wound alone in a section of its own (no parallel-0 turn shares a layer
+    // with its entrance turn), so its first layer is a chain of its own.
+    size_t entrancesChecked = 0;
+    bool secondaryParallel1Checked = false;
+    const auto layout = coil.get_connection_layout();
+    for (const auto& route : layout.routes) {
+        if (route.kind != OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE) {
+            continue;
+        }
+        REQUIRE(turnByName.count(route.toTurn));
+        const auto& entranceTurn = turnByName.at(route.toTurn);
+        REQUIRE(entranceTurn.get_layer());
+        const std::string entranceLayer = entranceTurn.get_layer().value();
+        const double entranceY = entranceTurn.get_coordinates()[1];
+        // The first layer's start edge: the entrance turn is the extreme of its own parallel's turns there.
+        bool othersAbove = false;
+        bool othersBelow = false;
+        bool otherParallelInLayer = false;
+        for (const auto& turn : turns) {
+            if (turn.get_name() == entranceTurn.get_name() || !turn.get_layer() || turn.get_layer().value() != entranceLayer) {
+                continue;
+            }
+            if (turn.get_parallel() != entranceTurn.get_parallel()) {
+                otherParallelInLayer = true;
+                continue;
+            }
+            (turn.get_coordinates()[1] > entranceY ? othersAbove : othersBelow) = true;
+        }
+        if (otherParallelInLayer || (!othersAbove && !othersBelow)) {
+            continue;   // N-filar layers follow their leading parallel; a lone-turn layer has no direction
+        }
+        INFO(route.toTurn << " in '" << entranceLayer << "' at y=" << entranceY * 1e3 << " mm");
+        REQUIRE(othersAbove != othersBelow);   // the entrance turn is where its first layer STARTS
+        const bool layerStartsAtBottom = othersAbove;
+        // The lead's edge: where its route goes from the turn (the farthest waypoint along the turn axis).
+        double farthestDy = 0;
+        for (const auto& waypoint : route.waypoints) {
+            if (std::abs(waypoint[1] - entranceY) > std::abs(farthestDy)) {
+                farthestDy = waypoint[1] - entranceY;
+            }
+        }
+        INFO("entrance lead moves " << farthestDy * 1e3 << " mm along the turn axis; first layer starts at the "
+             << (layerStartsAtBottom ? "bottom" : "top"));
+        if (std::abs(farthestDy) > 0) {
+            CHECK((farthestDy < 0) == layerStartsAtBottom);
+        }
+        ++entrancesChecked;
+        if (route.toTurn == "Secondary 0 parallel 1 turn 0") {
+            secondaryParallel1Checked = true;
+        }
+    }
+    REQUIRE(secondaryParallel1Checked);
+    CHECK(entrancesChecked >= 2);
+    // And no entrance lead crosses a turn of its own winding.
+    for (const auto& overlap : coil.judge_copper_overlaps()) {
+        if (overlap.kind != OpenMagnetics::CopperOverlapKind::LEAD_TURN ||
+            overlap.first.rfind("entrance lead of", 0) != 0) {
+            continue;
+        }
+        INFO(overlap.first << " x " << overlap.second << ": " << overlap.overlap * 1e3 << " mm");
+        CHECK(overlap.firstWinding != overlap.secondWinding);
     }
     settings.reset();
 }

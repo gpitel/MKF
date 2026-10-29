@@ -39,7 +39,7 @@ namespace OpenMagnetics {
         _painterMirroringDimension = defaults.magneticFieldMirroringDimension;
         _magneticFieldMirroringDimension = defaults.magneticFieldMirroringDimension;
         _harmonicAmplitudeThreshold = defaults.harmonicAmplitudeThreshold;
-        _coreLossesModelNames = {defaults.coreLossesModelDefault, CoreLossesModels::PROPRIETARY, CoreLossesModels::LOSS_FACTOR, CoreLossesModels::STEINMETZ, CoreLossesModels::ROSHEN};
+        _coreLossesModelNames = {defaults.coreLossesModelDefault, CoreLossesModels::PROPRIETARY, CoreLossesModels::LOSS_FACTOR, CoreLossesModels::LOSS_FACTOR_HYSTERESIS, CoreLossesModels::STEINMETZ, CoreLossesModels::ROSHEN};
 
         // Initialize centralized model configuration from defaults
         _magneticFieldStrengthModel = defaults.magneticFieldStrengthModelDefault;
@@ -166,6 +166,7 @@ namespace {
         add_to_fingerprint(text, _painterColorMargin);
         add_to_fingerprint(text, _painterColorSpacer);
         add_to_fingerprint(text, _painterColorShunt);
+        add_to_fingerprint(text, _painterColorCopperOverlap);
         add_to_fingerprint(text, _painterColorLines);
         add_to_fingerprint(text, _painterColorText);
         add_to_fingerprint(text, _painterColorCurrentDensity);
@@ -196,6 +197,7 @@ namespace {
         add_to_fingerprint(text, _coreAdviserSaturationDeratingTemperature);
         add_to_fingerprint(text, _thermalNetworkStrictGeometry);
         add_to_fingerprint(text, _allowMaterialDataExtrapolation);
+        add_to_fingerprint(text, _simulatorLossTemperatureLoop);
         add_to_fingerprint(text, _gappingStrategy);
         add_to_fingerprint(text, _wireAdviserIncludePlanar);
         add_to_fingerprint(text, _wireAdviserIncludeFoil);
@@ -313,6 +315,7 @@ namespace {
         _painterColorSilk = "0xe7e7e8";
         _painterColorSpacer = "0x3b3b3b";
         _painterColorShunt = "0x6a5acd";
+        _painterColorCopperOverlap = "0xff0000";
         _painterColorLines = "0x010000";
         _painterColorText = "0x000000";
         _painterColorCurrentDensity = "0x0892D0";
@@ -356,7 +359,9 @@ namespace {
         _coreAdviserSaturationDeratingTemperature = 100.0;
 
         _thermalNetworkStrictGeometry = true;
-        _allowMaterialDataExtrapolation = false;
+        // Alf, 2026-10-25: user/MAS data extrapolates with a WARNING; advisers never (barrier).
+        _allowMaterialDataExtrapolation = true;
+        _simulatorLossTemperatureLoop = true;
 
         _wireAdviserIncludePlanar = false;
         _wireAdviserIncludeFoil = false;
@@ -393,7 +398,7 @@ namespace {
 
         // Previously these survived reset(), leaking setter state across
         // tests/sessions (one cause of order-dependent adviser test results)
-        _coreLossesModelNames = {Defaults().coreLossesModelDefault, CoreLossesModels::PROPRIETARY, CoreLossesModels::LOSS_FACTOR, CoreLossesModels::STEINMETZ, CoreLossesModels::ROSHEN};
+        _coreLossesModelNames = {Defaults().coreLossesModelDefault, CoreLossesModels::PROPRIETARY, CoreLossesModels::LOSS_FACTOR, CoreLossesModels::LOSS_FACTOR_HYSTERESIS, CoreLossesModels::STEINMETZ, CoreLossesModels::ROSHEN};
         _coreLossesRequestedModel = std::nullopt;
         _circuitSimulatorCurveFittingMode = 0;
         _circuitSimulatorFracpoleOptions = std::nullopt;
@@ -793,6 +798,13 @@ namespace {
     }
     void Settings::set_painter_color_shunt(std::string value) {
         _painterColorShunt = value;
+    }
+
+    std::string Settings::get_painter_color_copper_overlap() const {
+        return _painterColorCopperOverlap;
+    }
+    void Settings::set_painter_color_copper_overlap(std::string value) {
+        _painterColorCopperOverlap = value;
     }
 
     std::string Settings::get_painter_color_lines() const {
@@ -1217,6 +1229,33 @@ namespace {
         _allowMaterialDataExtrapolation = value;
     }
 
+    // Depth of CatalogueSearchOnePassScope on this thread (ABT #2124, Alf 2026-10-28).
+    static thread_local int catalogueFilterOnePassScopes = 0;
+
+    CatalogueSearchOnePassScope::CatalogueSearchOnePassScope() {
+        ++catalogueFilterOnePassScopes;
+    }
+    CatalogueSearchOnePassScope::~CatalogueSearchOnePassScope() {
+        --catalogueFilterOnePassScopes;
+    }
+    bool CatalogueSearchOnePassScope::active() {
+        return catalogueFilterOnePassScopes > 0;
+    }
+
+    // Advisers keep the loss <-> temperature loop, whatever the caller chose for simulate: every adviser
+    // class holds a MaterialDataExtrapolationBarrier for its whole life, and the same count tells this
+    // getter an adviser is alive. The exception is the catalogue search, on its own thread
+    // (CatalogueSearchOnePassScope): one pass there (Alf, 2026-10-28).
+    bool Settings::get_simulator_loss_temperature_loop() const {
+        if (catalogueFilterOnePassScopes > 0) {
+            return false;
+        }
+        return _simulatorLossTemperatureLoop || materialDataExtrapolationBarriers.load() > 0;
+    }
+    void Settings::set_simulator_loss_temperature_loop(bool value) {
+        _simulatorLossTemperatureLoop = value;
+    }
+
     GappingOptimizationStrategy Settings::get_gapping_strategy() const {
         return _gappingStrategy;
     }
@@ -1298,7 +1337,7 @@ namespace {
         return _coreLossesModelNames;
     }
     void Settings::set_core_losses_preferred_model_name(CoreLossesModels value) {
-        _coreLossesModelNames = {value, CoreLossesModels::PROPRIETARY, CoreLossesModels::LOSS_FACTOR, CoreLossesModels::STEINMETZ, CoreLossesModels::ROSHEN};
+        _coreLossesModelNames = {value, CoreLossesModels::PROPRIETARY, CoreLossesModels::LOSS_FACTOR, CoreLossesModels::LOSS_FACTOR_HYSTERESIS, CoreLossesModels::STEINMETZ, CoreLossesModels::ROSHEN};
         _coreLossesRequestedModel = std::nullopt;
     }
     std::optional<CoreLossesModels> Settings::get_core_losses_requested_model() const {

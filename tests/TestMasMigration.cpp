@@ -339,3 +339,139 @@ TEST_CASE("Test_MasMigration_Old_Plastic_Spacer_Designs_Load_And_Compute_On_Ever
         }
     }
 }
+
+// ABT #1625: the pre-1.0 migration rewrote every string equal to an old enum spelling, wherever it
+// sat, so a winding named "Forward" became "forward" and a bobbin named "Basic" became "basic".
+// It now rewrites only the values of the keys whose enum carries the new spelling.
+TEST_CASE("Test_MasMigration_Rewrites_Enum_Fields_Only", "[constructive-model][mas-migration][abt-1625]") {
+    json document = json::parse(R"({
+        "coil": {"bobbin": "Basic",
+                 "functionalDescription": [{"name": "Forward", "isolationSide": "primary", "wire": "Custom"}],
+                 "layersDescription": [{"name": "Reverse", "insulationMaterial": "Industrial"}]},
+        "core": {"functionalDescription": {"type": "two-piece set", "name": "Power"}},
+        "inputs": {"designRequirements": {"topology": "Phase-Shifted Full-Bridge Converter",
+                                          "market": "Industrial",
+                                          "insulation": {"pollutionDegree": "P2", "overvoltageCategory": "OVC-II",
+                                                         "insulationType": "Basic", "cti": "Group I"}},
+                   "operatingPoints": [{"excitationsPerWinding": [{"current": {"processed": {"label": "Triangular"}}}]}]},
+        "application": ["Power", "Signal Processing"],
+        "sectionsAlignment": "inner or top"
+    })");
+    OpenMagnetics::compat::migrate_pre_1_0(document);
+
+    // Free text under non-enum keys is left alone.
+    CHECK(document["coil"]["bobbin"] == "Basic");
+    CHECK(document["coil"]["functionalDescription"][0]["name"] == "Forward");
+    CHECK(document["coil"]["functionalDescription"][0]["wire"] == "Custom");
+    CHECK(document["coil"]["layersDescription"][0]["name"] == "Reverse");
+    CHECK(document["coil"]["layersDescription"][0]["insulationMaterial"] == "Industrial");
+    CHECK(document["core"]["functionalDescription"]["name"] == "Power");
+
+    // Enum fields, including array elements under an enum key, are migrated.
+    CHECK(document["core"]["functionalDescription"]["type"] == "twoPieceSet");
+    CHECK(document["inputs"]["designRequirements"]["topology"] == "phaseShiftedFullBridgeConverter");
+    CHECK(document["inputs"]["designRequirements"]["market"] == "industrial");
+    CHECK(document["inputs"]["designRequirements"]["insulation"]["pollutionDegree"] == "PD2");
+    CHECK(document["inputs"]["designRequirements"]["insulation"]["overvoltageCategory"] == "II");
+    CHECK(document["inputs"]["designRequirements"]["insulation"]["insulationType"] == "basic");
+    CHECK(document["inputs"]["designRequirements"]["insulation"]["cti"] == "groupI");
+    CHECK(document["inputs"]["operatingPoints"][0]["excitationsPerWinding"][0]["current"]["processed"]["label"] == "triangular");
+    CHECK(document["application"] == json::array({"power", "signalProcessing"}));
+    CHECK(document["sectionsAlignment"] == "innerOrTop");
+
+    // A bare string has no key, so nothing says it is an enum value.
+    json bare = "Forward";
+    OpenMagnetics::compat::migrate_pre_1_0(bare);
+    CHECK(bare == "Forward");
+}
+
+// ABT #1480: MAS c2432e7 turned a core material's application into an array. A design exported
+// before it carries "application": "Power" on its inline material (750372745rA_PQ65, DMEGC
+// DMR96A), and loading it threw a bare nlohmann type_error 302 that named no field.
+TEST_CASE("Test_MasMigration_Core_Material_Application_String_Becomes_Array", "[constructive-model][core][mas-migration][abt-1480]") {
+    auto core = get_quick_core("ETD 34", get_ground_gap(0.001), 1, "N87");
+    json coreJson;
+    to_json(coreJson, core);
+    json materialJson;
+    to_json(materialJson, OpenMagnetics::find_core_material_by_name("N87"));
+    REQUIRE(materialJson.contains("permeability"));
+    materialJson["application"] = "Power";
+    coreJson["functionalDescription"]["material"] = materialJson;
+
+    std::optional<OpenMagnetics::Core> loaded;
+    REQUIRE_NOTHROW(loaded.emplace(coreJson));
+    auto application = loaded->resolve_material().get_application();
+    REQUIRE(application);
+    CHECK(application.value() == std::vector<MAS::MagneticApplication>{MAS::MagneticApplication::POWER});
+
+    // designRequirements.application is a single enum string and stays one.
+    json requirements = json::parse(R"({"designRequirements": {"application": "Power"}})");
+    OpenMagnetics::compat::migrate_pre_1_0(requirements);
+    CHECK(requirements["designRequirements"]["application"] == "power");
+}
+
+// ABT #1995: a coating thickness written as a bare number -- the core-coating form before MAS
+// efa299f (2026-10-01) made it a dimensionWithTolerance, and the same bare form on a wire coating.
+// Unmigrated, the generated converter read the number as an EMPTY dimension and the first consumer
+// threw ("DimensionWithTolerance has neither nominal, minimum nor maximum set"); 97 corpus chokes
+// saved by PyOM before efa299f were refused that way. Every entry point must read it as
+// {nominal: number} and give exactly what the wrapped form gives.
+namespace {
+json abt1995_toroid(json coatingThickness, json wireCoatingThickness) {
+    json magnetic = json::parse(R"({
+        "core": {"name": "abt1995", "functionalDescription": {"type": "toroidal", "material": "N30",
+                 "shape": "T 22/14/7.9", "gapping": [], "numberStacks": 1,
+                 "coating": {"type": "epoxy", "thickness": 0}}},
+        "coil": {"bobbin": "Dummy", "functionalDescription": [
+            {"name": "primary", "numberTurns": 12, "numberParallels": 1, "isolationSide": "primary",
+             "wire": {"type": "round", "material": "copper", "numberConductors": 1,
+                      "conductingDiameter": {"nominal": 0.0005}, "outerDiameter": {"nominal": 0.00056},
+                      "coating": {"type": "enamelled", "grade": 1, "thickness": 0, "material": "Polyurethane 155"}}}]}
+    })");
+    magnetic["core"]["functionalDescription"]["coating"]["thickness"] = coatingThickness;
+    magnetic["coil"]["functionalDescription"][0]["wire"]["coating"]["thickness"] = wireCoatingThickness;
+    return magnetic;
+}
+}
+
+TEST_CASE("Test_MasMigration_Bare_Number_Coating_Thickness_Reads_As_Nominal", "[constructive-model][mas-migration][abt1995][smoke-test]") {
+    const double coreCoating = 0.0003;
+    const double wireCoating = 0.00003;
+    json bare = abt1995_toroid(coreCoating, wireCoating);
+    json wrapped = abt1995_toroid(json{{"nominal", coreCoating}}, json{{"nominal", wireCoating}});
+    REQUIRE(bare["core"]["functionalDescription"]["coating"]["thickness"].is_number());
+    REQUIRE(bare["coil"]["functionalDescription"][0]["wire"]["coating"]["thickness"].is_number());
+
+    SECTION("Core(json)") {
+        OpenMagnetics::Core core(bare["core"]);
+        CHECK(core.get_coating_thickness() == coreCoating);
+    }
+    SECTION("Wire(json)") {
+        OpenMagnetics::Wire wire(bare["coil"]["functionalDescription"][0]["wire"]);
+        REQUIRE(wire.get_coating());
+        auto thickness = wire.resolve_coating()->get_thickness();
+        REQUIRE(thickness);
+        REQUIRE(thickness->get_nominal());
+        CHECK(thickness->get_nominal().value() == wireCoating);
+    }
+    SECTION("Magnetic(json) and from_json give the wrapped form's result") {
+        OpenMagnetics::Magnetic fromConstructor(bare);
+        OpenMagnetics::Magnetic fromJson;
+        OpenMagnetics::from_json(bare, fromJson);
+        OpenMagnetics::Magnetic reference(wrapped);
+        CHECK(fromConstructor.get_core().get_coating_thickness() == coreCoating);
+        CHECK(fromJson.get_core().get_coating_thickness() == coreCoating);
+
+        // End to end: the stray capacitance reads the core jacket and the wire enamel, so it is the
+        // number a lost or mis-read thickness changes (or throws on).
+        auto capacitanceOf = [](OpenMagnetics::Magnetic magnetic) {
+            auto completed = OpenMagnetics::magnetic_autocomplete(magnetic);
+            auto output = OpenMagnetics::StrayCapacitance().calculate_capacitance(completed);
+            return output.get_capacitance_among_windings().value().at("primary").at("primary");
+        };
+        double expected = capacitanceOf(reference);
+        CHECK(expected > 0);
+        CHECK(capacitanceOf(fromConstructor) == expected);
+        CHECK(capacitanceOf(fromJson) == expected);
+    }
+}

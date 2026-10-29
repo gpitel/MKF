@@ -817,7 +817,7 @@ namespace {
         SECTION("a winding with no turns, no parallels and no wire is not simulated") {
             auto mas = buildMas("", 0, 0, "");
             REQUIRE_THROWS_MATCHES(mas_autocomplete(mas), OpenMagnetics::InvalidInputException,
-                Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("winding 0 (''")
+                Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("winding 1: ")
                     && Catch::Matchers::ContainsSubstring("numberTurns is 0")
                     && Catch::Matchers::ContainsSubstring("numberParallels is 0")
                     && Catch::Matchers::ContainsSubstring("it names no wire")));
@@ -825,7 +825,7 @@ namespace {
         SECTION("a real turn count on the placeholder wire is not simulated either") {
             auto mas = buildMas("Primary", 10, 1, "Dummy");
             REQUIRE_THROWS_MATCHES(mas_autocomplete(mas), OpenMagnetics::InvalidInputException,
-                Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("winding 0 ('Primary')")
+                Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("winding 'Primary': ")
                     && Catch::Matchers::ContainsSubstring("placeholder 'Dummy'")));
         }
         SECTION("the geometry is still completed when no simulation is asked for") {
@@ -1161,6 +1161,73 @@ namespace {
         painter.export_svg();
     }
 
+    // magnetic_autocomplete reads the turns alignment, the sections orientation and the sections
+    // alignment its configuration asks for. All three were read with to_json(configuration[...], value),
+    // which writes the seed INTO the configuration: every requested turns alignment wound SPREAD, every
+    // sections orientation CONTIGUOUS and every sections alignment SPREAD (the layersOrientation read
+    // had the same fault, fixed with ABT #2071).
+    TEST_CASE("Test_Mas_Autocomplete_Reads_Requested_Alignments_And_Orientation", "[support][utils][abt-2086]") {
+        settings.reset();
+        settings.set_use_only_cores_in_stock(false);
+        auto autocompleteWith = [](const json& configuration) {
+            OpenMagnetics::Magnetic magnetic;
+            magnetic.set_core(find_core_by_name("PQ 32/30 - 3C90 - Gapped 0.492 mm"));
+            OpenMagnetics::Coil coil;
+            for (const std::string name : {"Primary", "Secondary"}) {
+                OpenMagnetics::Winding winding;
+                winding.set_name(name);
+                winding.set_number_turns(5);
+                winding.set_number_parallels(1);
+                winding.set_isolation_side(IsolationSide::PRIMARY);
+                winding.set_wire(find_wire_by_name("Round 0.4 - Grade 1"));
+                coil.get_mutable_functional_description().push_back(winding);
+            }
+            magnetic.set_coil(coil);
+            return magnetic_autocomplete(magnetic, configuration);
+        };
+        // The mean height of a winding's turns: a part-filled layer of 5 turns of 0.4 mm in the
+        // PQ 32/30 window sits at the top or the bottom as its alignment says.
+        auto meanHeight = [](const OpenMagnetics::Magnetic& magnetic, const std::string& winding) {
+            const auto turns = magnetic.get_coil().get_turns_description().value();
+            double sum = 0;
+            size_t count = 0;
+            for (const auto& turn : turns) {
+                if (turn.get_winding() == winding) {
+                    sum += turn.get_coordinates()[1];
+                    ++count;
+                }
+            }
+            REQUIRE(count > 0);
+            return sum / double(count);
+        };
+
+        auto top = autocompleteWith(json{{"turnsAlignment", "innerOrTop"}});
+        auto bottom = autocompleteWith(json{{"turnsAlignment", "outerOrBottom"}});
+        CHECK(top.get_coil().get_turns_alignment() == CoilAlignment::INNER_OR_TOP);
+        CHECK(bottom.get_coil().get_turns_alignment() == CoilAlignment::OUTER_OR_BOTTOM);
+        CHECK(meanHeight(top, "Primary") > meanHeight(bottom, "Primary") + 1e-3);
+
+        auto contiguous = autocompleteWith(json{{"windingOrientation", "contiguous"}});
+        auto overlapping = autocompleteWith(json{{"windingOrientation", "overlapping"}});
+        auto sectionsOrientation = [](OpenMagnetics::Magnetic& magnetic) {
+            const auto bobbin = magnetic.get_mutable_coil().resolve_bobbin();
+            const auto processed = bobbin.get_processed_description().value();
+            const auto windows = processed.get_winding_windows();
+            REQUIRE(windows[0].get_sections_orientation());
+            return windows[0].get_sections_orientation().value();
+        };
+        CHECK(sectionsOrientation(contiguous) == WindingOrientation::CONTIGUOUS);
+        CHECK(sectionsOrientation(overlapping) == WindingOrientation::OVERLAPPING);
+
+        auto centered = autocompleteWith(json{{"sectionAlignment", "centered"}});
+        const auto centeredBobbin = centered.get_mutable_coil().resolve_bobbin();
+        const auto centeredProcessed = centeredBobbin.get_processed_description().value();
+        const auto centeredWindows = centeredProcessed.get_winding_windows();
+        REQUIRE(centeredWindows[0].get_sections_alignment());
+        CHECK(centeredWindows[0].get_sections_alignment().value() == CoilAlignment::CENTERED);
+        settings.reset();
+    }
+
     TEST_CASE("Test_Mas_Autocomplete_Web_0", "[support][utils][bug][smoke-test]") {
         auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "geometricalDescriptionDebug.mas");
         auto mas = OpenMagneticsTesting::mas_loader(path.string());
@@ -1233,7 +1300,7 @@ namespace {
         // Names the winding, the part, and what could not be determined. The underlying
         // cause may still appear in parentheses — that is detail, not the whole message;
         // what must never happen again is the bare optional access on its own.
-        REQUIRE(message.find("winding 0 ('primary')") != std::string::npos);
+        REQUIRE(message.find("winding 'primary' of magnetic") != std::string::npos);
         REQUIRE(message.find("ABT823_UNDERIVABLE") != std::string::npos);
         REQUIRE(message.find("outer dimensions") != std::string::npos);
         REQUIRE(message != "bad optional access");
@@ -1503,4 +1570,47 @@ TEST_CASE("Test_Autocomplete_Throws_On_An_Unknown_Litz_Outer_Coating_Material", 
     REQUIRE_THROWS_WITH(OpenMagnetics::magnetic_autocomplete(magneticIn),
                         Catch::Matchers::ContainsSubstring("Not A Real Insulation Material"));
     settings.reset();
+}
+
+// ABT #1643: the first read_log() lowered the global logger level to WARNING for good, so every sink
+// (the console included) got WARNING entries from then on. The capture sink now has its own level.
+TEST_CASE("Test_Read_Log_Captures_Warnings_Without_Changing_The_Logger_Level", "[support][utils][abt-1643]") {
+    auto& logger = Logger::getInstance();
+    const LogLevel levelBefore = logger.getLevel();
+    read_log();  // starts the capture on first use, and drains it
+    CHECK(logger.getLevel() == levelBefore);
+    logEntry("abt-1643 read_log probe", "Coil", 1);  // verbosity 1 = WARNING
+    CHECK_THAT(read_log(), Catch::Matchers::ContainsSubstring("abt-1643 read_log probe"));
+    CHECK(logger.getLevel() == levelBefore);
+}
+
+// Log records reach the web's Engine log with their module as the source a design engineer reads:
+// MKF identifiers are translated, the translated names are kept, and an entry without a module, or
+// with one nobody named, is refused loudly at any level, never shown with a blank or generic source.
+TEST_CASE("Test_Log_Module_Is_Named_For_People_And_Required", "[support][utils][logger]") {
+    auto& logger = Logger::getInstance();
+    logger.disableCollector();
+    logger.enableCollector(LogLevel::TRACE);
+
+    logEntry("translated", "Coil", 1);
+    logEntry("kept", "Operating points", 1);
+    logger.warning("extrapolated", kMaterialDataExtrapolationModule);
+    auto records = logger.drainCollected();
+    REQUIRE(records.size() == 3);
+    CHECK(records[0].moduleOfOrigin == "Winding");
+    CHECK(records[1].moduleOfOrigin == "Operating points");
+    CHECK(records[2].moduleOfOrigin == "Material data extrapolation");
+
+    CHECK(user_facing_log_module("Inputs", "") == "Operating points");
+    CHECK(user_facing_log_module("CoreAdviser", "") == "Core adviser");
+    CHECK(user_facing_log_module("Temperature", "") == "Thermal model");
+
+    // Refused whatever the level, including one no sink or collector would keep.
+    CHECK_THROWS_WITH(logEntry("no module", "", 1), Catch::Matchers::ContainsSubstring("has no module"));
+    CHECK_THROWS_WITH(logEntry("no module", "", 3), Catch::Matchers::ContainsSubstring("has no module"));
+    CHECK_THROWS_WITH(logger.log(LogLevel::TRACE, "", "no module"), Catch::Matchers::ContainsSubstring("has no module"));
+    CHECK_THROWS_WITH(logger.error("unnamed", "Utils"),
+                      Catch::Matchers::ContainsSubstring("Log module 'Utils' has no user-facing name"));
+    CHECK(logger.drainCollected().empty());
+    logger.disableCollector();
 }

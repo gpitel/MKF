@@ -70,6 +70,7 @@
 #include "processors/Inputs.h"
 #include "processors/ResultsAnalyzer.h"
 #include "physical_models/MagnetizingInductance.h"
+#include "physical_models/LeakageInductance.h"
 #include "support/Settings.h"
 #include "support/Utils.h"
 #include "support/Exceptions.h"
@@ -255,15 +256,9 @@ const std::map<std::string, Snapshot> kSnapshots = {
     // model rejects → the double-call cannot be observed at this fixture.
     {"LOSSES_NO_PROXIMITY",                             {false, 0.0}},
     {"DIMENSIONS",                                      {true,  2.0178200000000003e-05}},
-    // LOCKS BUG (ABT #787): MagneticFilterAreaNoParallels compares
-    // `wire.get_maximum_outer_width() < section.get_dimensions()[0]` — STRICTLY.
-    // A section holding exactly one layer is compacted to exactly one wire width,
-    // so the comparison is an exact float equality and the winding is rejected.
-    // Here winding 1 (20 turns, one 1.062 mm layer) trips it, so the filter says
-    // false for a coil that fits with room to spare. Not fixture-dependent: any
-    // single-layer section hits it. Locked as {false, 0.0}; when #787 lands this
-    // flips back to {true, 0.0} and that is the signal, not a regression.
-    {"AREA_NO_PARALLELS",                               {false, 0.0}},
+    // ABT #787 (Alf 2026-10-24): winding 1 (20 turns, one 1.062 mm layer) sits in a section exactly one
+    // wire wide; the strict < rejected it on a float equality. Fixed to <= at nm rounding: {false, 0} -> {true, 0}.
+    {"AREA_NO_PARALLELS",                               {true,  0.0}},
     {"EFFECTIVE_RESISTANCE",                            {false, 0.0}},
     {"PROXIMITY_FACTOR",                                {false, 0.0}},
     {"TURNS_RATIOS",                                    {true,  0.0}},
@@ -515,7 +510,7 @@ TEST_CASE("MagneticFilter CORE_MINIMUM_IMPEDANCE snapshot",
 }
 
 TEST_CASE("MagneticFilter AREA_NO_PARALLELS snapshot",
-          "[magnetic-filter][characterisation][heavy][area-no-parallels]") {
+          "[magnetic-filter][characterisation][heavy][area-no-parallels][abt-787]") {
     evaluate_and_check("AREA_NO_PARALLELS", MagneticFilters::AREA_NO_PARALLELS);
 }
 
@@ -632,6 +627,34 @@ TEST_CASE("MagneticFilter HEIGHT snapshot",
 TEST_CASE("MagneticFilter TEMPERATURE_RISE snapshot",
           "[magnetic-filter][characterisation][heavy][temperature-rise]") {
     evaluate_and_check("TEMPERATURE_RISE", MagneticFilters::TEMPERATURE_RISE);
+}
+
+// The temperature-rise filter uses the core temperature model selected in the settings; it used to
+// build Defaults::coreTemperatureModelDefault (Maniktala) whatever was selected.
+TEST_CASE("MagneticFilter TEMPERATURE_RISE uses the core temperature model of the settings",
+          "[magnetic-filter][temperature-rise][abt-1230]") {
+    settings.reset();
+    auto examplePath = std::filesystem::path{std::source_location::current().file_name()}
+        .parent_path().append("..").append("MAS").append("examples").append("01_simple_inductor_etd34_n87.json");
+    REQUIRE(std::filesystem::exists(examplePath));
+    auto exampleMas = OpenMagneticsTesting::mas_loader(examplePath.string());
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(exampleMas.get_magnetic());
+    auto inputs = OpenMagnetics::inputs_autocomplete(exampleMas.get_inputs(), magnetic);
+    if (!magnetic.get_coil().get_turns_description()) {
+        magnetic.get_mutable_coil().wind();
+    }
+    auto evaluate = [&](CoreTemperatureModels model) {
+        settings.set_core_temperature_model(model);
+        auto magneticCopy = magnetic;
+        return MagneticFilterTemperatureRise().evaluate_magnetic(&magneticCopy, &inputs).second;
+    };
+    double maniktala = evaluate(CoreTemperatureModels::MANIKTALA);
+    double kazimierczuk = evaluate(CoreTemperatureModels::KAZIMIERCZUK);
+    settings.reset();
+    const double ambientTemperature = inputs.get_maximum_temperature();
+    INFO("ambient " << ambientTemperature << " C, Maniktala " << maniktala << " C, Kazimierczuk " << kazimierczuk << " C");
+    REQUIRE(maniktala > ambientTemperature + 1);
+    CHECK(std::fabs(kazimierczuk - maniktala) > 1e-3 * (maniktala - ambientTemperature));
 }
 
 TEST_CASE("MagneticFilter LOSSES_TIMES_VOLUME snapshot",
@@ -1220,6 +1243,60 @@ TEST_CASE("Processed-only excitation advises without a bad optional access (ABT 
     CHECK_THAT(requiredEnergy, Catch::Matchers::WithinRel(1.25e-3, 0.05));
 }
 
+TEST_CASE("EnergyStored passes a voltage-driven design only when told to, never an inductor (ABT #1891)",
+          "[adviser][magnetic-filter][abt-1891]") {
+    // The core adviser's ferrite path culls with EnergyStored before its pre-loss prune. A
+    // transformer's windings are voltage-driven: its flux is the saturation filter's check, and
+    // 1/2 L I^2 of its magnetizing inductance and current is not an energy it has to store, so the
+    // ferrite cull passes it (set_pass_voltage_driven). An inductor is still judged on its energy.
+    auto make_inputs = [](bool transformer) {
+        json excitation = json();
+        excitation["frequency"] = 100000;
+        excitation["current"]["processed"]["dutyCycle"] = 0.5;
+        excitation["current"]["processed"]["label"] = "Triangular";
+        excitation["current"]["processed"]["offset"] = 0;
+        excitation["current"]["processed"]["peakToPeak"] = 10;
+        json operatingPoint = json();
+        operatingPoint["name"] = "Nominal";
+        operatingPoint["conditions"]["ambientTemperature"] = 25;
+        json inputsJson = json();
+        if (transformer) {
+            inputsJson["designRequirements"]["magnetizingInductance"]["minimum"] = 1e-3;
+            inputsJson["designRequirements"]["turnsRatios"] = json::array({json{{"nominal", 1}}});
+            inputsJson["designRequirements"]["isolationSides"] = json::array({"primary", "secondary"});
+            // A transformer's required energy is read from its magnetizing current.
+            excitation["magnetizingCurrent"] = excitation["current"];
+            excitation["magnetizingCurrent"]["processed"]["peak"] = 5;
+            operatingPoint["excitationsPerWinding"] = json::array({excitation, excitation});
+        }
+        else {
+            inputsJson["designRequirements"]["magnetizingInductance"]["nominal"] = 1e-3;
+            inputsJson["designRequirements"]["turnsRatios"] = json::array();
+            operatingPoint["excitationsPerWinding"] = json::array({excitation});
+        }
+        inputsJson["operatingPoints"] = json::array({operatingPoint});
+        return OpenMagnetics::Inputs(inputsJson);
+    };
+    auto magnetic = OpenMagneticsTesting::get_quick_magnetic("E 13/7/4", OpenMagneticsTesting::get_ground_gap(1e-4), {10, 10});
+
+    for (bool transformer : {true, false}) {
+        INFO((transformer ? "transformer" : "inductor"));
+        auto inputs = make_inputs(transformer);
+        OpenMagnetics::MagneticEnergy magneticEnergy;
+        const double required = OpenMagnetics::resolve_dimensional_values(magneticEnergy.calculate_required_magnetic_energy(inputs));
+        const double storable = magneticEnergy.calculate_core_maximum_magnetic_energy(magnetic.get_core(), inputs.get_operating_point(0));
+        INFO("required " << required << " J, storable " << storable << " J");
+        // The core cannot hold the energy, so the plain filter rejects it either way.
+        REQUIRE(storable < required * OpenMagnetics::defaults.coreAdviserThresholdValidity);
+        OpenMagnetics::MagneticFilterEnergyStored plain(inputs, {});
+        CHECK_FALSE(plain.evaluate_magnetic(&magnetic, &inputs).first);
+
+        OpenMagnetics::MagneticFilterEnergyStored passVoltageDriven(inputs, {});
+        passVoltageDriven.set_pass_voltage_driven(true);
+        CHECK(passVoltageDriven.evaluate_magnetic(&magnetic, &inputs).first == transformer);
+    }
+}
+
 // ABT #1410: design mode holds maximumDimensions as the part can be mounted. A bobbin-wound
 // part keeps its height (laying it down needs a horizontal bobbin the design doesn't have) but
 // may be turned on the board (width and depth swap). A toroid mounts flat or on edge on a
@@ -1269,6 +1346,7 @@ TEST_CASE("MagneticAdviser catalogue path drops parts whose material has no loss
           "[adviser][magnetic-adviser][abt-1456]") {
     settings.reset();
     clear_databases();
+    settings.set_allow_material_data_extrapolation(false);  // the default is on since Alf, 2026-10-25
 
     auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(
         100000, 100e-6, 25, WaveformLabel::TRIANGULAR, 2, 0.5, 1);
@@ -1827,6 +1905,7 @@ OpenMagnetics::Inputs make_cmc_inputs_with_mains() {
 
 TEST_CASE("MagneticAdviser_Loss_Span_Gate_Keeps_A_Part_When_No_Losses_Are_Computed", "[magnetic-adviser][loss-span-gate][covered-band]") {
     settings.reset();
+    settings.set_allow_material_data_extrapolation(false);  // the default is on since Alf, 2026-10-25
     auto part = make_p47_cmc();
     auto inputs = make_cmc_inputs_with_mains();
     REQUIRE_FALSE(MagneticFilterLossModelFrequencySpan::is_material_evaluable(part.get_core().resolve_material(), inputs));
@@ -2253,4 +2332,130 @@ TEST_CASE("MagneticFilter CORE_AND_DC_LOSSES turn sweep stops at the last count 
     REQUIRE_NOTHROW(verdict = filter.evaluate_magnetic(&saturated, &inputs));
     CHECK(verdict == std::pair<bool, double>{false, 0.0});
     settings.reset();
+}
+
+TEST_CASE("MagneticFilter SATURATION keeps a powder DMC choke driven past 100 Oe but short of its saturation field",
+          "[magnetic-filter][saturation][dmc][abt-1786]") {
+    // The default DMC wizard inputs (two windings, 50 Hz line current with its switching ripple). With the line swing
+    // read on the magnetisation curve (ABT #1786), the line peak of these powder chokes lies above 7957 A/m (100 Oe),
+    // the placeholder saturation field every powder material in MAS used to carry: the filter's field criterion
+    // (peak H * margin > H_sat) refused every DMC candidate there although B on the curve stayed at 0.3-0.6 of B_sat.
+    // MAS now gives each such material's H_sat as H10, the field where its own DC-bias curve has fallen to 10 % of
+    // the initial permeability (material.json's definition): Edge 90 22.4 kA/m, Kool Mu MAX 26 64.7 kA/m.
+    // Edge 90 on T 75/44/36 with 46 + 46 turns is the default DMC adviser's pick.
+    settings.reset();
+    clear_databases();
+    std::ifstream file(OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "dmc/dmc_default_inputs.json"));
+    REQUIRE(file.good());
+    OpenMagnetics::Inputs inputs(json::parse(file));
+    double placeholderFieldStrength = 7957;
+    double margin = settings.get_core_adviser_saturation_margin();
+    // The filter judges at the hot corner: the ambient, or the derating temperature when that is hotter.
+    double temperature = std::max(inputs.get_operating_point(0).get_conditions().get_ambient_temperature(),
+                                  settings.get_core_adviser_saturation_derating_temperature());
+    for (std::string materialName : {"Edge 90", "Kool Mµ MAX 26"}) {
+        auto magnetic = OpenMagneticsTesting::get_quick_magnetic("T 75/44/36", json::array(), {46, 46}, 1, materialName);
+        auto operatingPoint = inputs.get_operating_point(0);
+        MagnetizingInductance model;
+        model.set_topology(inputs.get_design_requirements().get_topology());
+        auto fluxDensity = model.calculate_inductance_and_magnetic_flux_density(magnetic.get_core(), magnetic.get_coil(), &operatingPoint).second;
+        auto dcBiasPoint = model.get_last_dc_bias_point();
+        REQUIRE(dcBiasPoint);
+        REQUIRE(dcBiasPoint->peakMagneticFieldStrength);
+        double peakFieldStrength = dcBiasPoint->peakMagneticFieldStrength.value();
+        double saturationFieldStrength = magnetic.get_mutable_core().get_magnetic_field_strength_saturation(temperature);
+        double peakFluxDensity = ResultsAnalyzer::get_peak_flux_density(fluxDensity);
+        double saturationFluxDensity = magnetic.get_mutable_core().get_magnetic_flux_density_saturation(temperature, false);
+        INFO(materialName << ": H peak " << peakFieldStrength << " A/m (x " << margin << "), H_sat " << saturationFieldStrength
+             << " A/m at " << temperature << " C; B peak " << peakFluxDensity << " T, B_sat " << saturationFluxDensity << " T");
+        // Past the old placeholder: the case it refused.
+        CHECK(peakFieldStrength * margin > placeholderFieldStrength);
+        CHECK(peakFieldStrength * margin < saturationFieldStrength);
+        CHECK(peakFluxDensity * margin < saturationFluxDensity);
+        MagneticFilterSaturation filter;
+        CHECK(filter.evaluate_magnetic(&magnetic, &inputs).first);
+    }
+    settings.reset();
+}
+
+TEST_CASE("MagneticFilter LEAKAGE_INDUCTANCE normalises a DMC by the magnetizing inductance of the DMC topology",
+          "[magnetic-filter][leakage-inductance][dmc][abt-1787]") {
+    // Without the topology the magnetizing-inductance model cannot tell the DMC from a CMC and drives the
+    // core with the CMC's magnetizing current (a triangle of the whole line swing at the switching frequency).
+    settings.reset();
+    clear_databases();
+    std::ifstream file(OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "dmc/dmc_default_inputs.json"));
+    REQUIRE(file.good());
+    OpenMagnetics::Inputs inputs(json::parse(file));
+    REQUIRE(inputs.get_design_requirements().get_topology() == Topology::DIFFERENTIAL_MODE_CHOKE);
+    auto magnetic = OpenMagneticsTesting::get_quick_magnetic("T 75/44/36", json::array(), {46, 46}, 1, "Edge 90");
+    // get_quick_magnetic strips the turns; the leakage needs them, so keep the same quick coil wound.
+    magnetic.set_coil(OpenMagneticsTesting::get_quick_coil({46, 46}, {1, 1}, "T 75/44/36", 1));
+    REQUIRE(magnetic.get_coil().get_turns_description());
+
+    double frequency = inputs.get_operating_point(0).get_excitations_per_winding()[0].get_frequency();
+    double leakageInductance = resolve_dimensional_values(
+        LeakageInductance().calculate_leakage_inductance(magnetic, frequency, 0, 1).get_leakage_inductance_per_winding()[0]);
+    auto magnetizingInductanceWith = [&](std::optional<Topology> topology) {
+        MagnetizingInductance model("ZHANG");
+        model.set_topology(topology);
+        auto operatingPoint = inputs.get_operating_point(0);
+        return resolve_dimensional_values(model.calculate_inductance_from_number_turns_and_gapping(
+            magnetic.get_mutable_core(), magnetic.get_mutable_coil(), &operatingPoint).get_magnetizing_inductance());
+    };
+    double dmcMagnetizingInductance = magnetizingInductanceWith(inputs.get_design_requirements().get_topology());
+    double cmcBranchMagnetizingInductance = magnetizingInductanceWith(std::nullopt);
+    INFO("Lk " << leakageInductance << " H; Lm " << dmcMagnetizingInductance << " H as a DMC, " << cmcBranchMagnetizingInductance << " H without the topology");
+    REQUIRE(std::abs(dmcMagnetizingInductance / cmcBranchMagnetizingInductance - 1) > 1e-3);  // the check can tell them apart
+
+    MagneticFilterLeakageInductance filter;
+    auto [valid, scoring] = filter.evaluate_magnetic(&magnetic, &inputs);
+    CHECK(valid);
+    CHECK_THAT(scoring, Catch::Matchers::WithinRel(leakageInductance / dmcMagnetizingInductance, 1e-9));
+    settings.reset();
+}
+
+// Alf, 2026-10-28: a powder's inductance rolls off with its bias, so the saturation filter's current gate takes its
+// saturation current from the inductance at the operating point, not at zero bias. The design: Infineon DN 2013-01's
+// 1200 W PFC choke, two stacked Kool Mu 60 toroids (MAS T 40/24/14.5), 64 turns, 22.5 A at the line peak; the source
+// runs it at 0.85 T and measures 680 uH falling to 165 uH at full load.
+TEST_CASE("The saturation filter judges a powder's saturation current on its rolled-off inductance", "[powder-isat]") {
+    const double frequency = 100e3;
+    const double dcCurrent = 21.5;
+    const int samples = 64;
+    json time = json::array(), data = json::array();
+    for (int k = 0; k <= samples; ++k) {
+        time.push_back(k / (samples * frequency));
+        data.push_back(dcCurrent + (k < samples / 2 ? -1.0 + 2.0 * k / (samples / 2) : 1.0 - 2.0 * (k - samples / 2) / (samples / 2)));
+    }
+    OpenMagnetics::Inputs inputs(json{
+        {"designRequirements", {{"magnetizingInductance", {{"minimum", 165e-6}}},
+                                {"turnsRatios", json::array()}, {"isolationSides", {"primary"}}, {"topology", "buckConverter"}}},
+        {"operatingPoints", {{{"name", "line peak"}, {"conditions", {{"ambientTemperature", 25}}},
+                              {"excitationsPerWinding", {{{"name", "Primary"}, {"frequency", frequency},
+                                                          {"current", {{"waveform", {{"time", time}, {"data", data}}}}}}}}}}}});
+    OpenMagneticsTesting::QuickMagneticConfig cfg;
+    cfg.numberTurns = {64};
+    cfg.numberParallels = {1};
+    cfg.coreShapeName = "T 40/24/14.5";
+    cfg.coreMaterialName = "Kool Mµ 60";
+    cfg.wireNames = {"Round 1.00 - Grade 1"};
+    cfg.numberStacks = 2;
+    auto magnetic = OpenMagneticsTesting::create_quick_test_magnetic(cfg);
+    REQUIRE(magnetic.get_mutable_core().resolve_material().get_material() == MAS::MaterialType::POWDER);
+
+    const double margin = Settings::GetInstance().get_core_adviser_saturation_margin();
+    auto operatingPoint = inputs.get_operating_points()[0];
+    const double currentPeak = operatingPoint.get_excitations_per_winding()[0].get_current()->get_processed()->get_peak().value();
+    const double temperature = 25;
+    const double zeroBias = magnetic.calculate_saturation_current(temperature, false);
+    const double rolledOff = magnetic.calculate_saturation_current(operatingPoint, temperature, false);
+    INFO("I peak " << currentPeak << " A, margin " << margin << ", I_sat at zero bias " << zeroBias << " A, at the operating point " << rolledOff << " A");
+    // The premise: the zero-bias inductance calls it saturated, the rolled-off one does not.
+    REQUIRE(zeroBias < margin * currentPeak);
+    REQUIRE(rolledOff > margin * currentPeak);
+
+    MagneticFilterSaturation filter;
+    auto [valid, scoring] = filter.evaluate_magnetic(&magnetic, &inputs, nullptr);
+    CHECK(valid);
 }

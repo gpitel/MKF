@@ -1,6 +1,6 @@
 #include "advisers/CoreAdviser.h"
 #include "advisers/MagneticFilter.h"
-#include "advisers/MagneticFilterInternal.h"  // is_energy_storing_topology
+#include "advisers/MagneticFilterInternal.h"  // is_transformer_role
 #include "constructive_models/Bobbin.h"
 #include "constructive_models/Insulation.h"
 #include "constructive_models/NumberTurns.h"
@@ -127,7 +127,7 @@ CoreAdviser::GappingConstraints CoreAdviser::calculate_gapping_constraints(Input
             // fallback is named, logged, and bounded — not a hidden default.
             logEntry(std::string("Golden-section gap optimization failed (")
                      + e.what() + "), falling back to SIMPLE strategy for core "
-                     + core.get_name().value_or("unnamed"), "CoreAdviser");
+                     + core.get_name().value_or("unnamed"), "CoreAdviser", 1);
             constraints.optimalGap = effectiveMinGap;
         }
     } else {
@@ -147,32 +147,59 @@ double CoreAdviser::calculate_gap_for_fringing_factor(double targetFringingFacto
 double CoreAdviser::get_peak_current(Inputs inputs) {
     double peakCurrent = 0.0;
 
-    // For transformers (forward converters), core saturation is driven by
-    // magnetizing current only. The reflected secondary current is balanced and does
-    // not contribute to net flux. Using actual current would oversize the core.
-    bool isTransformerTopology = !is_inductor(inputs);
-
+    // The current that saturates the core is the magnetizing current, whatever the magnetic does:
+    // the one the inputs carry when there is one; else on a single winding its own current; else,
+    // when every winding carries a current waveform, the net ampere-turns referred to the primary
+    // (a transformer's load currents cancel in it, a coupled inductor's add). Without either there
+    // is no magnetizing current to read (a voltage-driven design whose magnetizing current is not
+    // derived yet), and the operating point adds nothing.
+    const bool singleWinding = is_single_winding_design(inputs);
     for (auto& op : inputs.get_operating_points()) {
         auto excitation = Inputs::get_primary_excitation(op);
 
-        // Check magnetizing current
         if (excitation.get_magnetizing_current() &&
             excitation.get_magnetizing_current()->get_processed() &&
             excitation.get_magnetizing_current()->get_processed()->get_peak()) {
             peakCurrent = std::max(peakCurrent,
                 excitation.get_magnetizing_current()->get_processed()->get_peak().value());
+            continue;
         }
 
-        // Check actual current only for energy-storing topologies (e.g. flyback, boost)
-        // and inductors (identified by having a nominal inductance).
-        // For pure transformer topologies the actual current includes reflected secondary
-        // load current which does not bias the core.
-        if (!isTransformerTopology &&
-            excitation.get_current() &&
-            excitation.get_current()->get_processed() &&
-            excitation.get_current()->get_processed()->get_peak()) {
-            peakCurrent = std::max(peakCurrent,
-                excitation.get_current()->get_processed()->get_peak().value());
+        if (singleWinding) {
+            if (excitation.get_current() &&
+                excitation.get_current()->get_processed() &&
+                excitation.get_current()->get_processed()->get_peak()) {
+                peakCurrent = std::max(peakCurrent,
+                    excitation.get_current()->get_processed()->get_peak().value());
+            }
+            continue;
+        }
+
+        const auto& excitations = op.get_excitations_per_winding();
+        bool everyWindingHasCurrentWaveform = std::all_of(excitations.begin(), excitations.end(), [](const OperatingPointExcitation& windingExcitation) {
+            return windingExcitation.get_current() && windingExcitation.get_current()->get_waveform() &&
+                   !windingExcitation.get_current()->get_waveform()->get_data().empty();
+        });
+        bool sameFrequency = std::all_of(excitations.begin(), excitations.end(), [&](const OperatingPointExcitation& windingExcitation) {
+            return windingExcitation.get_frequency() == excitations[0].get_frequency();
+        });
+        std::vector<double> turnsRatios;
+        for (const auto& turnsRatio : inputs.get_design_requirements().get_turns_ratios()) {
+            turnsRatios.push_back(resolve_dimensional_values(turnsRatio));
+        }
+        bool turnsRatiosCoverWindings = turnsRatios.size() + 1 == excitations.size() &&
+                                        std::all_of(turnsRatios.begin(), turnsRatios.end(), [](double turnsRatio) { return turnsRatio > 0; });
+        if (everyWindingHasCurrentWaveform && sameFrequency && turnsRatiosCoverWindings) {
+            std::vector<IsolationSide> isolationSides;
+            auto declaredSides = inputs.get_design_requirements().get_isolation_sides();
+            for (size_t windingIndex = 0; windingIndex < excitations.size(); ++windingIndex) {
+                isolationSides.push_back((declaredSides && windingIndex < declaredSides->size()) ? declaredSides->at(windingIndex)
+                                                                                                 : get_isolation_side_from_index(windingIndex));
+            }
+            auto ampereTurnCurrent = Inputs::calculate_ampere_turn_current(op, turnsRatios, isolationSides);
+            if (ampereTurnCurrent.get_processed() && ampereTurnCurrent.get_processed()->get_peak()) {
+                peakCurrent = std::max(peakCurrent, std::abs(ampereTurnCurrent.get_processed()->get_peak().value()));
+            }
         }
     }
 
@@ -277,9 +304,9 @@ void CoreAdviser::add_gapping_standard_cores(std::vector<std::pair<Magnetic, dou
     // - The gap is computed directly: gap = (N² / Lm - R_core) × μ₀ × Ae,
     //   where N comes from the same volt-seconds estimate as add_initial_turns_by_inductance.
     // When only a minimum inductance is specified (want high Lm), no gap is needed.
-    // is_inductor, not the topology alone: the resonant inductor of an LLC carries the
+    // The role (magnetic_role), not the topology alone: the resonant inductor of an LLC carries the
     // converter's topology but is one winding, and must be gapped as an inductor (ABT #1411).
-    bool isTransformer = !is_inductor(inputs);
+    bool isTransformer = is_transformer_role(inputs);
 
     bool skipGapping = isTransformer && !hasNominalInductance && !hasMaxInductance;
 
@@ -357,7 +384,7 @@ void CoreAdviser::add_gapping_standard_cores(std::vector<std::pair<Magnetic, dou
                  + " maxGap=" + std::to_string(constraints.maxGap)
                  + " optGap=" + std::to_string(constraints.optimalGap)
                  + " peakI=" + std::to_string(get_peak_current(inputs)),
-                 "CoreAdviser");
+                 "CoreAdviser", 3);
 
         // Apply the optimal gap
         core.set_ground_gapping(constraints.optimalGap);
@@ -466,7 +493,7 @@ void CoreAdviser::reject_winding_killing_gaps(std::vector<std::pair<Magnetic, do
                  + std::to_string(before - kept.size())
                  + " core(s) whose finalized gap exceeded the fringing-factor limit "
                    "(winding/proximity-loss risk).",
-                 "CoreAdviser");
+                 "CoreAdviser", 1);
     }
     *magneticsWithScoring = std::move(kept);
 }
@@ -506,7 +533,7 @@ void CoreAdviser::select_inductor_turns_and_gap_by_losses(std::vector<std::pair<
     }
     logEntry("Loss-optimal inductor turns: " + std::to_string(moved) + " of " +
              std::to_string(magneticsWithScoring->size()) + " candidates moved above their saturation-floor turns, " +
-             std::to_string(failedIndexes.size()) + " dropped", "CoreAdviser");
+             std::to_string(failedIndexes.size()) + " dropped", "CoreAdviser", 3);
     for (auto it = failedIndexes.rbegin(); it != failedIndexes.rend(); ++it) {
         magneticsWithScoring->erase(magneticsWithScoring->begin() + static_cast<std::ptrdiff_t>(*it));
     }

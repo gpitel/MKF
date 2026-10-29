@@ -50,6 +50,8 @@ class WindingProximityEffectLossesModel {
     virtual ~WindingProximityEffectLossesModel() = default;
     std::optional<double> try_get_proximity_factor(const Wire& wire, double frequency, double temperature);
     void set_proximity_factor(const Wire& wire, double frequency, double temperature, double proximityFactor);
+    // How many proximity factors were computed and stored (memo misses) on this thread: a cost count for the tests (ABT #2124).
+    static size_t get_proximity_factor_evaluations();
     static std::shared_ptr<WindingProximityEffectLossesModel> factory(WindingProximityEffectLossesModels modelName);
 };
 
@@ -66,6 +68,10 @@ class WindingProximityEffectLosses {
     // quadratureFields, when given, must match fields harmonic by harmonic and point by point.
     static std::pair<double, std::vector<std::pair<double, double>>> calculate_proximity_effect_losses_per_meter(const Wire& wire, double temperature, std::vector<ComplexField> fields, std::optional<WindingProximityEffectLossesModels> modelOverride = std::nullopt, std::optional<std::vector<ComplexField>> quadratureFields = std::nullopt, std::optional<double> perpendicularOutlineFactor = std::nullopt, std::optional<double> stackSharingNumber = std::nullopt);
   private:
+    // The per-meter losses with the model already chosen: the coil's loop hands every turn of a winding the same
+    // model instance, so its proximity-factor memo serves that winding's turns (one wire, so one key per frequency
+    // and temperature) instead of starting empty for each turn.
+    static std::pair<double, std::vector<std::pair<double, double>>> calculate_proximity_effect_losses_per_meter(const std::shared_ptr<WindingProximityEffectLossesModel>& model, const Wire& wire, double temperature, std::vector<ComplexField> fields, std::optional<std::vector<ComplexField>> quadratureFields, std::optional<double> perpendicularOutlineFactor, std::optional<double> stackSharingNumber);
     static WindingLossesOutput calculate_proximity_effect_losses_impl(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, const std::vector<ComplexField>& fieldPerFrequency, const std::optional<std::vector<ComplexField>>& quadratureFieldPerFrequency, std::optional<WindingProximityEffectLossesModels> modelOverride, std::optional<std::map<WireType, WindingProximityEffectLossesModels>> modelPerWireType);
 
 };
@@ -74,7 +80,9 @@ class WindingProximityEffectLosses {
 // https://sci-hub.st/10.1109/tpel.2011.2143729
 class WindingProximityEffectLossesRossmanithModel : public WindingProximityEffectLossesModel {
   public:
-    std::string methodName = "Rossmanith";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesRossmanithModel() { methodName = "Rossmanith"; }
     static double calculate_proximity_factor(const Wire& wire, double frequency, double temperature);
     double calculate_turn_losses(const Wire& wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
 
@@ -84,7 +92,9 @@ class WindingProximityEffectLossesRossmanithModel : public WindingProximityEffec
 // https://sci-hub.st/10.1109/ECCE.2018.8558397
 class WindingProximityEffectLossesWangModel : public WindingProximityEffectLossesModel {
   public:
-    std::string methodName = "Wang";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesWangModel() { methodName = "Wang"; }
     double calculate_turn_losses(const Wire& wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
     // Its width-sample term bridges two different quadratic forms, so it is not additive.
     double calculate_turn_losses_from_phasors(const Wire& wire, double frequency, std::vector<ComplexFieldPoint> inPhaseData, std::vector<ComplexFieldPoint> quadratureData, double temperature) override;
@@ -126,7 +136,9 @@ class WindingProximityEffectLossesWangModel : public WindingProximityEffectLosse
 // modelled (the field arrives as one sum, so the stack's own current cannot be separated).
 class WindingProximityEffectLossesWangStackedModel : public WindingProximityEffectLossesWangModel {
   public:
-    std::string methodName = "WangStacked";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesWangStackedModel() { methodName = "WangStacked"; }
     void set_perpendicular_outline_factor(double factor) { _perpendicularOutlineFactor = factor; }
     // One factor per turn of the coil, in turns-description order (1 for unstacked or round turns).
     static std::vector<double> calculate_perpendicular_outline_factors(Coil coil);
@@ -142,7 +154,9 @@ class WindingProximityEffectLossesWangStackedModel : public WindingProximityEffe
 // https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=9485268
 class WindingProximityEffectLossesFerreiraModel : public WindingProximityEffectLossesModel {
   public:
-    std::string methodName = "Ferreira";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesFerreiraModel() { methodName = "Ferreira"; }
     static double calculate_proximity_factor(const Wire& wire, double frequency, double temperature);
     double calculate_turn_losses(const Wire& wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
 };
@@ -152,7 +166,9 @@ class WindingProximityEffectLossesFerreiraModel : public WindingProximityEffectL
 // https://libgen.rocks/get.php?md5=94b7f2906f53602f19892d7f1dabd929&key=YMKCEJOWB653PYLL
 class WindingProximityEffectLossesAlbachModel : public WindingProximityEffectLossesModel {
   public:
-    std::string methodName = "Albach";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesAlbachModel() { methodName = "Albach"; }
     double calculate_turn_losses(const Wire& wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
 };
 
@@ -178,7 +194,9 @@ class WindingProximityEffectLossesAlbachModel : public WindingProximityEffectLos
 // which might be problematic in terms of optimizations".
 class WindingProximityEffectLossesEwaldModel : public WindingProximityEffectLossesModel {
   public:
-    std::string methodName = "Ewald";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesEwaldModel() { methodName = "Ewald"; }
     double calculate_turn_losses(const Wire& wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
 };
 
@@ -233,7 +251,9 @@ class WindingProximityEffectLossesEwaldModel : public WindingProximityEffectLoss
 // still charged more field than they really see.
 class WindingProximityEffectLossesMartinezModel : public WindingProximityEffectLossesModel {
   public:
-    std::string methodName = "Martinez";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesMartinezModel() { methodName = "Martinez"; }
     // The exclusion factor C for a field along one of the conductor's axes. A conductor excludes
     // BOTH field components, not only the one normal to its wide face: the same ellipse solution
     // serves each, with the roles of the two axes swapped.
@@ -274,7 +294,9 @@ class WindingProximityEffectLossesMartinezModel : public WindingProximityEffectL
 // https://archive.org/details/eddycurrents0000lamm
 class WindingProximityEffectLossesLammeranerModel : public WindingProximityEffectLossesModel {
   public:
-    std::string methodName = "Lammeraner";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesLammeranerModel() { methodName = "Lammeraner"; }
     static double calculate_proximity_factor(const Wire& wire, double frequency, double temperature);
     double calculate_turn_losses(const Wire& wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
 };
@@ -283,7 +305,9 @@ class WindingProximityEffectLossesLammeranerModel : public WindingProximityEffec
 // https://ieeexplore.ieee.org/document/5247417
 class WindingProximityEffectLossesDowellModel : public WindingProximityEffectLossesModel {
   public:
-    std::string methodName = "Dowell";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesDowellModel() { methodName = "Dowell"; }
     static double calculate_proximity_factor(const Wire& wire, double frequency, double temperature);
     double calculate_turn_losses(const Wire& wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
 };
@@ -309,7 +333,9 @@ class WindingProximityEffectLossesDowellModel : public WindingProximityEffectLos
 // ============================================================================
 class WindingProximityEffectLossesNanModel : public WindingProximityEffectLossesModel {
   public:
-    std::string methodName = "Nan";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesNanModel() { methodName = "Nan"; }
     static double calculate_proximity_factor(const Wire& wire, double frequency, double temperature);
     double calculate_turn_losses(const Wire& wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
 };
@@ -336,7 +362,9 @@ class WindingProximityEffectLossesNanModel : public WindingProximityEffectLosses
 // ============================================================================
 class WindingProximityEffectLossesWojdaModel : public WindingProximityEffectLossesModel {
   public:
-    std::string methodName = "Wojda";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesWojdaModel() { methodName = "Wojda"; }
     static double calculate_proximity_factor(const Wire& wire, double frequency, double temperature);
     double calculate_turn_losses(const Wire& wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
 };
@@ -361,7 +389,9 @@ class WindingProximityEffectLossesWojdaModel : public WindingProximityEffectLoss
 // ============================================================================
 class WindingProximityEffectLossesSullivanModel : public WindingProximityEffectLossesModel {
   public:
-    std::string methodName = "Sullivan";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesSullivanModel() { methodName = "Sullivan"; }
     static double calculate_proximity_factor(const Wire& wire, double frequency, double temperature);
     double calculate_turn_losses(const Wire& wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
 };
@@ -390,7 +420,9 @@ class WindingProximityEffectLossesSullivanModel : public WindingProximityEffectL
 // ============================================================================
 class WindingProximityEffectLossesBartoliModel : public WindingProximityEffectLossesModel {
   public:
-    std::string methodName = "Bartoli";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesBartoliModel() { methodName = "Bartoli"; }
     static double calculate_proximity_factor(const Wire& wire, double frequency, double temperature);
     double calculate_turn_losses(const Wire& wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
 };
@@ -423,7 +455,9 @@ class WindingProximityEffectLossesBartoliModel : public WindingProximityEffectLo
 // ============================================================================
 class WindingProximityEffectLossesVandelacModel : public WindingProximityEffectLossesModel {
   public:
-    std::string methodName = "Vandelac";
+    // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
+    // results read through the base pointer, so every result reported "Default" (ABT #956).
+    WindingProximityEffectLossesVandelacModel() { methodName = "Vandelac"; }
     static double calculate_proximity_factor(const Wire& wire, double frequency, double temperature);
     double calculate_turn_losses(const Wire& wire, double frequency, std::vector<ComplexFieldPoint> data, double temperature);
 };
