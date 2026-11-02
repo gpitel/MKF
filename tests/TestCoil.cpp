@@ -13444,6 +13444,26 @@ TEST_CASE("Test_Abt1151_Autocompleted_Foil_Outer_Width_Is_Its_Conductor", "[cons
     settings.reset();
 }
 
+TEST_CASE("Test_Foil_Outer_Width_Refusal_Says_Outer_Equals_Conducting_And_Insulation_Is_Layers", "[constructive-model][coil][foil][regression]") {
+    // Alf, 2026-10-31: "in foil there is no coating, it is done with insulation layers... conducting and
+    // outer width in foil should be the same". The refusal of a foil whose outerWidth states extra
+    // insulation tells the user exactly that, instead of asking for the insulation as a coating.
+    settings.reset();
+    clear_databases();
+    OpenMagnetics::Wire wire = OpenMagnetics::find_wire_by_name("Foil 0.2");
+    REQUIRE(wire.get_type() == WireType::FOIL);
+    wire.set_coating(std::nullopt);
+    const double foil = resolve_dimensional_values(wire.get_conducting_width().value());
+    DimensionWithTolerance tooWide;
+    tooWide.set_nominal(foil + 30e-6);
+    wire.set_outer_width(tooWide);
+    REQUIRE_THROWS_WITH(wire.get_maximum_outer_width(),
+                        Catch::Matchers::ContainsSubstring("a foil's outer width must equal its conducting width") &&
+                        Catch::Matchers::ContainsSubstring("insulation is given by insulation layers") &&
+                        !Catch::Matchers::ContainsSubstring("coating."));
+    settings.reset();
+}
+
 TEST_CASE("Test_Abt881_Foil_Has_No_Crossing_Station", "[constructive-model][coil][real-geometry][foil][regression]") {
     // ABT #881: the real-winding crossing bump (ABT #685) charges every winding one extra station
     // per layer -- the slot a wire needs where it closes a layer and climbs to the next. A FOIL
@@ -13728,6 +13748,45 @@ TEST_CASE("Test_Foil_Cut_Reserves_A_Crossing_Leads_Corridor", "[constructive-mod
     // A corridor that leaves no sheet is refused, not silently clamped to nothing.
     OpenMagnetics::Wire impossible = wire;
     CHECK_THROWS(impossible.cut_foil_wire_to_section(section, 0.02));
+    settings.reset();
+}
+
+TEST_CASE("Test_Foil_Keeps_A_Declared_Height_Shorter_Than_Its_Section", "[constructive-model][coil][foil][regression]") {
+    // ABT #1001 / #836 (Alf, 2026-10-31): the winder cuts a foil sheet to its section only when the
+    // sheet's conducting height is unset or taller than the room the section leaves it. A sheet the
+    // user declares shorter keeps its height; 6a3f89c7 had cut every sheet to the section, which
+    // made the 7 mm foil of Ten_Short_Turns_Foil give exactly the losses of the full-height one.
+    settings.reset();
+    clear_databases();
+    auto make_foil = [](double conductingHeight) {
+        OpenMagnetics::Wire wire;
+        wire.set_nominal_value_conducting_width(0.0001);
+        wire.set_nominal_value_conducting_height(conductingHeight);
+        wire.set_nominal_value_outer_width(0.0001);   // a foil's outer width is its conductor
+        wire.set_nominal_value_outer_height(conductingHeight);
+        wire.set_number_conductors(1);
+        wire.set_material("copper");
+        wire.set_type(WireType::FOIL);
+        return wire;
+    };
+    auto wound_height = [&](double conductingHeight) {
+        std::vector<OpenMagnetics::Wire> wires{make_foil(conductingHeight)};
+        auto coil = OpenMagneticsTesting::get_quick_coil({10}, {1}, "ETD 34/17/11", 1,
+            WindingOrientation::OVERLAPPING, WindingOrientation::OVERLAPPING,
+            CoilAlignment::CENTERED, CoilAlignment::CENTERED, wires, false);
+        REQUIRE(coil.get_turns_description());
+        auto wire = coil.resolve_wire(0);
+        REQUIRE(wire.get_conducting_height());
+        return resolve_dimensional_values(wire.get_conducting_height().value());
+    };
+
+    // ETD 34/17/11's window is ~24 mm tall: a 7 mm sheet fits and keeps its declared height.
+    CHECK_THAT(wound_height(0.007), Catch::Matchers::WithinAbs(0.007, 1e-12));
+
+    // A sheet declared taller than its section is still cut to the section.
+    const double cut = wound_height(0.05);
+    CHECK(cut < 0.03);
+    CHECK(cut > 0.007);
     settings.reset();
 }
 
@@ -18138,4 +18197,34 @@ TEST_CASE("Windings wound together alternate turn by turn, or sit in blocks by c
     REQUIRE(blocks.size() == 8);
     for (size_t k = 0; k < 4; ++k) CHECK(blocks[k] == "winding 0");
     for (size_t k = 4; k < 8; ++k) CHECK(blocks[k] == "winding 1");
+}
+
+TEST_CASE("Test_Real_Winding_Helical_Turns_Stay_Inside_The_Window_With_The_Pitch_They_Were_Laid_At", "[constructive-model][coil][real-geometry][regression]") {
+    // ABT #2117: 14_dab_xfmr_pm8770_n97 (PM 87/70, Primary 12 x 4 and Secondary 12 x 4 Round 0.80, real winding).
+    // The first Primary turn was placed for a pitch of 0.855404 mm (its centre half that pitch above the window
+    // bottom) but carried the refined helical pitch 0.863417 mm as its axial size, so it reached 3.9 um below the
+    // window and the thermal model refused it at the bobbin flange. Every helical turn's axial extent, at the pitch
+    // its stations were laid for, lies inside the winding window.
+    settings.reset();
+    clear_databases();
+    settings.set_coil_use_real_winding_geometry(true);
+    auto mas = OpenMagneticsTesting::mas_loader(std::string(__FILE__).substr(0, std::string(__FILE__).rfind('/'))
+                                                + "/../MAS/examples/14_dab_xfmr_pm8770_n97.json");
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+    auto& coil = magnetic.get_mutable_coil();
+    auto bobbin = coil.resolve_bobbin();
+    const auto windows = bobbin.get_processed_description()->get_winding_windows();
+    REQUIRE(windows.size() == 1);
+    const double windowBottom = windows[0].get_coordinates().value()[1] - windows[0].get_height().value() / 2;
+    const double windowTop = windows[0].get_coordinates().value()[1] + windows[0].get_height().value() / 2;
+    const auto turns = coil.get_turns_description().value();
+    REQUIRE(!turns.empty());
+    for (const auto& turn : turns) {
+        INFO(turn.get_name());
+        REQUIRE(turn.get_dimensions());
+        const double halfHeight = turn.get_dimensions().value()[1] / 2;
+        CHECK(turn.get_coordinates()[1] - halfHeight >= windowBottom - 1e-12);
+        CHECK(turn.get_coordinates()[1] + halfHeight <= windowTop + 1e-12);
+    }
+    settings.reset();
 }

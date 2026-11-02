@@ -8,6 +8,7 @@
 #include "support/Utils.h"
 #include "constructive_models/Core.h"
 #include "processors/Inputs.h"
+#include "processors/WaveformProcessor.h"
 #include "processors/MagneticSimulator.h"
 #include "TestingUtils.h"
 #include "TestWindingLosses.h"
@@ -3866,6 +3867,53 @@ TEST_CASE("Test_Winding_Losses_Abt1463_Flyback_Per_Harmonic_Vs_OMFEM", "[physica
     settings.reset();
 }
 
+TEST_CASE("Test_Winding_Losses_Harmonics_Saved_With_Old_Frequency_Labels_Are_Derived_Again_From_The_Waveform", "[physical-model][winding-losses][abt-1880]") {
+    // The Abt1463 flyback fixture was saved by MKF before ABT #1880: its current and voltage harmonics are labelled
+    // k / (127 dt) on 128 open samples of step dt (100787.4 Hz for harmonic 1 of 100 kHz). Read by order since
+    // ABT #1880, such a list threw "100787.4 Hz is not a harmonic of 100000 Hz" in the field step, as any saved MAS
+    // file with those labels did. The losses must be those of the same operating point with its harmonics derived
+    // again from its waveforms.
+    settings.reset();
+    clear_databases();
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "Test_Winding_Losses_Abt1463_Flyback.json");
+    std::ifstream in(path);
+    json masJson = json::parse(in);
+    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+    OperatingPoint operatingPoint(masJson["inputs"]["operatingPoints"][0]);
+    const auto& primary = operatingPoint.get_excitations_per_winding()[0];
+    REQUIRE_FALSE(WaveformProcessor::harmonics_are_labelled_by_order(primary.get_current()->get_harmonics().value(), primary.get_frequency()));
+
+    WindingLossesOutput stored;
+    REQUIRE_NOTHROW(stored = WindingLosses().calculate_losses(magnetic, operatingPoint, 40));
+
+    double magnetizingInductance = OpenMagnetics::resolve_dimensional_values(MagnetizingInductance().calculate_inductance_from_number_turns_and_gapping(
+        magnetic.get_core(), magnetic.get_coil()).get_magnetizing_inductance());
+    auto derived = OpenMagnetics::Inputs::process_operating_point(operatingPoint, magnetizingInductance, magnetic.get_mutable_coil().get_turns_ratios(),
+                                                                  false, magnetic.get_mutable_coil().get_isolation_sides());
+    for (const auto& excitation : derived.get_excitations_per_winding()) {
+        CHECK(WaveformProcessor::harmonics_are_labelled_by_order(excitation.get_current()->get_harmonics().value(), excitation.get_frequency()));
+    }
+    auto expected = WindingLosses().calculate_losses(magnetic, derived, 40);
+    CHECK(stored.get_winding_losses() > 0);
+    CHECK(stored.get_winding_losses() == expected.get_winding_losses());
+    settings.reset();
+}
+
+TEST_CASE("Test_Winding_Losses_Trimmed_Harmonics_Are_Labelled_By_Order", "[physical-model][winding-losses][abt-1880]") {
+    // An imported waveform's harmonics are trimmed (calculate_harmonics_data with trimHarmonics): the list keeps
+    // the DC, the fundamental and the main harmonics, each at k * frequency, so it skips orders. That is MKF's own
+    // labelling and must not be taken for the pre-#1880 labels, which re-processed the operating point and needed
+    // a processed core (Test_Winding_Losses_Foil_Micro_Gap_Invariance threw CORE_NOT_PROCESSED).
+    Harmonics trimmed;
+    trimmed.set_frequencies({0, 40000, 120000, 560000});
+    trimmed.set_amplitudes({0, 1, 0.3, 0.1});
+    CHECK(WaveformProcessor::harmonics_are_labelled_by_order(trimmed, 40000));
+    Harmonics oldLabels;
+    oldLabels.set_frequencies({0, 100787.4, 201574.8});
+    oldLabels.set_amplitudes({0, 1, 0.3});
+    CHECK_FALSE(WaveformProcessor::harmonics_are_labelled_by_order(oldLabels, 100000));
+}
+
 // ABT #1759 re-score driver (hidden): the two default-fringing pins (Abt1463 flyback per harmonic, Wang_Stacked R_ac/R_dc)
 // under each fringing model as the DEFAULT (set in Settings, field model left automatic, exactly what a changed
 // Defaults value does in WindingLosses). Prints one line per model.
@@ -4064,11 +4112,11 @@ static OpenMagnetics::Magnetic build_e42_flat_fixture(bool foil, bool gapped) {
     OpenMagnetics::Wire wire;
     std::vector<int64_t> numberTurns;
     if (foil) {
-        // 8 foil turns 0.2 x 20 mm, 0.05 mm insulation each side.
+        // 8 foil turns 0.2 x 20 mm. A foil carries no coating: its outer width is its conducting width.
         numberTurns = {8};
         wire.set_nominal_value_conducting_width(0.0002);
         wire.set_nominal_value_conducting_height(0.02);
-        wire.set_nominal_value_outer_width(0.0003);
+        wire.set_nominal_value_outer_width(0.0002);
         wire.set_nominal_value_outer_height(0.02);
         wire.set_type(WireType::FOIL);
     }

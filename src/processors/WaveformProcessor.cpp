@@ -211,6 +211,17 @@ struct HarmonicsEntry {
     size_t bytes;
 };
 
+struct ProcessedEntry {
+    std::vector<double> harmonicsAmplitudes;
+    std::vector<double> harmonicsFrequencies;
+    WaveformKey waveform;
+    bool includeAdvancedData;
+    size_t numberPointsSampledWaveforms;
+    std::optional<WaveformKey> givenWaveform;
+    ProcessedWaveform value;
+    size_t bytes;
+};
+
 // Set while calculate_basic_processed_data compresses its own input: that input missed the basic memo,
 // so its compressed copy is not worth a second memo (storing it copied the record twice).
 thread_local bool compressMemoBypassed = false;
@@ -1833,6 +1844,21 @@ bool WaveformProcessor::is_zero_harmonic(const FourierSeries& series, double lis
     return std::fabs(listedAmplitude) < zeroScale && std::abs(phasor) < zeroScale;
 }
 
+bool WaveformProcessor::harmonics_are_labelled_by_order(const Harmonics& harmonics, double frequency) {
+    if (!std::isfinite(frequency) || frequency <= 0) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Harmonics labels: the excitation frequency must be positive and finite, got " + std::to_string(frequency));
+    }
+    const auto& frequencies = harmonics.get_frequencies();
+    // By order, not by position: a trimmed list (calculate_harmonics_data with trimHarmonics) skips orders.
+    for (const double harmonicFrequency : frequencies) {
+        const double order = harmonicFrequency / frequency;
+        if (std::fabs(order - std::round(order)) > 1e-6) {
+            return false;
+        }
+    }
+    return true;
+}
+
 Harmonics WaveformProcessor::calculate_harmonics_data(const Waveform& waveform, double frequency, bool trimHarmonics, double harmonicAmplitudeThreshold, size_t numberPointsSampledWaveforms) {
     // Thousands of entries: a line-cycle record's switching cycles are transformed once per loss evaluation.
     thread_local WaveformMemo<HarmonicsEntry> memo{kWaveformMemoCycleEntries, kWaveformMemoBytes};
@@ -2048,6 +2074,21 @@ ProcessedWaveform WaveformProcessor::calculate_processed_data(Harmonics harmonic
                                             std::optional<ProcessedWaveform> processed,
                                             size_t numberPointsSampledWaveforms,
                                             std::optional<Waveform> givenWaveform) {
+    // Exact memo (ABT #2160), for the calls that compute the processed data from scratch (no `processed` handed in):
+    // a magnetizing current's processed data is computed once where it is integrated and again, from the same
+    // harmonics and samples, by the caller that stores it. The key is every argument, bit for bit.
+    thread_local WaveformMemo<ProcessedEntry> memo{64, kWaveformMemoBytes};
+    std::optional<size_t> hash;
+    if (!processed) {
+        hash = waveform_bits_hash(waveform);
+        if (auto hit = memo.find(hash.value(), [&](const ProcessedEntry& entry) {
+                return entry.includeAdvancedData == includeAdvancedData && entry.numberPointsSampledWaveforms == numberPointsSampledWaveforms &&
+                       same_bits(entry.harmonicsAmplitudes, harmonics.get_amplitudes()) && same_bits(entry.harmonicsFrequencies, harmonics.get_frequencies()) &&
+                       entry.waveform.matches(waveform) && same_key(entry.givenWaveform, givenWaveform);
+            })) {
+            return hit->value;
+        }
+    }
     auto sampledDataToProcess = waveform;
 
     if (waveform.get_time() && waveform.get_data().size() < numberPointsSampledWaveforms) {
@@ -2135,6 +2176,17 @@ ProcessedWaveform WaveformProcessor::calculate_processed_data(Harmonics harmonic
         }
     }
 
+    if (hash) {
+        WaveformKey key(waveform);
+        std::optional<WaveformKey> givenKey;
+        if (givenWaveform) {
+            givenKey.emplace(givenWaveform.value());
+        }
+        size_t bytes = sizeof(ProcessedEntry) + key.bytes() + (givenKey ? givenKey->bytes() : 0) +
+                       (harmonics.get_amplitudes().size() + harmonics.get_frequencies().size()) * sizeof(double);
+        memo.insert(hash.value(), ProcessedEntry{harmonics.get_amplitudes(), harmonics.get_frequencies(), std::move(key), includeAdvancedData,
+                                                 numberPointsSampledWaveforms, std::move(givenKey), processedResult, bytes});
+    }
     return processedResult;
 }
 

@@ -24,6 +24,8 @@
 #include <iostream>
 #include <chrono>
 #include <thread>
+#include <algorithm>
+#include <cmath>
 
 using namespace MAS;
 using namespace OpenMagnetics;
@@ -268,7 +270,7 @@ namespace {
         dimensionWithToleranceHeight.set_nominal(0.010);
         wire.set_conducting_height(dimensionWithToleranceHeight);
         DimensionWithTolerance dimensionWithToleranceWidth;
-        dimensionWithToleranceWidth.set_nominal(0.2e-3);
+        dimensionWithToleranceWidth.set_nominal(0.15e-3);
         wire.set_outer_width(dimensionWithToleranceWidth);
         wire.set_outer_height(dimensionWithToleranceHeight);
         auto wires = std::vector<OpenMagnetics::Wire>({wire});
@@ -322,7 +324,7 @@ namespace {
         dimensionWithToleranceHeight.set_nominal(0.010);
         wire.set_conducting_height(dimensionWithToleranceHeight);
         DimensionWithTolerance dimensionWithToleranceWidth;
-        dimensionWithToleranceWidth.set_nominal(0.2e-3);
+        dimensionWithToleranceWidth.set_nominal(0.15e-3);
         wire.set_outer_width(dimensionWithToleranceWidth);
         wire.set_outer_height(dimensionWithToleranceHeight);
         auto wires = std::vector<OpenMagnetics::Wire>({wire});
@@ -1944,16 +1946,79 @@ namespace {
             int64_t numberStacks = 1;
             std::string coreShape = shapeName;
             std::string coreMaterial = "3C97";
-            // drumRing (shielded drum, ABT #366) rejects user gapping: its two annular clearance
-            // gaps are structural, derived from the geometry. Paint it with no user gaps and let
-            // process_gap derive them; every other family keeps the ground gap.
+            // drumRing (shielded drum, ABT #366) and drumSemishielded (ABT #362, #1442) reject user
+            // gapping: their clearance gaps are structural, derived from the geometry. Paint them with
+            // no user gaps and let process_gap derive them; every other family keeps the ground gap.
             std::vector<CoreGap> gapping;
-            if (OpenMagnetics::find_core_shape_by_name(coreShape).get_family() != CoreShapeFamily::DRUM_RING) {
+            auto family = OpenMagnetics::find_core_shape_by_name(coreShape).get_family();
+            if (family != CoreShapeFamily::DRUM_RING && family != CoreShapeFamily::DRUM_SEMISHIELDED) {
                 gapping = OpenMagneticsTesting::get_ground_gap(0.0001);
             }
 
-            auto coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, coreShape, interleavingLevel);
             auto core = OpenMagneticsTesting::get_quick_core(coreShape, gapping, numberStacks, coreMaterial);
+
+            // The winding is sized to the shape (Alf, 2026-10-31): 42 turns x 3 parallels per winding is the design
+            // wherever it fits, and a shape whose winding window cannot hold it gets the turns and parallels its
+            // window area holds, at half fill of the quick coil's Round 0.475 - Grade 1 square-packed, so that every
+            // shape is painted. Each winding keeps at least one turn per section of the interleaving. A window that
+            // cannot hold one turn of Round 0.475 per winding (EI 3.02/1.95/1.35/4.87/1/2.5/2.3: 0.2 mm2) is wound
+            // with the thinnest round wire of the catalogue that holds one, so that every shape is painted wound.
+            std::vector<OpenMagnetics::Wire> wires;
+            {
+                auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core);
+                auto windingWindow = bobbin.get_processed_description()->get_winding_windows()[0];
+                double windowArea;
+                if (windingWindow.get_width() && windingWindow.get_height()) {
+                    windowArea = windingWindow.get_width().value() * windingWindow.get_height().value();
+                }
+                else {
+                    REQUIRE(windingWindow.get_area());
+                    windowArea = windingWindow.get_area().value();
+                }
+                auto wiresHeld = [&](double wireOuterDiameter) {
+                    return int64_t(std::floor(0.5 * windowArea / (wireOuterDiameter * wireOuterDiameter) / numberTurns.size()));
+                };
+                auto wire = OpenMagnetics::find_wire_by_name("Round 0.475 - Grade 1");
+                auto wiresPerWinding = wiresHeld(wire.get_maximum_outer_width());
+                if (wiresPerWinding < 1) {
+                    std::optional<OpenMagnetics::Wire> thinnest;
+                    for (auto& candidate : OpenMagnetics::get_wires(WireType::ROUND)) {
+                        double outerDiameter = candidate.get_maximum_outer_width();
+                        if (wiresHeld(outerDiameter) >= 1 &&
+                            (!thinnest || outerDiameter < thinnest->get_maximum_outer_width())) {
+                            thinnest = candidate;
+                        }
+                    }
+                    REQUIRE(thinnest);
+                    wire = thinnest.value();
+                    wiresPerWinding = wiresHeld(wire.get_maximum_outer_width());
+                    std::cout << "Test_Painter_All_Cores: " << coreShape << " winding window " << windowArea * 1e6
+                              << " mm2 holds no turn of Round 0.475 per winding: wound with "
+                              << wire.get_name().value() << std::endl;
+                    wires = {wire, wire};
+                }
+                if (wiresPerWinding < numberTurns[0] * numberParallels[0]) {
+                    int64_t parallels = std::clamp<int64_t>(wiresPerWinding / interleavingLevel, 1, numberParallels[0]);
+                    int64_t turns = std::max<int64_t>(wiresPerWinding / parallels, interleavingLevel);
+                    std::cout << "Test_Painter_All_Cores: " << coreShape << " winding window " << windowArea * 1e6
+                              << " mm2 holds " << wiresPerWinding << " wires per winding: painted with " << turns << " x "
+                              << parallels << std::endl;
+                    numberTurns = {turns, turns};
+                    numberParallels = {parallels, parallels};
+                }
+            }
+            auto coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, coreShape, interleavingLevel,
+                                                             MAS::WindingOrientation::OVERLAPPING, MAS::WindingOrientation::OVERLAPPING,
+                                                             MAS::CoilAlignment::CENTERED, MAS::CoilAlignment::CENTERED, wires);
+            // A window that cannot take the two windings interleaved (no sections created at interleaving 2)
+            // is wound without interleaving, and still painted (Alf, 2026-10-31).
+            if (!coil.get_sections_description()) {
+                std::cout << "Test_Painter_All_Cores: " << coreShape << " cannot be wound at interleaving "
+                          << int(interleavingLevel) << ": wound without interleaving" << std::endl;
+                coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, coreShape, 1,
+                                                            MAS::WindingOrientation::OVERLAPPING, MAS::WindingOrientation::OVERLAPPING,
+                                                            MAS::CoilAlignment::CENTERED, MAS::CoilAlignment::CENTERED, wires);
+            }
 
             std::replace( shapeName.begin(), shapeName.end(), '.', '_');
             std::replace( shapeName.begin(), shapeName.end(), '/', '_');
@@ -5866,6 +5931,83 @@ namespace {
         CHECK(red == 1);
         CHECK(svg.find("&apos;" + turns[0].get_name() + "&apos; overlaps &apos;" + turns[1].get_name() + "&apos;") != std::string::npos);
         CHECK(svg.find("#ff0000") != std::string::npos);
+        settings.reset();
+    }
+
+    // Alf, 2026-10-27: "when we are working with real windings, can you actually ALWAYS paint in
+    // Painter the full magnetic, not just +x?" With real winding ON the XY view must show copper,
+    // bobbin and ferrite on the -x side too; with it OFF the view keeps its historical +x half.
+    TEST_CASE("Test_Painter_Real_Winding_Paints_The_Whole_Magnetic", "[support][painter][real-winding][whole-view]") {
+        std::ifstream json_file(std::filesystem::path{std::source_location::current().file_name()}
+                                    .parent_path()
+                                    .append("testData")
+                                    .append("abt646_e16_litz_2layer_leadcollision.json")
+                                    .string());
+        REQUIRE(json_file.good());
+        auto masJson = json::parse(json_file);
+
+        // The most negative x among the points of every element of class `cssClass` (circle cx,
+        // rect x, polygon points), in SVG user units; +infinity when there is no such element.
+        auto mostNegativeX = [](const std::string& svg, const std::string& cssClass) {
+            double minimum = std::numeric_limits<double>::infinity();
+            const std::regex element("<(circle|rect|polygon)\\b[^>]*>");
+            const std::regex number("-?[0-9]+(\\.[0-9]+)?([eE]-?[0-9]+)?");
+            for (auto it = std::sregex_iterator(svg.begin(), svg.end(), element); it != std::sregex_iterator(); ++it) {
+                const std::string tag = it->str();
+                if (tag.find("class=\"" + cssClass + "\"") == std::string::npos) {
+                    continue;
+                }
+                std::smatch m;
+                if (it->str(1) == "circle" && std::regex_search(tag, m, std::regex("cx=\"([^\"]+)\""))) {
+                    minimum = std::min(minimum, std::stod(m.str(1)));
+                }
+                else if (it->str(1) == "rect" && std::regex_search(tag, m, std::regex(" x=\"([^\"]+)\""))) {
+                    minimum = std::min(minimum, std::stod(m.str(1)));
+                }
+                else if (it->str(1) == "polygon" && std::regex_search(tag, m, std::regex("points=\"([^\"]+)\""))) {
+                    const std::string points = m.str(1);
+                    bool isX = true;
+                    for (auto n = std::sregex_iterator(points.begin(), points.end(), number); n != std::sregex_iterator(); ++n) {
+                        if (isX) {
+                            minimum = std::min(minimum, std::stod(n->str()));
+                        }
+                        isX = !isX;
+                    }
+                }
+            }
+            return minimum;
+        };
+
+        for (bool realWinding : {true, false}) {
+            settings.reset();
+            settings.set_coil_use_real_winding_geometry(realWinding);
+            auto magnetic = OpenMagnetics::magnetic_autocomplete(OpenMagnetics::Magnetic(masJson["magnetic"]), json{});
+            auto outFile = outputFilePath;
+            outFile.append(std::string("Test_Painter_Real_Winding_Whole_Magnetic_") + (realWinding ? "real" : "ideal") + ".svg");
+            std::filesystem::remove(outFile);
+            Painter painter(outFile);
+            painter.paint_magnetic(magnetic, PainterProjection::XY);
+            const auto svg = painter.export_svg();
+
+            const double copperMinX = mostNegativeX(svg, "copper");
+            const double bobbinMinX = mostNegativeX(svg, "bobbin");
+            const double ferriteMinX = mostNegativeX(svg, "ferrite");
+            INFO("realWinding " << realWinding << " copper " << copperMinX << " bobbin " << bobbinMinX << " ferrite " << ferriteMinX);
+            REQUIRE(std::isfinite(copperMinX));
+            REQUIRE(std::isfinite(bobbinMinX));
+            REQUIRE(std::isfinite(ferriteMinX));
+            if (realWinding) {
+                // Copper and bobbin wrap the column, so they cross the plane on -x as well.
+                CHECK(copperMinX < 0);
+                CHECK(bobbinMinX < 0);
+                CHECK(ferriteMinX < 0);
+            }
+            else {
+                CHECK(copperMinX >= 0);
+                CHECK(bobbinMinX >= 0);
+                CHECK(ferriteMinX >= 0);
+            }
+        }
         settings.reset();
     }
 }  // namespace

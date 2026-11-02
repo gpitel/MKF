@@ -1,3 +1,4 @@
+#include "support/LogOnceScope.h"
 #include "constructive_models/MasMigration.h"
 #include "support/FastJsonParse.h"
 #include "physical_models/MagnetizingInductance.h"
@@ -18,6 +19,7 @@
 #include <numbers>
 #include <streambuf>
 #include <vector>
+#include <sstream>
 #include <cmrc/cmrc.hpp>
 #include "support/Utils.h"
 #include "support/Settings.h"
@@ -1012,6 +1014,11 @@ std::vector<std::string> get_shape_family_dimensions(CoreShapeFamily family, std
     std::vector<std::string> distinctDimensions;
     if (!familySubtype) {
         distinctDimensions = get_core_shape_family_required_dimensions(family);
+        // And the letters the geometry reads when present (drumRing's base plate M/N),
+        // so a custom shape can state them.
+        for (const auto& optional : get_core_shape_family_optional_dimensions(family)) {
+            distinctDimensions.push_back(optional);
+        }
     }
 
     // Plus whatever the published shapes additionally carry. These are real: some are optional
@@ -2834,6 +2841,7 @@ std::optional<double> magnetizing_inductance_unless_past_magnetisation_curve(Mag
 } // namespace
 
 Mas mas_autocomplete(Mas mas, bool simulate, json configuration) {
+    LogOnceScope logOnceScope;  // a warning about an excitation is logged once per autocomplete (ABT #2160)
 
     if (simulate) {
         throw_if_a_winding_would_be_invented(mas.get_magnetic());
@@ -3309,10 +3317,41 @@ std::optional<std::string> real_winding_refusal(const Magnetic& woundMagnetic, s
     if (!coil.are_turns_inside_winding_window()) {
         return "real winding puts turns outside the winding window: " + coil.get_last_fit_failure();
     }
+    // Spec section 17 (Alf, 2026-10-26): the winder draws and reports a lead that collides or does not
+    // fit; an adviser never accepts such a design. It reads the same reports: each route's findings (a
+    // tangent lead's turn collisions included, fed from TangentDeparture::collisions) and the drawn
+    // copper's overlaps. A condition the route does not model (ROUTE_NOT_MODELLED) is refused too: an
+    // adviser accepts only what it can show fits.
+    for (const auto& route : coil.get_connection_layout().routes) {
+        for (const auto& finding : route.findings) {
+            const char* kind = "";
+            switch (finding.kind) {
+                case LeadFindingKind::TURN_COLLISION: kind = "a turn is wound across it"; break;
+                case LeadFindingKind::ROUTE_NOT_MODELLED: kind = "its route is not modelled, so it cannot be shown to fit"; break;
+                case LeadFindingKind::CROSSES_FAR_SIDE: kind = "it crosses the far side of its turn"; break;
+                case LeadFindingKind::NO_RADIAL_RUN: kind = "it has no radial run"; break;
+                case LeadFindingKind::MEETS_CORE_LEG: kind = "it meets the core's outer leg"; break;
+                case LeadFindingKind::LEADS_TOO_CLOSE: kind = "it comes too close to another lead"; break;
+                case LeadFindingKind::TIED_LEADS_COLLIDE: kind = "no order of its tied leads clears"; break;
+                case LeadFindingKind::LANES_COLLIDE: kind = "its lane collides with another lead"; break;
+                case LeadFindingKind::PIN_RUN_COLLIDES: kind = "its run to the pin collides"; break;
+                case LeadFindingKind::LIFT_TOO_SHORT: kind = "its lift off the face has no room for its bend"; break;
+            }
+            return "real winding: the terminal lead of winding '" + route.winding + "' parallel " + std::to_string(route.parallel) +
+                   " does not fit (" + kind + "): " + finding.witness;
+        }
+    }
+    for (const auto& overlap : coil.judge_copper_overlaps()) {
+        std::ostringstream out;
+        out << "real winding: the copper of " << overlap.first << " (winding '" << overlap.firstWinding << "') overlaps "
+            << overlap.second << " (winding '" << overlap.secondWinding << "') by " << overlap.overlap * 1e3 << " mm";
+        return out.str();
+    }
     return std::nullopt;
 }
 
 Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optional<Inputs> inputs) {
+    LogOnceScope logOnceScope;  // a warning about an excitation is logged once per autocomplete (ABT #2160)
     // A datasheet-only catalogue part (neither core nor coil, see Magnetic.h) has no construction
     // to complete: it is returned as it is, so a catalogue mixing such parts with constructed ones
     // can be loaded with expansion on. A part with only one of the two is still refused below.
@@ -3719,6 +3758,22 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optio
         magnetic.get_mutable_coil().set_core_columns(magnetic.get_mutable_core().get_processed_description()->get_columns());
         // ABT #1487 (R3): and the core itself, for the room its outline leaves around the build.
         magnetic.get_mutable_coil().set_core_geometry(magnetic.get_mutable_core());
+    }
+    // A CLOSED core (drum + seated ring, molded body) has no free azimuth for the
+    // terminal leads; its lead exit is part of its construction. Handed to the coil BEFORE wind(),
+    // so the leads are laid on the plate-side edge and the reservations carry their runs.
+    // A catalogue drumRing (no base plate M) has NO lead exit: the coil carries that refusal and
+    // Coil::get_connection_layout -- the 3D/route contract -- throws it. Autocomplete itself, the
+    // magnetics and the in-window reservations are untouched, as they were before, so a catalogue
+    // drumRing part keeps its inductance and losses; only drawing its leads is refused.
+    if (magnetic.get_mutable_core().get_processed_description()) {
+        auto& autocompletedCore = magnetic.get_mutable_core();
+        if (auto refusal = autocompletedCore.get_lead_exit_refusal()) {
+            magnetic.get_mutable_coil().set_core_lead_exit_refusal(refusal.value());
+        }
+        else {
+            magnetic.get_mutable_coil().set_core_lead_exit(autocompletedCore.get_lead_exit_geometry());
+        }
     }
 
     // ABT #646: real winding is a LAYOUT setting, not a drawing one — wind() reserves the
