@@ -374,11 +374,12 @@ class Bobbin : public MAS::Bobbin {
      * @brief One plastic block of a pin rail, an axis-aligned box in the bobbin frame (ABT #1249).
      *
      * Frame as expand_pinout: origin at the centre of the main column, column axis Y, pin rows
-     * along X, rows at z = -+ rowDistance/2 (row 0 on the negative side).
+     * along X. Vertical pins: rows at z = -+ rowDistance/2. Horizontal pins: rows at
+     * y = -+ rowDistance/2, one outboard of each end flange. Row 0 is on the negative side.
      */
     struct PinRailBlock {
         std::string name;                 // "rail <row> block <k>", k counted along +X
-        size_t row;                       // 0: the row at negative Z, 1: at positive Z
+        size_t row;                       // 0: the row on the negative side (Z, or Y if horizontal), 1: positive
         std::vector<double> centre;       // {x, y, z}, metres
         std::vector<double> halfExtents;  // {x, y, z}, metres
     };
@@ -397,6 +398,12 @@ class Bobbin : public MAS::Bobbin {
      * row's side, y from -H1/2 to -(H1/2 + H3). Labels as documented in MAS docs/magnetic/coil.md
      * ("Pin rail labels"), measured on the Miles-Platts PQ0010..PQ0080 drawings.
      *
+     * Catalogue horizontal former (the rule get_pin_rail_distance reads from 'r1'): its pins leave
+     * along -Z, and each row has one block outboard of its end flange: x from -a/2 to a/2, y from the
+     * flange's outer face to b/2 on the row's side, z from -r3 (the rail top) down to -r1 (the pin
+     * standoff). Labels as documented in MAS docs/magnetic/coil.md ("Pin rail labels for a
+     * horizontal former"), measured on the Ferroxcube CPH-ETD29-1S-13P drawing.
+     *
      * Quick bobbin with synthesised pins (no functional description, ABT #1220), VERTICAL pins
      * only: one block per row, from src/data/quick_bobbin_pins.json (medians over the same PQ
      * drawings): across the row pin diameter + railInnerWall + railOuterWall around the row's pin
@@ -408,8 +415,8 @@ class Bobbin : public MAS::Bobbin {
      *
      * @throws InvalidInputException when the bobbin carries pins but a label the rule needs is
      *         missing (naming it), when a catalogue pin does not lie inside its rail block (the
-     *         labels contradict the pinout), for horizontal pins (no drawing in MAS describes a
-     *         horizontal former's rail), or for a catalogue family with no rail rule.
+     *         labels contradict the pinout), for horizontal pins on anything but a catalogue
+     *         horizontal former, or for a catalogue family with no rail rule.
      */
     std::vector<PinRailBlock> get_pin_rails() const;
 

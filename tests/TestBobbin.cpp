@@ -1241,6 +1241,139 @@ TEST_CASE("Pin rails: no pins -> none; pins but a missing or contradicting rail 
     }
 }
 
+// A horizontal former: the Ferroxcube CPH-ETD29-1S-13P as gpitel/MAS holds it. Labels (MAS
+// docs/magnetic/coil.md, "Pin rail labels for a horizontal former") from Fig. 2 of the ETD29/16/10
+// datasheet: a = b = 35.2 mm max (stated), pin 0.7 mm square (stated); r1 = 11.33, r3 = 5.00 and
+// b1 = 7.0 mm measured at scale on the vector drawing.
+namespace {
+
+json etd29_horizontal_former() {
+    return json::parse(R"json({
+        "name": "Bobbin ETD 29 13-pin (Ferroxcube CPH-ETD29-1S-13P)",
+        "functionalDescription": {
+            "type": "standard", "family": "etd", "shape": "ETD 29/16/10", "orientation": "horizontal", "material": "PBT",
+            "dimensions": {
+                "d1": {"minimum": 0.0216, "maximum": 0.0218}, "d2": {"minimum": 0.01155, "maximum": 0.0118},
+                "d3": {"minimum": 0.01, "maximum": 0.0103}, "h1": {"minimum": 0.02095, "maximum": 0.0212},
+                "h2": {"minimum": 0.0194}, "a": {"maximum": 0.0352}, "b": {"maximum": 0.0352}, "b1": {"nominal": 0.007},
+                "r1": {"nominal": 0.01133}, "r2": {"nominal": 0.01429}, "r3": {"nominal": 0.005}},
+            "pinout": {
+                "numberPins": 13, "numberRows": 2, "numberPinsPerRow": [7, 6], "pitch": 0.00508,
+                "centralPitch": 0.01016, "rowDistance": 0.0254,
+                "pinDescription": {"shape": "rectangular", "type": "tht", "dimensions": [0.0007, 0.0007, 0.00636]}}}
+    })json");
+}
+
+}  // namespace
+
+TEST_CASE("A horizontal former's pins leave from r1, and its rails stand outboard of the end flanges from r3 down to r1",
+          "[constructive-model][bobbin][pins][pinrail][horizontal-pinrail]") {
+    OpenMagnetics::Bobbin bobbin(etd29_horizontal_former());
+    const double r1 = 0.01133;
+    const double r3 = 0.005;
+    CHECK_THAT(OpenMagnetics::Bobbin::get_pin_rail_distance(bobbin.get_functional_description().value()),
+               Catch::Matchers::WithinAbs(r1, 1e-12));
+
+    REQUIRE(bobbin.get_processed_description()->get_pins());
+    const auto pins = bobbin.get_processed_description()->get_pins().value();
+    REQUIRE(pins.size() == 13);
+    for (const auto& pin : pins) {
+        INFO("pin " << pin.get_name().value());
+        // Lying on its side, each pin leaves along -Z from the rail underside, r1 below the column axis.
+        REQUIRE(pin.get_rotation());
+        const auto coordinates = pin.get_coordinates().value();
+        CHECK_THAT(coordinates[2] + pin.get_dimensions()[2] / 2, Catch::Matchers::WithinAbs(-r1, 1e-12));
+        // One row outboard of each end flange: y = -+ rowDistance / 2.
+        CHECK_THAT(std::abs(coordinates[1]), Catch::Matchers::WithinAbs(0.0127, 1e-12));
+    }
+    // The 7-pin row steps by the 5.08 mm pitch from its middle pin; the 6-pin row skips its centre,
+    // so its middle pair stands centralPitch = 10.16 mm apart.
+    std::vector<double> sevenRow;
+    std::vector<double> sixRow;
+    for (size_t index = 0; index < pins.size(); ++index) {
+        (index < 7 ? sevenRow : sixRow).push_back(pins[index].get_coordinates().value()[0]);
+    }
+    std::sort(sevenRow.begin(), sevenRow.end());
+    std::sort(sixRow.begin(), sixRow.end());
+    const std::vector<double> sevenExpected = {-0.01524, -0.01016, -0.00508, 0.0, 0.00508, 0.01016, 0.01524};
+    const std::vector<double> sixExpected = {-0.01524, -0.01016, -0.00508, 0.00508, 0.01016, 0.01524};
+    for (size_t index = 0; index < 7; ++index) {
+        CHECK_THAT(sevenRow[index], Catch::Matchers::WithinAbs(sevenExpected[index], 1e-12));
+    }
+    for (size_t index = 0; index < 6; ++index) {
+        CHECK_THAT(sixRow[index], Catch::Matchers::WithinAbs(sixExpected[index], 1e-12));
+    }
+
+    const auto rails = bobbin.get_pin_rails();
+    REQUIRE(rails.size() == 2);
+    CHECK(rails[0].name == "rail 0 block 0");
+    CHECK(rails[1].name == "rail 1 block 0");
+    const auto processed = bobbin.get_processed_description().value();
+    const double flangeOuterFace = processed.get_winding_windows()[0].get_height().value() / 2 + processed.get_wall_thickness();
+    // The rail starts at the processed flange face; b/2 - b1 = 10.6 mm is where the drawing puts it,
+    // and the processed flange (the middle of h1's tolerance) is within 0.1 mm of that.
+    CHECK_THAT(flangeOuterFace, Catch::Matchers::WithinAbs(0.0352 / 2 - 0.007, 1e-4));
+    auto core = OpenMagneticsTesting::get_quick_core("ETD 29/16/10", OpenMagneticsTesting::get_ground_gap(0.001), 1, "3C97");
+    for (const auto& rail : rails) {
+        INFO(rail.name);
+        const auto [x0, x1] = rail_bounds(rail, 0);
+        const auto [y0, y1] = rail_bounds(rail, 1);
+        const auto [z0, z1] = rail_bounds(rail, 2);
+        // Across the axis: -+ a/2.
+        CHECK_THAT(x0, Catch::Matchers::WithinAbs(-0.0176, 1e-12));
+        CHECK_THAT(x1, Catch::Matchers::WithinAbs(0.0176, 1e-12));
+        // Along the axis, on the row's side: from the end flange's outer face out to b/2.
+        CHECK_THAT(rail.row == 1 ? y0 : -y1, Catch::Matchers::WithinAbs(flangeOuterFace, 1e-12));
+        CHECK_THAT(rail.row == 1 ? y1 : -y0, Catch::Matchers::WithinAbs(0.0176, 1e-12));
+        // Below the column: from the pin standoff up to the rail top.
+        CHECK_THAT(z0, Catch::Matchers::WithinAbs(-r1, 1e-12));
+        CHECK_THAT(z1, Catch::Matchers::WithinAbs(-r3, 1e-12));
+        // The core's back plate passes over the rail top, through the pocket above it.
+        CHECK(rail_clears_core_box(rail, core.get_width() / 2, core.get_height() / 2, core.get_depth() / 2));
+    }
+    // Every pin passes through exactly one block, inside its footprint (X, Y), and leaves from its underside.
+    for (const auto& pin : pins) {
+        const auto coordinates = pin.get_coordinates().value();
+        const double radius = pin.get_dimensions()[0] / 2;
+        size_t holders = 0;
+        for (const auto& rail : rails) {
+            const auto [x0, x1] = rail_bounds(rail, 0);
+            const auto [y0, y1] = rail_bounds(rail, 1);
+            const auto [z0, z1] = rail_bounds(rail, 2);
+            if (coordinates[0] - radius >= x0 && coordinates[0] + radius <= x1 && coordinates[1] - radius >= y0 &&
+                coordinates[1] + radius <= y1 && std::abs(coordinates[2] + pin.get_dimensions()[2] / 2 - z0) < 1e-9) {
+                ++holders;
+            }
+        }
+        INFO("pin " << pin.get_name().value());
+        CHECK(holders == 1);
+    }
+}
+
+TEST_CASE("A horizontal former without 'r1' keeps no pins, and one without 'r3' keeps its pins but builds no rails",
+          "[constructive-model][bobbin][pins][pinrail][horizontal-pinrail]") {
+    auto record = etd29_horizontal_former();
+    SECTION("no 'r1': no rail datum, so no pins, and get_pin names the label") {
+        record["functionalDescription"]["dimensions"].erase("r1");
+        OpenMagnetics::Bobbin bobbin(record);
+        const auto pins = bobbin.get_processed_description()->get_pins();
+        CHECK((!pins || pins->empty()));
+        CHECK_THROWS_WITH(bobbin.get_pin("1"), Catch::Matchers::ContainsSubstring("standoff ('r1'"));
+        CHECK(bobbin.get_pin_rails().empty());
+    }
+    SECTION("no 'r3': the pins are placed, the rails are refused naming 'r3'") {
+        record["functionalDescription"]["dimensions"].erase("r3");
+        OpenMagnetics::Bobbin bobbin(record);
+        REQUIRE(bobbin.get_processed_description()->get_pins());
+        CHECK_THROWS_WITH(bobbin.get_pin_rails(), Catch::Matchers::ContainsSubstring("the record has no 'r3'"));
+    }
+    SECTION("a rail narrower than the pin row contradicts the pinout") {
+        record["functionalDescription"]["dimensions"]["a"] = {{"maximum", 0.025}};
+        OpenMagnetics::Bobbin bobbin(record);
+        CHECK_THROWS_WITH(bobbin.get_pin_rails(), Catch::Matchers::ContainsSubstring("the rail labels contradict the pinout"));
+    }
+}
+
 // ABT #761: a molded core with a SQUARE footprint (A == C, the norm for WE-MAPI/MXGI 1610 ...
 // 6060) was reported to get a zero-width bobbin winding window. A zero-width (or zero-height)
 // window is never a valid answer -- MAS rejects the magnetic -- so create_quick_bobbin must
