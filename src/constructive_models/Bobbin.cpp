@@ -2066,12 +2066,27 @@ std::vector<Bobbin::PinRailBlock> Bobbin::get_pin_rails() const {
         rows[rowPosition < 0 ? 0 : 1].pins.push_back(&pin);
     }
 
-    if (processed.get_winding_windows().empty() || !processed.get_winding_windows()[0].get_height()) {
-        throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
-            "Bobbin '" + bobbinName + "' has no main winding window height, so the bottom flange's outer face, where the "
-            "pin rails hang from, is unknown.");
+    // The bottom flange's outer face lies a wall thickness past the lowest edge of all the winding
+    // windows. A chambered former splits its window along the column axis, so window 0 is one
+    // chamber: on the two-chamber Ferroxcube CSH-EP13-2S-10P it put the face at 2.3 mm, inside
+    // the former, where the flange is at 4.4 mm, and MVBpp refused the rail it hung from there.
+    std::optional<double> lowestEdge;
+    for (const auto& window : processed.get_winding_windows()) {
+        if (!window.get_height()) {
+            lowestEdge.reset();
+            break;
+        }
+        const auto coordinates = window.get_coordinates();
+        const double centre = coordinates && coordinates->size() > 1 ? (*coordinates)[1] : 0;
+        const double edge = centre - window.get_height().value() / 2;
+        lowestEdge = lowestEdge ? std::min(*lowestEdge, edge) : edge;
     }
-    const double flangeFace = -(processed.get_winding_windows()[0].get_height().value() / 2 + processed.get_wall_thickness());
+    if (!lowestEdge) {
+        throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+            "Bobbin '" + bobbinName + "' has no winding window, or one without a height, so the bottom flange's outer "
+            "face, where the pin rails hang from, is unknown.");
+    }
+    const double flangeFace = *lowestEdge - processed.get_wall_thickness();
 
     auto pinTop = [](const MAS::Pin& pin) { return pin.get_coordinates().value()[1] + pin.get_dimensions()[2] / 2; };
     auto pinName = [](const MAS::Pin& pin) { return pin.get_name().value_or("<unnamed>"); };

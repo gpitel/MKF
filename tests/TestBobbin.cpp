@@ -1374,6 +1374,50 @@ TEST_CASE("A horizontal former without 'r1' keeps no pins, and one without 'r3' 
     }
 }
 
+// A two-chamber horizontal former: the Ferroxcube CSH-EP13-2S-10P as gpitel/MAS holds it (MAS #9).
+// Labels from Fig. 2 of the EP13 coil-former page (Ferroxcube Data Handbook, p. 453): a = b = 13.6 mm
+// max, r3 = 2.5, r1 = 2.5 + 2.7 = 5.2 and the pin 0.6 mm round, all printed. Its two chambers sit at
+// y = -+2.1 mm, 3.4 mm each, so window 0 alone ends 1.7 mm from the axis, not at the end flange.
+TEST_CASE("A chambered horizontal former's rails hang from its end flanges, not from its first chamber",
+          "[constructive-model][bobbin][pins][pinrail][horizontal-pinrail]") {
+    OpenMagnetics::Bobbin bobbin(json::parse(R"json({
+        "name": "Bobbin EP 13 10-pin 2.54mm 2-chamber (Ferroxcube CSH-EP13-2S-10P)",
+        "functionalDescription": {
+            "type": "standard", "family": "ep", "shape": "EP 13", "orientation": "horizontal", "material": "PF",
+            "variant": "2-chamber", "numberChambers": 2,
+            "dimensions": {
+                "d1": {"minimum": 0.0094, "maximum": 0.0096}, "d2": {"minimum": 0.0057, "maximum": 0.0058},
+                "d3": {"minimum": 0.0045, "maximum": 0.0047}, "h": {"minimum": 0.0088, "maximum": 0.009},
+                "s": {"nominal": 0.0006}, "w1": {"nominal": 0.0008}, "c1": {"minimum": 0.0034}, "c2": {"minimum": 0.0034},
+                "a": {"maximum": 0.0136}, "b": {"maximum": 0.0136},
+                "r1": {"nominal": 0.0052}, "r2": {"nominal": 0.0062}, "r3": {"nominal": 0.0025}},
+            "pinout": {
+                "numberPins": 10, "numberRows": 2, "numberPinsPerRow": [5, 5], "rowDistance": 0.01016, "pitch": 0.00254,
+                "pinDescription": {"shape": "round", "type": "tht", "dimensions": [0.0006, 0.0006, 0.0048]}}}
+    })json"));
+    const auto processed = bobbin.get_processed_description().value();
+    REQUIRE(processed.get_winding_windows().size() == 2);
+    REQUIRE(processed.get_pins());
+    REQUIRE(processed.get_pins()->size() == 10);
+    // The end flange: the chambers' outer edge (2.1 + 3.4 / 2 = 3.8 mm) plus the 0.6 mm wall.
+    const double flangeOuterFace = 0.0044;
+
+    const auto rails = bobbin.get_pin_rails();
+    REQUIRE(rails.size() == 2);
+    for (const auto& rail : rails) {
+        INFO(rail.name);
+        const auto [x0, x1] = rail_bounds(rail, 0);
+        const auto [y0, y1] = rail_bounds(rail, 1);
+        const auto [z0, z1] = rail_bounds(rail, 2);
+        CHECK_THAT(x0, Catch::Matchers::WithinAbs(-0.0068, 1e-12));
+        CHECK_THAT(x1, Catch::Matchers::WithinAbs(0.0068, 1e-12));
+        CHECK_THAT(rail.row == 1 ? y0 : -y1, Catch::Matchers::WithinAbs(flangeOuterFace, 1e-12));
+        CHECK_THAT(rail.row == 1 ? y1 : -y0, Catch::Matchers::WithinAbs(0.0068, 1e-12));
+        CHECK_THAT(z0, Catch::Matchers::WithinAbs(-0.0052, 1e-12));
+        CHECK_THAT(z1, Catch::Matchers::WithinAbs(-0.0025, 1e-12));
+    }
+}
+
 // ABT #761: a molded core with a SQUARE footprint (A == C, the norm for WE-MAPI/MXGI 1610 ...
 // 6060) was reported to get a zero-width bobbin winding window. A zero-width (or zero-height)
 // window is never a valid answer -- MAS rejects the magnetic -- so create_quick_bobbin must
