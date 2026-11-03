@@ -1667,6 +1667,21 @@ PinRailDatum find_pin_rail_distance(const MAS::BobbinFunctionalDescription& func
         return datum;
     }
 
+    if (orientation == MAS::OrientationEnum::HORIZONTAL && dimensions.find("r1") != dimensions.end()) {
+        // A horizontal former lies with its column axis parallel to the board, and its pins leave
+        // downwards from a rail outboard of each end flange. 'r1' runs from the column axis to the
+        // rail underside, where the pins leave (MAS docs/magnetic/coil.md, "Pin rail labels for a
+        // horizontal former"; measured on the Ferroxcube CPH-ETD29-1S-13P drawing).
+        const double r1 = dimensions.at("r1");
+        if (!(r1 > 0)) {
+            datum.missing = "a horizontal former's 'r1' (column axis to the pin standoff) is " + std::to_string(r1) +
+                            " m; it must be positive for the pins to leave below the column";
+            return datum;
+        }
+        datum.distance = r1;
+        return datum;
+    }
+
     datum.missing = "no dimension in the record locates the pin rail of a " +
                     std::string(orientation == MAS::OrientationEnum::VERTICAL ? "vertical" : "horizontal") +
                     " '" + to_string(family) + "' bobbin: a " +
@@ -1674,9 +1689,9 @@ PinRailDatum find_pin_rail_distance(const MAS::BobbinFunctionalDescription& func
                         ? "vertical former needs its flange-to-flange height together with the rail "
                           "height from the bottom flange's outer face to the pin standoff"
                         : "horizontal former needs the distance from the column axis to the pin "
-                          "standoff (seating plane) of its end-flange rails") +
+                          "standoff ('r1', the underside of its end-flange rails)") +
                     ", and MKF reads that only from labels checked against a vendor drawing (so far: "
-                    "'H1' and 'H3' on vertical PQ). The record declares {";
+                    "'H1' and 'H3' on vertical PQ, 'r1' on a horizontal former). The record declares {";
     std::string declared;
     for (const auto& [key, _] : dimensions) {
         declared += (declared.empty() ? "" : ", ") + key;
@@ -1912,11 +1927,22 @@ std::vector<MAS::Pin> Bobbin::expand_pinout(const MAS::Pinout& pinout,
     const double pinCentreY = -(pinRailDistance + pinLength / 2);
     const double pinCentreZ = -(pinRailDistance + pinLength / 2);
 
+    // centralPitch is one number for the whole pinout, the distance between the central pins. On
+    // a pinout whose rows differ, such as 7 + 6 where the 6-pin row skips its centre (Ferroxcube
+    // CPH-ETD29-1S-13P), it describes the rows with a middle pair; a row with a middle pin steps
+    // by its pitch from that pin. When no row has a middle pair, the field describes nothing, and
+    // row_positions refuses it.
+    bool hasMiddlePair = false;
+    for (auto pinsInRow : pinsPerRow) {
+        hasMiddlePair = hasMiddlePair || pinsInRow % 2 == 0;
+    }
+
     std::vector<MAS::Pin> pins;
     int64_t pinNumber = 1;
     for (size_t rowIndex = 0; rowIndex < pinsPerRow.size(); ++rowIndex) {
+        const bool usesCentralPitch = pinsPerRow[rowIndex] % 2 == 0 || !hasMiddlePair;
         auto positions = row_positions(pinsPerRow[rowIndex], pitchPerRow[rowIndex],
-                                       pinout.get_central_pitch(), rowIndex);
+                                       usesCentralPitch ? pinout.get_central_pitch() : std::nullopt, rowIndex);
         // Counter-clockwise as a ring: out along +X on row 0, back along -X on row 1.
         if (rowIndex % 2 == 1) {
             std::reverse(positions.begin(), positions.end());
@@ -1998,12 +2024,22 @@ std::vector<Bobbin::PinRailBlock> Bobbin::get_pin_rails() const {
     }
     const auto& pins = pinsOptional.value();
 
-    // Every pin must be a vertical one (no rotation: its length runs along -Y from the rail).
+    // A catalogue former stated horizontal carries only horizontal pins (expand_pinout rotates them
+    // to leave along -Z); every other bobbin carries only vertical ones (no rotation, along -Y). A
+    // horizontal quick bobbin has no rail rule: only a record's 'r1' and 'r3' describe one.
+    const bool isHorizontalFormer = get_functional_description() &&
+                                    get_functional_description()->get_orientation() == MAS::OrientationEnum::HORIZONTAL;
     for (const auto& pin : pins) {
-        if (pin.get_rotation()) {
+        if (pin.get_rotation() && !isHorizontalFormer) {
             throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
                 "Bobbin '" + bobbinName + "' carries horizontal pins (pin '" + pin.get_name().value_or("<unnamed>") +
-                "' is rotated). No drawing in MAS describes the rail of a horizontal former, so its pin rail is not modelled.");
+                "' is rotated) but is no catalogue horizontal former. Only a record's 'r1' and 'r3' describe the rail of a "
+                "horizontal former, so this pin rail is not modelled.");
+        }
+        if (!pin.get_rotation() && isHorizontalFormer) {
+            throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+                "Bobbin '" + bobbinName + "' is a horizontal former but pin '" + pin.get_name().value_or("<unnamed>") +
+                "' is not rotated, so it does not leave along -Z from the rail underside.");
         }
         if (!pin.get_coordinates() || pin.get_coordinates()->size() != 3 || pin.get_dimensions().size() < 3) {
             throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
@@ -2012,19 +2048,22 @@ std::vector<Bobbin::PinRailBlock> Bobbin::get_pin_rails() const {
         }
     }
 
-    // Rows: expand_pinout puts row 0 at negative Z, row 1 at positive Z, both rows at -+ rowDistance/2.
+    // Rows: expand_pinout puts row 0 on the negative side and row 1 on the positive side, at
+    // -+ rowDistance/2: along Z for vertical pins, along the column axis Y for horizontal ones.
     struct Row {
         std::vector<const MAS::Pin*> pins;
     };
     Row rows[2];
+    const size_t rowAxis = isHorizontalFormer ? 1 : 2;
     for (const auto& pin : pins) {
-        const double z = pin.get_coordinates().value()[2];
-        if (z == 0) {
+        const double rowPosition = pin.get_coordinates().value()[rowAxis];
+        if (rowPosition == 0) {
             throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
                 "Bobbin '" + bobbinName + "': pin '" + pin.get_name().value_or("<unnamed>") +
-                "' sits on the column's mid-plane (z = 0), in neither pin row, so no rail can hold it.");
+                "' sits on the column's mid-plane (" + (isHorizontalFormer ? "y" : "z") +
+                " = 0), in neither pin row, so no rail can hold it.");
         }
-        rows[z < 0 ? 0 : 1].pins.push_back(&pin);
+        rows[rowPosition < 0 ? 0 : 1].pins.push_back(&pin);
     }
 
     if (processed.get_winding_windows().empty() || !processed.get_winding_windows()[0].get_height()) {
@@ -2092,6 +2131,70 @@ std::vector<Bobbin::PinRailBlock> Bobbin::get_pin_rails() const {
     }
 
     const auto functionalDescription = get_functional_description().value();
+    if (isHorizontalFormer) {
+        // A horizontal former (MAS docs/magnetic/coil.md, "Pin rail labels for a horizontal former"):
+        // one block per row, outboard of that row's end flange. Across the column axis it is 'a' long.
+        // Along the axis it runs from the flange's outer face out to b/2. Below the column it stands
+        // from its top, 'r3' below the axis, down to the pin standoff 'r1', where the pins leave.
+        // The block starts at the processed flange face, not at b/2 - b1: 'b1' is measured to the
+        // drawn flange, and the processed flange sits at the middle of h1's tolerance (0.06 mm
+        // inside it on the CPH-ETD29-1S-13P), so a block from b/2 - b1 would stand apart from the
+        // flange it is moulded to.
+        const auto dimensions = flatten_dimensions(functionalDescription.get_dimensions());
+        std::string absent;
+        for (const auto* label : {"a", "b", "r1", "r3"}) {
+            if (dimensions.find(label) == dimensions.end()) {
+                absent += (absent.empty() ? "'" : ", '") + std::string(label) + "'";
+            }
+        }
+        if (!absent.empty()) {
+            throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+                "Bobbin '" + bobbinName + "' carries pins but its pin rails cannot be built: a horizontal former's rail "
+                "blocks are bounded by 'a' (rail length across the column axis), 'b' (outer rail face to outer rail face, "
+                "along the axis), 'r1' (column axis to the pin standoff) and 'r3' (column axis to the rail top), and the "
+                "record has no " + absent + " (MAS docs/magnetic/coil.md, \"Pin rail labels for a horizontal former\").");
+        }
+        const double a = dimensions.at("a");
+        const double b = dimensions.at("b");
+        const double r1 = dimensions.at("r1");
+        const double r3 = dimensions.at("r3");
+        const double flangeOuterFace = -flangeFace;
+        if (!(a > 0 && b / 2 > flangeOuterFace && r1 > r3 && r3 > 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+                "Bobbin '" + bobbinName + "': rail labels a = " + format_mm(a) + ", b = " + format_mm(b) + ", r1 = " +
+                format_mm(r1) + ", r3 = " + format_mm(r3) + " do not bound a rail block (need a > 0, b/2 beyond the end "
+                "flange's outer face at " + format_mm(flangeOuterFace) + ", r1 > r3 > 0).");
+        }
+        for (size_t rowIndex = 0; rowIndex < 2; ++rowIndex) {
+            if (rows[rowIndex].pins.empty()) {
+                continue;
+            }
+            const double side = rowIndex == 0 ? -1.0 : 1.0;
+            const double y0 = std::min(side * flangeOuterFace, side * b / 2);
+            const double y1 = std::max(side * flangeOuterFace, side * b / 2);
+            const PinRailBlock block = boxFromBounds("rail " + std::to_string(rowIndex) + " block 0", rowIndex,
+                                                     -a / 2, a / 2, y0, y1, -r1, -r3);
+            // Every pin of the row passes through the block and leaves from its underside, as on a
+            // vertical former; otherwise the labels contradict the pinout.
+            for (const auto* pin : rows[rowIndex].pins) {
+                const auto coordinates = pin->get_coordinates().value();
+                const double radius = pin->get_dimensions()[0] / 2;
+                const double x = coordinates[0];
+                const double y = coordinates[1];
+                const double pinStart = coordinates[2] + pin->get_dimensions()[2] / 2;
+                if (!(x - radius >= -a / 2 && x + radius <= a / 2 && y - radius >= y0 && y + radius <= y1) ||
+                    std::abs(pinStart + r1) > 1e-9) {
+                    throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+                        "Bobbin '" + bobbinName + "': pin '" + pinName(*pin) + "' at x = " + format_mm(x) + ", y = " + format_mm(y) +
+                        " (top end z = " + format_mm(pinStart) + ") does not lie inside its rail block (x within -+" +
+                        format_mm(a / 2) + ", y within [" + format_mm(y0) + ", " + format_mm(y1) + "], starting at the "
+                        "underside z = " + format_mm(-r1) + "): the rail labels contradict the pinout.");
+                }
+            }
+            blocks.push_back(block);
+        }
+        return blocks;
+    }
     if (functionalDescription.get_family() != MAS::BobbinFamily::PQ ||
         functionalDescription.get_orientation() != MAS::OrientationEnum::VERTICAL) {
         throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
