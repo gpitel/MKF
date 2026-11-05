@@ -1228,14 +1228,52 @@ void Painter::paint_two_piece_set_bobbin(Magnetic magnetic) {
             }
         }
     }
+    // The windows that host a lateral winding, each with the core column it wraps.
+    auto coreColumns = magnetic.get_mutable_core().get_columns();
+    std::map<size_t, size_t> woundLateralColumns;
+    if (perColumnWindows) {
+        auto mainColumnEdge = bobbinWindingWindows[0].get_column();
+        for (size_t windowIndex = 1; windowIndex < bobbinWindingWindows.size(); ++windowIndex) {
+            auto& windingWindow = bobbinWindingWindows[windowIndex];
+            auto columnEdge = windingWindow.get_column();
+            bool lateralWound = columnEdge && (!mainColumnEdge || columnEdge.value() != mainColumnEdge.value());
+            if (!lateralWound || !windingWindow.get_coordinates() || !usedWindowIndexes.contains(windowIndex)) {
+                continue;
+            }
+            if (columnEdge.value() < 0 || static_cast<size_t>(columnEdge.value()) >= coreColumns.size()) {
+                throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                    "Winding window " + std::to_string(windowIndex) + " references core column " +
+                        std::to_string(columnEdge.value()) + " but the core has " + std::to_string(coreColumns.size()) + " columns");
+            }
+            woundLateralColumns[windowIndex] = static_cast<size_t>(columnEdge.value());
+        }
+    }
+
     // The reflection axis that maps the main bobbin's wall face onto the leg face:
-    // the CORE window's midline. Reflecting the main polygon across it puts the
+    // the CORE window's midline, halfway between the main leg's face and the facing
+    // face of the lateral column. Reflecting the main polygon across it puts the
     // lateral bobbin's wall on the WINDOW side of the leg (a wall reflected across
     // the bobbin-window center would land inside the ferrite), and clipping the
     // main flanges to it splits the shared region into equal winding spaces.
-    double coreWindowMidline = (bobbinCoordinates[0] + bobbinProcessedDescription.get_column_width().value() - columnThickness + bobbinOuterWidth) / 2;
-    if (perColumnWindows && mainColumnWound && lateralColumnWound) {
-        bobbinOuterWidth = coreWindowMidline;
+    // It comes from the core's columns, never from the main bobbin's own window:
+    // that window ends at the midline only when the winder cuts it there, and starts
+    // at the tube, so its midpoint is the core window's midline only when it runs
+    // the whole way to the lateral leg and the tube sits on the main leg. With a
+    // bore larger than the leg, or a window cut at the midline, the midpoint of the
+    // bobbin's window clipped the main flanges short of the midline and drew the
+    // lateral bobbin about the wrong axis, off its own leg.
+    auto coreWindowMidlineOf = [&](size_t columnIndex) {
+        auto& mainColumn = coreColumns[magnetic.get_mutable_core().get_main_column_index()];
+        auto& lateralColumn = coreColumns[columnIndex];
+        double mainX = mainColumn.get_coordinates()[0];
+        double mainFace = mainX + mainColumn.get_width() / 2;
+        double lateralFace = mainX + std::abs(lateralColumn.get_coordinates()[0] - mainX) - lateralColumn.get_width() / 2;
+        return (mainFace + lateralFace) / 2;
+    };
+    if (mainColumnWound && lateralColumnWound && !woundLateralColumns.empty()) {
+        for (auto& [windowIndex, columnIndex] : woundLateralColumns) {
+            bobbinOuterWidth = std::min(bobbinOuterWidth, coreWindowMidlineOf(columnIndex));
+        }
     }
 
     double bobbinOuterHeight = wallThickness;
@@ -1310,28 +1348,16 @@ void Painter::paint_two_piece_set_bobbin(Magnetic magnetic) {
 
     if (perColumnWindows) {
         // One bobbin per lateral-wound window, wrapping ITS column, drawn as BOTH
-        // halves: the window-side half (main polygon reflected across the window
-        // center so its column wall lands on the leg's inner face) and the
+        // halves: the window-side half (main polygon reflected across the core
+        // window's midline so its column wall lands on the leg's inner face) and the
         // outside-core half (that polygon reflected again across the leg's axis).
         // Side-mirrored for negative-x windows.
-        auto mainColumnEdge = bobbinWindingWindows[0].get_column();
-        auto coreColumns = magnetic.get_mutable_core().get_columns();
-        for (size_t windowIndex = 1; windowIndex < bobbinWindingWindows.size(); ++windowIndex) {
+        for (auto& [windowIndex, columnIndex] : woundLateralColumns) {
             auto& windingWindow = bobbinWindingWindows[windowIndex];
-            auto columnEdge = windingWindow.get_column();
-            bool lateralWound = columnEdge && (!mainColumnEdge || columnEdge.value() != mainColumnEdge.value());
-            if (!lateralWound || !windingWindow.get_coordinates() || !usedWindowIndexes.contains(windowIndex)) {
-                continue;
-            }
-            if (columnEdge.value() < 0 || static_cast<size_t>(columnEdge.value()) >= coreColumns.size()) {
-                throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
-                    "Winding window " + std::to_string(windowIndex) + " references core column " +
-                        std::to_string(columnEdge.value()) + " but the core has " + std::to_string(coreColumns.size()) + " columns");
-            }
-            double legAxisX = std::abs(coreColumns[static_cast<size_t>(columnEdge.value())].get_coordinates()[0]);
+            double legAxisX = std::abs(coreColumns[columnIndex].get_coordinates()[0]);
             bool mirrorSide = windingWindow.get_coordinates().value()[0] < 0;
 
-            auto innerHalf = reflectAcross(bobbinPoints, coreWindowMidline);
+            auto innerHalf = reflectAcross(bobbinPoints, coreWindowMidlineOf(columnIndex));
             auto outerHalf = reflectAcross(innerHalf, legAxisX);
             if (mirrorSide) {
                 innerHalf = mirrorSideOf(innerHalf);

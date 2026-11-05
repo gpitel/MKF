@@ -1905,8 +1905,8 @@ namespace {
 
     using FerritePolygons = std::vector<std::vector<std::pair<double, double>>>;
 
-    // The ferrite polygons of a painted SVG, in painter units (metres * coilPainterScale, y pointing down).
-    FerritePolygons get_ferrite_polygons(const std::string& svg) {
+    // The polygons of a painted SVG with a CSS class, in painter units (metres * coilPainterScale, y pointing down).
+    FerritePolygons get_polygons(const std::string& svg, const std::string& cssClass) {
         auto numbersIn = [](const std::string& text) {
             std::vector<double> values;
             std::regex numberRegex(R"re(-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)re");
@@ -1920,7 +1920,7 @@ namespace {
         std::regex polygonRegex(R"re(<polygon[^>]*>)re");
         for (auto it = std::sregex_iterator(svg.begin(), svg.end(), polygonRegex); it != std::sregex_iterator(); ++it) {
             std::string tag = it->str();
-            if (tag.find("ferrite") == std::string::npos) {
+            if (tag.find(cssClass) == std::string::npos) {
                 continue;
             }
             std::smatch pointsMatch;
@@ -1934,6 +1934,10 @@ namespace {
             ferritePolygons.push_back(polygon);
         }
         return ferritePolygons;
+    }
+
+    FerritePolygons get_ferrite_polygons(const std::string& svg) {
+        return get_polygons(svg, "ferrite");
     }
 
     bool is_inside_ferrite(const FerritePolygons& ferritePolygons, double x, double y) {
@@ -2048,6 +2052,109 @@ namespace {
             ++turnsChecked;
         }
         CHECK(turnsChecked >= 12);
+        settings.reset();
+    }
+
+    // With one coil on each leg the two bobbins share the core's winding window, and each is drawn
+    // as the mirror of the other about the CORE window's midline: halfway between the main leg's face
+    // and the far leg's facing face. The painter took the midpoint of the main bobbin's OWN window
+    // instead, which is the core window's midline only when that window runs the whole way to the far
+    // leg. When the main bobbin's window is cut at the midline, as an exporter cuts it, and the bore is
+    // larger than the leg, the main flanges were clipped short of the midline and the far leg's bobbin
+    // was drawn about the wrong axis, off its leg.
+    TEST_CASE("Test_Painter_UI_Core_Bobbin_Window_Cut_At_The_Midline_Mirrors_About_It", "[support][painter][magnetic-painter][ui-core][smoke-test]") {
+        settings.reset();
+        settings.set_core_per_column_winding_windows(true);
+        auto core = OpenMagneticsTesting::get_quick_core("UI 93/76/16", json::parse("[]"), 1, "3C97");
+        auto columns = core.get_processed_description()->get_columns();
+        REQUIRE(columns.size() == 2);
+        auto mainColumn = columns[core.get_main_column_index()];
+        auto farColumn = columns[1 - core.get_main_column_index()];
+        double mainFace = mainColumn.get_coordinates()[0] + mainColumn.get_width() / 2;
+        double farFace = farColumn.get_coordinates()[0] - farColumn.get_width() / 2;
+        double midline = (mainFace + farFace) / 2;
+
+        // The bore is 2.5 mm larger than the leg on each side, and the tube is 1 mm thick.
+        const double boreGap = 0.0025;
+        const double tubeThickness = 0.001;
+        double tubeInnerFace = mainFace + boreGap;
+        double windowStart = tubeInnerFace + tubeThickness;
+        double windowWidth = midline - windowStart;
+        double windowHeight = core.get_processed_description()->get_winding_windows()[0].get_height().value();
+
+        auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.001, 0.001);
+        json bobbinJson;
+        to_json(bobbinJson, bobbin);
+        auto& processedJson = bobbinJson["processedDescription"];
+        processedJson["columnWidth"] = windowStart;
+        processedJson["columnThickness"] = tubeThickness;
+        // Window 0 is the main leg's half of the shared window, cut at the midline; window 1 is the far
+        // leg's half, its mirror.
+        for (size_t windowIndex = 0; windowIndex < 2; ++windowIndex) {
+            auto& windowJson = processedJson["windingWindows"][windowIndex];
+            windowJson["width"] = windowWidth;
+            windowJson["height"] = windowHeight;
+            windowJson["area"] = windowWidth * windowHeight;
+            windowJson["coordinates"][0] = windowIndex == 0 ? windowStart + windowWidth / 2 : 2 * midline - windowStart - windowWidth / 2;
+        }
+
+        json coilJson;
+        coilJson["bobbin"] = bobbinJson;
+        coilJson["functionalDescription"] = json::array();
+        coilJson["functionalDescription"].push_back(json{{"name", "Primary"}, {"numberTurns", 6}, {"numberParallels", 1},
+                                                         {"isolationSide", "primary"}, {"wire", "Round 0.475 - Grade 1"}});
+        coilJson["functionalDescription"].push_back(json{{"name", "Secondary"}, {"numberTurns", 6}, {"numberParallels", 1},
+                                                         {"isolationSide", "secondary"}, {"wire", "Round 0.475 - Grade 1"}});
+        OpenMagnetics::Coil coil(coilJson, false);
+        coil.get_mutable_functional_description()[1].set_winding_window(1);
+        coil.set_core_columns(columns);
+        REQUIRE(coil.wind());
+
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(coil);
+
+        Painter painter("");
+        painter.paint_core(magnetic);
+        painter.paint_bobbin(magnetic);
+        std::string svg = painter.export_svg();
+
+        // The main bobbin's two halves, then the far leg's: the inner half in the window and the outer
+        // half beyond its leg.
+        auto bobbinPolygons = get_polygons(svg, "bobbin");
+        REQUIRE(bobbinPolygons.size() == 4);
+        std::vector<std::pair<double, double>> spans;
+        for (auto& polygon : bobbinPolygons) {
+            double minimumX = std::numeric_limits<double>::max();
+            double maximumX = std::numeric_limits<double>::lowest();
+            for (auto& [x, y] : polygon) {
+                minimumX = std::min(minimumX, x);
+                maximumX = std::max(maximumX, x);
+            }
+            spans.push_back({minimumX, maximumX});
+        }
+        std::sort(spans.begin(), spans.end());
+        auto mainLeftSpan = spans[0];
+        auto mainSpan = spans[1];
+        auto farInnerSpan = spans[2];
+        auto farOuterSpan = spans[3];
+
+        const double scale = Constants().coilPainterScale;
+        // Coordinates are printed with one decimal.
+        const double printTolerance = 0.2;
+        // The main bobbin is drawn from its tube, 2.5 mm off the leg, to the midline.
+        CHECK_THAT(mainSpan.first, Catch::Matchers::WithinAbs(tubeInnerFace * scale, printTolerance));
+        CHECK_THAT(mainLeftSpan.second, Catch::Matchers::WithinAbs(-tubeInnerFace * scale, printTolerance));
+        // Its flanges reach the midline, and neither bobbin crosses it.
+        CHECK_THAT(mainSpan.second, Catch::Matchers::WithinAbs(midline * scale, printTolerance));
+        CHECK_THAT(farInnerSpan.first, Catch::Matchers::WithinAbs(midline * scale, printTolerance));
+        // The far leg's bobbin is the main one reflected about the midline, its tube 2.5 mm off its leg.
+        CHECK_THAT(farInnerSpan.second, Catch::Matchers::WithinAbs((2 * midline - tubeInnerFace) * scale, printTolerance));
+        CHECK_THAT(farInnerSpan.second, Catch::Matchers::WithinAbs((farFace - boreGap) * scale, printTolerance));
+        // Its outer half is the inner half reflected about the far leg's axis.
+        double farAxis = farColumn.get_coordinates()[0];
+        CHECK_THAT(farOuterSpan.first, Catch::Matchers::WithinAbs((2 * farAxis - (2 * midline - tubeInnerFace)) * scale, printTolerance));
+        CHECK_THAT(farOuterSpan.second, Catch::Matchers::WithinAbs((2 * farAxis - midline) * scale, printTolerance));
         settings.reset();
     }
 
