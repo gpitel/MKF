@@ -39,6 +39,7 @@ std::vector<double> Painter::get_image_size(Magnetic magnetic) {
         case CoreShapeFamily::U:
         case CoreShapeFamily::UR:
         case CoreShapeFamily::UT:
+        case CoreShapeFamily::UI:
             _extraDimension = 1;
             showingCoreWidth = (processedDescription.get_width() - mainColumn.get_width() / 2);
             break;
@@ -1288,12 +1289,12 @@ void Painter::paint_two_piece_set_bobbin(Magnetic magnetic) {
 
     // The historical polygon is only the +x HALF of the main bobbin (the column wall
     // plus the flanges on one side of the leg). Whenever the drawing shows the whole
-    // leg — per-column multi-window plots and the asymmetric C/U/UR families — draw
+    // leg — per-column multi-window plots and the asymmetric C/U/UR/UT/UI families — draw
     // the other half too (its reflection across the leg axis at x=0).
     auto coreShapeFamily = magnetic.get_mutable_core().get_shape_family();
     bool fullMainLegDrawn = perColumnWindows || coreShapeFamily == MAS::CoreShapeFamily::C ||
                             coreShapeFamily == MAS::CoreShapeFamily::U || coreShapeFamily == MAS::CoreShapeFamily::UR ||
-                            coreShapeFamily == MAS::CoreShapeFamily::UT;
+                            coreShapeFamily == MAS::CoreShapeFamily::UT || coreShapeFamily == MAS::CoreShapeFamily::UI;
     if (mainColumnWound) {
         addBobbinPolygon(bobbinPoints);
         if (fullMainLegDrawn) {
@@ -1358,6 +1359,7 @@ void Painter::paint_two_piece_set_core(Core core) {
         case MAS::CoreShapeFamily::U:
         case MAS::CoreShapeFamily::UR:
         case MAS::CoreShapeFamily::UT:
+        case MAS::CoreShapeFamily::UI:
             showingMainColumnWidth = mainColumn.get_width() / 2;
             showingCoreWidth = processedDescription.get_width() - mainColumn.get_width() / 2;
             break;
@@ -1424,13 +1426,13 @@ void Painter::paint_two_piece_set_core(Core core) {
             }
         }
 
-        // C/U/UR draw the whole (asymmetric) core, so the main leg must be shown in
+        // C/U/UR/UT/UI draw the whole (asymmetric) core, so the main leg must be shown in
         // full: its left face sits at -width/2 of the main column, not at the leg's
         // axis. Symmetric families keep x=0 (the left half is drawn as a mirror).
         double mainLegLeftEdge = 0;
         // UT is the same asymmetric U piece (closed by a plate), with unequal legs.
         if (family == MAS::CoreShapeFamily::C || family == MAS::CoreShapeFamily::U || family == MAS::CoreShapeFamily::UR ||
-            family == MAS::CoreShapeFamily::UT) {
+            family == MAS::CoreShapeFamily::UT || family == MAS::CoreShapeFamily::UI) {
             mainLegLeftEdge = -showingMainColumnWidth;
         }
 
@@ -1479,11 +1481,12 @@ void Painter::paint_two_piece_set_core(Core core) {
 
     // Multi-column winding: with per-column winding windows the coil can occupy the
     // left window, so draw the full mirror-symmetric silhouette instead of the
-    // historical right half. C/U/UR shapes keep their asymmetric full drawing;
+    // historical right half. C/U/UR/UT/UI shapes keep their asymmetric full drawing;
     // single-window cores keep the historical half view untouched.
     bool mirrorLeftHalf = processedDescription.get_winding_windows().size() > 1 &&
                           family != MAS::CoreShapeFamily::C && family != MAS::CoreShapeFamily::U &&
-                          family != MAS::CoreShapeFamily::UR && family != MAS::CoreShapeFamily::UT;
+                          family != MAS::CoreShapeFamily::UR && family != MAS::CoreShapeFamily::UT &&
+                          family != MAS::CoreShapeFamily::UI;
     auto mirrorPoints = [](const std::vector<SVG::Point>& points) {
         std::vector<SVG::Point> mirroredPoints;
         for (auto& point : points) {
@@ -1513,9 +1516,10 @@ void Painter::paint_two_piece_set_core(Core core) {
     // Alf, 2026-10-27: under real winding every view shows the WHOLE magnetic, not its +x half.
     // The -x half is built from the core's OWN data there: the main leg (centred on x = 0, so its
     // half is the same leg and the same gaps) and the lateral column nearest -x, with that
-    // column's width, height and gaps. C/U/UR/UT already draw their whole core.
+    // column's width, height and gaps. C/U/UR/UT/UI already draw their whole core.
     const bool wholeCoreDrawn = mirrorLeftHalf || family == MAS::CoreShapeFamily::C || family == MAS::CoreShapeFamily::U ||
-                                family == MAS::CoreShapeFamily::UR || family == MAS::CoreShapeFamily::UT;
+                                family == MAS::CoreShapeFamily::UR || family == MAS::CoreShapeFamily::UT ||
+                                family == MAS::CoreShapeFamily::UI;
     if (settings.get_coil_use_real_winding_geometry() && !wholeCoreDrawn) {
         if (mainColumn.get_coordinates()[0] != 0) {
             throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
@@ -2498,6 +2502,7 @@ void Painter::paint_temperature_field(Magnetic magnetic, const std::map<std::str
         case MAS::CoreShapeFamily::U:
         case MAS::CoreShapeFamily::UR:
         case MAS::CoreShapeFamily::UT:
+        case MAS::CoreShapeFamily::UI:
             showingMainColumnWidth = mainColumn.get_width() / 2;
             showingCoreWidth = processedElements.get_width() - mainColumn.get_width() / 2;
             break;

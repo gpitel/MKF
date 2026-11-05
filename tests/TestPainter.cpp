@@ -1903,6 +1903,154 @@ namespace {
         settings.reset();
     }
 
+    using FerritePolygons = std::vector<std::vector<std::pair<double, double>>>;
+
+    // The ferrite polygons of a painted SVG, in painter units (metres * coilPainterScale, y pointing down).
+    FerritePolygons get_ferrite_polygons(const std::string& svg) {
+        auto numbersIn = [](const std::string& text) {
+            std::vector<double> values;
+            std::regex numberRegex(R"re(-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)re");
+            for (auto it = std::sregex_iterator(text.begin(), text.end(), numberRegex); it != std::sregex_iterator(); ++it) {
+                values.push_back(std::stod(it->str()));
+            }
+            return values;
+        };
+
+        FerritePolygons ferritePolygons;
+        std::regex polygonRegex(R"re(<polygon[^>]*>)re");
+        for (auto it = std::sregex_iterator(svg.begin(), svg.end(), polygonRegex); it != std::sregex_iterator(); ++it) {
+            std::string tag = it->str();
+            if (tag.find("ferrite") == std::string::npos) {
+                continue;
+            }
+            std::smatch pointsMatch;
+            REQUIRE(std::regex_search(tag, pointsMatch, std::regex(R"re(points="([^"]+)")re")));
+            auto values = numbersIn(pointsMatch[1].str());
+            REQUIRE(values.size() % 2 == 0);
+            std::vector<std::pair<double, double>> polygon;
+            for (size_t i = 0; i < values.size(); i += 2) {
+                polygon.push_back({values[i], values[i + 1]});
+            }
+            ferritePolygons.push_back(polygon);
+        }
+        return ferritePolygons;
+    }
+
+    bool is_inside_ferrite(const FerritePolygons& ferritePolygons, double x, double y) {
+        for (auto& polygon : ferritePolygons) {
+            bool isInside = false;
+            for (size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++) {
+                if ((polygon[i].second > y) != (polygon[j].second > y) &&
+                    x < (polygon[j].first - polygon[i].first) * (y - polygon[i].second) / (polygon[j].second - polygon[i].second) + polygon[i].first) {
+                    isInside = !isInside;
+                }
+            }
+            if (isInside) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The whole U-type core is on the drawing, at its true place: it spans the core's width from the main
+    // leg's left face, the far leg is ferrite on its own axis, and the window between the legs is air.
+    void check_whole_core_drawn(const std::string& svg, Core& core) {
+        auto ferritePolygons = get_ferrite_polygons(svg);
+        REQUIRE(!ferritePolygons.empty());
+        auto processedDescription = core.get_processed_description().value();
+        auto columns = processedDescription.get_columns();
+        REQUIRE(columns.size() == 2);
+        auto mainColumn = columns[core.get_main_column_index()];
+        auto farColumn = columns[1 - core.get_main_column_index()];
+        const double scale = Constants().coilPainterScale;
+        // Coordinates are printed with one decimal.
+        const double printTolerance = 0.2;
+
+        double minimumX = std::numeric_limits<double>::max();
+        double maximumX = std::numeric_limits<double>::lowest();
+        for (auto& polygon : ferritePolygons) {
+            for (auto& [x, y] : polygon) {
+                minimumX = std::min(minimumX, x);
+                maximumX = std::max(maximumX, x);
+            }
+        }
+        CHECK_THAT(minimumX, Catch::Matchers::WithinAbs(-mainColumn.get_width() / 2 * scale, printTolerance));
+        CHECK_THAT(maximumX - minimumX, Catch::Matchers::WithinAbs(processedDescription.get_width() * scale, printTolerance));
+
+        double windowCentreX = (mainColumn.get_coordinates()[0] + mainColumn.get_width() / 2 +
+                                farColumn.get_coordinates()[0] - farColumn.get_width() / 2) / 2;
+        double windowQuarterHeight = processedDescription.get_winding_windows()[0].get_height().value() / 4;
+        CHECK(!is_inside_ferrite(ferritePolygons, windowCentreX * scale, windowQuarterHeight * scale));
+        CHECK(!is_inside_ferrite(ferritePolygons, windowCentreX * scale, -windowQuarterHeight * scale));
+        CHECK(is_inside_ferrite(ferritePolygons, farColumn.get_coordinates()[0] * scale, windowQuarterHeight * scale));
+        CHECK(is_inside_ferrite(ferritePolygons, mainColumn.get_coordinates()[0] * scale, windowQuarterHeight * scale));
+    }
+
+    // A UI core is a U piece closed by an I bar, so it is drawn like a U: the whole core, with the
+    // main leg shown in full and the far leg at its true place. The painter listed C, U, UR and UT as
+    // the asymmetric families and drew every other family as its +x half, so a UI core came out as a
+    // half drawing that covered the left side, with the window gone and the turns drawn over ferrite.
+    TEST_CASE("Test_Painter_UI_Core_Is_Drawn_Whole", "[support][painter][magnetic-painter][ui-core][smoke-test]") {
+        settings.reset();
+        auto core = OpenMagneticsTesting::get_quick_core("UI 93/76/16", json::parse("[]"), 1, "3C97");
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+
+        Painter painter("");
+        painter.paint_core(magnetic);
+        check_whole_core_drawn(painter.export_svg(), core);
+        settings.reset();
+    }
+
+    TEST_CASE("Test_Painter_UI_Core_With_A_Coil_On_Each_Leg_Is_Drawn_Whole", "[support][painter][magnetic-painter][ui-core][smoke-test]") {
+        settings.reset();
+        settings.set_core_per_column_winding_windows(true);
+        auto core = OpenMagneticsTesting::get_quick_core("UI 93/76/16", json::parse("[]"), 1, "3C97");
+        auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.001, 0.001);
+        auto columns = core.get_processed_description()->get_columns();
+        REQUIRE(core.get_processed_description()->get_winding_windows().size() == 2);
+
+        json bobbinJson;
+        to_json(bobbinJson, bobbin);
+        json coilJson;
+        coilJson["bobbin"] = bobbinJson;
+        coilJson["functionalDescription"] = json::array();
+        coilJson["functionalDescription"].push_back(json{{"name", "Primary"}, {"numberTurns", 6}, {"numberParallels", 1},
+                                                         {"isolationSide", "primary"}, {"wire", "Round 0.475 - Grade 1"}});
+        coilJson["functionalDescription"].push_back(json{{"name", "Secondary"}, {"numberTurns", 6}, {"numberParallels", 1},
+                                                         {"isolationSide", "secondary"}, {"wire", "Round 0.475 - Grade 1"}});
+        OpenMagnetics::Coil coil(coilJson, false);
+        // One coil on each leg: the primary on the main leg's window, the secondary on the far leg's.
+        coil.get_mutable_functional_description()[1].set_winding_window(1);
+        coil.set_core_columns(columns);
+        REQUIRE(coil.wind());
+
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(coil);
+
+        Painter painter("");
+        painter.paint_core(magnetic);
+        painter.paint_bobbin(magnetic);
+        painter.paint_coil_turns(magnetic);
+        std::string svg = painter.export_svg();
+        check_whole_core_drawn(svg, core);
+
+        // No turn is drawn over ferrite.
+        auto ferritePolygons = get_ferrite_polygons(svg);
+        size_t turnsChecked = 0;
+        std::regex circleRegex(R"re(<circle[^>]*\bcx="([^"]+)"[^>]*\bcy="([^"]+)")re");
+        for (auto it = std::sregex_iterator(svg.begin(), svg.end(), circleRegex); it != std::sregex_iterator(); ++it) {
+            double x = std::stod((*it)[1].str());
+            double y = std::stod((*it)[2].str());
+            INFO("Turn at x = " << x << ", y = " << y);
+            CHECK(!is_inside_ferrite(ferritePolygons, x, y));
+            ++turnsChecked;
+        }
+        CHECK(turnsChecked >= 12);
+        settings.reset();
+    }
+
     TEST_CASE("Test_Painter_Ep_Core_Grinded_Gap", "[support][painter][magnetic-painter][rectangular-winding-window][smoke-test]") {
         std::vector<int64_t> numberTurns = {42, 42};
         std::vector<int64_t> numberParallels = {3, 3};
