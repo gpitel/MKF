@@ -104,6 +104,24 @@ double resolve_maximum_design_temperature(Inputs& inputs);
  * - Industry practice: LI² (energy storage), Area Product method
  * - Colonel Wm. T. McLyman, "Transformer and Inductor Design Handbook"
  */
+// ABT #2244: what the core adviser already worked out for a candidate, kept on this thread for the
+// life of the outermost scope: the turns and gap add_initial_turns_by_inductance seeds it with, and
+// the loss filter's verdict (its turn sweep). The same candidates reach those stages several times
+// in one advise: the core adviser searches the single cores and then the stacked ones, and the
+// magnetic adviser calls the core adviser again with a larger request when too few cores wind. A
+// result depends on the candidate (its whole json), the inputs, the stage's construction and the
+// settings, and is kept under a key holding all of them. A candidate a stage drops, or whose
+// evaluation throws, is kept as such, and the same exception is thrown again.
+class CandidateMemoScope {
+    public:
+        CandidateMemoScope();
+        ~CandidateMemoScope();
+        CandidateMemoScope(const CandidateMemoScope&) = delete;
+        CandidateMemoScope& operator=(const CandidateMemoScope&) = delete;
+    private:
+        bool _owner = false;
+};
+
 class CoreAdviser {
     private:
         // ABT #1652: first member, so no adviser code runs without it: while this adviser exists,
@@ -248,6 +266,12 @@ class CoreAdviser {
         std::vector<CoreShape> create_custom_core_shapes(Inputs inputs);
 
         Mas post_process_core(Magnetic magnetic, Inputs inputs);
+        // ABT #2244: with the temperature gate the caller will judge the part on
+        // (post_process_and_cut), the operating points are solved in order only until the solved
+        // ones fail it (MagneticFilterTemperature::solved_outputs_exceed_limit): the part is then
+        // rejected whatever the remaining points give, and the Mas comes back with the outputs of
+        // the points solved so far. Without a gate (nullptr) every point is solved.
+        Mas post_process_core(Magnetic magnetic, Inputs inputs, const MagneticFilterTemperature* temperatureGate);
 
         // ABT #126: post-process candidates in score order and keep the first
         // maximumNumberResults that SURVIVE post-processing (backfilling from the
@@ -259,9 +283,12 @@ class CoreAdviser {
         // alternative-materials lookup per kept candidate (STANDARD_CORES path).
         // maximumTemperature (ABT #1802): the temperature gate's limit when that gate ran; a
         // candidate whose published loss-temperature solve is hotter is dropped and backfilled.
+        // stacksAreDistinctShapes (ABT #1984): with unique core shapes, whether a stack count of a
+        // shape is a shape of its own (the available-cores, stock, search) or not (standard cores).
         std::vector<std::pair<Mas, double>> post_process_and_cut(std::vector<std::pair<Magnetic, double>>& magneticsWithScoring,
                                                                  Inputs& inputs,
                                                                  size_t maximumNumberResults,
+                                                                 bool stacksAreDistinctShapes,
                                                                  bool withAlternativeMaterials = false,
                                                                  std::optional<double> maximumTemperature = std::nullopt);
         // The same walk, appending to parts already kept (ABT #1875): it stops when `kept` holds
@@ -272,6 +299,7 @@ class CoreAdviser {
         void post_process_and_append(std::vector<std::pair<Magnetic, double>>& magneticsWithScoring,
                                      Inputs& inputs,
                                      size_t maximumNumberResults,
+                                     bool stacksAreDistinctShapes,
                                      bool withAlternativeMaterials,
                                      std::optional<double> maximumTemperature,
                                      std::vector<std::pair<Mas, double>>& kept);
@@ -502,6 +530,9 @@ class CoreAdviser {
     class MagneticCoreFilterLosses : public MagneticCoreFilter {
         private:
             MagneticFilterCoreDcAndSkinLosses _filter; // F23 FIX: use DC+skin losses instead of DC-only
+            // What _filter was built from (inputs, models, application, settings): part of the
+            // CandidateMemoScope key.
+            std::string _memoConstruction;
 
         public:
             MagneticCoreFilterLosses(Inputs inputs, std::map<std::string, std::string> models, MAS::MagneticApplication application);

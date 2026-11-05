@@ -1716,6 +1716,10 @@ std::vector<ConnectionReservedSpace> Coil::get_connection_reserved_spaces(
     // inset on the tape-free side, stacked through the tape on the other.
     std::map<size_t, double> topMarginPerWindow;
     std::map<size_t, double> bottomMarginPerWindow;
+    // Each conduction section's OWN margin, {virtual top, virtual bottom}: where a lead into that
+    // section leaves its margin band (ConnectionRoute::marginInnerFace). The window maximum above is
+    // for runs ALONG an edge, which cross every section's band.
+    std::map<std::string, std::pair<double, double>> marginPerSection;
     if (sectionsDescription) {
         for (const auto& marginSection : sectionsDescription.value()) {
             if (marginSection.get_type() != ElectricalType::CONDUCTION) {
@@ -1727,6 +1731,7 @@ std::vector<ConnectionReservedSpace> Coil::get_connection_reserved_spaces(
             double virtualBottomMargin = layersAreContiguous ? sectionMargin[0] : sectionMargin[1];
             topMarginPerWindow[windowIndex] = std::max(topMarginPerWindow[windowIndex], virtualTopMargin);
             bottomMarginPerWindow[windowIndex] = std::max(bottomMarginPerWindow[windowIndex], virtualBottomMargin);
+            marginPerSection[marginSection.get_name()] = {virtualTopMargin, virtualBottomMargin};
         }
     }
     // ABT #726 (remainder): every window's edge rows measure from that window's OWN turn-axis
@@ -2236,8 +2241,19 @@ std::vector<ConnectionReservedSpace> Coil::get_connection_reserved_spaces(
                 routes.back().sleeveOuterDiameter = sleeveOuterDiameter;
                 // ABT #1269: the sleeve's end condition -- where this lead leaves the margin band and
                 // enters the winding area. The overlap past it is ConnectionSleeve::overlapIntoWinding.
-                const size_t sleeveWindowIndex = windowIndexOf(connectingTurn.get_section().value_or(""));
-                const double sleeveMargin = edgeMargin(sleeveWindowIndex, atTopEdge);
+                // The band this lead crosses is its own section's margin, not the widest margin in the window:
+                // with a Primary margin of 2.272 mm and a Secondary one of 1.904 mm in one window, the window's
+                // face lay 0.37 mm inside the Secondary's own winding area (its end turns at 7.386 mm, its
+                // section from 7.496 mm), so its sleeve's end condition named a face inside its copper.
+                const std::string sleeveSectionName = connectingTurn.get_section().value_or("");
+                auto ownMargin = marginPerSection.find(sleeveSectionName);
+                if (ownMargin == marginPerSection.end()) {
+                    throw CoilException(ErrorCode::COIL_WINDING_ERROR,
+                        "Sleeved lead of turn '" + connectingTurn.get_name() + "': its section '" + sleeveSectionName +
+                        "' is not a conduction section of this coil, so the margin band it crosses is unknown");
+                }
+                const size_t sleeveWindowIndex = windowIndexOf(sleeveSectionName);
+                const double sleeveMargin = atTopEdge ? ownMargin->second.first : ownMargin->second.second;
                 if (sleeveMargin > 0) {
                     const double edge = windowEdgeY(sleeveWindowIndex, atTopEdge);
                     routes.back().marginInnerFace = atTopEdge ? edge - sleeveMargin : edge + sleeveMargin;
@@ -6816,8 +6832,31 @@ void Coil::plan_terminal_tangential_departures(std::vector<ConnectionRoute>& rou
     }
 }
 
+void Coil::refuse_foil_ends_without_lead_conductor() {
+    // ABT #1496 under Alf's 2026-11-02 rule: a coil wound without lead planning plans no lead, but a
+    // foil end that has to cross the layers wound over it with no conductor joined to it cannot be
+    // laid out at all, planned or not -- there is no lead size anybody could reserve. That refusal
+    // lives in the terminal-lead pass of get_connection_reserved_spaces, which counts the layers the
+    // end crosses; it is asked here once, on the wound geometry, and nothing it derives is applied
+    // (no blocking, no rewind, no tangent departure). Only coils with a foil winding are asked: the
+    // refusal concerns foil ends alone.
+    bool anyFoil = false;
+    for (size_t windingIndex = 0; windingIndex < get_functional_description().size(); ++windingIndex) {
+        if (resolve_wire(windingIndex).get_type() == WireType::FOIL) {
+            anyFoil = true;
+            break;
+        }
+    }
+    if (!anyFoil) {
+        return;
+    }
+    ConnectionLayoutRecords discardedRecords;
+    get_connection_reserved_spaces(nullptr, nullptr, false, nullptr, &discardedRecords);
+}
+
 void Coil::charge_tangent_departures() {
-    if (!settings.get_coil_use_real_winding_geometry() || !get_turns_description()) {
+    // A tangent departure is a connection lead: a coil wound without lead planning charges none.
+    if (!settings.get_coil_use_real_winding_geometry() || !_connectionLeadPlanning || !get_turns_description()) {
         return;
     }
     std::vector<ConnectionRoute> routes;
@@ -6915,25 +6954,17 @@ void Coil::align_blocked_layer_turns() {
     if (realWinding) {
         respace_helical_layers_at_final_radius();
     }
-    if (_connectionBlockedSlotsPerLayer.empty()) {
-        // ABT #1424: the bundle keeps its stacking whether or not any lead blocked a slot. The
-        // order law used to live only in the blocked-slot path below, so a real-winding layout
-        // whose leads blocked nothing kept the winder's flipped bundle at every U turnaround.
-        // Measured on 21_interleaved_flyback_etd39 (Secondary, 7 t x 3 p, U): layer 0 closes
-        // p0/p1/p2 at y = 5.551/6.231/6.910 mm and layer 1 opened them at 6.904/6.213/5.521, so
-        // the three radial layer links crossed in the connection plane (p0 climbing 1.353 mm over
-        // the 0.679 mm step, p2 falling 1.389 mm); MVB++'s gate refused p0/p1 at 0.578 mm against
-        // the 0.63 mm copper.
-        if (realWinding) {
-            auto turns = get_turns_description().value();
-            auto layers = get_layers_description().value();
-            keep_parallel_order_in_every_layer(turns, layers);
-            fund_radial_steps_against_sibling_wraps(turns, layers);
-            recharge_turns_moved_since(turns, turnsAsCharged);
-            set_turns_description(turns);
-        }
-        return;
-    }
+    // ABT #2232 (Alf, 2026-11-04: "SPREAD is for real winding in general, blocked or not
+    // blocked"). Real winding lays EVERY conduction layer through the re-lay below, whether or
+    // not any connection lead blocks a slot: a layer no lead crosses is re-laid with zero depths
+    // over its whole band, by the same fence-post law, N-filar bundles, helical pitch fixpoint,
+    // parallel order (ABT #1424), link pitch and radial steps against the sibling wraps (ABT
+    // #1422) as a crossed one. Only that re-lay used to run on crossed layers; the others kept
+    // the winder's alignment (CENTERED by default, packed), so an unplanned wind's centred
+    // partial outer layer put its layer links 0.308 mm apart against a 0.556 mm wire
+    // (refuse_sibling_layer_links_closer_than_the_wire) on layouts that wind once their leads are
+    // planned and the crossed layers spread. This overrides the user-set alignment in real
+    // winding only; ideal winding returned above.
     auto windingWindow = bobbin.get_processed_description().value().get_winding_windows()[0];
     // ABT #427: the band the turns are spread along is the layer's TURN axis — the window's HEIGHT for
     // an OVERLAPPING layer (turns stack axially) and its WIDTH for a CONTIGUOUS one (turns run
@@ -7029,8 +7060,11 @@ void Coil::align_blocked_layer_turns() {
                 }
             }
         }
-        if (effectiveDepths.first <= 1e-12 && effectiveDepths.second <= 1e-12 && !inTurnAxisOverflowSection) {
-            continue;  // untouched layer: leave delimit's centring (fills the full height)
+        // Outside real winding a layer no lead crosses keeps delimit's centring (ABT #2232: in real
+        // winding every layer is re-laid, see above).
+        if (!realWinding && effectiveDepths.first <= 1e-12 && effectiveDepths.second <= 1e-12 &&
+            !inTurnAxisOverflowSection) {
+            continue;
         }
         size_t windingIndex = get_winding_index_by_name(layer.get_partial_windings()[0].get_winding());
         double wirePitch = (turnAxis == 1) ? wires[windingIndex].get_maximum_outer_height()
@@ -8578,14 +8612,14 @@ std::map<std::string, uint64_t> Coil::align_blocked_ring_turns(bool forceSpreadB
                     double turnRadius = std::hypot(turns[t].get_coordinates()[0], turns[t].get_coordinates()[1]);
                     double newAngleRadians = newAngleDegrees / 180.0 * std::numbers::pi;
                     turns[t].set_coordinates(std::vector<double>{
-                        roundFloat(turnRadius * std::cos(newAngleRadians), 9),
-                        roundFloat(turnRadius * std::sin(newAngleRadians), 9), 0});
+                        turnRadius * std::cos(newAngleRadians),
+                        turnRadius * std::sin(newAngleRadians), 0});
                     if (turns[t].get_additional_coordinates()) {
                         auto additionalCoordinates = turns[t].get_additional_coordinates().value();
                         for (auto& additional : additionalCoordinates) {
                             double additionalRadius = std::hypot(additional[0], additional[1]);
-                            additional = {roundFloat(additionalRadius * std::cos(newAngleRadians), 9),
-                                          roundFloat(additionalRadius * std::sin(newAngleRadians), 9)};
+                            additional = {additionalRadius * std::cos(newAngleRadians),
+                                          additionalRadius * std::sin(newAngleRadians)};
                         }
                         turns[t].set_additional_coordinates(additionalCoordinates);
                     }
@@ -8862,16 +8896,16 @@ std::map<std::string, uint64_t> Coil::align_blocked_ring_turns(bool forceSpreadB
                 double turnRadius = std::hypot(turns[t].get_coordinates()[0], turns[t].get_coordinates()[1]);
                 double positionRadians = position / 180.0 * std::numbers::pi;
                 turns[t].set_coordinates(std::vector<double>{
-                    roundFloat(turnRadius * std::cos(positionRadians), 9),
-                    roundFloat(turnRadius * std::sin(positionRadians), 9)});
+                    turnRadius * std::cos(positionRadians),
+                    turnRadius * std::sin(positionRadians)});
                 // Same invariant as ABT #186: a toroidal turn's rotation is its azimuth.
                 turns[t].set_rotation(roundFloat(position, 6));
                 if (turns[t].get_additional_coordinates()) {
                     auto additionalCoordinates = turns[t].get_additional_coordinates().value();
                     for (auto& additional : additionalCoordinates) {
                         double additionalRadius = std::hypot(additional[0], additional[1]);
-                        additional = {roundFloat(additionalRadius * std::cos(positionRadians), 9),
-                                      roundFloat(additionalRadius * std::sin(positionRadians), 9)};
+                        additional = {additionalRadius * std::cos(positionRadians),
+                                      additionalRadius * std::sin(positionRadians)};
                     }
                     turns[t].set_additional_coordinates(additionalCoordinates);
                 }
@@ -10241,9 +10275,13 @@ bool Coil::wind_inner(std::vector<double> proportionPerWinding, std::vector<size
     // LEADS_COLLIDE). The verdict stays the IDEAL one: blocking only takes room, and a wind whose
     // ideal layout does not fit returns false whatever the blocked layout reads.
     const bool idealWindFits = result;
-    _realWindingBlockingApplied = settings.get_coil_use_real_winding_geometry() && (result || bool(get_turns_description()));
+    // Alf, 2026-11-02: a coil wound without connection lead planning (_connectionLeadPlanning, set
+    // by the coil adviser while it ranks) keeps the real geometry's crossing stations below and
+    // takes no lead blocking.
+    _realWindingBlockingApplied = settings.get_coil_use_real_winding_geometry() && _connectionLeadPlanning &&
+                                  (result || bool(get_turns_description()));
     _blockingAnUnfitWind = _realWindingBlockingApplied && !idealWindFits;
-    if (settings.get_coil_use_real_winding_geometry() && !result) {
+    if (settings.get_coil_use_real_winding_geometry() && _connectionLeadPlanning && !result) {
         logEntry(std::string(_realWindingBlockingApplied
                                  ? "Real winding: the ideal wind does not fit; connection blocking is applied to "
                                    "the overflowing layout all the same"
@@ -10355,6 +10393,22 @@ bool Coil::wind_inner(std::vector<double> proportionPerWinding, std::vector<size
                 }
             }
         }
+    }
+    if (settings.get_coil_use_real_winding_geometry() && !_connectionLeadPlanning && get_turns_description()) {
+        // The real geometry's layout laws that do not depend on any lead (ABT #1424 bundle order at
+        // every layer turnaround, ABT #1401 helical pitch at the final radius, the radial steps
+        // against sibling wraps, ABT #2091 recharge of moved turns) all live in
+        // align_blocked_layer_turns, which a planned wind reaches only through the blocking loop
+        // below. Unplanned, no slot is blocked (the state was cleared at the start of this wind),
+        // so this one call takes exactly its no-blocked-slot branch and applies no lead blocking.
+        if (!_connectionBlockedSlotsPerLayer.empty() || !_connectionBlockedDepthPerLayer.empty() ||
+            !_uLandingDepthPerLayer.empty()) {
+            throw CoilException(ErrorCode::COIL_WINDING_ERROR,
+                                "Real winding: a coil wound without connection lead planning carries blocked "
+                                "connection slots");
+        }
+        align_blocked_layer_turns();
+        refuse_foil_ends_without_lead_conductor();
     }
     if (_realWindingBlockingApplied) {
         // Turn blocking is GLOBAL to the winding window: a connection lead routes through the whole
@@ -15037,6 +15091,49 @@ std::map<std::pair<std::string, std::string>, ConnectionKind> Coil::connection_k
         }
     }
     return kinds;
+}
+
+std::vector<RevolutionHalfPath> Coil::get_revolutions_at_half_path() {
+    if (!settings.get_coil_use_real_winding_geometry()) {
+        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+            "Coil: the revolutions of a coil are known only under real winding geometry, where each turn of the turns description is a station");
+    }
+    if (is_planar()) {
+        throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION,
+            "Coil: a planar coil's turns are spirals on their boards, not revolutions round a column");
+    }
+    if (!get_turns_description()) {
+        throw CoilNotProcessedException("Coil: the revolutions need the turns description");
+    }
+    const auto turns = get_turns_description().value();
+    // The previous station of each conductor (winding, parallel): the turns description lists each
+    // parallel's stations in electrical order.
+    std::map<std::pair<std::string, int64_t>, size_t> previousOfConductor;
+    std::vector<RevolutionHalfPath> revolutions;
+    for (size_t index = 0; index < turns.size(); ++index) {
+        const auto& turn = turns[index];
+        if (!turn.get_layer()) {
+            throw CoilNotProcessedException("Coil: station '" + turn.get_name() + "' names no layer, so its revolutions cannot be told from its layer changes");
+        }
+        if (turn.get_coordinates().size() < 2) {
+            throw CoilNotProcessedException("Coil: station '" + turn.get_name() + "' has no section coordinates");
+        }
+        const auto key = std::make_pair(turn.get_winding(), turn.get_parallel());
+        const auto found = previousOfConductor.find(key);
+        if (found != previousOfConductor.end()) {
+            const auto& from = turns[found->second];
+            if (from.get_layer().value() == turn.get_layer().value()) {
+                RevolutionHalfPath revolution;
+                revolution.fromTurn = found->second;
+                revolution.toTurn = index;
+                revolution.coordinates = {(from.get_coordinates()[0] + turn.get_coordinates()[0]) / 2,
+                                          (from.get_coordinates()[1] + turn.get_coordinates()[1]) / 2};
+                revolutions.push_back(revolution);
+            }
+        }
+        previousOfConductor[key] = index;
+    }
+    return revolutions;
 }
 
 // ABT #1424. What a connection between two layers IS comes from MKF's own connection layout

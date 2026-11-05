@@ -320,6 +320,8 @@ class MagneticFilterEstimatedCost : public MagneticFilter {
         double _estimatedWireTotalArea = 0;
         double _wireAirFillingFactor = 0;
         double _skinDepth = 0;
+        // Radius of the estimated strand: the skin depth, or the smaller wire the rms current needs.
+        double _estimatedWireConductingRadius = 0;
         double _averageMarginInWindingWindow = 0;
 
     public:
@@ -374,6 +376,14 @@ class MagneticFilterLosses : public MagneticFilterCoreLossesBased {
         MagneticFilterLosses() {};
         MagneticFilterLosses(std::map<std::string, std::string> models);
         std::pair<bool, double> evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs = nullptr);
+        // Per operating point of the last evaluate_magnetic (up to the one it stopped at): the iterate before its core
+        // was held at its material's data limit, empty for a point whose core was not held (Alf, 2026-11-01).
+        const std::vector<std::optional<LossesBeforeHold>>& get_last_losses_before_hold() const { return _lossesBeforeHold; }
+        // Why the last evaluate_magnetic rejected the magnetic for saturation, if it did.
+        const std::optional<std::string>& get_last_saturation_rejection() const { return _saturationRejection; }
+    private:
+        std::vector<std::optional<LossesBeforeHold>> _lossesBeforeHold;
+        std::optional<std::string> _saturationRejection;
 };
 
 class MagneticFilterLossesNoProximity : public MagneticFilterCoreLossesBased {
@@ -974,6 +984,12 @@ public:
     // operating points, as that solve published it in each Outputs' temperature, against the
     // limit. Throws when an operating point carries no solved temperature.
     std::pair<bool, double> evaluate_solved_outputs(const std::vector<Outputs>& outputs) const;
+    // ABT #2244: whether the operating points solved so far already fail the gate, so that
+    // evaluate_solved_outputs fails on these outputs and on any longer list they begin: every one
+    // carries its solved temperature and the hottest of them is above the limit (the hottest point
+    // over more points is never cooler). False otherwise, including when one carries no
+    // temperature: evaluate_solved_outputs decides that case once every point is solved.
+    bool solved_outputs_exceed_limit(const std::vector<Outputs>& outputs) const;
 };
 
 // // Nice to have in the future

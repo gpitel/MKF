@@ -49,16 +49,13 @@ public:
     void setRowZero(size_t row) { std::fill(data[row].begin(), data[row].end(), 0.0); }
     void setColZero(size_t col) { for (size_t i = 0; i < rows_; ++i) data[i][col] = 0.0; }
 
-    // Non-throwing solve with success flag
-    static std::vector<double> solve(SimpleMatrix A, std::vector<double> b, bool& success) {
+    // Non-throwing solve with success flag. `system` is the augmented matrix [A | b]: n rows of n + 1
+    // columns, eliminated in place (its rows are left permuted and reduced).
+    static std::vector<double> solve_augmented_in_place(SimpleMatrix& system, bool& success) {
         success = true;
-        size_t n = A.rows();
-        if (n == 0 || b.size() != n) { success = false; return std::vector<double>(n, 0.0); }
-        std::vector<std::vector<double>> aug(n, std::vector<double>(n + 1));
-        for (size_t i = 0; i < n; ++i) {
-            for (size_t j = 0; j < n; ++j) aug[i][j] = A(i, j);
-            aug[i][n] = b[i];
-        }
+        size_t n = system.rows();
+        if (n == 0 || system.cols() != n + 1) { success = false; return std::vector<double>(n, 0.0); }
+        auto& aug = system.data;
         // The thermal network is sparse: most rows below the pivot have a zero in the pivot column, and their
         // elimination update subtracts (+-0) * pivot-row entries, which leaves every entry bit for bit as it is
         // (x - (+-0) == x for any x that is not -0, and a finite pivot row keeps the products at +-0, never NaN).
@@ -6290,6 +6287,7 @@ Temperature::CoreExteriorAreas Temperature::calculateConcentricCoreExteriorAreas
     //   DS 26/16     see slab: two flat-cut pot halves
     //   DRH-18X22-4C 917.0 = two flange discs (18 mm, 3.2 mm bore) + two rims 3.75 mm
     //   DRS (semishielded) 130 = the finished J x K x L body
+    //   DR 2.3 + SRI 3.0  23.67 = 2x(flange 4.15 + ring end 2.54) + ring cylinder 9.90 + ring bore past the flanges 2x0.19
     auto core = _magnetic.get_core();
     auto processed = core.get_processed_description();
     if (!processed) {
@@ -6321,6 +6319,61 @@ Temperature::CoreExteriorAreas Temperature::calculateConcentricCoreExteriorAreas
         areas.secondPlateFace = pi / 4 * (secondFlange * secondFlange - bore * bore);
         areas.plateSideBand = pi * flange * required("D");
         areas.secondPlateSideBand = pi * secondFlange * required("F");
+        return areas;
+    }
+    // A shielded drum (drum + ring, ABT #1658): the drum's two flanges and the ring around them,
+    // all on one axis. The flange outer faces and the ring's end annuli and outer cylinder face
+    // the room; the ring's bore and the flange rims face each other across the two annular
+    // clearance gaps, and the groove is the winding's. Where the ring and the drum differ in
+    // height, the part of the taller one standing out is room-facing too: the ring's bore above
+    // a flange face (ring taller) or a flange rim above the ring's end (drum taller). As for the
+    // bare drum, a bore H is taken off the flange faces.
+    //   Catalogue construction: ring and drum share their mid-plane.
+    //   Ring seated on a square base plate M (chamfer leg N): the plate is the bottom flange, F
+    //   thick; the ring stands on it, and the plate's top face outside the ring faces the room.
+    if (family == CoreShapeFamily::DRUM_RING) {
+        double flange = required("A"), drumHeight = required("B"), topFlange = required("D"),
+               bottomFlange = required("F"), ringOuter = required("J"), ringInner = required("K"),
+               ringHeight = required("L");
+        double bore = optionalLetter("H");
+        if (!(ringInner > flange && ringOuter > ringInner)) {
+            throw std::runtime_error("Temperature::calculateConcentricCoreExteriorAreas: drumRing needs A < K < J "
+                                     "(flange inside the ring bore, ring wall of positive thickness).");
+        }
+        const double flangeFace = pi / 4 * (flange * flange - bore * bore);
+        const double ringEnd = pi / 4 * (ringOuter * ringOuter - ringInner * ringInner);
+        // The room-facing band above one end of the ring (positive: ring stands out; negative:
+        // the drum does), given how far the ring's end sits beyond that flange's outer face.
+        auto standingOutBand = [&](double ringBeyondFace, double flangeThickness, const char* which) {
+            if (ringBeyondFace >= 0) return pi * ringInner * ringBeyondFace;
+            if (-ringBeyondFace >= flangeThickness) {
+                throw std::runtime_error(std::string("Temperature::calculateConcentricCoreExteriorAreas: the drumRing's "
+                                         "ring does not reach the ") + which + " flange (it ends " +
+                                         std::to_string(-ringBeyondFace) + " m below the flange face, which is " +
+                                         std::to_string(flangeThickness) + " m thick); the ring does not close the core.");
+            }
+            return pi * flange * (-ringBeyondFace);
+        };
+        if (!drum_ring_has_seat_plate(dimensions)) {
+            const double ringBeyondFace = (ringHeight - drumHeight) / 2;
+            areas.plateFace = flangeFace + ringEnd;
+            areas.secondPlateFace = areas.plateFace;
+            areas.plateSideBand = pi * ringOuter * ringHeight / 2 + standingOutBand(ringBeyondFace, topFlange, "top");
+            areas.secondPlateSideBand = pi * ringOuter * ringHeight / 2 + standingOutBand(ringBeyondFace, bottomFlange, "bottom");
+            return areas;
+        }
+        auto [plateSide, chamferLeg] = drum_ring_seat_plate(dimensions);
+        const double plateArea = plateSide * plateSide - 2 * chamferLeg * chamferLeg;  // four corners, N^2/2 each
+        const double platePerimeter = 4 * (plateSide - 2 * chamferLeg) + 4 * std::numbers::sqrt2 * chamferLeg;
+        // Top: the top flange's face and the ring's top end; the ring's top sits F + L above the
+        // drum's bottom face, the top flange's face B above it.
+        areas.plateFace = flangeFace + ringEnd;
+        areas.plateSideBand = pi * ringOuter * ringHeight / 2 +
+                              standingOutBand(bottomFlange + ringHeight - drumHeight, topFlange, "top");
+        // Bottom: the plate's underside, its edge, and its top face outside the ring.
+        areas.secondPlateFace = plateArea - pi * bore * bore / 4;
+        areas.secondPlateSideBand = platePerimeter * bottomFlange + (plateArea - pi * ringOuter * ringOuter / 4) +
+                                    pi * ringOuter * ringHeight / 2;
         return areas;
     }
     // A semishielded drum is finished as a J x K x L body that encloses the winding.
@@ -7153,11 +7206,14 @@ ThermalResult Temperature::solveThermalCircuit() {
     bool converged = false;
     std::vector<double> oldTemperatures = temperatures;
     
+    // The conductance matrix is built straight into the augmented system [G | P] the solver
+    // eliminates in place: column n holds the power inputs (and the fixed temperatures).
+    SimpleMatrix G(n, n + 1, 0.0);
     while (iteration < _config.maxIterations && !converged) {
         // IMP-5
         if (iteration > 0) { recalculateConvectionResistances(temperatures); }
 
-        SimpleMatrix G(n, n, 0.0);
+        G.setZero();
 
         for (const auto& res : _resistances) {
             size_t i = res.nodeFromId;
@@ -7201,7 +7257,10 @@ ThermalResult Temperature::solveThermalCircuit() {
         // turns outside the core kept their convection to ambient, so only the one turn left
         // inside the window was stranded -- but an island whose members only touch each other
         // passed the old G(i,i) test and went to a singular solve.
-        {
+        // The network's topology (its nodes and which of them each resistor joins) is the same at
+        // every iteration -- only the convection and radiation values are recalculated -- so its
+        // connectivity is checked once, at the first iteration.
+        if (iteration == 0) {
             std::vector<size_t> roots;
             for (size_t i = 0; i < n; ++i) {
                 if (i == ambientIdx || _nodes[i].isFixedTemperature) {
@@ -7253,7 +7312,10 @@ ThermalResult Temperature::solveThermalCircuit() {
         try {
             // IMP-10: Non-throwing solve
             bool solveSuccess = true;
-            temperatures = SimpleMatrix::solve(G, powerInputs, solveSuccess);
+            for (size_t i = 0; i < n; ++i) {
+                G(i, n) = powerInputs[i];
+            }
+            temperatures = SimpleMatrix::solve_augmented_in_place(G, solveSuccess);
             if (!solveSuccess) {
                 throw std::runtime_error("Temperature::solveThermalCircuit: Thermal matrix is singular (not solvable). "
                                          "This indicates disconnected thermal nodes or missing boundary conditions.");

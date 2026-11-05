@@ -12,6 +12,7 @@
 #include <numbers>
 #include <streambuf>
 #include <vector>
+#include <tuple>
 #include "spline.h"
 #include "support/Exceptions.h"
 #include <cmrc/cmrc.hpp>
@@ -364,8 +365,17 @@ std::shared_ptr<BobbinDataProcessor> BobbinDataProcessor::factory(Bobbin bobbin)
     }
 }
 
+// The catalogue generation the interpolators and the own-former table above were built from (per thread, like
+// them). A LibraryContext scope swaps the bobbin and core-shape catalogues these are fitted over, and a Replace scope
+// empties the bobbins, so the fits are rebuilt inside it from that scope's shapes only; without this stamp that
+// narrow fit outlived the scope and served every later call on the full catalogue (a 5-shape PQ context left the
+// filling factor of an E 19/8/10 window at -0.04 and dropped ETD 29/16/10's own former).
+static thread_local std::optional<uint64_t> bobbinInterpolatorsCatalogueGeneration;
+
 void load_interpolators() {
     if (bobbinDatabase.empty() ||
+        !bobbinInterpolatorsCatalogueGeneration ||
+        bobbinInterpolatorsCatalogueGeneration.value() != catalogueGeneration.load(std::memory_order_relaxed) ||
         bobbinFillingFactorInterpWidth.get_x().size() == 0 || 
         bobbinFillingFactorInterpHeight.get_x().size() == 0 || 
         bobbinWindingWindowProportionInterpWidth.get_x().size() == 0 || 
@@ -383,10 +393,12 @@ void load_interpolators() {
         struct AuxFillingFactorWidth
         {
             double windingWindowWidth, fillingFactor;
+            std::string formerName;
         };
         struct AuxFillingFactorHeight
         {
             double windingWindowHeight, fillingFactor;
+            std::string formerName;
         };
         std::vector<AuxFillingFactorWidth> auxFillingFactorWidth;
         std::vector<AuxFillingFactorHeight> auxFillingFactorHeight;
@@ -394,10 +406,12 @@ void load_interpolators() {
         struct AuxWindingWindowWidth
         {
             double windingWindowWidth, windingWindowProportion;
+            std::string formerName;
         };
         struct AuxWindingWindowHeight
         {
             double windingWindowHeight, windingWindowProportion;
+            std::string formerName;
         };
         std::vector<AuxWindingWindowWidth> auxWindingWindowWidth;
         std::vector<AuxWindingWindowHeight> auxWindingWindowHeight;
@@ -405,6 +419,7 @@ void load_interpolators() {
 
         minBobbinWallThickness = std::numeric_limits<double>::infinity();
         minBobbinColumnThickness = std::numeric_limits<double>::infinity();
+        bobbinFormersPerCoreShape.clear();
 
         // Column-corner samples (see BobbinColumnCornerSamples): (columnWidth, inside corner) per
         // shape of the core column the catalogue former's bore follows.
@@ -504,14 +519,24 @@ void load_interpolators() {
                 if (sampleColumnThickness > 0) {
                     minBobbinColumnThickness = std::min(minBobbinColumnThickness, sampleColumnThickness);
                 }
-                AuxFillingFactorWidth bobbinAuxFillingFactorWidth = { bobbinWindingWindowWidth, bobbinFillingFactor };
-                AuxFillingFactorHeight bobbinAuxFillingFactorHeight = { bobbinWindingWindowHeight, bobbinFillingFactor };
+                AuxFillingFactorWidth bobbinAuxFillingFactorWidth = { bobbinWindingWindowWidth, bobbinFillingFactor, datum.first };
+                AuxFillingFactorHeight bobbinAuxFillingFactorHeight = { bobbinWindingWindowHeight, bobbinFillingFactor, datum.first };
                 auxFillingFactorWidth.push_back(bobbinAuxFillingFactorWidth);
                 auxFillingFactorHeight.push_back(bobbinAuxFillingFactorHeight);
-                AuxWindingWindowWidth coreAuxWindingWindowWidth = { coreWindingWindowWidth, bobbinWindingWindowWidthProportion };
-                AuxWindingWindowHeight coreAuxWindingWindowHeight = { coreWindingWindowHeight, bobbinWindingWindowHeightProportion };
+                AuxWindingWindowWidth coreAuxWindingWindowWidth = { coreWindingWindowWidth, bobbinWindingWindowWidthProportion, datum.first };
+                AuxWindingWindowHeight coreAuxWindingWindowHeight = { coreWindingWindowHeight, bobbinWindingWindowHeightProportion, datum.first };
                 auxWindingWindowWidth.push_back(coreAuxWindingWindowWidth);
                 auxWindingWindowHeight.push_back(coreAuxWindingWindowHeight);
+                // ABT #1582: the former's own window, for the core shape it names (keyed by the shape's database
+                // name, which is what Core::get_shape_name returns for a core of that shape).
+                if (!coreShape.get_name()) {
+                    unusableBobbins.push_back(datum.first + " -> core shape '" + coreShapeName + "' has no name (own-former table)");
+                }
+                else {
+                    bobbinFormersPerCoreShape[coreShape.get_name().value()].push_back(
+                        {datum.first, bobbinWindingWindowWidth, bobbinWindingWindowHeight,
+                         coreWindingWindowWidth, coreWindingWindowHeight, bobbinFillingFactor});
+                }
 
                 // The corner this former's bore follows, derived from the core shape it names
                 // (Alf, 2026-10-26). Taken after the samples above, so a former whose corner
@@ -563,82 +588,44 @@ void load_interpolators() {
             logEntry(entry, "Bobbin", 2);
         }
 
-        {
-            size_t n = auxFillingFactorWidth.size();
-            std::vector<double> x, y;
-
-            std::sort(auxFillingFactorWidth.begin(), auxFillingFactorWidth.end(), [](const AuxFillingFactorWidth& b1, const AuxFillingFactorWidth& b2) {
-                return b1.windingWindowWidth < b2.windingWindowWidth;
-            });
-            minBobbinWidth = auxFillingFactorWidth[0].windingWindowWidth;
-            maxBobbinWidth = auxFillingFactorWidth[n - 1].windingWindowWidth;
-
-            for (size_t i = 0; i < n; i++) {
-                if (x.size() == 0 || fabs(auxFillingFactorWidth[i].windingWindowWidth - x.back()) > 1e-9) {
-                    x.push_back(auxFillingFactorWidth[i].windingWindowWidth);
-                    y.push_back(auxFillingFactorWidth[i].fillingFactor);
-                }
+        // ABT #1582: each fit's knots come from Bobbin::select_tied_samples. When several catalogue formers tie on
+        // the fit's x, the knot takes the ONE former with the lexicographically smallest catalogue name (no
+        // averaging). These fits used to std::sort (not stable) and keep the FIRST of each run of equal x, so the
+        // knot at a tie (e.g. the EER 42L horizontal and vertical formers, 27.5 mm high, filling factor 0.734 vs
+        // 0.489) depended on where unrelated catalogue rows fell in the sort.
+        auto fitKnots = [](const auto& auxSamples, auto getX, auto getY) {
+            std::vector<Bobbin::FitSample> samples;
+            for (const auto& sample : auxSamples) {
+                samples.push_back({getX(sample), sample.formerName, getY(sample)});
             }
-
+            return Bobbin::select_tied_samples(std::move(samples));
+        };
+        {
+            auto [x, y] = fitKnots(auxFillingFactorWidth, [](const auto& s) { return s.windingWindowWidth; },
+                                   [](const auto& s) { return s.fillingFactor; });
+            minBobbinWidth = x.front();
+            maxBobbinWidth = x.back();
             bobbinFillingFactorInterpWidth = tk::spline(x, y, tk::spline::cspline_hermite, true);
-
         }
         {
-            size_t n = auxFillingFactorHeight.size();
-            std::vector<double> x, y;
-
-            std::sort(auxFillingFactorHeight.begin(), auxFillingFactorHeight.end(), [](const AuxFillingFactorHeight& b1, const AuxFillingFactorHeight& b2) {
-                return b1.windingWindowHeight < b2.windingWindowHeight;
-            });
-            minBobbinHeight = auxFillingFactorHeight[0].windingWindowHeight;
-            maxBobbinHeight = auxFillingFactorHeight[n - 1].windingWindowHeight;
-
-            for (size_t i = 0; i < n; i++) {
-                if (x.size() == 0 || fabs(auxFillingFactorHeight[i].windingWindowHeight - x.back()) > 1e-9) {
-                    x.push_back(auxFillingFactorHeight[i].windingWindowHeight);
-                    y.push_back(auxFillingFactorHeight[i].fillingFactor);
-                }
-            }
-
+            auto [x, y] = fitKnots(auxFillingFactorHeight, [](const auto& s) { return s.windingWindowHeight; },
+                                   [](const auto& s) { return s.fillingFactor; });
+            minBobbinHeight = x.front();
+            maxBobbinHeight = x.back();
             bobbinFillingFactorInterpHeight = tk::spline(x, y, tk::spline::cspline_hermite, true);
         }
-
         {
-            size_t n = auxWindingWindowWidth.size();
-            std::vector<double> x, y;
-
-            std::sort(auxWindingWindowWidth.begin(), auxWindingWindowWidth.end(), [](const AuxWindingWindowWidth& b1, const AuxWindingWindowWidth& b2) {
-                return b1.windingWindowWidth < b2.windingWindowWidth;
-            });
-            minWindingWindowWidth = auxWindingWindowWidth[0].windingWindowWidth;
-            maxWindingWindowWidth = auxWindingWindowWidth[n - 1].windingWindowWidth;
-
-            for (size_t i = 0; i < n; i++) {
-                if (x.size() == 0 || fabs(auxWindingWindowWidth[i].windingWindowWidth - x.back()) > 1e-9) {
-                    x.push_back(auxWindingWindowWidth[i].windingWindowWidth);
-                    y.push_back(auxWindingWindowWidth[i].windingWindowProportion);
-                }
-            }
-
+            auto [x, y] = fitKnots(auxWindingWindowWidth, [](const auto& s) { return s.windingWindowWidth; },
+                                   [](const auto& s) { return s.windingWindowProportion; });
+            minWindingWindowWidth = x.front();
+            maxWindingWindowWidth = x.back();
             bobbinWindingWindowProportionInterpWidth = tk::spline(x, y, tk::spline::linear, false);
         }
         {
-            size_t n = auxWindingWindowHeight.size();
-            std::vector<double> x, y;
-
-            std::sort(auxWindingWindowHeight.begin(), auxWindingWindowHeight.end(), [](const AuxWindingWindowHeight& b1, const AuxWindingWindowHeight& b2) {
-                return b1.windingWindowHeight < b2.windingWindowHeight;
-            });
-            minWindingWindowHeight = auxWindingWindowHeight[0].windingWindowHeight;
-            maxWindingWindowHeight = auxWindingWindowHeight[n - 1].windingWindowHeight;
-
-            for (size_t i = 0; i < n; i++) {
-                if (x.size() == 0 || fabs(auxWindingWindowHeight[i].windingWindowHeight - x.back()) > 1e-9) {
-                    x.push_back(auxWindingWindowHeight[i].windingWindowHeight);
-                    y.push_back(auxWindingWindowHeight[i].windingWindowProportion);
-                }
-            }
-
+            auto [x, y] = fitKnots(auxWindingWindowHeight, [](const auto& s) { return s.windingWindowHeight; },
+                                   [](const auto& s) { return s.windingWindowProportion; });
+            minWindingWindowHeight = x.front();
+            maxWindingWindowHeight = x.back();
             bobbinWindingWindowProportionInterpHeight = tk::spline(x, y, tk::spline::linear, false);
         }
 
@@ -664,7 +651,38 @@ void load_interpolators() {
             bobbinColumnCornerSamples[columnShape] = table;
         }
         bobbinColumnCornerSamplesLoaded = true;
+        // Stamped last: load_bobbins and the shape lookups above may load a catalogue (and bump the generation).
+        bobbinInterpolatorsCatalogueGeneration = catalogueGeneration.load(std::memory_order_relaxed);
     }
+}
+
+std::pair<std::vector<double>, std::vector<double>> Bobbin::select_tied_samples(std::vector<FitSample> samples) {
+    if (samples.empty()) {
+        throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA, "Bobbin: no catalogue samples to fit the bobbin interpolators through");
+    }
+    // Tiebreak rule (ABT #1582, Alf 2026-11-01: fixed tiebreak, no averaging): of the formers whose x lies within
+    // 1e-9 of the run's first x, the knot is the one with the lexicographically smallest catalogue name (then the
+    // smallest y, should two samples share a name). The full (x, name, y) sort makes the result independent of
+    // the order the samples came in.
+    std::sort(samples.begin(), samples.end(), [](const FitSample& a, const FitSample& b) {
+        return std::tie(a.x, a.formerName, a.y) < std::tie(b.x, b.formerName, b.y);
+    });
+    std::vector<double> x, y;
+    size_t first = 0;
+    while (first < samples.size()) {
+        size_t chosen = first;
+        size_t last = first + 1;
+        while (last < samples.size() && fabs(samples[last].x - samples[first].x) <= 1e-9) {
+            if (std::tie(samples[last].formerName, samples[last].y) < std::tie(samples[chosen].formerName, samples[chosen].y)) {
+                chosen = last;
+            }
+            ++last;
+        }
+        x.push_back(samples[chosen].x);
+        y.push_back(samples[chosen].y);
+        first = last;
+    }
+    return {x, y};
 }
 
 const std::map<ColumnShape, BobbinColumnCornerSamples>& Bobbin::get_column_corner_samples() {
@@ -726,6 +744,64 @@ double Bobbin::get_filling_factor(double windingWindowWidth, double windingWindo
     double fillingFactorHeight = bobbinFillingFactorInterpHeight(windingWindowHeight);
 
     return (fillingFactorWidth + fillingFactorHeight) / 2;
+}
+
+std::optional<CatalogueFormerWindow> Bobbin::get_own_catalogue_former(const std::string& coreShapeName) {
+    load_interpolators();
+    auto it = bobbinFormersPerCoreShape.find(coreShapeName);
+    if (it == bobbinFormersPerCoreShape.end() || it->second.empty()) {
+        return std::nullopt;
+    }
+    // Rule (Alf, 2026-11-01): when the catalogue formers of a shape disagree on the window, the core's own former is
+    // the one with the smallest winding area; a tie on the area goes to the smallest catalogue name. It never throws
+    // and never goes to the fit: 23 of the 120 shapes with formers have such a disagreement (ETD 29/16/10: 4.8 or
+    // 4.9 mm wide). The fits serve only cores whose shape has no former at all.
+    return *std::min_element(it->second.begin(), it->second.end(), [](const CatalogueFormerWindow& a, const CatalogueFormerWindow& b) {
+        const double areaA = a.bobbinWindowWidth * a.bobbinWindowHeight;
+        const double areaB = b.bobbinWindowWidth * b.bobbinWindowHeight;
+        return std::tie(areaA, a.formerName) < std::tie(areaB, b.formerName);
+    });
+}
+
+// The own former was measured against the two-piece set of its shape; a core of that shape whose first winding
+// window is a different one (another set-up of the shape) is not the core that former fits.
+static const CatalogueFormerWindow& check_own_former_fits_core(const CatalogueFormerWindow& former, const Core& core,
+                                                               double coreWindowWidth, double coreWindowHeight) {
+    auto agrees = [](double a, double b) { return fabs(a - b) <= 1e-6 * std::max(fabs(a), fabs(b)); };
+    if (!agrees(former.coreWindowWidth, coreWindowWidth) || !agrees(former.coreWindowHeight, coreWindowHeight)) {
+        throw InvalidInputException(ErrorCode::INVALID_BOBBIN_DATA,
+            "Core '" + core.get_name().value_or("<unnamed>") + "' has a winding window of " +
+            std::to_string(coreWindowWidth * 1000) + " mm x " + std::to_string(coreWindowHeight * 1000) +
+            " mm, but its shape's catalogue former " + former.formerName + " was made for a window of " +
+            std::to_string(former.coreWindowWidth * 1000) + " mm x " + std::to_string(former.coreWindowHeight * 1000) + " mm");
+    }
+    return former;
+}
+
+static std::pair<double, double> first_core_winding_window(const Core& core) {
+    auto windingWindows = core.get_winding_windows();
+    if (windingWindows.empty() || !windingWindows[0].get_width() || !windingWindows[0].get_height()) {
+        throw CoreNotProcessedException("Bobbin: core " + core.get_name().value_or("<unnamed>") +
+                                        " has no rectangular first winding window (width and height)");
+    }
+    return {windingWindows[0].get_width().value(), windingWindows[0].get_height().value()};
+}
+
+double Bobbin::get_filling_factor(const Core& core) {
+    auto [coreWindowWidth, coreWindowHeight] = first_core_winding_window(core);
+    if (auto former = get_own_catalogue_former(core.get_shape_name())) {
+        return check_own_former_fits_core(former.value(), core, coreWindowWidth, coreWindowHeight).fillingFactor;
+    }
+    return get_filling_factor(coreWindowWidth, coreWindowHeight);
+}
+
+std::vector<double> Bobbin::get_winding_window_dimensions(const Core& core) {
+    auto [coreWindowWidth, coreWindowHeight] = first_core_winding_window(core);
+    if (auto former = get_own_catalogue_former(core.get_shape_name())) {
+        const auto& fitted = check_own_former_fits_core(former.value(), core, coreWindowWidth, coreWindowHeight);
+        return {fitted.bobbinWindowWidth, fitted.bobbinWindowHeight};
+    }
+    return get_winding_window_dimensions(coreWindowWidth, coreWindowHeight);
 }
 
 std::vector<double> Bobbin::get_winding_window_dimensions(double coreWindingWindowWidth, double coreWindingWindowHeight){
@@ -847,7 +923,10 @@ Bobbin Bobbin::create_quick_bobbin(Core core, bool nullDimensions, std::optional
 
     if (!nullDimensions && bobbinWindingWindowShape == WindingWindowShape::RECTANGULAR) {
 
-        std::vector<double> bobbinWindingWindowDimensions = get_winding_window_dimensions(coreWindingWindow.get_width().value(), coreWindingWindow.get_height().value());
+        // ABT #1582: a core whose shape has a catalogue former takes that former's real window; the fit (and the
+        // thickness floor below, which only guards the fit's extrapolation) serves the cores with none.
+        const bool hasOwnFormer = get_own_catalogue_former(core.get_shape_name()).has_value();
+        std::vector<double> bobbinWindingWindowDimensions = get_winding_window_dimensions(core);
         bobbinColumnThickness = coreWindingWindow.get_width().value() - bobbinWindingWindowDimensions[0];
         bobbinWallThickness = (coreWindingWindow.get_height().value() - bobbinWindingWindowDimensions[1]) / 2;
         // Floor the thicknesses at the smallest real bobbin in the database. The
@@ -855,10 +934,10 @@ Bobbin Bobbin::create_quick_bobbin(Core core, bool nullDimensions, std::optional
         // its training range, which produces ~µm walls that are physically impossible
         // (real injection-molded bobbins are at least ~0.3 mm). Use the database min
         // instead, then re-derive the bobbin window dimensions to stay consistent.
-        if (std::isfinite(minBobbinWallThickness) && bobbinWallThickness < minBobbinWallThickness) {
+        if (!hasOwnFormer && std::isfinite(minBobbinWallThickness) && bobbinWallThickness < minBobbinWallThickness) {
             bobbinWallThickness = minBobbinWallThickness;
         }
-        if (std::isfinite(minBobbinColumnThickness) && bobbinColumnThickness < minBobbinColumnThickness) {
+        if (!hasOwnFormer && std::isfinite(minBobbinColumnThickness) && bobbinColumnThickness < minBobbinColumnThickness) {
             bobbinColumnThickness = minBobbinColumnThickness;
         }
         if (bobbinWallThickness <= 0) {

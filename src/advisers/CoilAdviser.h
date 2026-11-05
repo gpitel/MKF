@@ -5,6 +5,7 @@
 #include "constructive_models/Mas.h"
 #include "support/Utils.h"
 #include <MAS.hpp>
+#include <functional>
 #include <limits>
 #include <optional>
 
@@ -142,6 +143,13 @@ class CoilAdviser : public WireAdviser {
         std::string _diagnosisRealWindingRefusal;  // the first such refusal, as the real winder named it
         size_t _diagnosisInsulationOutsideWindow = 0;  // wound coils whose insulation escapes the window (ABT #838)
         std::string _diagnosisInsulationOutsideWindowReason;  // the first such escape
+        size_t _diagnosisTemperatureRejections = 0;  // wound coils the temperature gate rejected (ABT #1394)
+        std::string _diagnosisTemperatureRejection;  // the first such rejection
+        size_t _diagnosisSaturationRejections = 0;  // wound coils rejected because their core saturates (ABT #838)
+        std::string _diagnosisSaturationRejection;  // the first such rejection
+        // Every wound coil the temperature gate rejected in the last get_advised_coil call: its reference and the
+        // reason (ABT #1394), so a caller (MagneticAdviser) can report each one as a failed candidate.
+        std::vector<std::pair<std::string, std::string>> _temperatureRejections;
         std::optional<std::string> _lastNoResultsReason;
 
     public:
@@ -156,10 +164,28 @@ class CoilAdviser : public WireAdviser {
             return _lastNoResultsReason;
         }
 
+        // The wound coils the temperature gate rejected in the last get_advised_coil call, as (coil reference,
+        // reason) pairs, whether or not the call returned other coils.
+        const std::vector<std::pair<std::string, std::string>>& get_last_temperature_rejections() const {
+            return _temperatureRejections;
+        }
+
         // ABT #1699: the first maximumNumberResults of `rankedMases` (in their order). With real
         // winding geometry on, only those MagneticFilterRealWinding accepts; refusals are counted
-        // in the no-results diagnosis.
-        std::vector<Mas> select_real_windable(std::vector<Mas> rankedMases, size_t maximumNumberResults);
+        // in the no-results diagnosis. Alf, 2026-11-02: with `finalWind`, each coil walked is first
+        // wound again by it with its connection leads planned (the adviser ranked it wound without
+        // them); the text it returns is that coil's refusal, counted with the others.
+        std::vector<Mas> select_real_windable(std::vector<Mas> rankedMases, size_t maximumNumberResults,
+                                              const std::function<std::optional<std::string>(Mas&)>& finalWind = {});
+
+        // ABT #1394: the temperature gate the core and magnetic advisers apply, on the wound coils. Each coil of
+        // `scoredMases` is solved by MagneticFilterLosses (losses and hot spot from one loss <-> temperature solve
+        // per operating point) and held by MagneticFilterTemperature to resolve_maximum_design_temperature: a coil
+        // hotter than the limit, one with no thermal operating point, one whose core saturates, and one whose losses
+        // cannot be evaluated at all (e.g. the material's loss fit does not cover the frequency: it has no temperature
+        // the limit could accept) are rejected, each logged with its reason and counted in the no-results diagnosis.
+        // The order of the kept coils is unchanged. Applied to the valid coils and to the INVALID fallback alike.
+        std::vector<std::pair<Mas, double>> reject_coils_above_temperature_limit(std::vector<std::pair<Mas, double>> scoredMases);
 
         /**
          * @brief The wires get_advised_coil(mas) advises from: the catalogue (or the active

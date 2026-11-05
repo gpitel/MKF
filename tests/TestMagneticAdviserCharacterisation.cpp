@@ -222,15 +222,24 @@ const std::vector<MagneticEntry> kTopThreeWinding = {
     // E 8/2 2-stack leaves the top 3 and a 79 E 8.3/4 2-stack at 12 turns takes slots 1-2 (the same
     // design in two winding orders). Both 79 and 95 are priced MnZn ferrites, so no candidate was
     // dropped by a COST throw; the old winner was out-scored. The per-design US$ were not broken down.
-    {"79 E 10/3 gapped 0.04 mm, Turns: 21, Order: 021, Non-Interleaved, Margin Taped 01",
-     "Round 35.5 - Single Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
+    // Re-pinned 2026-11-01 (ABT #1582, approved by Alf): the same three designs with and without the own-former rule, so
+    // the rule did not cause the move from the 79 E 10/3. L 86.3, 86.3 and 111.6 uH, inside the fixture's 80-120 uH.
+    // Re-pinned 2026-11-04 (ABT #2226, approved by Alf): the CoilAdviser now orders the coils it returns by their losses
+    // (MagneticFilterLosses on the planned wind), the score only breaking ties, so the coil each core brings to the
+    // MagneticAdviser changed. Old top 3 (coil-adviser losses 0.596 / 0.586 / 0.716 W):
+    //   "79 P 14/8/I gapped 0.30 mm, Turns: 26, Order: 012, Non-Interleaved, Margin Taped 00", 36.0 || 41.0 || 41.0 Single Build, 2.3149134012428343
+    //   "79 P 14/8/I gapped 0.30 mm, Turns: 26, Order: 021, Non-Interleaved, Margin Taped 01", 36.0 || 44.0 || 41.0 Single Build, 2
+    //   "79 RM 6/I-R gapped 0.30 mm, Turns: 28, Order: 021, Non-Interleaved, Margin Taped 00", 33.0 || 38.0 || 38.0 Single Build, 1.1716032439500208
+    // New top 3: coil-adviser losses 0.331 / 0.322 / 0.369 W, the same two cores in winding order 102.
+    {"79 P 14/8/I gapped 0.30 mm, Turns: 26, Order: 102, Non-Interleaved, Margin Taped 00",
+     "Round 36.0 - Single Build || Round 41.0 - Single Build || Round 41.0 - Single Build",
+     2.4165906971317161},
+    {"79 RM 6/I-R gapped 0.30 mm, Turns: 28, Order: 102, Non-Interleaved, Margin Taped 00",
+     "Round 33.0 - Single Build || Round 38.0 - Single Build || Round 38.0 - Single Build",
      2},
-    {"79 E 8.3/4 2 stacks gapped 0.01 mm, Turns: 12, Order: 021, Non-Interleaved, Margin Taped 00",
-     "Round 33.0 - Single Build || Round 38.0 - Single Build || Round 38.0 - Single Build",
-     0.85007868429843947},
-    {"79 E 8.3/4 2 stacks gapped 0.01 mm, Turns: 12, Order: 012, Non-Interleaved, Margin Taped 00",
-     "Round 33.0 - Single Build || Round 38.0 - Single Build || Round 38.0 - Single Build",
-     0.84999999999999998},
+    {"79 RM 6/I-R gapped 0.30 mm, Turns: 28, Order: 102, Non-Interleaved, Margin Taped 01",
+     "Round 33.0 - Heavy Build || Round 38.0 - Single Build || Round 38.0 - Single Build",
+     1.641471883537829},
 };
 
 } // namespace
@@ -824,11 +833,20 @@ TEST_CASE("MagneticAdviser web DMC whose switching ripple is resolved returns wo
     // 33 + 33 turns (I_sat 10.48 A at 100 C) no longer clears the margin. The adviser now picks the
     // ungapped T 47/24/18.0 HF 160 (High Flux 160) with 38 + 38 turns: I_sat 22.18 A at 100 C, 9.04 W of core loss
     // in the simulator, solved core 91.2 C. The design (inputs) is unchanged.
-    REQUIRE(magnetic.get_core().get_shape_name() == "T 47/24/18.0");
-    REQUIRE(magnetic.get_core().get_material_name() == "HF 160");
+    // Re-pinned 2026-11-03 (ABT #2234, Alf-approved): MAS c7a7cbc replaced XFlux 125's DC-bias coefficients
+    // (Magnetics catalogue/web set: b 5.44e-10 -> 5.26e-12, c 1.956 -> 2.477). Bisected on the materials
+    // file: that record alone moves the pick (it changes the candidate pool the scores are normalised
+    // over). The adviser now picks the ungapped T 28/14/19 High Flux 125 with 41 + 41 turns: 3.76 W of
+    // core loss in the simulator, solved core 98.3 C. The design (inputs) is unchanged.
+    // Re-pinned 2026-11-03 (Alf-approved, cause not bisected): with the coil-adviser changes of the ABT #1394 /
+    // #1582 batch on top of MAS 6e288e9 the adviser picks the ungapped T 34/19/22 High Flux 125 with 42 + 42
+    // turns: 4.00 W of core loss in the simulator, solved core 79.3 C. On the older MAS e56be36 the same batch kept
+    // the then pin (T 47/24/18.0 HF 160). The design (inputs) is unchanged.
+    REQUIRE(magnetic.get_core().get_shape_name() == "T 34/19/22");  // was T 28/14/19
+    REQUIRE(magnetic.get_core().get_material_name() == "High Flux 125");
     REQUIRE(magnetic.get_core().get_functional_description().get_gapping().empty());
-    REQUIRE(magnetic.get_coil().get_functional_description()[0].get_number_turns() == 38);
-    CHECK_THAT(simulatedCoreLosses.get_core_losses(), Catch::Matchers::WithinRel(9.04, 0.05));
+    REQUIRE(magnetic.get_coil().get_functional_description()[0].get_number_turns() == 42);  // was 41
+    CHECK_THAT(simulatedCoreLosses.get_core_losses(), Catch::Matchers::WithinRel(4.00, 0.05));  // was 3.76 W
 
     // The operating point as stored (waveforms, no harmonics) is the same excitation as its processed
     // copy, so the sweep must price it the same (ABT #1764): it read 16.3 W against 1.74 W, because

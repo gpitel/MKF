@@ -16,6 +16,7 @@
 #include "physical_models/WindingProximityEffectLosses.h"
 #include "physical_models/WindingSkinEffectLosses.h"
 #include "support/Exceptions.h"
+#include "support/NumberFormat.h"
 #include "support/Utils.h"
 
 #include <algorithm>
@@ -655,6 +656,8 @@ MagneticFilterLosses::MagneticFilterLosses(std::map<std::string, std::string> mo
 
 std::pair<bool, double> MagneticFilterLosses::evaluate_magnetic(Magnetic* magnetic, Inputs* inputs, std::vector<Outputs>* outputs) {
     double scoring = 0;
+    _lossesBeforeHold.clear();
+    _saturationRejection.reset();
     _magneticSimulator.set_topology(magnetizing_model_topology(*inputs));
 
     if (inputs->get_operating_points().size() > 0 && magnetic->get_mutable_coil().get_functional_description().size() != inputs->get_operating_points()[0].get_excitations_per_winding().size()) {
@@ -667,8 +670,11 @@ std::pair<bool, double> MagneticFilterLosses::evaluate_magnetic(Magnetic* magnet
         // temperature their combined heat produces (previously the winding losses were computed
         // here at ambient, beside core losses solved at the hot core: an inconsistent pair, and
         // the winding losses computed twice).
+        // The hot spot that solve found is published with the losses, as the core adviser's loss step does (ABT
+        // #1802), so a caller holds the part to a temperature limit without solving it again (CoilAdviser, ABT #1394).
         std::optional<WindingLossesOutput> solvedWindingLosses;
-        auto coreLosses = _magneticSimulator.calculate_core_losses(operatingPoint, *magnetic, &solvedWindingLosses, nullptr,
+        std::optional<TemperatureOutput> solvedTemperature;
+        auto coreLosses = _magneticSimulator.calculate_core_losses(operatingPoint, *magnetic, &solvedWindingLosses, &solvedTemperature,
                                                                    WindingLossesScope::FULL, NoThermalOperatingPointPolicy::THROW);
         // A core that saturates at the temperature its losses heat it to is not a candidate: the loss solve
         // gives its numbers (ABT #1855) and the verdict is the saturation check analyze_results makes, on the
@@ -677,13 +683,53 @@ std::pair<bool, double> MagneticFilterLosses::evaluate_magnetic(Magnetic* magnet
         auto saturation = ResultsAnalyzer::check_saturation(magnetic->get_mutable_core().resolve_material(),
             ResultsAnalyzer::get_peak_flux_density(coreLosses.get_magnetic_flux_density().value()), coreLosses.get_temperature(),
             1.0, _magneticSimulator.get_last_dc_bias_point());
+        // Alf, 2026-11-01: a core the solve held at its material's data limit is judged for saturation on the last
+        // iterate before the hold, its flux density at that temperature, as its material describes it: held at its
+        // Curie point it is magnetized as paramagnetic, which has no knee to saturate, and says nothing of the core.
+        // The solve's numbers (simulate's) are not touched; this is the filter's verdict.
+        auto lossesBeforeHold = _magneticSimulator.get_last_losses_before_hold();
+        _lossesBeforeHold.push_back(lossesBeforeHold);
+        std::string saturationContext;
+        if (!saturation.saturates && lossesBeforeHold) {
+            const auto& beforeHold = lossesBeforeHold.value();
+            if (!beforeHold.coreLosses.get_magnetic_flux_density()) {
+                throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+                    "Losses filter: the loss solve's iterate before the core was held at its data limit has no flux density");
+            }
+            auto saturationBeforeHold = ResultsAnalyzer::check_saturation(magnetic->get_mutable_core().resolve_material(),
+                ResultsAnalyzer::get_peak_flux_density(beforeHold.coreLosses.get_magnetic_flux_density().value()),
+                beforeHold.coreLosses.get_temperature(), 1.0, beforeHold.dcBiasPoint);
+            if (saturationBeforeHold.saturates) {
+                saturation = saturationBeforeHold;
+                saturationContext = "before its core was held at its material's data limit (" +
+                                    format_significant(beforeHold.heldAt.temperature) + " C): ";
+            }
+        }
         if (saturation.saturates) {
+            // Alf, 2026-11-01: a core that saturates only because its B_sat fell with the heat says so: more turns or
+            // gap are not the remedy for it. It is told by its B peak against B_sat at ambient, and only when B against
+            // B_sat is the criterion that fired: the others do not read B_sat.
+            const double ambientTemperature = operatingPoint.get_conditions().get_ambient_temperature();
+            const double ambientSaturationFluxDensity = Core::get_magnetic_flux_density_saturation(
+                magnetic->get_mutable_core().resolve_material(), ambientTemperature, false);
+            const bool saturatesOnlyFromHeat =
+                saturation.fluxDensityAboveSaturation && !saturation.permeabilityCollapsed && !saturation.fieldStrengthAboveSaturation &&
+                !saturation.noDcOperatingPoint && saturation.peakFluxDensity <= ambientSaturationFluxDensity;
+            if (saturatesOnlyFromHeat) {
+                saturation.message = saturation.messageWithoutRemedy + " It saturates at that temperature only: its B peak is within the " +
+                    format_quantity(ambientSaturationFluxDensity, "T") + " B_sat of its material at the " +
+                    format_significant(ambientTemperature) + " C ambient. The remedy is reducing its losses or improving its " +
+                    "cooling, not more turns or gap.";
+            }
+            saturation.message = saturationContext + saturation.message;
+            _saturationRejection = saturation.message;
             if (outputs != nullptr) {
                 while (outputs->size() < operatingPointIndex + 1) {
                     outputs->push_back(Outputs());
                 }
                 (*outputs)[operatingPointIndex].set_core_losses(coreLosses);
                 (*outputs)[operatingPointIndex].set_winding_losses(solvedWindingLosses.value());
+                (*outputs)[operatingPointIndex].set_temperature(solvedTemperature);
             }
             logEntry(std::string("Losses filter: rejecting candidate: ") + saturation.message, "MagneticFilter", 2);
             return {false, 0.0};
@@ -699,6 +745,7 @@ std::pair<bool, double> MagneticFilterLosses::evaluate_magnetic(Magnetic* magnet
             }
             (*outputs)[operatingPointIndex].set_core_losses(coreLosses);
             (*outputs)[operatingPointIndex].set_winding_losses(windingLosses);
+            (*outputs)[operatingPointIndex].set_temperature(solvedTemperature);
         }
     }
 
@@ -1045,7 +1092,7 @@ std::pair<bool, double> MagneticFilterInductorTurnsAndGapByLosses::evaluate_magn
     double windingBreadth = bobbinWindow.get_height().value();
     auto coreWindow = core.get_winding_windows()[0];
     double coreWindowArea = coreWindow.get_area().value();
-    double bobbinFillingFactor = Bobbin::get_filling_factor(coreWindow.get_width().value(), coreWindow.get_height().value());
+    double bobbinFillingFactor = Bobbin::get_filling_factor(core);
     auto wire = coil.get_wires()[0];
 
     double hottestTemperature = *std::max_element(_temperatures.begin(), _temperatures.end());

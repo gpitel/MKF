@@ -449,7 +449,37 @@ std::vector<std::pair<Magnetic, double>> CoreAdviser::create_magnetic_dataset(In
     return magnetics;
 }
 
+// The stacked pool holds tens of thousands of variants of a few thousand cores (60,823 on a 1 kW PFC
+// choke), and process_data() leaves each core's material resolved INLINE: every variant then carried a
+// deep copy of its catalogue material, complex-permeability and loss tables included, which peaked
+// the native adviser at 9 GB and ran the browser engine out of memory (std::bad_alloc). A variant whose
+// inline material IS the catalogue record of that name refers to it by name instead: every evaluation
+// resolves the name to that same record (Core::resolve_material), so no number changes, and only the
+// candidates a filter keeps inline it again. A material that differs from the catalogue record of its
+// name (a user's own data) stays inline. The verdict is cached per name for one expansion.
+static bool material_is_catalogue_record(const CoreMaterial& material, std::map<std::string, bool>& verdicts) {
+    const std::string& name = material.get_name();
+    auto known = verdicts.find(name);
+    if (known != verdicts.end()) {
+        return known->second;
+    }
+    if (coreMaterialDatabase.empty()) {
+        load_core_materials();
+    }
+    bool isCatalogueRecord = false;
+    if (coreMaterialDatabase.count(name)) {
+        // The record the name resolves to, by the same lookup Core::resolve_material makes.
+        json inlineJson, catalogueJson;
+        to_json(inlineJson, material);
+        to_json(catalogueJson, find_core_material_by_name(name));
+        isCatalogueRecord = inlineJson == catalogueJson;
+    }
+    verdicts[name] = isCatalogueRecord;
+    return isCatalogueRecord;
+}
+
 void CoreAdviser::expand_magnetic_dataset_with_stacks(Inputs inputs, std::vector<Core>* cores, std::vector<std::pair<Magnetic, double>>* magnetics) {
+    std::map<std::string, bool> catalogueMaterialVerdicts;
     Coil coil = get_dummy_coil(inputs, get_application() != MAS::MagneticApplication::INTERFERENCE_SUPPRESSION);
     auto includeToroidalCores = settings.get_use_toroidal_cores();
 
@@ -479,13 +509,18 @@ void CoreAdviser::expand_magnetic_dataset_with_stacks(Inputs inputs, std::vector
     }
     magnetics->reserve(magnetics->size() + stackedVariantsBound);
 
-    for (auto& core : *cores){
-        if (!includeToroidalCores && core.get_type() == CoreType::TOROIDAL) {
+    for (const auto& catalogueCore : *cores){
+        if (!includeToroidalCores && catalogueCore.get_type() == CoreType::TOROIDAL) {
             continue;
         }
 
 
-        if (isStackable(core)) {
+        if (isStackable(catalogueCore)) {
+            // ABT #1984: the stacked variants are built on a copy. *cores is the shared core
+            // database; stacking it in place left its cores at the last stack count, named
+            // "... 4 stacks", for every later search in the process (the magnetic adviser's
+            // second core-adviser pass searched them as single cores).
+            Core core = catalogueCore;
 
             core.process_data();
             if (!core.process_gap()) {
@@ -511,6 +546,11 @@ void CoreAdviser::expand_magnetic_dataset_with_stacks(Inputs inputs, std::vector
                     continue;
                 }
                 magnetic.set_core(core);
+                const auto& material = core.get_functional_description().get_material();
+                if (std::holds_alternative<CoreMaterial>(material) &&
+                    material_is_catalogue_record(std::get<CoreMaterial>(material), catalogueMaterialVerdicts)) {
+                    magnetic.get_mutable_core().get_mutable_functional_description().set_material(std::get<CoreMaterial>(material).get_name());
+                }
                 (*magnetics).push_back(std::pair<Magnetic, double>{magnetic, 0});
             }
         }
@@ -587,7 +627,28 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
     // INFEASIBLE, not fatal: collect them and erase after the loop so the advise still returns the
     // sizable cores instead of aborting the whole call.
     std::vector<size_t> indexesToEraseForSizing;
+    // ABT #2244: a candidate already seeded under the same inputs and settings gets the same turns
+    // and gap (or is dropped again) from CandidateMemoScope.
+    std::unordered_map<std::string, std::optional<Magnetic>>* memo = nullptr;
+    if (auto* candidateMemo = active_candidate_memo()) {
+        json inputsJson;
+        to_json(inputsJson, inputs);
+        memo = &candidateMemo->initialTurns[inputsJson.dump() + "\n" + candidate_memo_settings_key()];
+    }
     for (size_t i = 0; i < (*magneticsWithScoring).size(); ++i){
+      std::string candidateKey;
+      if (memo != nullptr) {
+          candidateKey = candidate_memo_key((*magneticsWithScoring)[i].first);
+          if (auto found = memo->find(candidateKey); found != memo->end()) {
+              if (found->second) {
+                  (*magneticsWithScoring)[i].first = found->second.value();
+              }
+              else {
+                  indexesToEraseForSizing.push_back(i);
+              }
+              continue;
+          }
+      }
       try {
         // ABT #1875: set when the inductor turns solve refused its answer as saturating; the
         // candidate then lives only if the saturation-aware re-gap clears it (see below).
@@ -1005,9 +1066,15 @@ void add_initial_turns_by_inductance(std::vector<std::pair<Magnetic, double>> *m
         }
 
         (*magneticsWithScoring)[i].first.get_mutable_coil().get_mutable_functional_description()[0].set_number_turns(initialNumberTurns);
+        if (memo != nullptr) {
+            memo->emplace(std::move(candidateKey), (*magneticsWithScoring)[i].first);
+        }
       }
       catch (const OpenMagneticsException&) {
         indexesToEraseForSizing.push_back(i);  // abt #53: drop a candidate whose sizing throws
+        if (memo != nullptr) {
+            memo->emplace(std::move(candidateKey), std::nullopt);
+        }
       }
     }
     for (auto it = indexesToEraseForSizing.rbegin(); it != indexesToEraseForSizing.rend(); ++it) {

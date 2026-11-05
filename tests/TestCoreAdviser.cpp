@@ -566,7 +566,9 @@ TEST_CASE("Test_CoreAdviserAvailableCores_All_Cores_Two_Chosen_Ones", "[adviser]
     // above the limit: ETD 29 - 3C97 - Gapped 0.5 mm (132.49 C), RM 10 - 3C91 - Gapped 0.29 mm and
     // 0.3 mm (218.36 C each, a fixed point inside 3C91's permeability collapse below Curie) and
     // RM 10 - 3C97 - Gapped 0.3 mm (135.45 C).
-    REQUIRE(masMagnetics.size() == 14);
+    // Re-pinned 2026-11-01, 14 -> 17 (ABT #1582, approved by Alf): pinned with the own-former rule in place. The count is
+    // 17 without the rule too, so the rule did not cause the move.
+    REQUIRE(masMagnetics.size() == 17);
     
     // Verify results have valid scores and contain suitable cores
     bool hasToroidal = false;
@@ -929,7 +931,11 @@ TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_Low_Power", "[adviser][core
         // successor EFD 12/6/3.5 sits in the current top-5 (full top-5: E 13/6.5/3.7,
         // EP 7 x2, EFD 12/6/3.5, EPX 8 — all sane low-power cores). Shape-level match:
         // the material/gap choice may legitimately drift with loss-model improvements.
-        if (name.find("EFD 12/6/3.5") != std::string::npos) {
+        // Re-pinned 2026-11-02 (approved by Alf): the estimated-cost filter now sizes its wire by
+        // current density when that needs less copper than a skin-depth strand (~0.43 A rms here),
+        // which moved EFD 12/6/3.5 out of the top 5 (now EP 7 x4 and E 13/6.5/3.7). E 13/6.5/3.7
+        // (78, ungapped, 1 stack) is in the top 5 both before and after that change.
+        if (name.find("E 13/6.5/3.7") != std::string::npos) {
             if (stacks == 1) {
                 found = true;
             }
@@ -1264,7 +1270,14 @@ TEST_CASE("Test_CoreAdviserAvailableCores_No_Toroids_Two_Windings","[adviser][co
     // volt-seconds used to be its peak-to-peak, doubling N_Phi and ballooning the gap for 100 uH).
     // Result: main's 10 plus ETD 34 - 3C97 - Gapped 0.5 mm, all at N = 20 (first search 9,
     // stacked search 4, merged).
-    REQUIRE(masMagnetics.size() == 11);
+    // Re-pinned 2026-11-02, 11 -> 12 (Alf approved, ABT #1582 own former; fixture unchanged): the new one is
+    // P 30/19 - 3C90 - Gapped 1.06 mm. Alone it passes every gate both before and after the own-former rule; what
+    // changed is the first search's area-product score-cull (the best 400 kept). The area-product filter weighs the
+    // core window by the bobbin filling factor: the catalogue-wide fit gave P 30/19 0.680594, its own catalogue former
+    // (4.85 x 11.3 mm in the 6.05 x 13.2 mm = 79.86 mm2 window) gives 54.805 / 79.86 = 0.686263 (+0.83 %). Before, it
+    // missed the cull (cut-off score 0.530519); now it is kept 399th of 400 (score 0.505612, the cut-off score), stays
+    // under the temperature limit (9th of the first search's 10) and is merged in.
+    REQUIRE(masMagnetics.size() == 12);
 
     // Verify all results are non-toroidal (by name pattern) and have valid scores
     for (auto& [mas, scoring] : masMagnetics) {
@@ -4126,13 +4139,23 @@ TEST_CASE("Test_CoreAdviser_Window_Copper_Capacity_Rejects_A_Core_That_Cannot_Ho
         mas.set_magnetic(magnetic);
         CoilAdviser coilAdviser;
         auto coils = coilAdviser.get_advised_coil(mas, 1);
-        REQUIRE(coils.size() > 0);
-        CHECK(withinLimits == !coil_failed_validity_filters(coils[0]));
         if (shapeName == "ETD 49/25/16") {
+            REQUIRE(coils.size() > 0);
+            CHECK(withinLimits == !coil_failed_validity_filters(coils[0]));
             CHECK(withinLimits);
         }
         else {
             CHECK_FALSE(withinLimits);
+            // Rewritten 2026-11-02 (Alf approved; fixture unchanged): the coil stage's temperature gate now refuses
+            // every E 26/9.5/14.1 coil it winds, so it returns none instead of an INVALID one. The coolest wound coil
+            // dissipates 8.78 W (core 0.47 W) and its hot spot reaches about 246 C against the 130 C limit. The
+            // diagnosis found the refusal physically right: with the winding losses corrected by 2D OMFEM (F_R
+            // primary 1.79x, secondary 1.26x lower than MKF's) the hot spot is still 144 C, and OMFEM's own thermal
+            // FEA on its own 2.26 W gives 144.5 C.
+            REQUIRE(coils.empty());
+            auto noResultsReason = coilAdviser.get_last_no_results_reason();
+            REQUIRE(noResultsReason.has_value());
+            CHECK_THAT(*noResultsReason, Catch::Matchers::ContainsSubstring("rejected by the temperature limit"));
         }
     }
     settings.reset();
@@ -4580,5 +4603,46 @@ TEST_CASE("Test_CoreAdviser_Csv_Design_Without_Topology_Or_SubApplication_Advise
         CHECK(true);
     }
     CHECK_FALSE(results.empty());
+    settings.reset();
+}
+
+// ABT #1984: the stacked search builds its 2..N-stack variants from the cores it is given. It used
+// to stack the cores themselves (a loop by reference over the core database), so after one advise
+// the database held N-stack cores named "... N stacks", and every later search took those for
+// single cores and lost the real single ones. The cores must come out exactly as they went in.
+TEST_CASE("Test_CoreAdviser_Stack_Expansion_Leaves_The_Cores_As_Given", "[adviser][core-adviser][available-cores][abt-1984]") {
+    clear_databases();
+    OpenMagnetics::Inputs inputs;
+    prepare_test_parameters(0, 25, 100000, {}, 10e-5, inputs, 600);
+
+    CoreAdviser coreAdviser;
+    coreAdviser.set_mode(CoreAdviser::CoreAdviserModes::AVAILABLE_CORES);
+    auto cores = load_test_data();
+    REQUIRE(!cores.empty());
+    std::vector<std::pair<std::string, int64_t>> before;
+    for (const auto& core : cores) {
+        REQUIRE(core.get_name());
+        before.emplace_back(core.get_name().value(), core.get_number_stacks());
+    }
+
+    auto magnetics = coreAdviser.create_magnetic_dataset(inputs, &cores, false);
+    const size_t singleCoreCandidates = magnetics.size();
+    coreAdviser.expand_magnetic_dataset_with_stacks(inputs, &cores, &magnetics);
+
+    // The premise: the expansion did build stacked variants.
+    REQUIRE(magnetics.size() > singleCoreCandidates);
+    size_t twoStackVariants = 0;
+    for (size_t index = singleCoreCandidates; index < magnetics.size(); ++index) {
+        if (magnetics[index].first.get_core().get_number_stacks() == 2) {
+            ++twoStackVariants;
+        }
+    }
+    REQUIRE(twoStackVariants > 0);
+
+    REQUIRE(cores.size() == before.size());
+    for (size_t index = 0; index < cores.size(); ++index) {
+        CHECK(cores[index].get_name().value() == before[index].first);
+        CHECK(cores[index].get_number_stacks() == before[index].second);
+    }
     settings.reset();
 }

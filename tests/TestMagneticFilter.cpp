@@ -235,7 +235,14 @@ const std::map<std::string, Snapshot> kSnapshots = {
     // 1.8031756024430384e-4, COST 4.45732988417687 -> 4.3620705094657808 (smaller Ve, lighter core),
     // MAGNETIZING_INDUCTANCE 5.7629428244944511e-3 -> 6.006604362371216e-3.
     {"ENERGY_STORED",                                   {true,  0.00018031756024430384}},
-    {"ESTIMATED_COST",                                  {true,  1.7774692926005085}},
+    // Re-pinned 2026-11-02 (Alf approved, ABT #1582 tiebreak bb6e08d3; fixture unchanged): 1.7774692926005085 ->
+    // 1.7644236464162844. The score is the estimated layers, N x parallels x (2 skin depths / ff) / h, with h the E 35
+    // quick bobbin's window height. E 35's window is 7.5 x 25.0 mm and has no own former; the height fit's knot at
+    // 25.0 mm is a tie of 11 catalogue formers (proportions 0.500 to 0.892). The old keep-first merge read 15.664 mm
+    // there, which the 1.2 wall/column disproportion cap lifted to 25 - 2 x 1.2 x 1.4 = 21.640 mm (column 7.5 - 6.1 =
+    // 1.4 mm). The smallest-name tiebreak takes "Bobbin EER 28L horizontal 12-pin" (0.872): h = 21.800 mm, under the
+    // cap. 1.7774692926005085 x 21.640 / 21.800 = 1.7644236464162844.
+    {"ESTIMATED_COST",                                  {true,  1.7644236464162844}},
     // COST re-derived 2026-09-30: the filter now scores the unit cost in US$ at 1000 pieces (CostBasis) instead
     // of numberLayers + wire relative cost (7.0). By hand, for this fixture:
     //   core      E 35 Ve 8.07 cm3 x 3C97 4800 kg/m3 = 38.74 g; MnZn law 21.03 x 0.03874^0.6407 = US$2.620
@@ -1535,6 +1542,75 @@ TEST_CASE("MagneticFilter COST flags a core with no price law instead of estimat
     auto unpriced = MagneticFilterCost(basis).calculate_cost(reference);
     CHECK_FALSE(unpriced.priced());
     CHECK_THAT(unpriced.coreUnpricedReason, Catch::Matchers::ContainsSubstring("no price law for ferrite/MnZn"));
+}
+
+TEST_CASE("MagneticFilter COST logs which candidate it rejects for having no unit cost, and why",
+          "[magnetic-filter][cost]") {
+    // The same unpriced Fair-Rite 46 (MgZn) part as above: the rejection must say which part and why,
+    // so an adviser run that drops it can be read back from the log.
+    OpenMagneticsTesting::QuickMagneticConfig cfg;
+    cfg.numberTurns = {40, 20};
+    cfg.numberParallels = {1, 1};
+    cfg.coreShapeName = "E 35";
+    cfg.coreMaterialName = "46";
+    cfg.wireNames = {"Round 1.00 - Grade 1", "Round 1.00 - Grade 1"};
+    auto magnetic = OpenMagneticsTesting::create_quick_test_magnetic(cfg);
+    magnetic.get_mutable_coil().wind();
+    auto inputs = make_reference_inputs();
+
+    auto& logger = OpenMagnetics::Logger::getInstance();
+    logger.enableCollector(OpenMagnetics::LogLevel::INFO);
+    logger.drainCollected();
+    auto verdict = MagneticFilterCost().evaluate_magnetic(&magnetic, &inputs);
+    auto records = logger.drainCollected();
+    logger.disableCollector();
+
+    CHECK(verdict == std::pair<bool, double>{false, 0.0});
+    size_t rejections = 0;
+    for (const auto& record : records) {
+        if (record.message.find("Cost filter: rejecting candidate") != std::string::npos) {
+            ++rejections;
+            CHECK_THAT(record.message, Catch::Matchers::ContainsSubstring("it has no unit cost"));
+            CHECK_THAT(record.message, Catch::Matchers::ContainsSubstring("no price law for ferrite/MgZn"));
+        }
+    }
+    CHECK(rejections == 1);
+}
+
+TEST_CASE("MagneticFilter ESTIMATED_COST sizes a 50 Hz wire by current density, not by the skin depth",
+          "[magnetic-filter][estimated-cost]") {
+    // A PFC choke at its 50 Hz line envelope, 3.6 A rms: the skin depth is ~9 mm, so a strand one skin
+    // depth in radius is ~270 mm2 of copper per turn, against ~0.5 mm2 the current needs at the house
+    // current density. Sized by the skin depth, no toroid's window fits a handful of turns and every
+    // PFC candidate was rejected; the current-density wire must fit easily.
+    settings.reset();
+    OpenMagneticsTesting::QuickInputsConfig inputsConfig;
+    inputsConfig.frequency = 50;
+    inputsConfig.magnetizingInductance = 1e-3;
+    inputsConfig.temperature = 25;
+    inputsConfig.label = WaveformLabel::SINUSOIDAL;
+    inputsConfig.peakToPeak = 2 * std::numbers::sqrt2 * 3.6;
+    inputsConfig.offset = 0;
+    auto inputs = OpenMagneticsTesting::create_quick_test_inputs(inputsConfig);
+
+    OpenMagneticsTesting::QuickMagneticConfig cfg;
+    cfg.numberTurns = {30};
+    cfg.numberParallels = {1};
+    cfg.coreShapeName = "T 40/24/14.5";
+    cfg.coreMaterialName = "Kool Mµ 60";
+    cfg.wireNames = {"Round 1.00 - Grade 1"};
+    auto magnetic = OpenMagneticsTesting::create_quick_test_magnetic(cfg);
+
+    // The premise: thirty skin-depth strands do not fit this toroid's window.
+    const double skinDepth = WindingSkinEffectLosses().calculate_skin_depth("copper", 50, inputs.get_maximum_temperature());
+    const double windowArea = magnetic.get_core().get_winding_windows()[0].get_area().value();
+    INFO("skin depth " << skinDepth * 1e3 << " mm, window " << windowArea * 1e6 << " mm2");
+    REQUIRE(30 * std::numbers::pi * skinDepth * skinDepth > windowArea);
+
+    auto [valid, scoring] = MagneticFilterEstimatedCost(inputs).evaluate_magnetic(&magnetic, &inputs);
+    CHECK(valid);
+    CHECK(std::isfinite(scoring));
+    CHECK(scoring > 0);
 }
 
 TEST_CASE("MagneticAdviser keeps a core COST cannot price and ranks it last for cost",

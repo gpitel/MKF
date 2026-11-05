@@ -6,6 +6,8 @@
 // records back to a caller (the web app shows them in its log panel). Off, or under any adviser (ABT #1652:
 // advisers never extrapolate), every such use throws.
 #include "physical_models/CoreLosses.h"
+#include "physical_models/ComplexPermeability.h"
+#include "physical_models/InitialPermeability.h"
 #include "advisers/MagneticFilter.h"
 #include "advisers/CoreAdviser.h"
 #include "advisers/CoilAdviser.h"
@@ -22,10 +24,15 @@
 #include "TestingUtils.h"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <cmath>
+#include <map>
+#include <set>
 #include <filesystem>
+#include <functional>
+#include <optional>
 #include <source_location>
 #include <numbers>
 #include <thread>
@@ -507,5 +514,453 @@ TEST_CASE("A MAS below its material's fitted span extrapolates by default with o
         CHECK(extrapolation_records(Logger::getInstance().drainCollected()).empty());
     }
     CHECK(settings.get_allow_material_data_extrapolation());
+    settings.reset();
+}
+
+// ABT #2235 (Alf, 2026-11-02: "make sure that all material admit extrapolation when the proper flag is set, not
+// just throw"). Complex permeability of a material the estimator refuses (here an iron powder): outside its table
+// there is no estimate, so off it throws; on, each part is held at its nearest tabulated value, with a WARNING.
+TEST_CASE("Complex permeability the estimator refuses: off throws, on holds the nearest tabulated value and warns", "[material-extrapolation][complex-permeability]") {
+    settings.reset();
+    clear_databases();
+    CollectorGuard collector;
+    auto material = Core::resolve_material("Mix 26");
+    REQUIRE(material.get_permeability().get_complex());
+    ComplexPermeability complexPermeability;
+    auto [minimumFrequency, maximumFrequency] = complexPermeability.get_frequency_range(material);
+    REQUIRE(minimumFrequency > 100);
+    // The premise: the estimator has no estimate for this material (a refusal, not an estimate).
+    REQUIRE(complexPermeability.get_estimated_ranges(material).empty());
+
+    SECTION("off") {
+        settings.set_allow_material_data_extrapolation(false);
+        CHECK_THROWS_AS(complexPermeability.get_complex_permeability(material, minimumFrequency / 10),
+                        ComplexPermeabilityEstimateUnavailableException);
+        CHECK_THROWS_AS(complexPermeability.get_complex_permeability(material, maximumFrequency * 10),
+                        ComplexPermeabilityEstimateUnavailableException);
+        CHECK(extrapolation_records(Logger::getInstance().drainCollected()).empty());
+    }
+    SECTION("on") {
+        settings.set_allow_material_data_extrapolation(true);
+        auto lowEdge = complexPermeability.get_tabulated_complex_permeability(material, minimumFrequency);
+        auto below = complexPermeability.get_complex_permeability_with_source(material, minimumFrequency / 10);
+        CHECK(below.real == lowEdge.first);
+        CHECK(below.imaginary == lowEdge.second);
+        CHECK(below.realSource == ComplexPermeabilitySource::HELD_FLAT);
+        CHECK(below.imaginarySource == ComplexPermeabilitySource::HELD_FLAT);
+        CHECK(below.is_estimated());
+        auto records = extrapolation_records(Logger::getInstance().drainCollected());
+        REQUIRE_FALSE(records.empty());
+        CHECK(records[0].level == LogLevel::WARNING);
+        CHECK_THAT(records[0].message, Catch::Matchers::ContainsSubstring("Mix 26") &&
+                                       Catch::Matchers::ContainsSubstring("complex permeability") &&
+                                       Catch::Matchers::ContainsSubstring(format_quantity(minimumFrequency, "Hz")));
+        CHECK_THAT(records[0].detail, Catch::Matchers::ContainsSubstring("below"));
+        // Above: each part is held at the end of its own table (one part may be tabulated further than the
+        // range where both are), so the value no longer changes with frequency.
+        auto above = complexPermeability.get_complex_permeability_with_source(material, maximumFrequency * 10);
+        auto farAbove = complexPermeability.get_complex_permeability_with_source(material, maximumFrequency * 1000);
+        CHECK(above.realSource == ComplexPermeabilitySource::HELD_FLAT);
+        CHECK(above.imaginarySource == ComplexPermeabilitySource::HELD_FLAT);
+        CHECK(farAbove.real == above.real);
+        CHECK(farAbove.imaginary == above.imaginary);
+        CHECK(std::isfinite(above.real));
+        CHECK(std::isfinite(above.imaginary));
+        auto aboveRecords = extrapolation_records(Logger::getInstance().drainCollected());
+        REQUIRE_FALSE(aboveRecords.empty());
+        CHECK_THAT(aboveRecords[0].detail, Catch::Matchers::ContainsSubstring("above"));
+        // Inside the table nothing is logged.
+        complexPermeability.get_complex_permeability(material, std::sqrt(minimumFrequency * maximumFrequency));
+        CHECK(extrapolation_records(Logger::getInstance().drainCollected()).empty());
+    }
+    settings.reset();
+}
+
+// ABT #2235: remanence, coercive force and saturation field strength run to zero at the Curie temperature past
+// their last data point. A material with no Curie temperature has no such end: off it throws, on the property is
+// held at its last tabulated value, with a WARNING. A material without the property at all still throws.
+TEST_CASE("Ferromagnetic properties above their data without a Curie temperature: off throws, on holds the last value and warns", "[material-extrapolation][saturation]") {
+    settings.reset();
+    clear_databases();
+    CollectorGuard collector;
+    json materialJson;
+    to_json(materialJson, Core::resolve_material("3C95"));
+    materialJson.erase("curieTemperature");
+    materialJson["name"] = "3C95 without a Curie temperature";
+    CoreMaterial material;
+    from_json(materialJson, material);
+    REQUIRE_FALSE(material.get_curie_temperature());
+    REQUIRE(material.get_remanence());
+    double lastRemanenceTemperature = std::numeric_limits<double>::lowest();
+    double lastRemanence = 0;
+    auto remanenceData = material.get_remanence().value();  // a local: range-for over .value() of a temporary dangles
+    for (const auto& datum : remanenceData) {
+        if (datum.get_temperature() > lastRemanenceTemperature) {
+            lastRemanenceTemperature = datum.get_temperature();
+            lastRemanence = datum.get_magnetic_flux_density();
+        }
+    }
+    // Above every tabulated point of the three properties (3C95's data ends at 100 C).
+    double temperature = 300;
+    REQUIRE(temperature > lastRemanenceTemperature);
+
+    SECTION("off") {
+        settings.set_allow_material_data_extrapolation(false);
+        CHECK_THROWS_AS(Core::get_remanence(material, temperature), MaterialException);
+        CHECK_THROWS_AS(Core::get_coercive_force(material, temperature), MaterialException);
+        CHECK_THROWS_AS(Core::get_magnetic_field_strength_saturation(material, temperature), MaterialException);
+        CHECK(extrapolation_records(Logger::getInstance().drainCollected()).empty());
+    }
+    SECTION("on") {
+        settings.set_allow_material_data_extrapolation(true);
+        CHECK(Core::get_remanence(material, temperature) == lastRemanence);
+        CHECK(std::isfinite(Core::get_coercive_force(material, temperature)));
+        CHECK(std::isfinite(Core::get_magnetic_field_strength_saturation(material, temperature)));
+        auto records = extrapolation_records(Logger::getInstance().drainCollected());
+        REQUIRE(records.size() == 3);
+        CHECK_THAT(records[0].message, Catch::Matchers::ContainsSubstring("3C95 without a Curie temperature") &&
+                                       Catch::Matchers::ContainsSubstring("remanence") &&
+                                       Catch::Matchers::ContainsSubstring("no Curie temperature"));
+        CHECK_THAT(records[0].detail, Catch::Matchers::ContainsSubstring(format_significant(temperature) + " C"));
+        // Inside its data nothing is logged.
+        Core::get_remanence(material, lastRemanenceTemperature);
+        CHECK(extrapolation_records(Logger::getInstance().drainCollected()).empty());
+    }
+    SECTION("missing data still throws with the flag on") {
+        settings.set_allow_material_data_extrapolation(true);
+        json emptyJson = materialJson;
+        emptyJson["coerciveForce"] = json::array();
+        CoreMaterial empty;
+        from_json(emptyJson, empty);
+        CHECK_THROWS_AS(Core::get_coercive_force(empty, temperature), InvalidInputException);
+    }
+    settings.reset();
+}
+
+namespace {
+
+// The ErrorCode of what `call` throws as an OpenMagneticsException; none if it does not throw.
+template <typename Call>
+std::optional<ErrorCode> thrown_code(Call call) {
+    try {
+        call();
+    }
+    catch (const OpenMagneticsException& e) {
+        return e.code();
+    }
+    return std::nullopt;
+}
+
+std::string thrown_message(const std::function<void()>& call) {
+    try {
+        call();
+    }
+    catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+// 3C95 with its saturation, remanence, coercive force and resistivity replaced by the given tables, renamed so
+// no cache keyed by name sees the catalogue's 3C95.
+CoreMaterial material_with(const std::string& name, const std::function<void(json&)>& edit) {
+    json materialJson;
+    to_json(materialJson, Core::resolve_material("3C95"));
+    materialJson["name"] = name;
+    edit(materialJson);
+    CoreMaterial material;
+    from_json(materialJson, material);
+    return material;
+}
+
+}  // namespace
+
+// ABT #2235 (Alf, 2026-11-03): the saturation flux density, remanence, coercive force and saturation field strength
+// below their first data point, a core material's resistivity and mu_i(f) outside their tabulated range are
+// extrapolated exactly as they always were, whatever Settings::allowMaterialDataExtrapolation says: they never throw
+// for being outside their data, and every such ask logs a WARNING from kMaterialDataExtrapolationModule. Inside the
+// data nothing is logged. Where an extrapolated saturation flux density reaches zero or below it is unphysical and
+// refused whatever the flag.
+TEST_CASE("Saturation flux density outside its temperatures: both flags extrapolate and warn, unphysical always throws", "[material-extrapolation][saturation]") {
+    settings.reset();
+    clear_databases();
+    CollectorGuard collector;
+    auto material = material_with("3C95 with a two-point saturation table", [](json& j) {
+        j["saturation"] = json::array({{{"magneticFluxDensity", 0.5}, {"magneticField", 1200}, {"temperature", 25}},
+                                       {{"magneticFluxDensity", 0.4}, {"magneticField", 1200}, {"temperature", 100}}});
+    });
+    for (bool allow : {true, false}) {
+        INFO("flag " << allow);
+        settings.set_allow_material_data_extrapolation(allow);
+        Logger::getInstance().drainCollected();
+        CHECK(Core::get_magnetic_flux_density_saturation(material, 60, false) == Catch::Approx(0.5 - 35 * 0.1 / 75));
+        CHECK(extrapolation_records(Logger::getInstance().drainCollected()).empty());
+        double above = 0, below = 0;
+        CHECK_NOTHROW(above = Core::get_magnetic_flux_density_saturation(material, 150, false));
+        CHECK_NOTHROW(below = Core::get_magnetic_flux_density_saturation(material, -40, false));
+        CHECK(above == Catch::Approx(0.5 - 125 * 0.1 / 75));
+        CHECK(below == Catch::Approx(0.5 + 65 * 0.1 / 75));
+        auto records = extrapolation_records(Logger::getInstance().drainCollected());
+        REQUIRE(records.size() == 1);  // one material and quantity: the two asks merge into one record
+        CHECK(records[0].level == LogLevel::WARNING);
+        CHECK_THAT(records[0].message, Catch::Matchers::ContainsSubstring("3C95 with a two-point saturation table") &&
+                                       Catch::Matchers::ContainsSubstring("saturation flux density") &&
+                                       Catch::Matchers::ContainsSubstring("from 25 C to 100 C"));
+        // 0.5 T - 475 C * 0.1 T / 75 C = -0.133 T at 500 C: unphysical, refused whatever the flag.
+        CHECK(thrown_code([&] { Core::get_magnetic_flux_density_saturation(material, 500, false); }) == ErrorCode::MATERIAL_INVALID_PROPERTY);
+        CHECK_THAT(thrown_message([&] { Core::get_magnetic_flux_density_saturation(material, 500, false); }),
+                   Catch::Matchers::ContainsSubstring("is unphysical"));
+    }
+    settings.reset();
+}
+
+TEST_CASE("Saturation flux density from a one-point table: both flags hold the point and warn", "[material-extrapolation][saturation]") {
+    settings.reset();
+    clear_databases();
+    CollectorGuard collector;
+    auto material = material_with("3C95 with a one-point saturation table", [](json& j) {
+        j["saturation"] = json::array({{{"magneticFluxDensity", 0.45}, {"magneticField", 1200}, {"temperature", 100}}});
+    });
+    for (bool allow : {true, false}) {
+        INFO("flag " << allow);
+        settings.set_allow_material_data_extrapolation(allow);
+        Logger::getInstance().drainCollected();
+        CHECK(Core::get_magnetic_flux_density_saturation(material, 100, false) == 0.45);
+        CHECK(extrapolation_records(Logger::getInstance().drainCollected()).empty());
+        double value = 0;
+        CHECK_NOTHROW(value = Core::get_magnetic_flux_density_saturation(material, 20, false));
+        CHECK(value == 0.45);
+        auto records = extrapolation_records(Logger::getInstance().drainCollected());
+        REQUIRE(records.size() == 1);
+        CHECK_THAT(records[0].message, Catch::Matchers::ContainsSubstring("at 100 C only"));
+        CHECK_THAT(records[0].detail, Catch::Matchers::ContainsSubstring("20 C"));
+    }
+    settings.reset();
+}
+
+// ABT #2235: below their first data point remanence, coercive force and the saturation field strength are their
+// tables extrapolated (above it they run to zero at the Curie temperature, ABT #1736), whatever the flag, with a
+// WARNING.
+TEST_CASE("Ferromagnetic properties below their data: both flags extrapolate and warn", "[material-extrapolation][saturation]") {
+    settings.reset();
+    clear_databases();
+    CollectorGuard collector;
+    auto material = material_with("3C95 with two-point ferromagnetic tables", [](json& j) {
+        j["saturation"] = json::array({{{"magneticFluxDensity", 0.5}, {"magneticField", 1200}, {"temperature", 25}},
+                                       {{"magneticFluxDensity", 0.4}, {"magneticField", 1000}, {"temperature", 100}}});
+        j["remanence"] = json::array({{{"magneticFluxDensity", 0.1}, {"magneticField", 0}, {"temperature", 25}},
+                                      {{"magneticFluxDensity", 0.06}, {"magneticField", 0}, {"temperature", 100}}});
+        j["coerciveForce"] = json::array({{{"magneticFluxDensity", 0}, {"magneticField", 15}, {"temperature", 25}},
+                                          {{"magneticFluxDensity", 0}, {"magneticField", 10}, {"temperature", 100}}});
+    });
+    double temperature = -40;  // 65 C below the first point
+    for (bool allow : {true, false}) {
+        INFO("flag " << allow);
+        settings.set_allow_material_data_extrapolation(allow);
+        Logger::getInstance().drainCollected();
+        CHECK(Core::get_remanence(material, 25) == Catch::Approx(0.1));
+        CHECK(extrapolation_records(Logger::getInstance().drainCollected()).empty());
+        double remanence = 0, coerciveForce = 0, saturationField = 0;
+        CHECK_NOTHROW(remanence = Core::get_remanence(material, temperature));
+        CHECK_NOTHROW(coerciveForce = Core::get_coercive_force(material, temperature));
+        CHECK_NOTHROW(saturationField = Core::get_magnetic_field_strength_saturation(material, temperature));
+        CHECK(remanence == Catch::Approx(0.1 + 65 * 0.04 / 75));
+        CHECK(coerciveForce == Catch::Approx(15 + 65 * 5.0 / 75));
+        CHECK(saturationField == Catch::Approx(1200 + 65 * 200.0 / 75));
+        auto records = extrapolation_records(Logger::getInstance().drainCollected());
+        REQUIRE(records.size() == 3);
+        CHECK_THAT(records[0].message, Catch::Matchers::ContainsSubstring("remanence"));
+        CHECK_THAT(records[1].message, Catch::Matchers::ContainsSubstring("coercive force"));
+        CHECK_THAT(records[2].message, Catch::Matchers::ContainsSubstring("saturation field strength"));
+        CHECK_THAT(records[0].detail, Catch::Matchers::ContainsSubstring("-40 C") && Catch::Matchers::ContainsSubstring("below"));
+    }
+    settings.reset();
+}
+
+// ABT #2235: a core material's resistivity outside its tabulated temperatures (one point, or several) is extrapolated
+// as before (a single point is held), whatever the flag, with a WARNING.
+TEST_CASE("Core resistivity outside its temperatures: both flags extrapolate and warn", "[material-extrapolation][resistivity]") {
+    settings.reset();
+    clear_databases();
+    CollectorGuard collector;
+    auto single = material_with("3C95 with one resistivity point", [](json& j) {
+        j["resistivity"] = json::array({{{"value", 5}, {"temperature", 25}}});
+    });
+    // Collinear points: the table's spline and its extrapolation are that line.
+    auto table = material_with("3C95 with a resistivity table", [](json& j) {
+        j["resistivity"] = json::array({{{"value", 5}, {"temperature", 25}}, {{"value", 4}, {"temperature", 62.5}}, {{"value", 3}, {"temperature", 100}}});
+    });
+    for (bool allow : {true, false}) {
+        INFO("flag " << allow);
+        settings.set_allow_material_data_extrapolation(allow);
+        Logger::getInstance().drainCollected();
+        CHECK(Core::get_resistivity(single, 25) == 5);
+        CHECK(Core::get_resistivity(table, 80) == Catch::Approx(5 - 55 * 2.0 / 75));
+        CHECK(extrapolation_records(Logger::getInstance().drainCollected()).empty());
+        double singleHot = 0, singleCold = 0, tableHot = 0, tableCold = 0;
+        CHECK_NOTHROW(singleHot = Core::get_resistivity(single, 150));
+        CHECK_NOTHROW(singleCold = Core::get_resistivity(single, -40));
+        CHECK_NOTHROW(tableHot = Core::get_resistivity(table, 150));
+        CHECK_NOTHROW(tableCold = Core::get_resistivity(table, -10));
+        CHECK(singleHot == 5);
+        CHECK(singleCold == 5);
+        CHECK(tableHot == Catch::Approx(5 - 125 * 2.0 / 75));
+        CHECK(tableCold == Catch::Approx(5 + 35 * 2.0 / 75));
+        auto records = extrapolation_records(Logger::getInstance().drainCollected());
+        REQUIRE(records.size() == 2);
+        CHECK_THAT(records[0].message, Catch::Matchers::ContainsSubstring("3C95 with one resistivity point") &&
+                                       Catch::Matchers::ContainsSubstring("resistivity") && Catch::Matchers::ContainsSubstring("at 25 C only"));
+        CHECK_THAT(records[1].message, Catch::Matchers::ContainsSubstring("3C95 with a resistivity table") &&
+                                       Catch::Matchers::ContainsSubstring("from 25 C to 100 C"));
+    }
+    settings.reset();
+}
+
+// ABT #2235: mu_i(f) outside its tabulated frequencies is the spline extrapolated (floored at 1) as before, whatever
+// the flag, with a WARNING. PC95 tabulates mu_i from 2 kHz to 1.5 MHz.
+TEST_CASE("Initial permeability outside its frequencies: both flags extrapolate the same and warn", "[material-extrapolation][initial-permeability]") {
+    settings.reset();
+    clear_databases();
+    CollectorGuard collector;
+    auto material = find_core_material_by_name("PC95");
+    std::map<bool, std::vector<double>> values;
+    for (bool allow : {true, false}) {
+        INFO("flag " << allow);
+        settings.set_allow_material_data_extrapolation(allow);
+        Logger::getInstance().drainCollected();
+        CHECK_NOTHROW(InitialPermeability::get_initial_permeability_frequency_dependent(material, 100e3));
+        CHECK(extrapolation_records(Logger::getInstance().drainCollected()).empty());
+        for (double frequency : {100.0, 500.0, 1.2e3, 2.9e6, 5e6, 20e6}) {
+            double value = 0;
+            CHECK_NOTHROW(value = InitialPermeability::get_initial_permeability_frequency_dependent(material, frequency));
+            CHECK(value >= 1);
+            values[allow].push_back(value);
+        }
+        auto records = extrapolation_records(Logger::getInstance().drainCollected());
+        REQUIRE(records.size() == 1);
+        CHECK(records[0].level == LogLevel::WARNING);
+        CHECK_THAT(records[0].message, Catch::Matchers::ContainsSubstring("PC95") && Catch::Matchers::ContainsSubstring("initial permeability"));
+    }
+    CHECK(values[true] == values[false]);
+    settings.reset();
+}
+
+// ABT #2235: the Magnetics temperature and frequency polynomials declare no span; outside the range they were
+// fitted on they run below 1 (Edge 125 from 5 MHz). The checked getter refuses that whatever the flag, saying the
+// value is unphysical. The raw model value (get_initial_permeability_model_value) stays the formula's value.
+TEST_CASE("Magnetics initial permeability formula below 1: refused as unphysical whatever the flag", "[material-extrapolation][initial-permeability]") {
+    settings.reset();
+    clear_databases();
+    auto material = find_core_material_by_name("Edge 125");
+    for (bool allow : {true, false}) {
+        INFO("flag " << allow);
+        settings.set_allow_material_data_extrapolation(allow);
+        CHECK_NOTHROW(InitialPermeability::get_initial_permeability(material, 25, std::nullopt, 100e3));
+        CHECK_THROWS_AS(InitialPermeability::get_initial_permeability(material, 25, std::nullopt, 10e6), PermeabilityBelowVacuumException);
+        CHECK_THAT(thrown_message([&] { InitialPermeability::get_initial_permeability(material, 25, std::nullopt, 10e6); }),
+                   Catch::Matchers::ContainsSubstring("is unphysical"));
+    }
+    settings.reset();
+}
+
+// Alf, 2026-11-03: an adviser reads tables of materials the user never chose (a Vienna run logged 50,514 such
+// WARNINGs, mostly Kool Mu saturation tabulated at 100 C only), and the web showed them all as warnings. While an
+// adviser runs (a MaterialDataExtrapolationBarrier exists) a material read outside its tables is a DEBUG record;
+// outside any adviser the same read is a WARNING, as ABT #2235 decided.
+TEST_CASE("Material tables read outside their data under an adviser log DEBUG, outside it WARNING", "[material-extrapolation][adviser]") {
+    settings.reset();
+    clear_databases();
+    CollectorGuard collector(LogLevel::DEBUG);
+    auto material = material_with("3C95 with a saturation table at 100 C only", [](json& j) {
+        j["saturation"] = json::array({{{"magneticFluxDensity", 0.45}, {"magneticField", 1200}, {"temperature", 100}}});
+    });
+    auto pc95 = find_core_material_by_name("PC95");  // mu_i tabulated from 2 kHz to 1.5 MHz
+    auto levels = [&]() {
+        CHECK(Core::get_magnetic_flux_density_saturation(material, 25, false) == 0.45);
+        CHECK_NOTHROW(InitialPermeability::get_initial_permeability_frequency_dependent(pc95, 5e6));
+        auto records = extrapolation_records(Logger::getInstance().drainCollected());
+        REQUIRE(records.size() == 2);
+        std::set<LogLevel> found;
+        for (const auto& record : records) {
+            found.insert(record.level);
+        }
+        return found;
+    };
+    Logger::getInstance().drainCollected();
+    CHECK(levels() == std::set<LogLevel>{LogLevel::WARNING});
+    {
+        MaterialDataExtrapolationBarrier adviser;
+        CHECK(levels() == std::set<LogLevel>{LogLevel::DEBUG});
+    }
+    CHECK(levels() == std::set<LogLevel>{LogLevel::WARNING});
+    settings.reset();
+}
+
+// Alf, 2026-11-04: outside its tabulated frequencies a material's loss factor is unknown. ACME's A10 is tabulated
+// from 1 kHz to 576 kHz (ABT #2251: where ACME's catalogue chart stops, just below its resonance); above that the
+// endpoint used to be held silently (ABT #118). Now, as for all material data (ABT #2235), the endpoint is held with
+// a WARNING when extrapolation is allowed, and it throws when it is off or under an adviser.
+TEST_CASE("Loss factor outside its frequencies: warns with the flag, throws without it and under an adviser", "[material-extrapolation][loss-factor]") {
+    settings.reset();
+    clear_databases();
+    CollectorGuard collector;
+    auto a10 = find_core_material_by_name("A10");
+    double endpoint = CoreLossesLossFactorModel::get_loss_factor(a10, 575655.284);
+
+    settings.set_allow_material_data_extrapolation(true);
+    Logger::getInstance().drainCollected();
+    CHECK_NOTHROW(CoreLossesLossFactorModel::get_loss_factor(a10, 300e3));
+    CHECK(extrapolation_records(Logger::getInstance().drainCollected()).empty());
+    double above = 0;
+    CHECK_NOTHROW(above = CoreLossesLossFactorModel::get_loss_factor(a10, 1e6));
+    CHECK(above == endpoint);
+    auto records = extrapolation_records(Logger::getInstance().drainCollected());
+    REQUIRE(records.size() == 1);
+    CHECK(records[0].level == LogLevel::WARNING);
+    CHECK_THAT(records[0].message, Catch::Matchers::ContainsSubstring("A10") && Catch::Matchers::ContainsSubstring("loss factor"));
+    CHECK_THAT(records[0].detail, Catch::Matchers::ContainsSubstring("above"));
+
+    {
+        MaterialDataExtrapolationBarrier adviser;
+        CHECK(thrown_code([&] { CoreLossesLossFactorModel::get_loss_factor(a10, 1e6); }) == ErrorCode::MATERIAL_FREQUENCY_OUT_OF_SPAN);
+        CHECK_NOTHROW(CoreLossesLossFactorModel::get_loss_factor(a10, 300e3));
+    }
+
+    settings.set_allow_material_data_extrapolation(false);
+    CHECK(thrown_code([&] { CoreLossesLossFactorModel::get_loss_factor(a10, 1e6); }) == ErrorCode::MATERIAL_FREQUENCY_OUT_OF_SPAN);
+    CHECK(thrown_code([&] { CoreLossesLossFactorModel::get_loss_factor(a10, 500.0); }) == ErrorCode::MATERIAL_FREQUENCY_OUT_OF_SPAN);
+    CHECK_THAT(thrown_message([&] { CoreLossesLossFactorModel::get_loss_factor(a10, 1e6); }),
+               Catch::Matchers::ContainsSubstring("tabulated from"));
+    CHECK(extrapolation_records(Logger::getInstance().drainCollected()).empty());
+    settings.reset();
+}
+
+// Alf, 2026-11-04: a loss factor given at one frequency only (KM42B: 100 kHz) keeps being used at every frequency,
+// whatever the flag and under an adviser, with a WARNING naming where it was given (DEBUG under an adviser).
+TEST_CASE("One-point loss factor: used at every frequency, warns outside its point, DEBUG under an adviser", "[material-extrapolation][loss-factor]") {
+    settings.reset();
+    clear_databases();
+    CollectorGuard collector(LogLevel::DEBUG);
+    auto km42b = find_core_material_by_name("KM42B");
+    double atPoint = CoreLossesLossFactorModel::get_loss_factor(km42b, 100e3);
+    for (bool allow : {true, false}) {
+        INFO("flag " << allow);
+        settings.set_allow_material_data_extrapolation(allow);
+        Logger::getInstance().drainCollected();
+        CHECK(CoreLossesLossFactorModel::get_loss_factor(km42b, 100e3) == atPoint);
+        CHECK(extrapolation_records(Logger::getInstance().drainCollected()).empty());
+        CHECK(CoreLossesLossFactorModel::get_loss_factor(km42b, 200e3) == atPoint);
+        auto records = extrapolation_records(Logger::getInstance().drainCollected());
+        REQUIRE(records.size() == 1);
+        CHECK(records[0].level == LogLevel::WARNING);
+        CHECK_THAT(records[0].message, Catch::Matchers::ContainsSubstring("KM42B") && Catch::Matchers::ContainsSubstring("at 100 kHz only"));
+    }
+    {
+        MaterialDataExtrapolationBarrier adviser;
+        CHECK(CoreLossesLossFactorModel::get_loss_factor(km42b, 200e3) == atPoint);
+        auto records = extrapolation_records(Logger::getInstance().drainCollected());
+        REQUIRE(records.size() == 1);
+        CHECK(records[0].level == LogLevel::DEBUG);
+    }
     settings.reset();
 }

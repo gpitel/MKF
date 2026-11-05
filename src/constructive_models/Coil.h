@@ -508,6 +508,23 @@ struct AxialLead {
 // and its ramp may leave the face: the straight on a rectangular column, the radius of the arc the
 // face is on a round or oblong one. Built by Coil::terminal_turn_path.
 //
+// ABT #2257 (Alf, 2026-11-04): one REVOLUTION of a real-winding conductor and the point of the
+// winding-window section it passes through half way round. Under real winding a turns-description
+// entry is a STATION, the conductor's crossing of the connection plane (the 2-D section), and a layer
+// of N turns lays N+1 of them (fence post): each revolution runs from one station to the conductor's
+// next station IN THE SAME LAYER. A conductor changing layer does it by a connection (a link in the
+// connection plane, or a dragback), not by a revolution, so a layer change starts no revolution.
+// The revolution climbs its advance (the step from its first station to its last) uniformly along its
+// whole path (MVB++ appendRoundWrap / appendRectWrap, the model Coil::terminal_turn_height_along
+// reads), and the column it wraps is mirror-symmetric about the plane of the crossing, so half its
+// path is the far crossing, opposite the connection plane: there it stands at the MIDPOINT of its two
+// stations, axially (the helix of an overlapping layer) and radially (the spiral of a contiguous one).
+struct RevolutionHalfPath {
+    size_t fromTurn = 0;               // index in the turns description of the station it leaves
+    size_t toTurn = 0;                 // index of the station it reaches (the conductor's next one)
+    std::vector<double> coordinates;   // {x, y} half way round, in the section frame of the stations
+};
+
 // ABT #1705: seen across the column, the turn is a rounded rectangle about the wound column's axis
 // (the connection face at -z): straights of half length faceHalfStraight along x (the connection
 // face) and lateralHalfStraight along z (the lateral faces), joined by arcs of cornerRadius. ROUND:
@@ -621,7 +638,8 @@ struct ConnectionRoute {
     // ABT #1174: the sleeve's outer diameter on a sleeved TERMINAL route, empty otherwise.
     std::optional<double> sleeveOuterDiameter;
     // ABT #1269: where this SLEEVED lead crosses the margin's INNER face, on the turn axis and in
-    // the coil's own frame -- the window edge inset by that window's margin. It is the END CONDITION
+    // the coil's own frame -- the window edge inset by the margin of the section the lead's turn is in
+    // (not the widest margin in the window, which may lie inside this section's copper). It is the END CONDITION
     // the sleeve realises: AN-18 has the tubing run "from the transformer pin to inside of the
     // margin barrier", so a consumer draws the sleeve from the terminal to this crossing and on by
     // ConnectionSleeve::overlapIntoWinding, instead of guessing a length. Empty on an unsleeved
@@ -1147,6 +1165,16 @@ class Coil : public MAS::Coil {
         // (the ABT #650 gate declined). Consumers that require blocked geometry — the 3D
         // ConductorBuilder above all — must ASK instead of discovering it as a collision.
         bool _realWindingBlockingApplied = false;
+        // Alf, 2026-11-02: "lead planning should only be for the final survivor candidates, the ones
+        // that are accepted and will be returned to the user". With real winding geometry on and this
+        // false, wind() lays the real geometry (one crossing station per layer and parallel, the
+        // closing stations) but plans no connection lead into it: no lead blocking fixpoint, no
+        // tangent-departure charge, so is_real_winding_blocking_applied() stays false (and a lead
+        // layout asked of it, e.g. for lead lengths, is the untied one of an unblocked wind).
+        // The coil adviser ranks its candidates wound this way and winds the ones it returns again
+        // with it true. An explicit mode, not a setting: it belongs to the coil being wound, and a
+        // coil built any other way (constructor, JSON) plans its leads.
+        bool _connectionLeadPlanning = true;
         // ABT #2071 (Alf, 2026-10-26): the blocking now running lays out a wind whose IDEAL layout does
         // not fit. Its blocked layout overflows the window rather than being refused (see
         // wind_by_rectangular_layers for the rule).
@@ -1412,6 +1440,12 @@ class Coil : public MAS::Coil {
         // (fromTurn, toTurn). The single source both the #1424 refusal and the LINK-PITCH pass read,
         // so neither re-derives a link from the slope between two stations.
         std::map<std::pair<std::string, std::string>, ConnectionKind> connection_kind_by_transition();
+        // ABT #2257: every revolution of every conductor, in turns-description order of its first
+        // station, with the point half way round (RevolutionHalfPath). Real winding only, where the turns
+        // description holds stations; throws under ideal winding, on a planar coil (a printed trace is a
+        // spiral on its board, not a revolution round a column), when the turns are not wound, and on a
+        // station that names no layer.
+        std::vector<RevolutionHalfPath> get_revolutions_at_half_path();
         // ABT #1424: the kinds drawn as ONE step in the connection plane, pinned there (MVB++
         // registers them as pinned verticals): the U turnaround, the same-section tangential link
         // and the final landing. Sibling parallels' copies of these share the plane.
@@ -1665,6 +1699,9 @@ class Coil : public MAS::Coil {
         bool are_sections_and_layers_fitting();
         // ABT #685: did the last wind apply real-winding connection blocking? (see the member)
         bool is_real_winding_blocking_applied() const { return _realWindingBlockingApplied; }
+        // Whether the next wind plans the connection leads under real winding geometry (see the member).
+        void set_connection_lead_planning(bool value) { _connectionLeadPlanning = value; }
+        bool get_connection_lead_planning() const { return _connectionLeadPlanning; }
         // ABT #624: every turn's copper inside the winding window (final wind verdict only).
         bool are_turns_inside_winding_window();
         // ABT #838: every INSULATION section and insulation layer inside a winding window too (the
@@ -1995,6 +2032,10 @@ class Coil : public MAS::Coil {
                                                                const std::vector<Turn>& turns);
         // ABT #1423: take the tangent departures' cut-off copper off the revolutions that lost it.
         void charge_tangent_departures();
+        // ABT #1496: for a coil wound without connection lead planning, the one lead refusal that does
+        // not depend on planning: throws (COIL_WINDING_ERROR, from get_connection_reserved_spaces) when a
+        // foil end crosses outer layers with no lead conductor stated. Applies nothing to the coil.
+        void refuse_foil_ends_without_lead_conductor();
         // ABT #187: toroidal analog of align_blocked_layer_turns. Radial terminal leads emit angular
         // crossing markers on every ring they pass over (toroidal_connection_reserved_spaces); this
         // re-spreads each crossed ring's turns over the angular space OUTSIDE those corridors —
