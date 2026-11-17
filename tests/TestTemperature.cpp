@@ -3,6 +3,7 @@
 #include "physical_models/WindingLosses.h"
 #include "constructive_models/Bobbin.h"
 #include "support/Settings.h"
+#include "support/Utils.h"
 #include "support/Exceptions.h"
 #include "support/Painter.h"
 #include "processors/MagneticSimulator.h"
@@ -5246,6 +5247,8 @@ TEST_CASE("Temperature: ABT 1454 a coil that does not fit its window throws unle
     REQUIRE(settings.get_thermal_network_strict_geometry());
     REQUIRE_THROWS_WITH(abt1454MaximumTemperatureAtFixedLoss(magnetic, 0.3, 0.3),
                         Catch::Matchers::ContainsSubstring("the coil does not fit in its window"));
+    // A winding refusal, typed: callers (Henry's material ranking) catch it by type, not by its words.
+    REQUIRE_THROWS_AS(abt1454MaximumTemperatureAtFixedLoss(magnetic, 0.3, 0.3), CoilException);
 
     SettingsGuard<bool> lenient(Settings::GetInstance(), &Settings::get_thermal_network_strict_geometry,
                                 &Settings::set_thermal_network_strict_geometry, false);
@@ -5253,6 +5256,43 @@ TEST_CASE("Temperature: ABT 1454 a coil that does not fit its window throws unle
     INFO("EI 6.8/3 non-strict Tmax " << maximumTemperature << " C");
     CHECK(std::isfinite(maximumTemperature));
     CHECK(maximumTemperature > 40.0);
+}
+
+// ABT #2302 (Alf, 2026-11-07): with strict geometry off, a coil that does not fit logged one ERROR per turn face on
+// every build of the network: a user's PQ 26/25 whose Primary sat in the core column filled the web's log with 11
+// records x93. The faces are now gathered per winding and logged once per winding, at DEBUG: the results check
+// ("N turns outside the winding window") is what tells the user.
+TEST_CASE("Temperature: a coil that does not fit logs one DEBUG record per winding, no ERROR, when strict geometry is off", "[temperature][abt-2302]") {
+    const std::string shape = "EI 6.8/3/0.8/6.8/1.48/6/3.32";  // the ABT 1454 coil that cannot fit (test above)
+    auto magnetic = abt1454Transformer(shape, {0, 1}, 1, 10, 5, 1, "Round 0.3 - Grade 1", "Round 0.3 - Grade 1");
+    REQUIRE_FALSE(magnetic.get_mutable_coil().are_sections_and_layers_fitting());
+
+    SettingsGuard<bool> lenient(Settings::GetInstance(), &Settings::get_thermal_network_strict_geometry,
+                                &Settings::set_thermal_network_strict_geometry, false);
+    auto& logger = OpenMagnetics::Logger::getInstance();
+    logger.disableCollector();
+    logger.enableCollector(OpenMagnetics::LogLevel::DEBUG);
+    double maximumTemperature = abt1454MaximumTemperatureAtFixedLoss(magnetic, 0.3, 0.3);
+    auto records = logger.drainCollected();
+    logger.disableCollector();
+    CHECK(std::isfinite(maximumTemperature));
+
+    std::set<std::string> windingsReported;
+    std::string all;
+    for (const auto& record : records) {
+        all += "\n" + std::to_string(static_cast<int>(record.level)) + " [" + record.moduleOfOrigin + "] " + record.message;
+        const bool aboutAFace = record.message.find("into the") != std::string::npos &&
+                                record.message.find("does not fit in its window") != std::string::npos;
+        if (!aboutAFace) continue;
+        CHECK(record.level == OpenMagnetics::LogLevel::DEBUG);
+        REQUIRE(record.message.rfind("Thermal network of ", 0) == 0);
+        auto name = record.message.substr(std::string("Thermal network of ").size());
+        name = name.substr(0, name.find(':'));
+        CHECK(windingsReported.insert(name).second);  // one record per winding (repeats of it merge into its count)
+    }
+    INFO("records:" << all);
+    CHECK_FALSE(windingsReported.empty());
+    CHECK(windingsReported.size() <= magnetic.get_coil().get_functional_description().size());
 }
 
 TEST_CASE("Temperature: ABT 1454 an unserved litz rests on its enclosure through its strands' enamel", "[temperature][abt-1454][smoke-test]") {
@@ -5816,4 +5856,31 @@ TEST_CASE("Temperature: the bobbin conductivity is the resolver's, and a materia
         CHECK(e.code() == ErrorCode::MATERIAL_NOT_FOUND);
         CHECK(std::string(e.what()).find("Valox 420-SE0") != std::string::npos);
     }
+}
+
+TEST_CASE("Temperature: a rod core's room-facing surface is its two end discs", "[temperature][rod]") {
+    // A rod is wound over its whole length, so its winding window is as tall as the core and the
+    // concentric yoke formula found no yoke ("non-positive width, depth or yoke thickness") and threw,
+    // which made every rod magnetic fail to autocomplete (2026-11-15).
+    auto coreJson = json::parse(R"({"functionalDescription": {"type": "openShape", "material": "N87", "gapping": [], "numberStacks": 1,
+        "shape": {"family": "rod", "type": "custom", "name": "Rod 4x12", "magneticCircuit": "open", "aliases": [],
+                  "dimensions": {"A": {"nominal": 0.004}, "B": {"nominal": 0.012}}}}})");
+    OpenMagnetics::Core rod(coreJson);
+    json coilJson;
+    coilJson["bobbin"] = "Dummy";
+    coilJson["functionalDescription"] = json::array({{
+        {"name", "Primary"}, {"numberTurns", 30}, {"numberParallels", 1},
+        {"isolationSide", "primary"}, {"wire", "Round 0.25 - Grade 1"}}});
+    OpenMagnetics::Magnetic magnetic;
+    magnetic.set_core(rod);
+    magnetic.set_coil(OpenMagnetics::Coil(coilJson, false));
+    // mas_autocomplete simulates the design, and the simulation's temperature is what read the exterior areas.
+    auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(200000, 10e-6, 25, WaveformLabel::SINUSOIDAL, 2, 0.5, 0);
+    OpenMagnetics::Mas mas;
+    mas.set_magnetic(magnetic);
+    mas.set_inputs(inputs);
+    mas.set_outputs({});
+    auto completed = OpenMagnetics::mas_autocomplete(mas);
+    REQUIRE(completed.get_magnetic().get_coil().get_turns_description());
+    CHECK(completed.get_magnetic().get_coil().get_turns_description()->size() == 30);
 }

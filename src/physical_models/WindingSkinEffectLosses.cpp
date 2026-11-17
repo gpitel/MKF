@@ -1,5 +1,6 @@
 #include <bit>
 #include <map>
+#include <tuple>
 #include "physical_models/WindingSkinEffectLosses.h"
 #include "support/MasAccess.h"
 #include "physical_models/WindingOhmicLosses.h"
@@ -303,7 +304,8 @@ WindingLossesOutput WindingSkinEffectLosses::calculate_skin_effect_losses(Coil c
         return windingModelOverride;
     };
 
-    std::map<std::pair<size_t, uint64_t>, std::vector<std::pair<double, double>>> lossesPerMeterPerWindingAndDivider;
+    std::map<std::tuple<size_t, uint64_t, int>, std::vector<std::pair<double, double>>> lossesPerMeterPerWindingAndDivider;
+    const bool toroidal = coil.resolve_bobbin().get_winding_window_shape() == WindingWindowShape::ROUND;
     for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex)
     {
         const auto& turn = turns[turnIndex];
@@ -316,7 +318,26 @@ WindingLossesOutput WindingSkinEffectLosses::calculate_skin_effect_losses(Coil c
         }
         const auto& wire = wirePerWinding[windingIndex].value();
         std::optional<WindingSkinEffectLossesModels> turnModelOverride = modelOverrideForWinding(windingIndex);
-        double wireLength = turn.get_length();
+        // ABT #2384: a rectangular, foil or planar turn resolved into width cells (FlatTurnCells, the screened width-cell model)
+        // is booked by two halves, both from the field step. The cell kernel
+        // (WindingProximityEffectLossesMartinezModel::calculate_flat_cell_losses) charges each cell from the field along its
+        // faces at its "cellsample" point and from the cell currents the split solved (the redistribution across the width,
+        // edge crowding included), and takes off the loss of the turn's current spread uniformly over its width,
+        //     W |I / W|^2 (F/2 + G) / (2 sigma delta) = P_dc * (nu/2) (sinh nu + sin nu) / (cosh nu - cos nu),
+        // the uniform sheet whose faces carry its own +-K/2. That uniform-sheet term is this turn's skin loss, and it is
+        // exactly FERREIRA's flat-conductor skin factor. KUTKUT, an isolated-strip fit, already holds the edge crowding the
+        // cells resolve, so with it the edge loss was booked twice (an isolated 5.5 x 0.4 mm strip at 200 kHz read
+        // R_ac/R_dc 2.56 against KUTKUT's own 1.80), and the interleave's cancelling face fields never lowered it. PLANAR's
+        // default, ALBACH, books a trace as a round wire of diameter = thickness, below the uniform-sheet term, so there
+        // the difference was lost instead (interleaved E 64 planar, 2 MHz: -36 % against OMFEM, FERREIRA +0.2 %).
+        if (parallelCurrentSplit && turnIndex < parallelCurrentSplit->flatTurnPerTurn.size() && parallelCurrentSplit->flatTurnPerTurn[turnIndex] &&
+            (wire.get_type() == WireType::RECTANGULAR || wire.get_type() == WireType::FOIL || wire.get_type() == WireType::PLANAR)) {
+            turnModelOverride = WindingSkinEffectLossesModels::FERREIRA;
+        }
+        // The skin loss is the loss above DC of the turn's current, so it is booked over the length the DC loss is
+        // (WindingOhmicLosses::calculate_turn_conductor_length, the conductor's own length): a flat turn's cell kernel takes
+        // off the uniform sheet over that same length, and at DC the cells (each over its own length) give exactly it.
+        double wireLength = WindingOhmicLosses::calculate_turn_conductor_length(turn, wire, toroidal);
 
         if (static_cast<size_t>(windingIndex) >= operatingPoint.get_excitations_per_winding().size() ||
             !operatingPoint.get_excitations_per_winding()[windingIndex].get_current()) {
@@ -337,7 +358,8 @@ WindingLossesOutput WindingSkinEffectLosses::calculate_skin_effect_losses(Coil c
                                                                                &splitDivider.value()).second;
         }
         else {
-            const std::pair<size_t, uint64_t> perMeterKey{static_cast<size_t>(windingIndex), std::bit_cast<uint64_t>(currentDividerPerTurn[turnIndex])};
+            const std::tuple<size_t, uint64_t, int> perMeterKey{static_cast<size_t>(windingIndex), std::bit_cast<uint64_t>(currentDividerPerTurn[turnIndex]),
+                                                                turnModelOverride ? static_cast<int>(turnModelOverride.value()) : -1};
             auto found = lossesPerMeterPerWindingAndDivider.find(perMeterKey);
             if (found == lossesPerMeterPerWindingAndDivider.end()) {
                 found = lossesPerMeterPerWindingAndDivider.emplace(perMeterKey,

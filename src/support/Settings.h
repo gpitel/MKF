@@ -73,8 +73,10 @@ class Settings
         // ABT #1237 (Alf, 2026-09-13): connecting winding leads to the bobbin's pins. When false
         // (default) magnetic_autocomplete assigns no pins, so connections[] get no pinName/end from
         // it and every terminal lead ends at the window border (its pre-WP3 length). When true it runs
-        // Coil::assign_pins and the terminal routes continue to their pins. An explicit
-        // Coil::assign_pins call, or pins the design names itself, work regardless.
+        // Coil::assign_pins and writes each winding end's pin into connections[] (pinName/end).
+        // An explicit Coil::assign_pins call, or pins the design names itself, work regardless.
+        // ABT #2268 (Alf, 2026-11-04): the 3D runs of the leads to their pins are parked; with this
+        // on or off every terminal lead ends at the window border.
         bool _coilConnectLeadsToPins = false;
         OrientationEnum _coilQuickBobbinPinsOrientation = OrientationEnum::VERTICAL;  // Keep in sync with reset()
         // ABT #1248 (Alf, 2026-09-13): how a wound TOROID is mounted in the 3D assembly frame
@@ -259,6 +261,12 @@ class Settings
         // hits it returns alike, inside a CatalogueSearchOnePassScope on the searching thread. Keep in sync
         // with reset().
         bool   _simulatorLossTemperatureLoop = true;
+        // MagneticSimulator::simulate leaves out the leakage inductance of a magnetic with more than one winding
+        // (Alf, 2026-11-05: a caller that reads no leakage pays for none). FALSE (default): simulate computes it as
+        // always. TRUE: the inductance output of every point has NO leakage inductance (absent, never zero), and
+        // every other output is the one simulate gives with it FALSE. Only simulate reads it: the leakage
+        // functions, filters and Painter compute leakage whatever it holds. Keep in sync with reset().
+        bool   _simulatorSkipLeakageInductance = false;
         GappingOptimizationStrategy _gappingStrategy = GappingOptimizationStrategy::SIMPLE;
 
 
@@ -655,6 +663,10 @@ class Settings
         // caller's choice untouched; it reads back once the advisers and scopes are gone.
         bool   get_simulator_loss_temperature_loop() const;
         void   set_simulator_loss_temperature_loop(bool value);
+
+        // See _simulatorSkipLeakageInductance.
+        bool   get_simulator_skip_leakage_inductance() const;
+        void   set_simulator_skip_leakage_inductance(bool value);
 
         GappingOptimizationStrategy get_gapping_strategy() const;
         void set_gapping_strategy(GappingOptimizationStrategy value);

@@ -12,6 +12,7 @@
 #include "processors/MagneticSimulator.h"
 #include "physical_models/ReluctanceNetwork.h"
 #include "physical_models/Inductance.h"
+#include "physical_models/Reluctance.h"
 #include "processors/Inputs.h"
 #include "json.hpp"
 
@@ -20,6 +21,7 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <algorithm>
+#include <sstream>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -1226,7 +1228,7 @@ TEST_CASE("UT_20", "[constructive-model][core][processed-description][smoke-test
     json coreJson;
     coreJson["functionalDescription"] = json();
     coreJson["name"] = "core_UT_20_N97";
-    coreJson["functionalDescription"]["type"] = "closedShape";
+    coreJson["functionalDescription"]["type"] = "pieceAndPlate";
     coreJson["functionalDescription"]["material"] = "N97";
     coreJson["functionalDescription"]["shape"] = "UT 20";
     coreJson["functionalDescription"]["gapping"] = json::array();
@@ -1240,7 +1242,7 @@ TEST_CASE("UT_20", "[constructive-model][core][processed-description][smoke-test
     REQUIRE(std::get<CoreMaterial>(core.get_mutable_functional_description().get_mutable_material())
               .get_mutable_volumetric_losses()["default"]
               .size() > 0);
-    REQUIRE(geometrical_description[0].get_type() == CoreGeometricalDescriptionElementType::CLOSED);
+    REQUIRE(geometrical_description[0].get_type() == CoreGeometricalDescriptionElementType::HALF_SET);
     REQUIRE_THAT(core.get_processed_description()->get_effective_parameters().get_effective_area(), Catch::Matchers::WithinAbs(0.000013 * numberStacks, 0.000013 * numberStacks * 0.2));
     REQUIRE_THAT(core.get_processed_description()->get_effective_parameters().get_effective_length(), Catch::Matchers::WithinAbs(0.053, 0.053 * 0.2));
     REQUIRE_THAT(core.get_processed_description()->get_effective_parameters().get_effective_volume(), Catch::Matchers::WithinAbs(0.000000688 * numberStacks, 0.000000688 * numberStacks * 0.2));
@@ -1980,7 +1982,7 @@ TEST_CASE("Test_Core_Standard_Shape_Reference_By_Object", "[constructive-model][
             json coreJson;
             coreJson["name"] = "t";
             coreJson["functionalDescription"] = {
-                {"type", "pieceAndPlate"}, {"material", "3C95"}, {"shape", shapeJson},
+                {"type", "twoPieceSet"}, {"material", "3C95"}, {"shape", shapeJson},
                 {"gapping", json::array()}, {"numberStacks", 1}};
 
             Core core(coreJson, false, false, false);
@@ -2595,6 +2597,102 @@ namespace TestDrumCore {
         settings.reset();
     }
 
+    // ABT #2414: Ae = c1/c2 is a length-weighted harmonic mean of the areas along the path, so with
+    // consistent integrals it can never fall below the smallest of them. The drum flange c2 term was
+    // copied from the pot core, which halves both c1 and c2 afterwards; the drum code halved only c1,
+    // so c2 was doubled and Ae/Le came out 1-48 % low, below minimumArea on 83 catalogue shapes.
+    TEST_CASE("Test_Drum_Family_Effective_Area_Is_Not_Below_Minimum_Area", "[core][drum][drum-ring][drum-semishielded]") {
+        settings.reset();
+        clear_databases();
+        size_t checked = 0;
+        std::vector<std::string> belowMinimum;
+        for (auto family : {CoreShapeFamily::DRUM, CoreShapeFamily::DRUM_RING, CoreShapeFamily::DRUM_SEMISHIELDED}) {
+            for (auto& name : get_core_shape_names(family)) {
+                auto shape = find_core_shape_by_name(name);
+                json shapeJson;
+                to_json(shapeJson, shape);
+                json coreJson;
+                coreJson["functionalDescription"] = {
+                    {"material", "3C95"}, {"shape", shapeJson},
+                    {"gapping", json::array()}, {"numberStacks", 1}};
+                coreJson["functionalDescription"]["type"] = json(core_type_for_shape_family(family));
+                Core core(coreJson);
+                auto effectiveParameters = core.get_processed_description()->get_effective_parameters();
+                checked++;
+                if (effectiveParameters.get_effective_area() < effectiveParameters.get_minimum_area() * (1 - 1e-9)) {
+                    belowMinimum.push_back(name + " (Ae " + std::to_string(effectiveParameters.get_effective_area() * 1e6) +
+                                           " mm2 < Amin " + std::to_string(effectiveParameters.get_minimum_area() * 1e6) + " mm2)");
+                }
+            }
+        }
+        REQUIRE(checked > 200);
+        INFO("drum-family shapes with Ae below minimumArea: " << [&] {
+            std::string joined;
+            for (auto& entry : belowMinimum) {
+                joined += "\n  " + entry;
+            }
+            return joined;
+        }());
+        CHECK(belowMinimum.empty());
+        settings.reset();
+    }
+
+    // ABT #2410: a design edited from a two-piece set (PQ 27/15 here) to a semi-shielded drum carries the
+    // previous core's processed gapping: its RESIDUAL mating-plane gaps. They are not the user's, so the drum
+    // drops and re-derives them (a cast shell has none) instead of refusing the whole core, as drumRing does.
+    // A user gap next to them is still refused.
+    TEST_CASE("Test_Drum_Semishielded_Drops_Carried_Residual_Gaps", "[core][drum-semishielded]") {
+        settings.reset();
+        clear_databases();
+        auto previousCore = OpenMagneticsTesting::get_quick_core("PQ 27/15", OpenMagneticsTesting::get_residual_gap(), 1, "3C90");
+        json carriedGapping = json::array();
+        for (auto& gap : previousCore.get_functional_description().get_gapping()) {
+            json gapJson;
+            to_json(gapJson, gap);
+            carriedGapping.push_back(gapJson);
+        }
+        REQUIRE(carriedGapping.size() > 0);
+        for (auto& gapJson : carriedGapping) {
+            REQUIRE(gapJson["type"] == "residual");
+        }
+
+        json shapeJson = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "drumSemishielded"},
+            {"aliases", json::array()}, {"name", "LQS-like 4018"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0038}}}, {"B", {{"nominal", 0.0018}}}, {"C", {{"nominal", 0.0015}}},
+                {"D", {{"nominal", 0.0004}}}, {"E", {{"nominal", 0.0010}}}, {"F", {{"nominal", 0.0004}}},
+                {"J", {{"nominal", 0.0040}}}, {"K", {{"nominal", 0.0040}}}, {"L", {{"nominal", 0.0018}}}}}
+        };
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", "pieceAndPlate"}, {"material", "3C90"}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1},
+            {"coating", {{"type", "magneticEpoxy"}, {"thickness", {{"nominal", 0.0001}}}, {"material", "Kool Mµ 26"}}}};
+        Core cleanCore(coreJson);
+        auto cleanEffectiveLength = cleanCore.get_processed_description()->get_effective_parameters().get_effective_length();
+
+        json carriedCoreJson = coreJson;
+        carriedCoreJson["functionalDescription"]["gapping"] = carriedGapping;
+        Core carriedCore(carriedCoreJson);
+        carriedCore.process_gap();
+        CHECK(carriedCore.get_functional_description().get_gapping().empty());
+        CHECK_THAT(carriedCore.get_processed_description()->get_effective_parameters().get_effective_length(),
+                   Catch::Matchers::WithinRel(cleanEffectiveLength, 1e-9));
+
+        // A user gap beside the carried residuals is still refused.
+        json userGappedCoreJson = carriedCoreJson;
+        userGappedCoreJson["functionalDescription"]["gapping"].push_back(
+            json{{"type", "subtractive"}, {"length", 0.0001}});
+        CHECK_THROWS_WITH(Core(userGappedCoreJson).process_gap(),
+                          Catch::Matchers::ContainsSubstring("Semi-shielded drums cannot be gapped"));
+        json additiveCoreJson = coreJson;
+        additiveCoreJson["functionalDescription"]["gapping"] = json::array({json{{"type", "additive"}, {"length", 0.0001}}});
+        CHECK_THROWS_WITH(Core(additiveCoreJson).process_gap(),
+                          Catch::Matchers::ContainsSubstring("Semi-shielded drums cannot be gapped"));
+        settings.reset();
+    }
+
     // ABT #366/#362/#357: the 2D painter used to reconstruct a mirrored half-set for EVERY
     // non-toroidal family, drawing drums/drumRings/semi-shielded/molded as nonsense; they now
     // route to paint_drum_family_core. Smoke: each family paints a valid, non-empty SVG.
@@ -2938,12 +3036,13 @@ TEST_CASE("Test_Catalogue_Core_With_Impossible_Gapping_Is_Refused_By_Name", "[co
 // candidate gap lengths and depends on that bool to silently skip the ones that don't fit
 // (see the comment on the Core(json) constructor). process_gap_or_throw() is the loud variant.
 TEST_CASE("ABT680_Gap_Longer_Than_Column_Opening_Throws_Instead_Of_Returning_Null_Fields", "[core][gapping]") {
-    // Same custom E+I geometry and threshold as the bug report: the column opening is exactly
-    // 2*D, confirmed there by bisection at several window heights.
+    // Same custom E+I geometry as the bug report, typed as the piece-and-plate set its EI family is
+    // (ABT #2372): the column opening is the E's own leg length D, so the threshold is D, not the
+    // 2*D the report measured on the mirrored E+E it was then processed as.
     auto coreJson = [](double gapLength) {
         json j;
         j["name"] = "t";
-        j["functionalDescription"]["type"] = "twoPieceSet";
+        j["functionalDescription"]["type"] = "pieceAndPlate";
         j["functionalDescription"]["material"] = "3C95";
         j["functionalDescription"]["shape"]["type"] = "custom";
         j["functionalDescription"]["shape"]["family"] = "ei";
@@ -2961,7 +3060,7 @@ TEST_CASE("ABT680_Gap_Longer_Than_Column_Opening_Throws_Instead_Of_Returning_Nul
     };
 
     SECTION("just inside the threshold: process_gap() succeeds and every field is populated") {
-        Core core(coreJson(0.00094), false, false, false);
+        Core core(coreJson(0.00047), false, false, false);
         core.process_data();
         REQUIRE(core.process_gap());
         auto gapping = core.get_functional_description().get_gapping();
@@ -2971,13 +3070,13 @@ TEST_CASE("ABT680_Gap_Longer_Than_Column_Opening_Throws_Instead_Of_Returning_Nul
     }
 
     SECTION("just past the threshold: process_gap() still just returns false") {
-        Core core(coreJson(0.00095), false, false, false);
+        Core core(coreJson(0.00048), false, false, false);
         core.process_data();
         CHECK_FALSE(core.process_gap());
     }
 
     SECTION("just past the threshold: process_gap_or_throw() throws, naming the gap and column") {
-        Core core(coreJson(0.00095), false, false, false);
+        Core core(coreJson(0.00048), false, false, false);
         core.process_data();
         std::string message = "no exception";
         try {
@@ -2988,7 +3087,7 @@ TEST_CASE("ABT680_Gap_Longer_Than_Column_Opening_Throws_Instead_Of_Returning_Nul
         }
         UNSCOPED_INFO(message);
         CHECK(message != "no exception");
-        CHECK(message.find("0.00095") != std::string::npos);
+        CHECK(message.find("0.00048") != std::string::npos);
         CHECK(message.find("does not fit") != std::string::npos);
         // And it must not have left a schema-invalid gap (every derived field null) behind for
         // an inattentive caller to trip over downstream.
@@ -4253,4 +4352,257 @@ TEST_CASE("Test_Rm_Shape_Missing_Required_Dimension_Throws", "[constructive-mode
     REQUIRE(dimensions.erase("C") == 1);
     typeTwoWithoutC.set_dimensions(dimensions);
     REQUIRE_THROWS_AS(CorePiece::factory(typeTwoWithoutC), InvalidInputException);
+}
+
+// ABT #2372 (web report #193): an EI saved as twoPieceSet was processed as a mirrored E+E — le
+// 21.74 mm instead of 10.87 mm, twice the volume and the window — because Core(json) kept whatever
+// type it was given. The family decides the type, through one rule, and a contradiction is refused.
+namespace TestCoreTypeFollowsFamily {
+json ei_core_json(const std::string& type) {
+    return json::parse(R"({"name":"Custom","functionalDescription":{"type":")" + type + R"(",
+        "material":"3C95","gapping":[],"numberStacks":1,
+        "shape":{"type":"custom","family":"ei","name":"EI 12.7/3.4/1.25/12.7/2.77/7.11/3.56","magneticCircuit":"open",
+            "dimensions":{"A":{"nominal":0.0127},"B":{"nominal":0.0034},"B2":{"nominal":0.00125},
+                          "C":{"nominal":0.0127},"D":{"nominal":0.00277},"E":{"nominal":0.00711},
+                          "F":{"nominal":0.00356}}}}})");
+}
+
+TEST_CASE("Test_Core_Type_For_Shape_Family_Rule", "[constructive-model][core][abt-2372]") {
+    CHECK(core_type_for_shape_family(CoreShapeFamily::T) == CoreType::TOROIDAL);
+    for (auto family : {CoreShapeFamily::EI, CoreShapeFamily::UI, CoreShapeFamily::PQI, CoreShapeFamily::UT,
+                        CoreShapeFamily::DRUM_RING, CoreShapeFamily::DRUM_SEMISHIELDED, CoreShapeFamily::DRUM_PLATE}) {
+        CAPTURE(magic_enum::enum_name(family));
+        CHECK(core_type_for_shape_family(family) == CoreType::PIECE_AND_PLATE);
+    }
+    CHECK(core_type_for_shape_family(CoreShapeFamily::DRUM) == CoreType::OPEN_SHAPE);
+    CHECK(core_type_for_shape_family(CoreShapeFamily::H) == CoreType::OPEN_SHAPE);
+    CHECK(core_type_for_shape_family(CoreShapeFamily::ROD) == CoreType::OPEN_SHAPE);
+    CHECK(core_type_for_shape_family(CoreShapeFamily::MOLDED) == CoreType::CLOSED_SHAPE);
+    for (auto family : {CoreShapeFamily::E, CoreShapeFamily::U, CoreShapeFamily::PQ, CoreShapeFamily::ETD,
+                        CoreShapeFamily::PLANAR_E, CoreShapeFamily::RM}) {
+        CAPTURE(magic_enum::enum_name(family));
+        CHECK(core_type_for_shape_family(family) == CoreType::TWO_PIECE_SET);
+    }
+    // The shape constructor and create_quick_core use the same rule.
+    CHECK(Core(find_core_shape_by_name("UT 20")).get_type() == CoreType::PIECE_AND_PLATE);
+    CHECK(Core::create_quick_core("E 25/13/7", "Dummy").get_type() == CoreType::TWO_PIECE_SET);
+}
+
+TEST_CASE("Test_Core_Json_Type_Contradicting_Family_Throws", "[constructive-model][core][abt-2372]") {
+    settings.reset();
+    clear_databases();
+
+    Core eiCore(ei_core_json("pieceAndPlate"));
+    CHECK_THAT(eiCore.get_effective_length(), Catch::Matchers::WithinRel(10.87e-3, 0.01));
+
+    // Report #193's core: refused by name of family and types, not mirrored into le 21.74 mm.
+    REQUIRE_THROWS_MATCHES(Core(ei_core_json("twoPieceSet")), InvalidInputException,
+                           Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring("'twoPieceSet'") &&
+                                                           Catch::Matchers::ContainsSubstring("'ei'") &&
+                                                           Catch::Matchers::ContainsSubstring("'pieceAndPlate'")));
+    // Also when it arrives unprocessed (a Magnetic's core, json -> Core conversion).
+    REQUIRE_THROWS_AS(Core(ei_core_json("twoPieceSet"), false, false, false), InvalidInputException);
+    REQUIRE_THROWS_AS(ei_core_json("toroidal").get<Core>(), InvalidInputException);
+
+    // A shape given by name is checked once process_data has looked it up.
+    json byName = json::parse(R"({"name":"by name","functionalDescription":{"type":"twoPieceSet",
+        "material":"3C95","gapping":[],"numberStacks":1,"shape":"UT 20"}})");
+    REQUIRE_THROWS_AS(Core(byName), InvalidInputException);
+    byName["functionalDescription"]["type"] = "pieceAndPlate";
+    REQUIRE_NOTHROW(Core(byName));
+
+    // A core whose type is changed after parsing is refused by process_data too.
+    Core retyped(ei_core_json("pieceAndPlate"), false, false, false);
+    retyped.set_type(CoreType::TWO_PIECE_SET);
+    REQUIRE_THROWS_AS(retyped.process_data(), InvalidInputException);
+    settings.reset();
+}
+} // namespace TestCoreTypeFollowsFamily
+
+// ABT #2372 (Alf, 2026-11-13): a piece-and-plate core has no mating plane between two halves. Its
+// ground gap is ground off the E centre-leg tip, against the I bar, and its residual gaps are the
+// leg-tip joints with the bar: at the plate end of the column, with no core between gap and plate
+// (distance to the closest normal surface 0). Geometry, machining and the gap agree on it.
+namespace TestPieceAndPlateGapAtPlate {
+const std::string eiShape = "EI 12.7/3.4/1.25/12.7/2.77/7.11/3.56";
+const double D = 0.00277;
+const double gapLength = 50e-6;
+
+Core ei_gapped_core() {
+    json gapping = json::array();
+    gapping.push_back({{"type", "subtractive"}, {"length", gapLength}});
+    gapping.push_back({{"type", "residual"}, {"length", 5e-6}});
+    gapping.push_back({{"type", "residual"}, {"length", 5e-6}});
+    json coreJson;
+    coreJson["name"] = "EI gapped";
+    coreJson["functionalDescription"] = {{"type", "pieceAndPlate"}, {"material", "3C95"}, {"shape", eiShape},
+                                         {"gapping", gapping}, {"numberStacks", 1}};
+    return Core(coreJson);
+}
+
+TEST_CASE("Test_Piece_And_Plate_Ground_Gap_Sits_At_The_Leg_Tip", "[constructive-model][core][gapping][abt-2372]") {
+    settings.reset();
+    auto core = ei_gapped_core();
+    auto gapping = core.get_functional_description().get_gapping();
+    REQUIRE(gapping.size() == 3);
+    REQUIRE(gapping[0].get_type() == GapType::SUBTRACTIVE);
+    // Centre leg spans -D/2..+D/2 in the processed frame; the gap fills its top L, against the plate.
+    CHECK_THAT(gapping[0].get_coordinates().value()[1], Catch::Matchers::WithinAbs(D / 2 - gapLength / 2, 1e-9));
+    CHECK(gapping[0].get_distance_closest_normal_surface().value() == 0);
+    CHECK_THAT(gapping[0].get_section_dimensions().value()[0], Catch::Matchers::WithinAbs(0.00356, 1e-9));
+    for (size_t i = 1; i < 3; ++i) {
+        CHECK(gapping[i].get_type() == GapType::RESIDUAL);
+        CHECK_THAT(gapping[i].get_coordinates().value()[1], Catch::Matchers::WithinAbs(D / 2 - 5e-6 / 2, 1e-9));
+        CHECK(gapping[i].get_distance_closest_normal_surface().value() == 0);
+    }
+
+    // The E is placed with its leg tips (its own y = 0) at +D/2, the plate's face there too, and the
+    // ground gap is cut from -L to 0 of the E's own frame.
+    auto geometricalDescription = core.get_geometrical_description().value();
+    REQUIRE(geometricalDescription.size() == 2);
+    REQUIRE(geometricalDescription[0].get_type() == CoreGeometricalDescriptionElementType::HALF_SET);
+    REQUIRE(geometricalDescription[1].get_type() == CoreGeometricalDescriptionElementType::PLATE);
+    CHECK_THAT(geometricalDescription[0].get_coordinates()[1], Catch::Matchers::WithinAbs(D / 2, 1e-9));
+    CHECK_THAT(geometricalDescription[1].get_coordinates()[1], Catch::Matchers::WithinAbs(D / 2, 1e-9));
+    auto machining = geometricalDescription[0].get_machining().value();
+    REQUIRE(machining.size() == 1);
+    CHECK_THAT(machining[0].get_coordinates()[1], Catch::Matchers::WithinAbs(-gapLength / 2, 1e-9));
+    CHECK_THAT(machining[0].get_length(), Catch::Matchers::WithinAbs(gapLength, 1e-12));
+    CHECK_FALSE(geometricalDescription[1].get_machining());
+    settings.reset();
+}
+
+TEST_CASE("Test_Two_Piece_Set_Ground_Gap_Unchanged_By_The_Plate_Rule", "[constructive-model][core][gapping][abt-2372]") {
+    settings.reset();
+    // Pinned from MKF before ABT #2372: a two-piece set's ground gap opens off the mating plane.
+    auto core = OpenMagneticsTesting::get_quick_core("E 42/21/20", OpenMagneticsTesting::get_ground_gap(0.001), 1, "3C95");
+    auto gapping = core.get_functional_description().get_gapping();
+    REQUIRE(gapping.size() == 3);
+    CHECK_THAT(gapping[0].get_coordinates().value()[1], Catch::Matchers::WithinAbs(0.0005, 1e-9));
+    double columnHeight = core.get_processed_description()->get_columns()[0].get_height();
+    CHECK_THAT(gapping[0].get_distance_closest_normal_surface().value(), Catch::Matchers::WithinAbs(columnHeight / 2 - 0.0005, 1e-9));
+    CHECK_THAT(gapping[1].get_coordinates().value()[1], Catch::Matchers::WithinAbs(0, 1e-12));
+    auto geometricalDescription = core.get_geometrical_description().value();
+    CHECK(geometricalDescription[0].get_coordinates()[1] == 0);
+    settings.reset();
+}
+
+TEST_CASE("Test_Piece_And_Plate_Gap_Reluctance_Zhang_Finite", "[physical-model][reluctance][abt-2372]") {
+    settings.reset();
+    auto core = ei_gapped_core();
+    auto gap = core.get_functional_description().get_gapping()[0];
+    auto model = ReluctanceModel::factory(ReluctanceModels::ZHANG);
+    auto result = model->get_gap_reluctance(gap, OpenMagnetics::Defaults().gapReluctanceEnergyFluxDensity);
+    double internal = gapLength / (Constants().vacuumPermeability * gap.get_area().value());
+    CHECK(std::isfinite(result.get_reluctance()));
+    CHECK(result.get_reluctance() > 0);
+    // With no core between the gap and the plate Zhang's fringing path has no length: R = l/(mu0 A).
+    CHECK_THAT(result.get_reluctance(), Catch::Matchers::WithinRel(internal, 1e-9));
+    settings.reset();
+}
+
+TEST_CASE("Test_Piece_And_Plate_Gap_Reluctance_Models_Invalid_Against_A_Plate_Throw", "[physical-model][reluctance][abt-2372]") {
+    settings.reset();
+    auto core = ei_gapped_core();
+    auto gap = core.get_functional_description().get_gapping()[0];
+    for (auto [modelName, label] : std::vector<std::pair<ReluctanceModels, std::string>>{
+             {ReluctanceModels::MUEHLETHALER, "Muehlethaler"}, {ReluctanceModels::STENGLEIN, "Stenglein"},
+             {ReluctanceModels::PARTRIDGE, "Partridge"}, {ReluctanceModels::BALAKRISHNAN, "Balakrishnan"}}) {
+        CAPTURE(label);
+        auto model = ReluctanceModel::factory(modelName);
+        REQUIRE_THROWS_MATCHES(model->get_gap_reluctance(gap, OpenMagnetics::Defaults().gapReluctanceEnergyFluxDensity),
+                               InvalidInputException,
+                               Catch::Matchers::MessageMatches(Catch::Matchers::ContainsSubstring(
+                                   label + " is not valid for a gap against a plate (zero distance to the closest normal surface)")));
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_Painter_Piece_And_Plate_Draws_Piece_And_Plate", "[support][painter][abt-2372]") {
+    settings.reset();
+    auto magnetic = OpenMagneticsTesting::get_quick_magnetic(eiShape, OpenMagneticsTesting::get_ground_gap(gapLength), {10}, 1, "3C95");
+    REQUIRE(magnetic.get_core().get_functional_description().get_type() == CoreType::PIECE_AND_PLATE);
+    auto outFile = std::filesystem::path{std::source_location::current().file_name()}.parent_path().append("..").append("output").append("Test_Painter_Piece_And_Plate_EI.svg");
+    std::filesystem::remove(outFile);
+    Painter painter(outFile);
+    painter.paint_core(magnetic);
+    auto svg = painter.export_svg();
+    // Right-half view: the E piece and the plate, two ferrite polygons; a mirrored two-piece set
+    // would be a top and a bottom half with no bar.
+    size_t polygons = 0;
+    for (size_t position = svg.find("<polygon"); position != std::string::npos; position = svg.find("<polygon", position + 1)) {
+        ++polygons;
+    }
+    CHECK(polygons == 2);
+    // The plate spans D/2..D/2 + B2 and the E's back sits at D/2 - B: the drawing is B + B2 tall
+    // and A/2 wide (right half), not the 2 B of a mirrored E + E. Read from the polygons' points.
+    double minX = std::numeric_limits<double>::max(), maxX = std::numeric_limits<double>::lowest();
+    double minY = minX, maxY = maxX;
+    std::vector<std::vector<std::pair<double, double>>> polygonPoints;
+    for (size_t position = svg.find("points=\""); position != std::string::npos; position = svg.find("points=\"", position + 1)) {
+        std::string points = svg.substr(position + 8, svg.find('"', position + 8) - position - 8);
+        std::replace(points.begin(), points.end(), ',', ' ');
+        std::stringstream stream(points);
+        double px, py;
+        polygonPoints.push_back({});
+        while (stream >> px >> py) {
+            polygonPoints.back().push_back({px, py});
+            minX = std::min(minX, px); maxX = std::max(maxX, px);
+            minY = std::min(minY, py); maxY = std::max(maxY, py);
+        }
+    }
+    double scale = (maxX - minX) / (0.0127 / 2);
+    CHECK_THAT((maxY - minY) / scale, Catch::Matchers::WithinRel(0.0034 + 0.00125, 0.01));
+    // One of the two is the plate: a full-width rectangle B2 thick.
+    bool plateFound = false;
+    for (auto& polygon : polygonPoints) {
+        if (polygon.size() != 4) {
+            continue;
+        }
+        double low = std::numeric_limits<double>::max(), high = std::numeric_limits<double>::lowest();
+        for (auto& [px, py] : polygon) {
+            low = std::min(low, py); high = std::max(high, py);
+        }
+        if (std::abs((high - low) / scale - 0.00125) < 0.00125 * 0.01) {
+            plateFound = true;
+        }
+    }
+    CHECK(plateFound);
+    settings.reset();
+}
+} // namespace TestPieceAndPlateGapAtPlate
+
+// ABT #1527: a processed gapping read back from its own JSON must give the same core. A single ground gap is placed
+// in one half (y = +length/2) with the validated clearance columnHeight/2 - length/2; reading those coordinates back
+// measured the clearance from the gap's centre instead (length/2 less), so the inductance of a gap MKF had solved for
+// changed when the gapping went through JSON: 2x on a 45 mm gap in an E 100/60/21.
+TEST_CASE("Core_Ground_Gap_Processing_Is_Idempotent_Through_Json", "[constructive-model][core][gap]") {
+    for (double gapLength : {0.0005, 0.01551, 0.04526}) {
+        CAPTURE(gapLength);
+        json coreJson = {{"name", "ground gap round trip"},
+                         {"functionalDescription",
+                          {{"type", "two-piece set"}, {"shape", "E 100/60/21"}, {"material", "N87"}, {"numberStacks", 1},
+                           {"gapping", json::array({{{"type", "subtractive"}, {"length", gapLength}},
+                                                    {{"type", "residual"}, {"length", 5e-6}},
+                                                    {{"type", "residual"}, {"length", 5e-6}}})}}}};
+        Core placed(coreJson, true);
+        json writtenBack;
+        to_json(writtenBack, placed);
+        Core reread(json{{"name", "ground gap round trip"}, {"functionalDescription", writtenBack["functionalDescription"]}}, true);
+
+        const auto first = placed.get_functional_description().get_gapping();
+        const auto second = reread.get_functional_description().get_gapping();
+        REQUIRE(first.size() == second.size());
+        // The premise: the gap carries the one-half placement into the JSON.
+        REQUIRE_THAT((*first[0].get_coordinates())[1], Catch::Matchers::WithinAbs(gapLength / 2, 1e-9));
+        for (size_t i = 0; i < first.size(); ++i) {
+            CAPTURE(i);
+            CHECK_THAT(*second[i].get_distance_closest_normal_surface(),
+                       Catch::Matchers::WithinAbs(*first[i].get_distance_closest_normal_surface(), 1e-9));
+        }
+        auto model = ReluctanceModel::factory(ReluctanceModels::ZHANG);
+        const double placedReluctance = model->get_core_reluctance(placed, 2000.0).get_core_reluctance();
+        const double rereadReluctance = model->get_core_reluctance(reread, 2000.0).get_core_reluctance();
+        CHECK_THAT(rereadReluctance, Catch::Matchers::WithinRel(placedReluctance, 1e-9));
+    }
 }

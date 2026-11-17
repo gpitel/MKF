@@ -41,7 +41,13 @@ double WindingLosses::get_total_winding_losses(std::vector<WindingLossesPerEleme
     return totalLossses;
 }
 
-WindingLossesPerElement combine_turn_losses_per_element(std::vector<WindingLossesPerElement> windingLossesPerTurn, std::vector<size_t> turnIndexesToCombine) {
+WindingLossesPerElement combine_turn_losses_per_element(std::vector<WindingLossesPerElement> windingLossesPerTurn, std::vector<size_t> turnIndexesToCombine,
+                                                        const std::string& elementDescription) {
+    // Only conducting elements are combined (insulation layers and sections are not), and a conducting layer, section or
+    // winding always holds turns: one without any is a coil that was not wound consistently.
+    if (turnIndexesToCombine.empty()) {
+        throw CoilNotProcessedException("Winding losses: " + elementDescription + " has no turns");
+    }
     WindingLossesPerElement windingLossesThisElement;
     OhmicLosses ohmicLossesThisElement;
     LossElementPerHarmonic skinEffectLossesThisElement;
@@ -115,7 +121,7 @@ WindingLossesOutput WindingLosses::combine_turn_losses(WindingLossesOutput windi
 
         auto layer = layers[layerIndex];
         auto turnsIndexes = coil.get_turns_indexes_by_layer(layer.get_name());
-        WindingLossesPerElement windingLossesThisLayer = combine_turn_losses_per_element(windingLossesPerTurn, turnsIndexes);
+        WindingLossesPerElement windingLossesThisLayer = combine_turn_losses_per_element(windingLossesPerTurn, turnsIndexes, "conduction layer '" + layer.get_name() + "'");
         windingLossesThisLayer.set_name(layer.get_name());
         windingLossesPerLayer.push_back(windingLossesThisLayer);
     }
@@ -131,7 +137,7 @@ WindingLossesOutput WindingLosses::combine_turn_losses(WindingLossesOutput windi
 
         auto section = sections[sectionIndex];
         auto turnsIndexes = coil.get_turns_indexes_by_section(section.get_name());
-        WindingLossesPerElement windingLossesThisSection = combine_turn_losses_per_element(windingLossesPerTurn, turnsIndexes);
+        WindingLossesPerElement windingLossesThisSection = combine_turn_losses_per_element(windingLossesPerTurn, turnsIndexes, "conduction section '" + section.get_name() + "'");
         windingLossesThisSection.set_name(section.get_name());
         windingLossesPerSection.push_back(windingLossesThisSection);
     }
@@ -146,7 +152,7 @@ WindingLossesOutput WindingLosses::combine_turn_losses(WindingLossesOutput windi
     for (size_t windingIndex = 0; windingIndex < coil.get_functional_description().size(); ++windingIndex) {
         auto winding = coil.get_functional_description()[windingIndex];
         auto turnsIndexes = coil.get_turns_indexes_by_winding(winding.get_name());
-        WindingLossesPerElement windingLossesThisWinding = combine_turn_losses_per_element(windingLossesPerTurn, turnsIndexes);
+        WindingLossesPerElement windingLossesThisWinding = combine_turn_losses_per_element(windingLossesPerTurn, turnsIndexes, "winding '" + winding.get_name() + "'");
         windingLossesThisWinding.set_name(winding.get_name());
 
         bool hasConnectionCopper = false;
@@ -312,7 +318,6 @@ WindingLosses::WindingLossesField WindingLosses::calculate_magnetic_field(Magnet
     // parallels). Solved once, at the conductors' temperature, and charged consistently to the skin (AC) and field
     // (proximity) losses; the ohmic losses keep the DC (resistive) split. The split feeds the field, so with parallels
     // the field step belongs to that temperature (WindingLossesField::temperature).
-    const auto parallelCurrentSplit = MagneticField::calculate_parallel_current_split(magnetic, operatingPoint, temperature);
     const WindingLossesModelSet* modelSet = resolve_model_set(magnetic);
 
     auto isPlanar = true;
@@ -374,6 +379,12 @@ WindingLosses::WindingLossesField WindingLosses::calculate_magnetic_field(Magnet
     }
     MagneticField magneticField(modelToUse, fringingModelToUse);
 
+    // The screened width-cell model (FlatTurnCells): the flat turns MARTINEZ charges are resolved across their width in
+    // the neutral window frame (MMF_BOUNDARY with the pure 2-D kernel), the only frame that images cells and walls alike.
+    const auto resolveFlatTurnsPerWinding = resolve_flat_cell_windings(magnetic, modelToUse, fringingModelToUse, modelSet, modelSet ? std::nullopt : _models.proximityEffectModel);
+    // Solved before the quick-mode harmonic threshold below: the skin model reads the split at the full threshold.
+    const auto parallelCurrentSplit = MagneticField::calculate_parallel_current_split(magnetic, operatingPoint, temperature, std::nullopt, resolveFlatTurnsPerWinding);
+
     // ARCH-002: RAII guard for harmonic threshold quick mode
     bool useQuickMode = use_quick_harmonic_threshold(magnetic);
     double thresholdToUse = useQuickMode ? settings.get_harmonic_amplitude_threshold() * 2 : settings.get_harmonic_amplitude_threshold();
@@ -381,12 +392,12 @@ WindingLosses::WindingLossesField WindingLosses::calculate_magnetic_field(Magnet
         &Settings::get_harmonic_amplitude_threshold,
         &Settings::set_harmonic_amplitude_threshold, thresholdToUse);
     // ABT #1304: the Wang mesher puts a flat turn's FULL current on each of its two inducing points; only the WANG field
-    // kernel halves them. Under any other kernel the turn's current is counted twice. When every flat winding is
-    // charged by MARTINEZ (which reads the field of complete turns), mesh the inducing turns with the CENTER mesher:
+    // kernel (retired 2026-11-09) halved them, so under every field model the turn's current is counted twice. When every
+    // flat winding is charged by MARTINEZ (which reads the field of complete turns), mesh the inducing turns with the CENTER mesher:
     // one exact Binns-Lawrenson rectangle per turn, with the same core images round wire gets. Other proximity models
     // keep the historical mesh (changing their pinned behaviour is a default change, ABT #1304).
     std::optional<CoilMesherModels> inducingMesher;
-    if (modelToUse != MagneticFieldStrengthModels::WANG) {
+    {
         bool anyFlatWinding = false;
         bool everyFlatWindingMartinez = true;
         auto& coilForMesher = magnetic.get_mutable_coil();
@@ -440,8 +451,8 @@ WindingLossesOutput WindingLosses::calculate_losses(Magnetic magnetic, const Win
         &Settings::get_harmonic_amplitude_threshold,
         &Settings::set_harmonic_amplitude_threshold, thresholdToUse);
     windingLossesOutput = modelSet ?
-        WindingProximityEffectLosses::calculate_proximity_effect_losses(magnetic.get_coil(), temperature, windingLossesOutput, field.field, std::nullopt, modelSet->proximityModelPerWireType) :
-        WindingProximityEffectLosses::calculate_proximity_effect_losses(magnetic.get_coil(), temperature, windingLossesOutput, field.field, _models.proximityEffectModel);
+        WindingProximityEffectLosses::calculate_proximity_effect_losses(magnetic.get_coil(), temperature, windingLossesOutput, field.field, std::nullopt, modelSet->proximityModelPerWireType, parallelCurrentSplitPointer) :
+        WindingProximityEffectLosses::calculate_proximity_effect_losses(magnetic.get_coil(), temperature, windingLossesOutput, field.field, _models.proximityEffectModel, std::nullopt, parallelCurrentSplitPointer);
     windingLossesOutput = combine_turn_losses(windingLossesOutput, magnetic.get_coil());
 
     return windingLossesOutput;

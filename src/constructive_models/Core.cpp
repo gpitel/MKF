@@ -95,55 +95,8 @@ Core::Core(const CoreShape declaredShape, std::optional<CoreMaterial> material) 
     else {
         get_mutable_functional_description().set_material("Dummy");
     }
-    // Core type follows the FAMILY, not the open/closed flag. That flag says whether a shape
-    // "can be combined with others" or "has to be used by itself" (MAS shape schema), which is a
-    // different question: a UI or PQI record describes a whole piece-and-plate assembly, so it is
-    // closed by that definition, yet it is obviously not a toroid. Keying the type off the flag
-    // made every closed shape TOROIDAL and would have turned UI/PQI into toroids.
-    auto shapeFamily = shape.get_family();
-    if (shapeFamily == CoreShapeFamily::T) {
-        get_mutable_functional_description().set_type(CoreType::TOROIDAL);
-    }
-    else if (shapeFamily == CoreShapeFamily::UI || shapeFamily == CoreShapeFamily::PQI ||
-             shapeFamily == CoreShapeFamily::UT || shapeFamily == CoreShapeFamily::EI ||
-             shapeFamily == CoreShapeFamily::DRUM_RING || shapeFamily == CoreShapeFamily::DRUM_SEMISHIELDED ||
-             shapeFamily == CoreShapeFamily::DRUM_PLATE) {
-        // DRUM_RING (ABT #366) / DRUM_SEMISHIELDED (ABT #362): a drum closed by its shield
-        // ring / magnetic-epoxy shell — same piece-plus-closer semantics as UI/PQI (nothing
-        // doubled, the piece class reports the whole assembly).
-        //
-        // EI: an E piece closed by an I bar — the same construction as UI, and the family the
-        // records themselves name "E+I". It had no entry either, so it was mirrored too:
-        // ET 20 reports le 99.51 mm as a twoPieceSet against 49.76 mm as a piece and plate,
-        // the same exact factor of two.
-        //
-        // UT (ABT #995): a U piece closed by a flat bar — the T — exactly the UI case. It had
-        // NO entry here at all and fell to the TWO_PIECE_SET default, which MIRRORED it and
-        // doubled the magnetic path: 106.41 mm against 53.20 mm on MAS's own UT 20, where the
-        // supplier catalogues quote 53.
-        //
-        // Do not be misled by "closed rectangular ferrite core" in UT choke datasheets, or by
-        // magneticCircuit: closed on the shape record — both describe the ASSEMBLED CIRCUIT,
-        // which is precisely the trap the comment above this cascade warns about. The pieces
-        // are two: US 11,749,439 describes the construction as "a U-shaped core and I-shaped
-        // core formed of ferrite, with the I-shaped core connecting both leg portions of the
-        // U-shaped core to form a closed magnetic path", and UT parts are wound on a bobbin,
-        // which a one-piece closed core could not accept.
-        get_mutable_functional_description().set_type(CoreType::PIECE_AND_PLATE);
-    }
-    else if (shapeFamily == CoreShapeFamily::DRUM || shapeFamily == CoreShapeFamily::ROD) {
-        // Single piece whose magnetic circuit closes through the surrounding air (drum ABT #331,
-        // rod ABT #933). Without this the default below would make a rod a TWO_PIECE_SET and
-        // silently double its effective length.
-        get_mutable_functional_description().set_type(CoreType::OPEN_SHAPE);
-    }
-    else if (shapeFamily == CoreShapeFamily::MOLDED) {
-        // Single pressed solid, circuit closed IN-MATERIAL (distributed gap, ABT #357).
-        get_mutable_functional_description().set_type(CoreType::CLOSED_SHAPE);
-    }
-    else {
-        get_mutable_functional_description().set_type(CoreType::TWO_PIECE_SET);
-    }
+    // The type follows the family through the one rule (ABT #2372).
+    get_mutable_functional_description().set_type(core_type_for_shape_family(shape.get_family()));
 
     if (material) {
         set_name(shape.get_name().value() + " " + material.value().get_name());
@@ -666,15 +619,41 @@ std::optional<std::vector<CoreGeometricalDescriptionElement>> Core::create_geome
             auto platePiece = piece;
             bottomPiece.set_type(CoreGeometricalDescriptionElementType::HALF_SET);
             platePiece.set_type(CoreGeometricalDescriptionElementType::PLATE);
+            // THE FRAME (ABT #2372). The processed description centres the piece's columns and its
+            // winding window on y = 0 (column height D, from -D/2 to +D/2), and the coil is wound in
+            // that frame. The piece itself is drawn with its leg tips at its own y = 0 and its back at
+            // -B, and the plate from its face at its own y = 0 up to B2. So both are placed at the leg
+            // tip, +D/2, with the plate on the +y side, and the machining, which is cut into the
+            // piece before it is placed, is moved into the piece's own frame: a ground gap at the leg
+            // tip, centred at D/2 - L/2 in the processed frame, is cut from -L to 0 of the piece.
+            // This is the E/U/PQ piece + I bar construction (EI, UI, PQI); UT and the drum plate are
+            // built as other solids by their consumers and keep their placement at the origin.
+            double legTip = 0;
+            auto pieceFamily = resolve_shape().get_family();
+            if (pieceFamily == CoreShapeFamily::EI || pieceFamily == CoreShapeFamily::UI ||
+                pieceFamily == CoreShapeFamily::PQI) {
+                if (!get_processed_description()) {
+                    // The columns are derived from the core's own shape, as process_gap() does.
+                    process_data();
+                }
+                auto processedColumns = get_processed_description().value().get_columns();
+                auto centralColumns = find_columns_by_type(ColumnType::CENTRAL);
+                auto windingColumn = centralColumns.size() > 0 ? centralColumns[0] : processedColumns[0];
+                legTip = roundFloat(windingColumn.get_coordinates()[1] + windingColumn.get_height() / 2);
+            }
+            auto pieceMachining = machining;
+            for (auto& operation : pieceMachining) {
+                operation.get_mutable_coordinates()[1] = roundFloat(operation.get_coordinates()[1] - legTip);
+            }
             for (auto i = 0; i < numberStacks; ++i) {
-                bottomPiece.set_coordinates(std::vector<double>({0, roundFloat(-spacerThickness / 2), currentDepth}));
+                bottomPiece.set_coordinates(std::vector<double>({0, roundFloat(legTip - spacerThickness / 2), currentDepth}));
                 bottomPiece.set_rotation(std::vector<double>({0, 0, 0}));
-                if (machining.size() > 0) {
-                    bottomPiece.set_machining(machining);
+                if (pieceMachining.size() > 0) {
+                    bottomPiece.set_machining(pieceMachining);
                 }
                 geometricalDescription.push_back(bottomPiece);
 
-                platePiece.set_coordinates(std::vector<double>({0, roundFloat(spacerThickness / 2), currentDepth}));
+                platePiece.set_coordinates(std::vector<double>({0, roundFloat(legTip + spacerThickness / 2), currentDepth}));
                 platePiece.set_rotation(std::vector<double>({0, 0, 0}));
                 platePiece.set_machining(std::nullopt);
                 geometricalDescription.push_back(platePiece);
@@ -1222,6 +1201,27 @@ bool Core::distribute_and_process_gap() {
         }
     }
 
+    // A PIECE AND PLATE (EI, UI, PQI) has no mating plane between two halves: the shaped piece's legs
+    // end on a flat plate (ABT #2372). So a single ground gap is ground off the tip of the centre leg,
+    // against the plate, and a residual gap is the joint between a leg tip and the plate: both sit at
+    // the plate end of their column (the +y end, the plate's side, see create_geometrical_description)
+    // with no core between them and the plate, so their distance to the closest normal surface is 0.
+    // The layout above is the two-piece set's (y = 0 is the mating plane there), and the fit checks it
+    // made (length <= column height) are exactly the leg-tip ones, so only the position moves here.
+    // Distributed gaps stay spread down the leg, and a spacer (additive) is left as it is.
+    if (get_functional_description().get_type() == CoreType::PIECE_AND_PLATE) {
+        bool singleGroundGap = numberSubtractiveGaps == 1 && numberAdditiveGaps == 0;
+        for (auto& gap : newGapping) {
+            if (gap.get_type() == GapType::RESIDUAL || (gap.get_type() == GapType::SUBTRACTIVE && singleGroundGap)) {
+                auto coordinates = gap.get_coordinates().value();
+                auto column = columns[find_closest_column_index_by_coordinates(columns, coordinates)];
+                coordinates[1] = roundFloat(column.get_coordinates()[1] + column.get_height() / 2 - gap.get_length() / 2);
+                gap.set_coordinates(coordinates);
+                gap.set_distance_closest_normal_surface(0);
+            }
+        }
+    }
+
     get_mutable_functional_description().set_gapping(newGapping);
     return true;
 }
@@ -1414,9 +1414,15 @@ bool Core::process_gap() {
         // Semi-shielded drum (ABT #362): the magnetic-epoxy shell is CAST in contact with the
         // flange rims — no mating surfaces, no clearance. The low-permeability return is a
         // MATERIAL section handled by the mixed-material reluctance path, not a gap.
-        if (gapping.size() > 0) {
-            throw GapException("Semi-shielded drums cannot be gapped: the glue shell is cast "
-                               "in contact; its low permeability is a material section, not a gap");
+        // User gapping is rejected. RESIDUAL entries are not the user's: they are the mating-plane
+        // residuals a processed core carries (a previous pass, or the previous core of an edited
+        // design), so they are dropped and re-derived, exactly as drumRing does; a cast shell has no
+        // mating plane, so the re-derived set is empty (ABT #2410).
+        for (auto& gap : gapping) {
+            if (gap.get_type() != GapType::RESIDUAL) {
+                throw GapException("Semi-shielded drums cannot be gapped: the glue shell is cast "
+                                   "in contact; its low permeability is a material section, not a gap");
+            }
         }
         get_mutable_functional_description().set_gapping(std::vector<CoreGap>{});
         return true;
@@ -1532,7 +1538,16 @@ bool Core::process_gap() {
                 // throw std::runtime_error("distance_closest_normal_surface cannot be negative in shape: " + std::get<CoreShape>(get_functional_description().get_shape()).get_name().value() + ", gap of index: " + std::to_string(i));
 
             }
-            gap.set_distance_closest_normal_surface(roundFloat(columns[columnIndex].get_height() / 2 - fabs((*gapping[i].get_coordinates())[1]) - gapping[i].get_length() / 2));
+            // A gap that touches the mating plane (|y| <= length/2: ground into one half, as distribute_and_process_gap
+            // places a single ground gap at y = +length/2, or straddling the joint) keeps the clearance that placement
+            // gives it, columnHeight/2 - length/2, the form validated on measured ground cores (see the single-gap branch
+            // of distribute_and_process_gap). Measuring it from its centre instead made processing not idempotent: a
+            // processed gapping read back from its own JSON lost length/2 of clearance (a 45 mm gap in an E 100/60/21:
+            // 24.2 mm -> 1.6 mm), and the inductance of a gap MKF had just solved for came out 2x off (ABT #1527).
+            const double offset = fabs((*gapping[i].get_coordinates())[1]);
+            const bool touchesMatingPlane = roundFloat(offset - gapping[i].get_length() / 2) <= 0;
+            gap.set_distance_closest_normal_surface(roundFloat(columns[columnIndex].get_height() / 2 - (touchesMatingPlane ? 0 : offset) -
+                                                               gapping[i].get_length() / 2));
             gap.set_distance_closest_parallel_surface(processedDescription.get_winding_windows()[0].get_width());
             gap.set_area(columns[columnIndex].get_area());
             gap.set_section_dimensions(std::vector<double>({columns[columnIndex].get_width(), columns[columnIndex].get_depth()}));
@@ -1754,6 +1769,85 @@ std::vector<CoreMaterial> Core::resolve_materials() {
     return resolved;
 }
 
+// ABT #2410/#2413 (Alf: "option B, but the second material is a magneticEpoxy"). The shell of a
+// semi-shielded drum is a MAGNETIC material: it closes the drum's flux path. It is declared as the
+// second entry of the material list, exactly like the ring of a two-grade drumRing (#576), and the
+// coating slot goes back to meaning an insulating jacket. Designs written before that carry the
+// shell as a coating {type: magneticEpoxy, material: <core material name>}; they are still read,
+// but a core that states the shell both ways with different materials is contradictory, and
+// picking one would silently discard the other, so it is refused.
+CoreMaterial Core::resolve_semishielded_shell_material() const {
+    if (get_shape_family() != CoreShapeFamily::DRUM_SEMISHIELDED) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "only a drumSemishielded core has a magnetic-epoxy shell; core '" + get_shape_name() + "' is not one");
+    }
+
+    std::optional<CoreMaterial> shellFromList;
+    const auto& materialField = get_functional_description().get_material();
+    if (std::holds_alternative<std::vector<MaterialElement>>(materialField)) {
+        const auto& materials = std::get<std::vector<MaterialElement>>(materialField);
+        if (materials.size() > 2) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "drumSemishielded names " + std::to_string(materials.size()) + " materials; it has exactly "
+                "two pieces (drum, then its magnetic-epoxy shell), so the list must hold one or two entries");
+        }
+        if (materials.size() == 2) {
+            if (is_non_magnetic_region(materials[1])) {
+                throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                    "drumSemishielded shell (material[1]) is the reserved non-magnetic region \"air\"; the "
+                    "shell is the magnetic-epoxy return path and must name a magneticEpoxy core material");
+            }
+            auto shell = resolve_material(material_element_to_union(materials[1]));
+            if (shell.get_material() != MaterialType::MAGNETIC_EPOXY) {
+                throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                    "drumSemishielded shell (material[1]) '" + shell.get_name() + "' is not a magneticEpoxy "
+                    "material; the second entry of a semi-shielded drum's material list is its magnetic-epoxy shell");
+            }
+            shellFromList = shell;
+        }
+    }
+
+    // Deprecated form: the shell carried as a magneticEpoxy coating.
+    std::optional<std::string> shellNameFromCoating;
+    const auto& coatingUnion = get_functional_description().get_coating();
+    if (coatingUnion) {
+        if (std::holds_alternative<CoreCoating>(coatingUnion.value())) {
+            const auto& coating = std::get<CoreCoating>(coatingUnion.value());
+            if (coating.get_type() && coating.get_type().value() == CoatingType::MAGNETIC_EPOXY) {
+                if (!coating.get_material() || !std::holds_alternative<std::string>(coating.get_material().value())) {
+                    throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                        "Semi-shielded drum magneticEpoxy coating must reference the shell CORE material by name");
+                }
+                shellNameFromCoating = std::get<std::string>(coating.get_material().value());
+            }
+        }
+        else if (std::get<std::string>(coatingUnion.value()) == "magneticEpoxy") {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "Semi-shielded drum coating 'magneticEpoxy' given by name carries no shell material; declare the "
+                "shell as the second entry of functionalDescription.material");
+        }
+    }
+
+    if (shellFromList && shellNameFromCoating) {
+        if (shellFromList->get_name() != shellNameFromCoating.value()) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "Semi-shielded drum states its shell twice and the two disagree: material[1] is '" +
+                shellFromList->get_name() + "' but the deprecated magneticEpoxy coating names '" +
+                shellNameFromCoating.value() + "'");
+        }
+        return shellFromList.value();
+    }
+    if (shellFromList) {
+        return shellFromList.value();
+    }
+    if (shellNameFromCoating) {
+        return find_core_material_by_name(shellNameFromCoating.value());
+    }
+    throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+        "Semi-shielded drum has no shell material: declare it as the second entry of "
+        "functionalDescription.material (a magneticEpoxy core material). None is present.");
+}
+
 bool Core::is_non_magnetic_region(const MaterialElement& materialElement) {
     if (!std::holds_alternative<std::string>(materialElement)) {
         return false;
@@ -1961,6 +2055,24 @@ double Core::get_toroid_edge_radius() const {
     return std::min(sourced, geometricLimit);
 }
 
+// The deprecated magneticEpoxy coating is the MAGNETIC shell of a semi-shielded drum (its material
+// is a core material, see resolve_semishielded_shell_material), not an insulating jacket on the
+// ferrite. Asking it for a jacket thickness or a dielectric permittivity would feed a magnetic
+// material into the insulation models (it used to surface as "Insulation material not found:
+// Kool Mu 26"), so the insulation readers refuse it. Callers that may meet one skip it first, as
+// StrayCapacitance does.
+static void throw_if_magnetic_shell_coating(const CoreCoatingDataOrNameUnion& coating, const std::string& question) {
+    bool magneticShell = std::holds_alternative<CoreCoating>(coating)
+        ? (std::get<CoreCoating>(coating).get_type() &&
+           std::get<CoreCoating>(coating).get_type().value() == CoatingType::MAGNETIC_EPOXY)
+        : std::get<std::string>(coating) == "magneticEpoxy";
+    if (magneticShell) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Core coating of type magneticEpoxy is the magnetic shell of a semi-shielded drum, not an insulating "
+            "coating; it has no " + question);
+    }
+}
+
 double Core::get_coating_thickness(DimensionalValues preferredValue) const {
     if (!get_functional_description().get_coating()) {
         // A core that declares no coating is bare: 0. The coating is a property of the part,
@@ -1972,6 +2084,7 @@ double Core::get_coating_thickness(DimensionalValues preferredValue) const {
         return 0;
     }
     auto coating = get_functional_description().get_coating().value();
+    throw_if_magnetic_shell_coating(coating, "an insulating coating thickness");
     // Explicit coating data (CoreCoating object). Its thickness is a dimensionWithTolerance:
     // sources bound the coating rather than state a nominal (ACME epoxy "0.6 mm max", the
     // Easy Magnet LoPs' per-ring minima), so collapse it with the shared resolver -- it throws
@@ -2009,6 +2122,7 @@ double Core::get_coating_relative_permittivity() const {
             "Core has no coating; cannot resolve coating relative permittivity");
     }
     auto coating = get_functional_description().get_coating().value();
+    throw_if_magnetic_shell_coating(coating, "an insulating coating permittivity");
     auto defaults = Defaults();
 
     // The coating type as a lowercase name, used to pick the default insulation
@@ -2255,7 +2369,7 @@ double interpolate_vac_column(const std::vector<std::pair<double, double>>& colu
 
 }  // namespace
 
-std::optional<double> Core::get_tape_wound_fill_factor(const CoreMaterial& coreMaterial, CoreShapeFamily shapeFamily) {
+std::optional<TapeWoundFillFactor> Core::get_tape_wound_fill_factor_with_source(const CoreMaterial& coreMaterial, CoreShapeFamily shapeFamily) {
     TapeWoundAlloyClass alloyClass;
     switch (coreMaterial.get_material()) {
         case MAS::MaterialType::NANOCRYSTALLINE: alloyClass = TapeWoundAlloyClass::NANOCRYSTALLINE; break;
@@ -2280,7 +2394,7 @@ std::optional<double> Core::get_tape_wound_fill_factor(const CoreMaterial& coreM
     // (a) The maker's own value for this material.
     for (const auto& entry : published_fill_factors()) {
         if (!entry.materialName.empty() && entry.materialName == materialName) {
-            return entry.value;
+            return TapeWoundFillFactor{entry.value, entry.source};
         }
     }
 
@@ -2322,7 +2436,9 @@ std::optional<double> Core::get_tape_wound_fill_factor(const CoreMaterial& coreM
         if (LogOnceScope::first_time("tape-wound fill factor: " + message)) {
             OM_WARNING_M("Core", message);
         }
-        return estimate;
+        return TapeWoundFillFactor{estimate, "Estimated: no ribbon thickness in MAS and no value from " + maker +
+                                                 "; mean of other manufacturers' published " +
+                                                 to_string(alloyClass) + " fill factors (" + makerList + ")"};
     }
 
     double thickness = resolve_dimensional_values(coreMaterial.get_lamination_thickness().value());
@@ -2331,7 +2447,8 @@ std::optional<double> Core::get_tape_wound_fill_factor(const CoreMaterial& coreM
     if (alloyClass == TapeWoundAlloyClass::CRYSTALLINE && isToroid && maker == "Magnetics") {
         for (const auto& [gauge, factor] : magneticsTapeWoundFillFactors) {
             if (std::abs(thickness - gauge) <= 0.01 * gauge) {
-                return factor;
+                return TapeWoundFillFactor{factor, "Magnetics 2016 Tape Wound Cores Catalog, Ae per tape thickness, " +
+                                                       format_significant(gauge / 25.4e-6, 2) + " mil tape"};
             }
         }
     }
@@ -2343,7 +2460,8 @@ std::optional<double> Core::get_tape_wound_fill_factor(const CoreMaterial& coreM
     if (!isToroid && alloyClass == TapeWoundAlloyClass::CRYSTALLINE) {
         for (const auto& [alloy, row] : vacCutCoreRows) {
             if (upperName.find(alloy) != std::string::npos) {
-                return interpolate_vac_column(row, thicknessInMm, materialName, "VAC Tabelle 10.17 row " + alloy);
+                return TapeWoundFillFactor{interpolate_vac_column(row, thicknessInMm, materialName, "VAC Tabelle 10.17 row " + alloy),
+                                           "VAC Tabelle 10.17 row " + alloy + ", " + format_significant(thicknessInMm * 1000, 3) + " um ribbon"};
             }
         }
     }
@@ -2354,13 +2472,24 @@ std::optional<double> Core::get_tape_wound_fill_factor(const CoreMaterial& coreM
     // Nanocrystalline ribbons read the "all other crystalline alloys" column (the alloy is crystalline once annealed);
     // over 0.015-0.025 mm, where nanocrystalline ribbons lie, it equals the VITROVAC column (0.70, 0.80).
     if (alloyClass == TapeWoundAlloyClass::AMORPHOUS) {
-        return interpolate_vac_column(vacToroidAmorphous, thicknessInMm, materialName, "VAC Tabelle 10.4 VITROVAC column");
+        return TapeWoundFillFactor{interpolate_vac_column(vacToroidAmorphous, thicknessInMm, materialName, "VAC Tabelle 10.4 VITROVAC column"),
+                                   "VAC Tabelle 10.4 VITROVAC column, " + format_significant(thicknessInMm * 1000, 3) + " um ribbon"};
     }
     if (isTrafopermN2) {
-        return interpolate_vac_column(vacToroidTrafopermN2, thicknessInMm, materialName, "VAC Tabelle 10.4 TRAFOPERM N2 column");
+        return TapeWoundFillFactor{interpolate_vac_column(vacToroidTrafopermN2, thicknessInMm, materialName, "VAC Tabelle 10.4 TRAFOPERM N2 column"),
+                                   "VAC Tabelle 10.4 TRAFOPERM N2 column, " + format_significant(thicknessInMm * 1000, 3) + " um ribbon"};
     }
-    return interpolate_vac_column(vacToroidOtherCrystalline, thicknessInMm, materialName,
-                                  "VAC Tabelle 10.4 other crystalline alloys column");
+    return TapeWoundFillFactor{interpolate_vac_column(vacToroidOtherCrystalline, thicknessInMm, materialName,
+                                                      "VAC Tabelle 10.4 other crystalline alloys column"),
+                               "VAC Tabelle 10.4 other crystalline alloys column, " + format_significant(thicknessInMm * 1000, 3) + " um ribbon"};
+}
+
+std::optional<double> Core::get_tape_wound_fill_factor(const CoreMaterial& coreMaterial, CoreShapeFamily shapeFamily) {
+    auto fillFactor = get_tape_wound_fill_factor_with_source(coreMaterial, shapeFamily);
+    if (!fillFactor) {
+        return std::nullopt;
+    }
+    return fillFactor->value;
 }
 
 void Core::process_data() {
@@ -2413,6 +2542,11 @@ void Core::process_data() {
     } else {
         settings.set_effective_parameter_standard(EffectiveParameterStandard::IEC_60205);
     }
+
+    // ABT #2372: the type decides how the pieces are assembled (a twoPieceSet mirrors the piece);
+    // one that contradicts the family is refused here, where a shape given by name is first known.
+    check_core_type_follows_shape_family(get_functional_description().get_type(),
+                                         std::get<CoreShape>(get_functional_description().get_shape()), get_name());
 
     auto corePiece =
         CorePiece::factory(std::get<CoreShape>(get_functional_description().get_shape()));
@@ -2628,7 +2762,7 @@ static double interpolate_ferromagnetic_property_to_curie(const CoreMaterial& co
                 "Material " + coreMaterial.get_name() + ": its " + propertyName + " is tabulated up to " +
                     format_significant(lastPoint.first) + " C and it has no Curie temperature; above that the " + propertyName +
                     " is held at its last tabulated value",
-                "asked at " + format_significant(temperature) + " C")) {
+                {MaterialDataAskedQuantity::TEMPERATURE, temperature, ""})) {
             return lastPoint.second;
         }
         throw MaterialException(ErrorCode::MATERIAL_DATA_MISSING,
@@ -3251,30 +3385,7 @@ Core Core::create_quick_core(std::string coreShapeName, std::string coreMaterial
     core.set_number_stacks(numberStacks);
     core.set_gapping(gapping);
     core.set_name("Quick core with " + coreMaterialName + " " + coreShapeName);
-    if (coreShape.get_family() == CoreShapeFamily::T) {
-        core.set_type(CoreType::TOROIDAL);
-    }
-    else if (coreShape.get_family() == CoreShapeFamily::UI || coreShape.get_family() == CoreShapeFamily::PQI ||
-             coreShape.get_family() == CoreShapeFamily::UT || coreShape.get_family() == CoreShapeFamily::EI ||
-             coreShape.get_family() == CoreShapeFamily::DRUM_RING ||
-             coreShape.get_family() == CoreShapeFamily::DRUM_SEMISHIELDED ||
-             coreShape.get_family() == CoreShapeFamily::DRUM_PLATE) {
-        // UT joins UI here (ABT #995), replacing a TWO_PIECE_SET branch labelled "UT cores are
-        // U-type assembled, not toroidal" — which corrected a wrong TOROIDAL classification and
-        // then stopped one step short. U-type assembled is right; two-piece-SET is not, because
-        // the second piece is a flat bar, not a mirrored half.
-        // A shaped piece closed by a plate/ring/shell, not by a mirrored half (ABT #274/#275, #366, #362).
-        core.set_type(CoreType::PIECE_AND_PLATE);
-    }
-    else if (coreShape.get_family() == CoreShapeFamily::DRUM || coreShape.get_family() == CoreShapeFamily::ROD) {
-        core.set_type(CoreType::OPEN_SHAPE);
-    }
-    else if (coreShape.get_family() == CoreShapeFamily::MOLDED) {
-        core.set_type(CoreType::CLOSED_SHAPE);
-    }
-    else {
-        core.set_type(CoreType::TWO_PIECE_SET);
-    }
+    core.set_type(core_type_for_shape_family(coreShape.get_family()));
 
     core.process_data();
     core.process_gap();
@@ -3321,6 +3432,30 @@ void from_json(const json& j, Core& x) {
     }
 
     MAS::from_json(migrated, static_cast<MAS::MagneticCore&>(x));
+
+    // ABT #2372: a stated type that contradicts the family is refused, not processed as written
+    // (an EI read as twoPieceSet is mirrored: twice the path length and volume). A shape given by
+    // name is checked once process_data has looked it up.
+    if (std::holds_alternative<CoreShape>(x.get_functional_description().get_shape())) {
+        check_core_type_follows_shape_family(x.get_functional_description().get_type(),
+                                             std::get<CoreShape>(x.get_functional_description().get_shape()), x.get_name());
+    }
+}
+
+void check_core_type_follows_shape_family(CoreType type, const CoreShape& shape, const std::optional<std::string>& coreName) {
+    auto expected = core_type_for_shape_family(shape.get_family());
+    if (type == expected) {
+        return;
+    }
+    json typeJson, expectedJson, familyJson;
+    MAS::to_json(typeJson, type);
+    MAS::to_json(expectedJson, expected);
+    MAS::to_json(familyJson, shape.get_family());
+    throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+        "Core " + (coreName ? "'" + coreName.value() + "'" : std::string("<unnamed>")) + " has type '" +
+        typeJson.get<std::string>() + "', which contradicts its shape family '" + familyJson.get<std::string>() +
+        "' (shape '" + shape.get_name().value_or("<unnamed>") + "'): a '" + familyJson.get<std::string>() +
+        "' core is a '" + expectedJson.get<std::string>() + "'");
 }
 
 namespace {

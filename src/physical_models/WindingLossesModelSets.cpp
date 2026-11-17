@@ -26,7 +26,7 @@ std::map<WindingLossesModelSets, WindingLossesModelSet> build_registry() {
 
     add({WindingLossesModelSets::LEGACY_DEFAULT, "Legacy default",
          "MKF's historical automatic choice: field model by wire type (LAMMERANER round/litz, BINNS_LAWRENSON "
-         "rectangular, WANG planar and foil), ROSHEN gap fringing, FERREIRA proximity for round/litz, WANG for flat wire.",
+         "rectangular, planar and foil), ROSHEN gap fringing, FERREIRA proximity for round/litz, WANG for flat wire.",
          "Reference behaviour. Known limits: a flat turn's current is counted twice under BINNS_LAWRENSON "
          "with the Wang mesher, residual gaps carry no field, the image lattice holds net current.",
          std::nullopt, Fringing::ROSHEN, historicalSkin,
@@ -34,33 +34,26 @@ std::map<WindingLossesModelSets, WindingLossesModelSet> build_registry() {
           {WireType::RECTANGULAR, Proximity::WANG}, {WireType::FOIL, Proximity::WANG}},
          {Scope::ANY}, true});
 
-    add({WindingLossesModelSets::NEUTRAL_WINDOW, "Neutral window (MMF boundary + Martinez)",
-         "Charge-neutral window field (MMF_BOUNDARY on BINNS_LAWRENSON): the core's gap and ferrite MMF drops on the "
-         "window boundary, every conductor imaged with its own images. MARTINEZ field-exclusion proximity for flat wire, "
-         "FERREIRA (exact Bessel) for round and litz.",
-         "Flat wire, per-turn R_ac/R_dc vs 2D OMFEM: E 42/21/20 0.75-1.73 per turn, 0.92-0.98 in total; PQ 27/17 "
-         "0.67-1.29 / 0.79-0.82. Round and litz: not yet validated per turn.",
+    add({WindingLossesModelSets::MARTINEZ, "Martinez method",
+         "The Martinez method for winding losses. Field: the charge-neutral window (MMF_BOUNDARY on BINNS_LAWRENSON), the "
+         "core's gap and ferrite MMF drops on the window boundary with the ferrite corners' bend excess, every conductor "
+         "imaged with its own images and reaching into the gap slots it faces; round turns react as induced dipoles. "
+         "Loss: MARTINEZ field-exclusion proximity for flat wire, each flat turn resolved into width cells solved together "
+         "with the parallel split; FERREIRA (exact Bessel) for round and litz; every turn and cell booked over its own length.",
+         "Per-turn / per-winding R_ac/R_dc vs 2D OMFEM on the test fixtures (2026-11-15, 213 values): round wire 5 % mean "
+         "error, foil 5 %, planar traces and strips 9 %; 73 % within 10 %, 91 % within 20 %. Known open: PQ 27/17 centre "
+         "turns up to 2x high at 0.2-1 MHz, multi-window E 42 primary 0.75x, litz + strips on a round post 0.7x AC excess.",
          Field::BINNS_LAWRENSON, Fringing::MMF_BOUNDARY, historicalSkin,
          {{WireType::ROUND, Proximity::FERREIRA}, {WireType::LITZ, Proximity::FERREIRA}, {WireType::PLANAR, Proximity::MARTINEZ},
           {WireType::RECTANGULAR, Proximity::MARTINEZ}, {WireType::FOIL, Proximity::MARTINEZ}},
-         {Scope::SINGLE_RECTANGULAR_WINDOW}, true});
+         {Scope::SINGLE_RECTANGULAR_WINDOW, Scope::MULTI_WINDOW}, true});
 
     add({WindingLossesModelSets::NEUTRAL_WINDOW_WANG, "Neutral window with Wang proximity",
-         "The neutral-window field with WANG slab proximity for flat wire, for comparison with NEUTRAL_WINDOW.",
+         "The Martinez method's field with WANG slab proximity for flat wire, for comparison with the Martinez method (MARTINEZ).",
          "Flat wire vs 2D OMFEM: E 42/21/20 totals 0.78-0.89. Round and litz: not validated per turn.",
          Field::BINNS_LAWRENSON, Fringing::MMF_BOUNDARY, historicalSkin,
          {{WireType::ROUND, Proximity::FERREIRA}, {WireType::LITZ, Proximity::FERREIRA}, {WireType::PLANAR, Proximity::WANG},
           {WireType::RECTANGULAR, Proximity::WANG}, {WireType::FOIL, Proximity::WANG}},
-         {Scope::SINGLE_RECTANGULAR_WINDOW}, true});
-
-    add({WindingLossesModelSets::WANG_PLANAR, "Wang planar",
-         "Wang's field model with its own two-point mesh and Wang proximity: the original calibrated pair for flat "
-         "conductors.",
-         "Field and loss are a calibrated pair: their product scales as width^2/thickness, right near the geometry it "
-         "was tuned on.",
-         Field::WANG, Fringing::ROSHEN,
-         {{WireType::PLANAR, Skin::ALBACH}, {WireType::RECTANGULAR, Skin::KUTKUT}, {WireType::FOIL, Skin::KUTKUT}},
-         {{WireType::PLANAR, Proximity::WANG}, {WireType::RECTANGULAR, Proximity::WANG}, {WireType::FOIL, Proximity::WANG}},
          {Scope::SINGLE_RECTANGULAR_WINDOW}, true});
 
     add({WindingLossesModelSets::SULLIVAN_GAP, "Sullivan gap",
@@ -82,7 +75,8 @@ std::map<WindingLossesModelSets, WindingLossesModelSet> build_registry() {
     add({WindingLossesModelSets::TOROID, "Toroid",
          "BINNS_LAWRENSON conductor field with Kelvin images for the ring, ROSHEN fringing; FERREIRA proximity for "
          "round and litz, MARTINEZ for flat wire.",
-         "Not validated per turn; flat wire on toroids never compared with FEM.",
+         "Per turn vs 2D OMFEM: one round turn 1.00-1.06, ten rectangular bars 0.83-0.90 (LEGACY_DEFAULT 0.65-0.77). A ring "
+         "has no gap, so no fringing source acts.",
          Field::BINNS_LAWRENSON, Fringing::ROSHEN, historicalSkin,
          {{WireType::ROUND, Proximity::FERREIRA}, {WireType::LITZ, Proximity::FERREIRA}, {WireType::PLANAR, Proximity::MARTINEZ},
           {WireType::RECTANGULAR, Proximity::MARTINEZ}, {WireType::FOIL, Proximity::MARTINEZ}},
@@ -91,7 +85,8 @@ std::map<WindingLossesModelSets, WindingLossesModelSet> build_registry() {
     add({WindingLossesModelSets::MULTI_WINDOW, "Multi-window",
          "BINNS_LAWRENSON conductor field with a mirror lattice per winding window, ROSHEN fringing; FERREIRA proximity "
          "for round and litz, MARTINEZ for flat wire.",
-         "Not validated per turn. MMF_BOUNDARY is not extended to multi-window cores yet.",
+         "Legacy: ROSHEN reads 0.44x 2D OMFEM beside a centre-leg gap on a multi-window E 42 (round), and 30-1800x with flat "
+         "wire; MARTINEZ (MMF_BOUNDARY per window) is the default there.",
          Field::BINNS_LAWRENSON, Fringing::ROSHEN, historicalSkin,
          {{WireType::ROUND, Proximity::FERREIRA}, {WireType::LITZ, Proximity::FERREIRA}, {WireType::PLANAR, Proximity::MARTINEZ},
           {WireType::RECTANGULAR, Proximity::MARTINEZ}, {WireType::FOIL, Proximity::MARTINEZ}},
@@ -168,6 +163,11 @@ const WindingLossesModelSet& get_winding_losses_model_set(WindingLossesModelSets
         throw InvalidInputException(ErrorCode::INVALID_INPUT,
             "CUSTOM is not a registered model set: it means the individually selected winding-loss models");
     }
+    if (id == WindingLossesModelSets::WANG_PLANAR) {
+        throw ModelNotAvailableException("The WANG_PLANAR model set was retired with the WANG field model: its edge formulas gave every other "
+                                         "conductor a field that does not fall off with distance. Use NEUTRAL_WINDOW_WANG for Wang proximity "
+                                         "on the neutral-window field");
+    }
     auto it = registry().find(id);
     if (it == registry().end()) {
         throw ModelNotAvailableException("Unknown winding-loss model set " + std::string(magic_enum::enum_name(id)));
@@ -178,7 +178,10 @@ const WindingLossesModelSet& get_winding_losses_model_set(WindingLossesModelSets
 std::vector<WindingLossesModelSets> get_all_winding_losses_model_sets() {
     std::vector<WindingLossesModelSets> all;
     for (auto id : magic_enum::enum_values<WindingLossesModelSets>()) {
-        all.push_back(id);
+        // WANG_PLANAR was retired with the WANG field (2026-11-09); its enum value stays for the ordinals UIs map.
+        if (id != WindingLossesModelSets::WANG_PLANAR) {
+            all.push_back(id);
+        }
     }
     return all;
 }
@@ -215,14 +218,16 @@ MagneticFieldStrengthModels automatic_winding_losses_field_model(Magnetic& magne
         isRectangular = isRectangular && wire.get_type() == WireType::RECTANGULAR;
         isFoil = isFoil && wire.get_type() == WireType::FOIL;
     }
-    if (isPlanar) {
-        return Field::WANG;
-    }
-    if (isRectangular) {
+    if (isPlanar || isRectangular) {
+        // All-planar windings take BINNS_LAWRENSON too. The WANG field mishandles neighbouring parallel traces: the
+        // 16-parallel planar stack of Test_Winding_Losses_Wang_Stacked_Planar_Parallel_Stack_Vs_OMFEM reads 137.7
+        // R_ac/R_dc under WANG against 100.1 in 2D OMFEM, 102.2 under BINNS_LAWRENSON (fringing off: WANG 37.7,
+        // ALBACH 2.3). Revisit when the WANG field shares the image boundary of the other models.
         return Field::BINNS_LAWRENSON;
     }
     if (isFoil) {
-        return Field::WANG;
+        // All-foil windings too, since the WANG field was retired (2026-11-09).
+        return Field::BINNS_LAWRENSON;
     }
     for (auto wire : magnetic.get_mutable_coil().get_wires()) {
         if (wire.get_type() == WireType::FOIL) {
@@ -242,6 +247,38 @@ MagneticFieldStrengthModels resolve_winding_losses_field_model(const WindingLoss
         return set.fieldModel.value();
     }
     return automatic_winding_losses_field_model(magnetic);
+}
+
+std::optional<std::vector<bool>> resolve_flat_cell_windings(Magnetic& magnetic, MagneticFieldStrengthModels fieldModel, MagneticFieldStrengthFringingEffectModels fringingModel,
+                                                            const WindingLossesModelSet* set, std::optional<WindingProximityEffectLossesModels> customProximityModel) {
+    // The frames that image cells: the neutral window (MMF_BOUNDARY on the pure 2-D kernel), and a toroid's ring under its
+    // 2-D field (BINNS_LAWRENSON; MagneticField reads ALBACH as BINNS_LAWRENSON on a toroid, see there).
+    if (magnetic.get_core().get_shape_family() == CoreShapeFamily::T) {
+        if (fieldModel != MagneticFieldStrengthModels::BINNS_LAWRENSON && fieldModel != MagneticFieldStrengthModels::ALBACH) {
+            return std::nullopt;
+        }
+    }
+    else if (fringingModel != MagneticFieldStrengthFringingEffectModels::MMF_BOUNDARY || fieldModel != MagneticFieldStrengthModels::BINNS_LAWRENSON) {
+        return std::nullopt;
+    }
+    auto& coil = magnetic.get_mutable_coil();
+    std::vector<bool> flags(coil.get_functional_description().size(), false);
+    for (size_t windingIndex = 0; windingIndex < flags.size(); ++windingIndex) {
+        const auto wireType = coil.get_wire_type(windingIndex);
+        if (wireType != WireType::RECTANGULAR && wireType != WireType::PLANAR && wireType != WireType::FOIL) {
+            continue;
+        }
+        std::optional<WindingProximityEffectLossesModels> proximityModel = customProximityModel;
+        if (set) {
+            proximityModel = std::nullopt;
+            const auto found = set->proximityModelPerWireType.find(wireType);
+            if (found != set->proximityModelPerWireType.end()) {
+                proximityModel = found->second;
+            }
+        }
+        flags[windingIndex] = proximityModel && proximityModel.value() == WindingProximityEffectLossesModels::MARTINEZ;
+    }
+    return flags;
 }
 
 WindingLossesModelSets get_default_winding_losses_model_set(Magnetic magnetic) {

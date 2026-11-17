@@ -3,6 +3,7 @@
 #include "processors/ResultsAnalyzer.h"
 #include "processors/MagneticSimulator.h"
 #include "physical_models/MagnetizingInductance.h"
+#include "physical_models/CoreLosses.h"
 #include "physical_models/InitialPermeability.h"
 #include "constructive_models/CorePiece.h"
 #include "physical_models/Reluctance.h"
@@ -1891,6 +1892,115 @@ TEST_CASE("Test_Drum_Semishielded_Inductance", "[physical-model][magnetizing-ind
     settings.reset();
 }
 
+// ABT #2410/#2413 (Alf: "option B, but the second material is a magneticEpoxy"): the shell of a
+// semi-shielded drum is the SECOND entry of functionalDescription.material, a core material of
+// type magneticEpoxy. The older magneticEpoxy coating form is deprecated but still read. These
+// pin: (1) both forms give the same inductance and core losses for the same shell material;
+// (2) a core that states the shell both ways with different materials throws; (3) a
+// drumSemishielded core with neither form throws; (4) a second entry that is not a magneticEpoxy
+// grade throws; (5) the coating-as-insulation readers refuse a magneticEpoxy coating instead of
+// looking a core material up as an insulation.
+//
+// No public magneticEpoxy grade is in MAS, so the shell record is the catalogue's Kool Mu 26 with
+// its material type set to magneticEpoxy and its name kept: the coating form can only name a
+// catalogue record, and the two forms must point at the same permeability data to be compared.
+TEST_CASE("Test_Drum_Semishielded_Shell_Is_Second_Material", "[physical-model][magnetizing-inductance][drum-semishielded][core]") {
+    settings.reset();
+    clear_databases();
+    double numberTurns = 20;
+    const std::string shellName = "Kool Mµ 26";
+
+    json shellRecord = find_core_material_by_name(shellName);
+    shellRecord["material"] = "magneticEpoxy";
+
+    auto buildCore = [](json materialJson, json coatingJson) {
+        json shapeJson = {
+            {"magneticCircuit", "closed"}, {"type", "custom"}, {"family", "drumSemishielded"},
+            {"aliases", json::array()}, {"name", "LQS-like 4018"},
+            {"dimensions", {
+                {"A", {{"nominal", 0.0038}}}, {"B", {{"nominal", 0.0018}}}, {"C", {{"nominal", 0.0015}}},
+                {"D", {{"nominal", 0.0004}}}, {"E", {{"nominal", 0.0010}}}, {"F", {{"nominal", 0.0004}}},
+                {"J", {{"nominal", 0.0040}}}, {"K", {{"nominal", 0.0040}}}, {"L", {{"nominal", 0.0018}}}}}
+        };
+        json coreJson;
+        coreJson["functionalDescription"] = {
+            {"type", "pieceAndPlate"}, {"material", materialJson}, {"shape", shapeJson},
+            {"gapping", json::array()}, {"numberStacks", 1}};
+        if (!coatingJson.is_null()) {
+            coreJson["functionalDescription"]["coating"] = coatingJson;
+        }
+        Core core(coreJson);
+        core.process_data();
+        core.process_gap();
+        return core;
+    };
+    auto glueCoating = [](const std::string& materialName) {
+        return json{{"type", "magneticEpoxy"}, {"thickness", {{"nominal", 0.0001}}}, {"material", materialName}};
+    };
+
+    auto listCore = buildCore(json::array({"3C90", shellRecord}), json());
+    auto coatingCore = buildCore("3C90", glueCoating(shellName));
+    auto bothAgreeingCore = buildCore(json::array({"3C90", shellRecord}), glueCoating(shellName));
+
+    SECTION("material[1] gives the same inductance and losses as the deprecated coating") {
+        double listInductance = MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(listCore, numberTurns, 25);
+        double coatingInductance = MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(coatingCore, numberTurns, 25);
+        double bothInductance = MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(bothAgreeingCore, numberTurns, 25);
+        UNSCOPED_INFO("material[1] " << listInductance * 1e6 << " uH, coating " << coatingInductance * 1e6 << " uH");
+        CHECK(std::isfinite(listInductance));
+        CHECK(listInductance > 0);
+        CHECK_THAT(listInductance, Catch::Matchers::WithinRel(coatingInductance, 1e-12));
+        CHECK_THAT(bothInductance, Catch::Matchers::WithinRel(coatingInductance, 1e-12));
+        // The drum keeps being the primary grade: material[0], not the shell.
+        CHECK(listCore.resolve_material().get_name() == "3C90");
+
+        json excitationJson = json();
+        excitationJson["frequency"] = 200000;
+        excitationJson["magneticFluxDensity"]["processed"]["dutyCycle"] = 0.5;
+        excitationJson["magneticFluxDensity"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+        excitationJson["magneticFluxDensity"]["processed"]["offset"] = 0;
+        excitationJson["magneticFluxDensity"]["processed"]["peak"] = 0.05;
+        excitationJson["magneticFluxDensity"]["processed"]["peakToPeak"] = 0.1;
+        excitationJson["magneticFieldStrength"]["processed"]["offset"] = 0;
+        excitationJson["magneticFieldStrength"]["processed"]["label"] = WaveformLabel::SINUSOIDAL;
+        excitationJson["magneticFieldStrength"]["processed"]["peakToPeak"] = 0;
+        OperatingPointExcitation excitation(excitationJson);
+        auto listLosses = CoreLosses().calculate_core_losses(listCore, excitation, 25);
+        auto coatingLosses = CoreLosses().calculate_core_losses(coatingCore, excitation, 25);
+        CHECK(listLosses.get_method_used() == coatingLosses.get_method_used());
+        CHECK_THAT(listLosses.get_core_losses(), Catch::Matchers::WithinRel(coatingLosses.get_core_losses(), 1e-12));
+    }
+
+    SECTION("material[1] and the deprecated coating naming different shells throws") {
+        auto disagreeingCore = buildCore(json::array({"3C90", shellRecord}), glueCoating("Kool Mµ 60"));
+        CHECK_THROWS_WITH(MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(disagreeingCore, numberTurns, 25),
+                          Catch::Matchers::ContainsSubstring("disagree"));
+    }
+
+    SECTION("a drumSemishielded core with neither form throws") {
+        auto bareCore = buildCore("3C90", json());
+        CHECK_THROWS_WITH(MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(bareCore, numberTurns, 25),
+                          Catch::Matchers::ContainsSubstring("no shell material"));
+        auto oneEntryCore = buildCore(json::array({"3C90"}), json());
+        CHECK_THROWS_WITH(MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(oneEntryCore, numberTurns, 25),
+                          Catch::Matchers::ContainsSubstring("no shell material"));
+    }
+
+    SECTION("a second entry that is not a magneticEpoxy grade throws") {
+        auto ferriteShellCore = buildCore(json::array({"3C90", "3C90"}), json());
+        CHECK_THROWS_WITH(MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(ferriteShellCore, numberTurns, 25),
+                          Catch::Matchers::ContainsSubstring("not a magneticEpoxy"));
+    }
+
+    SECTION("the insulation readers refuse a magneticEpoxy coating") {
+        CHECK_THROWS_WITH(coatingCore.get_coating_relative_permittivity(),
+                          Catch::Matchers::ContainsSubstring("not an insulating coating"));
+        CHECK_THROWS_WITH(coatingCore.get_coating_thickness(),
+                          Catch::Matchers::ContainsSubstring("not an insulating coating"));
+    }
+    settings.reset();
+}
+
 TEST_CASE("Test_ABT635_Gapping_From_Inductance_Without_ProcessedDescription",
           "[physical-model][magnetizing-inductance][bug]") {
     // ABT #635: calculate_gapping_from_number_turns_and_inductance() dereferenced
@@ -3397,4 +3507,144 @@ TEST_CASE("Test_Sizing_Saturation_Checks_Every_Operating_Point", "[physical-mode
     REQUIRE_FALSE(model.check_sizing_saturation(magnetic.get_core(), magnetic.get_coil(), numberTurns, &lightAlone).first);
     auto lightFirst = buck_like_inputs({1.0, 60.0}, requirement);
     CHECK(model.check_sizing_saturation(magnetic.get_core(), magnetic.get_coil(), numberTurns, &lightFirst).first);
+}
+
+// ABT #2394: one DC-bias point for a line-cycle record (one line period holding many switching cycles: a PFC or
+// active-front-end choke), shared by the inductance model and the gap solve: the peak magnitude of the record's
+// low-frequency envelope, the largest |cycle-averaged B|. The model took max(DC component, largest harmonic below the
+// switching frequency), which is the envelope's peak for a sine (AFE) and 2/pi of it for a rectified sine (CCM PFC);
+// the gap solve took the waveform's midpoint, ~0 for the sine and half the peak for the rectified one.
+namespace {
+// One 50 Hz line period, 16384 samples, of a choke current: the line current (a sine of linePeak, or its absolute
+// value) with a triangular switching ripple of zero mean in each of its 256 cycles (12.8 kHz). The rectified
+// record's ripple follows a boost PFC's, v_in (1 - v_in / V_o) with V_o = 400 V on a 325 V line peak, and reaches
+// ripplePeakToPeak at its widest; it vanishes at the line's zero crossing, so the current stays positive (CCM).
+// The sine's ripple is ripplePeakToPeak throughout.
+OpenMagnetics::Inputs line_cycle_inputs_abt2394(bool rectified, double linePeak, double ripplePeakToPeak, json magnetizingInductance) {
+    const double lineFrequency = 50;
+    const size_t samples = 16384;
+    const size_t samplesPerCycle = 64;
+    const double boostRatio = 325.0 / 400.0;
+    json time = json::array(), data = json::array();
+    for (size_t k = 0; k < samples; ++k) {
+        double instant = static_cast<double>(k) / (static_cast<double>(samples) * lineFrequency);
+        double line = sin(2 * M_PI * lineFrequency * instant);
+        double phase = static_cast<double>(k % samplesPerCycle) / static_cast<double>(samplesPerCycle);
+        double triangle = phase < 0.5 ? -0.5 + 2 * phase : 1.5 - 2 * phase;
+        double rippleScale = rectified ? 4 * boostRatio * fabs(line) * (1 - boostRatio * fabs(line)) : 1.0;
+        time.push_back(instant);
+        data.push_back(linePeak * (rectified ? fabs(line) : line) + ripplePeakToPeak * rippleScale * triangle);
+    }
+    OpenMagnetics::Inputs inputs(json{
+        {"designRequirements", {{"magnetizingInductance", magnetizingInductance}, {"turnsRatios", json::array()}, {"isolationSides", {"primary"}}}},
+        {"operatingPoints", {{{"name", rectified ? "rectified line" : "sine line"}, {"conditions", {{"ambientTemperature", 25}}},
+                              {"excitationsPerWinding", {{{"name", "Primary"}, {"frequency", lineFrequency},
+                                                          {"current", {{"waveform", {{"time", time}, {"data", data}}}}}}}}}}}});
+    return inputs;
+}
+
+// A DC operating point at the line frequency: dcCurrent with a 0.2 A peak-to-peak triangle (one period, not a record).
+OpenMagnetics::Inputs dc_inputs_abt2394(double dcCurrent, json magnetizingInductance) {
+    const double frequency = 50;
+    const size_t samples = 256;
+    json time = json::array(), data = json::array();
+    for (size_t k = 0; k <= samples; ++k) {
+        double phase = static_cast<double>(k) / static_cast<double>(samples);
+        time.push_back(phase / frequency);
+        data.push_back(dcCurrent + 0.2 * (phase < 0.5 ? -0.5 + 2 * phase : 1.5 - 2 * phase));
+    }
+    OpenMagnetics::Inputs inputs(json{
+        {"designRequirements", {{"magnetizingInductance", magnetizingInductance}, {"turnsRatios", json::array()}, {"isolationSides", {"primary"}}}},
+        {"operatingPoints", {{{"name", "dc"}, {"conditions", {{"ambientTemperature", 25}}},
+                              {"excitationsPerWinding", {{{"name", "Primary"}, {"frequency", frequency},
+                                                          {"current", {{"waveform", {{"time", time}, {"data", data}}}}}}}}}}}});
+    return inputs;
+}
+
+OpenMagnetics::Coil single_winding_coil_abt2394(int64_t numberTurns) {
+    return OpenMagnetics::Coil(json{{"bobbin", "Dummy"},
+                                    {"functionalDescription", {{{"name", "primary"}, {"numberTurns", numberTurns}, {"numberParallels", 1},
+                                                                {"isolationSide", "primary"}, {"wire", "Dummy"}}}}});
+}
+}  // namespace
+
+TEST_CASE("Test_Line_Cycle_Record_Inductance_Is_At_The_Envelope_Peak_Rectified_Line", "[physical-model][magnetizing-inductance][dc-bias][line-cycle][abt-2394]") {
+    // A 3.6 kW 230 V boost PFC choke's line-cycle record (line-current peak 22.5 A, 0 -> 22.5 A at 100 Hz, mean
+    // 2/pi * 22.5 = 14.3 A) on an ungapped High Flux 60 toroid, T 25.9/12.8/21.3 with 24 turns: the inductance the
+    // circuit can count on is the one at the envelope's peak, as a DC point at 22.5 A gives it, not the one at the mean.
+    settings.reset();
+    const double linePeak = 22.5;
+    const double meanCurrent = 2 / M_PI * linePeak;
+    const int numberTurns = 24;
+    const json requirement = {{"minimum", 50e-6}};
+    auto magnetic = powder_toroid("T 25.9/12.8/21.3", "High Flux 60");
+    MagnetizingInductance model(ReluctanceModels::ZHANG);
+    auto record = line_cycle_inputs_abt2394(true, linePeak, 8.0, requirement);
+    auto atPeak = dc_inputs_abt2394(linePeak, requirement);
+    auto atMean = dc_inputs_abt2394(meanCurrent, requirement);
+    double recordInductance = inductance_at(model, magnetic, numberTurns, record, 0);
+    double inductanceAtPeak = inductance_at(model, magnetic, numberTurns, atPeak, 0);
+    double inductanceAtMean = inductance_at(model, magnetic, numberTurns, atMean, 0);
+    INFO("rectified-line record " << recordInductance * 1e6 << " uH; DC point at the envelope peak (" << linePeak << " A) "
+         << inductanceAtPeak * 1e6 << " uH, at the mean (" << meanCurrent << " A) " << inductanceAtMean * 1e6 << " uH");
+    // The premise: the material rolls off clearly between the mean and the peak.
+    REQUIRE(inductanceAtMean > 1.1 * inductanceAtPeak);
+    CHECK_THAT(recordInductance, Catch::Matchers::WithinRel(inductanceAtPeak, 0.03));
+    CHECK(recordInductance < 0.95 * inductanceAtMean);
+    settings.reset();
+}
+
+TEST_CASE("Test_Line_Cycle_Record_Inductance_Is_At_The_Envelope_Peak_Sine_Line", "[physical-model][magnetizing-inductance][dc-bias][line-cycle][abt-2394]") {
+    // An active-front-end choke's record (a 22.5 A line sine with a 4 A switching ripple) on the same toroid: its
+    // envelope's peak is the line fundamental's amplitude, the bias the model already took, so the inductance is the
+    // one of a DC point at 22.5 A, before and after ABT #2394.
+    settings.reset();
+    const double linePeak = 22.5;
+    const int numberTurns = 24;
+    const json requirement = {{"minimum", 50e-6}};
+    auto magnetic = powder_toroid("T 25.9/12.8/21.3", "High Flux 60");
+    MagnetizingInductance model(ReluctanceModels::ZHANG);
+    auto record = line_cycle_inputs_abt2394(false, linePeak, 4.0, requirement);
+    auto atPeak = dc_inputs_abt2394(linePeak, requirement);
+    auto atZero = dc_inputs_abt2394(0.1, requirement);
+    double recordInductance = inductance_at(model, magnetic, numberTurns, record, 0);
+    double inductanceAtPeak = inductance_at(model, magnetic, numberTurns, atPeak, 0);
+    double inductanceAtZero = inductance_at(model, magnetic, numberTurns, atZero, 0);
+    INFO("sine-line record " << recordInductance * 1e6 << " uH; DC point at the envelope peak (" << linePeak << " A) "
+         << inductanceAtPeak * 1e6 << " uH, unbiased " << inductanceAtZero * 1e6 << " uH");
+    REQUIRE(inductanceAtZero > 1.1 * inductanceAtPeak);
+    CHECK_THAT(recordInductance, Catch::Matchers::WithinRel(inductanceAtPeak, 0.03));
+    settings.reset();
+}
+
+TEST_CASE("Test_Gapping_Of_A_Line_Cycle_Record_Meets_Its_Target_Under_The_Inductance_Model", "[physical-model][magnetizing-inductance][gapping][dc-bias][line-cycle][abt-2394]") {
+    // The gap solve sizes the gap at the DC-bias point the inductance model evaluates the gapped core at: the gap it
+    // returns for a line-cycle record, fed back to the model with the same operating point, gives the target.
+    settings.reset();
+    const double linePeak = 22.5;
+    const int64_t numberTurns = 40;
+    const double target = 200e-6;
+    const double tolerance = 0.02;
+    auto core = OpenMagneticsTesting::get_quick_core("E 65/32/27", json::array(), 1, "Kool Mµ 60");
+    auto coil = single_winding_coil_abt2394(numberTurns);
+    for (bool rectified : {true, false}) {
+        MagnetizingInductance model(ReluctanceModels::ZHANG);
+        auto inputs = line_cycle_inputs_abt2394(rectified, linePeak, rectified ? 8.0 : 4.0, json{{"nominal", target}});
+        auto operatingPoint = inputs.get_operating_point(0);
+        auto ungappedOperatingPoint = operatingPoint;
+        double ungappedInductance = resolve_dimensional_values(model.calculate_inductance_from_number_turns_and_gapping(core, coil, &ungappedOperatingPoint).get_magnetizing_inductance());
+        auto gapping = model.calculate_gapping_from_number_turns_and_inductance(core, coil, &inputs, GappingType::GROUND, 6);
+        Core gappedCore(core);
+        gappedCore.get_mutable_functional_description().set_gapping(gapping);
+        gappedCore.set_processed_description(std::nullopt);
+        gappedCore.process_data();
+        gappedCore.process_gap();
+        double inductance = resolve_dimensional_values(model.calculate_inductance_from_number_turns_and_gapping(gappedCore, coil, &operatingPoint).get_magnetizing_inductance());
+        INFO((rectified ? "rectified line" : "sine line") << ": ungapped " << ungappedInductance * 1e6 << " uH at the record; ground gap "
+             << gapping[0].get_length() * 1e3 << " mm gives " << inductance * 1e6 << " uH for a target of " << target * 1e6 << " uH");
+        // The premise: the target is reachable (below the ungapped core's inductance at this record) and needs a real gap.
+        REQUIRE(ungappedInductance > 1.2 * target);
+        CHECK_THAT(inductance, Catch::Matchers::WithinRel(target, tolerance));
+    }
+    settings.reset();
 }

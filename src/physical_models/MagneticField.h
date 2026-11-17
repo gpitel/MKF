@@ -1,4 +1,5 @@
 #pragma once
+#include "physical_models/AxisymmetricWindow.h"
 #include "Constants.h"
 #include "Defaults.h"
 #include "Models.h"
@@ -71,6 +72,9 @@ class MagneticFieldStrengthModel {
         // Dowell's one-dimensional field is assumed uniform (H = enclosed MMF / b). Only the
         // Dowell model reads it; the point-to-point models derive everything from the two points.
         double _windingWindowBreadth = 0;
+        // A round-post window on the neutral path (AxisymmetricWindow::applies): every conductor is a ring about the
+        // post's axis, x read as the radius and y as the height. Only BINNS_LAWRENSON reads it.
+        std::optional<AxisymmetricWindow> _axisymmetricWindow;
         virtual ComplexFieldPoint get_magnetic_field_strength_between_two_points(const FieldPoint& inducingFieldPoint, const FieldPoint& inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt) = 0;
         // (Hx, Hy) only: the point-pair sum calls this for every inducing/induced pair, and building a
         // ComplexFieldPoint (a heap-allocated point copy) per pair dominated its cost.
@@ -99,6 +103,27 @@ class MagneticFieldStrengthFringingEffectModel {
                                                                     [[maybe_unused]] double netAmpereTurns) const {
             throw ModelNotAvailableException("This fringing effect model has no window-boundary sources");
         }
+        // Multi-window cores (ABT #2267): the boundary sources' field at (x, y) per ampere of each winding's current, from
+        // the walls of the window that contains the point (zero outside every window). Single-window cores use the net form.
+        virtual bool is_multi_window() const { return false; }
+        virtual std::vector<std::pair<double, double>> get_window_boundary_field_per_winding([[maybe_unused]] double pointX, [[maybe_unused]] double pointY) const {
+            throw ModelNotAvailableException("This fringing effect model has no multi-window boundary sources");
+        }
+        // The window containing (x, y), if any, and per window and winding the current the walls return per ampere of
+        // that winding (minus the sum of its unimaged sheets there): the field step scales each winding's sheets so that
+        // they return what its conductors really enclose in each window.
+        virtual std::optional<size_t> get_window_of_point([[maybe_unused]] double pointX, [[maybe_unused]] double pointY) const {
+            throw ModelNotAvailableException("This fringing effect model has no multi-window boundary sources");
+        }
+        virtual std::vector<std::pair<double, double>> get_window_boundary_field_screened_per_winding([[maybe_unused]] double pointX, [[maybe_unused]] double pointY,
+                                                                                                  [[maybe_unused]] const std::vector<ScreeningStrip>& strips,
+                                                                                                  [[maybe_unused]] std::optional<int64_t> inducedTurn,
+                                                                                                  [[maybe_unused]] std::vector<ScreenedFieldSum>& screened) const {
+            throw ModelNotAvailableException("This fringing effect model has no multi-window boundary sources");
+        }
+        virtual const std::vector<std::vector<double>>& get_returned_current_per_window_per_winding() const {
+            throw ModelNotAvailableException("This fringing effect model has no multi-window boundary sources");
+        }
         // The same field per unit net MMF, split by the foil strips it crosses on its way to (x, y) (ABT #1645): returns
         // the part that crosses none and appends the screened parts to `screened`, grouped by the strips they cross.
         virtual std::pair<double, double> get_window_boundary_field_screened([[maybe_unused]] double pointX, [[maybe_unused]] double pointY,
@@ -120,19 +145,133 @@ class MagneticFieldStrengthFringingEffectModel {
 //  - NEUTRAL_WINDOW_IMPEDANCE: the strand impedance system above. Its strand inductance needs the neutral window frame
 //    (core image lattice + MMF_BOUNDARY window-wall sources), which exists for single-window, non-toroidal cores whose
 //    turns cross the section once.
+//  - RING_IMPEDANCE: the same strand impedance system on a toroid, in the ring's own frame. Each turn crosses the section
+//    twice (the bore crossing and its return outside the ring, opposite currents), and each crossing is a conductor of
+//    its own: its own longitudinal field over its half of the turn length, the two in series in the strand. The ferrite
+//    (mu -> inf) splits the plane into the bore and the outside: a crossing acts in its own region with its Kelvin image
+//    in the near wall, and a bore crossing is seen outside as a line current at the centre (CoilMesherCenterModel's
+//    toroid construction, the field step's own). The flux in the ferrite, linked by every turn alike, is left out.
 //  - RESISTIVE: every harmonic splits between the parallels by their DC conductance (series turn resistance plus the
 //    connection resistance), exactly the DC split, with no inductive term. Chosen deliberately (Alf, 2026-10-11, ABT
-//    #1759) for the geometries that have no neutral window frame yet: toroids (#1767), multi-window cores (#1768) and
-//    turns with additionalCoordinates (#1769). It ignores the proximity-driven redistribution between parallels, so
+//    #1759) for the geometries that have no window frame yet: multi-window cores (#1768) and turns with
+//    additionalCoordinates off a toroid (#1769). It ignores the proximity-driven redistribution between parallels, so
 //    it understates the AC losses of parallels that see different fields; those tickets carry the real AC split.
+//  - EQUAL: every parallel carries I_w / N_parallels at every harmonic, whatever its resistance or position: the drive of
+//    OMFEM's magnetostatic leakage solve, which spreads each turn's current uniformly over its parallels. Never chosen
+//    by geometry; the leakage inductance asks for it (Alf, 2026-11-09), so that leakage is the field of the turns'
+//    nominal currents, not of a frequency-dependent redistribution between parallels.
 enum class ParallelCurrentSplitModel {
     NEUTRAL_WINDOW_IMPEDANCE,
-    RESISTIVE
+    RING_IMPEDANCE,
+    RESISTIVE,
+    EQUAL
+};
+
+// A flat turn resolved across its width (the screened width-cell model): the conductor is cut into full-thickness cells
+// along its wide axis, each carrying its own current, and each cell's slab reaction to the field along its faces is a
+// pair of face sheets (see calculate_parallel_current_split). The end cells are exactly one thickness wide: the end
+// faces carry a current that does not shrink with the cell, and its loss is booked over the cell's width.
+struct FlatTurnCells {
+    size_t turnIndex = 0;
+    // Which crossing of the turn: 0 at its coordinates, 1 at its return crossing (a toroid's turn outside the ring).
+    size_t crossing = 0;
+    // The conductor's frame: its local axes are the window frame's turned by `angle` (radians). 0 in a window frame, where
+    // the turn's quarter-turn rotations are folded into wideAlongX; a toroid's turn lies radially at its rotation.
+    double angle = 0;
+    // The wide axis of the section in the conductor's frame: its local x, or its local y.
+    bool wideAlongX = true;
+    // Conducting thickness (thin axis) and width (wide axis).
+    double thickness = 0;
+    double width = 0;
+    // The crossing's centre, in the window frame.
+    double centreX = 0;
+    double centreY = 0;
+    // Per cell, in order along the wide axis: its centre's coordinate on that axis of the conductor's frame (the window
+    // frame's point turned by -angle) and its width.
+    std::vector<double> cellCentres;
+    std::vector<double> cellWidths;
+    // Per cell, its own length over the turn's: every loss of the cell (its DC share, its slab and end terms) is booked over
+    // its own length, not the turn's (WindingOhmicLosses::calculate_band_length: the cell between the offsets u0 and u1
+    // outwards of the turn's centre line, away from its column, is a ring as long as 2 pi (u1 - u0) / ln((L + 2 pi u1) /
+    // (L + 2 pi u0)), whatever the column's shape). Cells cut across the window's y all span the conductor's x, so each is as
+    // long as the conductor. 1 on a toroid (calculate_turn_conductor_length leaves its flat conductors at the turn's length)
+    // and for a turn of zero length (no loop: it books nothing).
+    std::vector<double> cellLengthRatios;
+    // The conductor's own length over the turn's (WindingOhmicLosses::calculate_turn_conductor_length): the length its DC
+    // and skin losses are booked over. The cells' lengths combine to it as their conductances do.
+    double conductorLengthRatio = 0;
+    // The cuts: the end cells and every cell from the ends inwards are one thickness wide for endCellCount cells, then
+    // each grows by cellGrowth up to maximumCellWidthInThicknesses thicknesses. The innermost remainder joins the last cell
+    // when it is under half of it. Fixed geometry, the same at every harmonic.
+    static constexpr size_t endCellCount = 3;
+    // x2 (Alf 2026-11-06, within 3 % of the full model): against x1.4 the planar OMFEM fixtures move at most 0.63 % and the
+    // planar adviser candidates 0.08 %. The end cells are the physics (one end cell, or end cells 2t wide, move Sixteen by
+    // 11-43 %) and stay as they are.
+    static constexpr double cellGrowth = 2.0;
+    static constexpr double maximumCellWidthInThicknesses = 10;
+    // A point's coordinate along the wide axis of the conductor's frame.
+    double along(double x, double y) const;
+    // The window-frame position of the point at `along` on the wide axis, on the crossing's centre line.
+    std::pair<double, double> position(double alongCoordinate) const;
+    // Relative accuracy of the split's compressed operators and of its iterative solve. 1e-4 (Alf 2026-11-06, up to 3 %
+    // allowed against the full model): on the planar adviser candidates and the planar OMFEM fixtures the total loss moves
+    // under 0.03 % from 1e-10 and the solve is ~1.4x faster (sweep in .mkf-triage-runs/wlfem/speed).
+    static constexpr double operatorTolerance = 1e-4;
+    // A flat turn is resolved when its wide side is at least this many thicknesses.
+    static constexpr double minimumAspectRatio = 4;
+    // The face sheets' own thickness, in conductor thicknesses (a sheet is a thin uniform rectangle inside the face).
+    static constexpr double faceSheetThicknessInThicknesses = 1.0 / 20;
+    // The cell cuts of a conductor of this width and thickness: cell widths in order along the wide axis.
+    static std::vector<double> calculate_cell_widths(double width, double thickness);
+    // A gap mouth on its column face, in the window frame: the face's x and the gap's extent y0..y1.
+    struct GapMouth {
+        double x = 0;
+        double y0 = 0;
+        double y1 = 0;
+    };
+    // Cuts beside a gap: the field leaving a gap mouth varies over the distance from it, so every cell is halved until it
+    // is no wider than gapRefinementMinimumInThicknesses thicknesses or gapRefinementInDistances times the distance from
+    // the nearest mouth to its nearest point, whichever is larger. Edge grading alone left 2 mm cells opposite a 1 mm gap
+    // on 0.2 mm foil: the gap-side foil read 0.32x OMFEM, 1.12x with these cuts (E42 foil stacks, Alf 2026-11-07). Cells
+    // far from every mouth are not touched.
+    static constexpr double gapRefinementInDistances = 1.0;
+    // The floor of those cuts. Beside a 1 mm gap the cells stop at the distance before they reach any floor, but a foil
+    // 0.115 mm from a 5 um residual gap concentrates its current within that distance: on the ungapped E 42 foil stack the
+    // column-side foil reads 0.71x 2D OMFEM at 500 kHz with a floor of one thickness, 0.83x at half a thickness, and
+    // 0.84x at 0.25 and 0.1 (the distance limit takes over), at 1.0, 1.5 and up to 14x the cost (2026-11-14).
+    static constexpr double gapRefinementMinimumInThicknesses = 0.5;
+    // `cellWidths` of the conductor whose wide axis starts at `start` (x when wideAlongX, else y), with `across` its
+    // coordinate on the other axis, cut further beside the gap mouths.
+    static std::vector<double> refine_cell_widths_near_gaps(const std::vector<double>& cellWidths, double start, double across, bool wideAlongX,
+                                                            double thickness, const std::vector<GapMouth>& mouths);
+    // Harmonics of the split solved by frequency interpolation (Alf 2026-11-07): the split is linear in the winding
+    // currents and smooth in log f, so with more than this many harmonics per winding it solves each winding's unit current
+    // at this many log-spaced frequencies spanning the harmonics and takes every harmonic's solution from a not-a-knot cubic
+    // spline in log f, scaled by that harmonic's winding currents. Total loss moves ~1e-5 on the planar benchmark, the
+    // split's solves drop from 64 to 16. 0 solves every harmonic directly. Thread-local so a test can compare both.
+    static inline thread_local size_t frequencyInterpolationSamples = 8;
 };
 
 struct ParallelCurrentSplit {
     // The model that produced this split (see ParallelCurrentSplitModel).
     ParallelCurrentSplitModel model = ParallelCurrentSplitModel::NEUTRAL_WINDOW_IMPEDANCE;
+    // The flat turns resolved across their width (empty when none is), and per turn its index there.
+    std::vector<FlatTurnCells> flatTurns;
+    std::vector<std::optional<size_t>> flatTurnPerTurn;
+    // Per turn, the index in flatTurns of its return crossing's cells (empty when no resolved turn has a return crossing).
+    std::vector<std::optional<size_t>> returnFlatTurnPerTurn;
+    // Per solved frequency, per flat turn, per cell: the cell's current in the field frame (the winding's current
+    // direction applied: the current that sources the field, along +z), the field along its faces at its centre from
+    // everything but its own turn's face sheets (the external field of its slab), and the slab's reaction D = -g H w, which
+    // its face sheets carry: -D on the face at the +normal side and +D on the other for a section wide along x, +D and
+    // -D for one wide along y (normal = the thin axis, in the conductor's frame). g = (s - tanh s) / s,
+    // s = (1 + j) t / (2 delta). The minus makes the sheets screen in the field kernels' sign convention.
+    std::vector<std::vector<std::vector<std::complex<double>>>> cellCurrentPerFrequency;
+    std::vector<std::vector<std::vector<std::complex<double>>>> cellFieldPerFrequency;
+    std::vector<std::vector<std::vector<std::complex<double>>>> cellReactionPerFrequency;
+    // ABT #2384: per solved frequency, the currents the width cells and their face sheets drive on the gap slots' correction
+    // sheets (one per piece of every mouth, in the field step's SlotCorrection order). Empty when the frame resolves no slot.
+    std::vector<std::vector<std::complex<double>>> slotPieceCurrentFromCellsPerFrequency;
     // The harmonics solved, as frequencies k f_excitation (k >= 1, ascending), and per harmonic every frequency the
     // windings' harmonics lists give it (a list built from a waveform's own time span can differ from k f_excitation).
     std::vector<double> frequencies;
@@ -163,7 +302,12 @@ class MagneticField {
         MagneticFieldStrengthFringingEffectModels _magneticFieldStrengthFringingEffectModel;
         std::shared_ptr<MagneticFieldStrengthModel>  _model;
         std::shared_ptr<MagneticFieldStrengthFringingEffectModel>  _fringingEffectModel;
+        // ABT #2267: the solid round turns' eddy reaction (their induced dipoles) in the field. On for the field at the
+        // conductors (losses, the Painter); off for a magnetostatic quantity such as the leakage inductance, defined by
+        // the turns' nominal currents alone.
+        bool _includeRoundTurnEddyReaction = true;
     public:
+        void set_include_round_turn_eddy_reaction(bool value) { _includeRoundTurnEddyReaction = value; }
         std::vector<Wire> _wirePerWinding;
         std::vector<double> _wireMaxOuterWidth;  // Precomputed for performance
         std::vector<double> _wireMaxOuterHeight; // Precomputed for performance
@@ -209,10 +353,18 @@ class MagneticField {
         // ABT #1314: the split of every winding's harmonic currents between its parallels (see ParallelCurrentSplit), at the
         // conductors' temperature, by the model parallel_current_split_model chooses for the magnetic. Empty when no
         // winding has more than one parallel.
+        // resolveFlatTurnsPerWinding: per winding, whether its flat turns (rectangular or planar, wide side at least
+        // FlatTurnCells::minimumAspectRatio thicknesses; axis-aligned in a window) are resolved across their width
+        // (FlatTurnCells). Only the impedance frames can (NEUTRAL_WINDOW_IMPEDANCE, RING_IMPEDANCE); the split then exists
+        // even without parallels.
+        // requestedModel: a model asked for instead of the geometry's (only EQUAL, which every geometry has).
         static std::optional<ParallelCurrentSplit> calculate_parallel_current_split(Magnetic magnetic, OperatingPoint operatingPoint, double temperature,
-                                                                                    std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding = std::nullopt);
-        // ABT #1759: the parallel current split model for this magnetic's geometry: RESISTIVE for toroids, multi-window
-        // cores and turns with additionalCoordinates (no neutral window frame), NEUTRAL_WINDOW_IMPEDANCE otherwise.
+                                                                                    std::optional<std::vector<int8_t>> customCurrentDirectionPerWinding = std::nullopt,
+                                                                                    std::optional<std::vector<bool>> resolveFlatTurnsPerWinding = std::nullopt,
+                                                                                    std::optional<ParallelCurrentSplitModel> requestedModel = std::nullopt);
+        // ABT #1759: the parallel current split model for this magnetic's geometry: RING_IMPEDANCE for toroids, RESISTIVE
+        // for multi-window cores and turns with additionalCoordinates off a toroid (no window frame),
+        // NEUTRAL_WINDOW_IMPEDANCE otherwise.
         static ParallelCurrentSplitModel parallel_current_split_model(const Magnetic& magnetic);
         static TurnSumsCacheStatistics get_turn_sums_cache_statistics();
         static void clear_turn_sums_cache();
@@ -242,15 +394,6 @@ class MagneticFieldStrengthDowellModel : public MagneticFieldStrengthModel {
         ComplexFieldPoint get_magnetic_field_strength_between_two_points(const FieldPoint& inducingFieldPoint, const FieldPoint& inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt);
 };
 
-
-
-// Based on Improved Analytical Calculation of High Frequency Winding Losses in Planar Inductors by Xiaohui Wang
-// https://sci-hub.st/10.1109/ECCE.2018.8558397
-class MagneticFieldStrengthWangModel : public MagneticFieldStrengthModel {
-    public:
-        std::string methodName = "Wang";
-        ComplexFieldPoint get_magnetic_field_strength_between_two_points(const FieldPoint& inducingFieldPoint, const FieldPoint& inducedFieldPoint, std::optional<size_t> inducingWireIndex = std::nullopt);
-};
 
 
 // Based on Analysis and Computation of Electric and Magnetic Field Problems By Kenneth John Binns and P. J. Lawrenson
@@ -400,7 +543,23 @@ class MagneticFieldStrengthMmfBoundaryModel : public MagneticFieldStrengthFringi
     };
     std::vector<SheetMultipole> _sheetMultipoles;
     bool _isSetUp = false;
+    // Multi-window cores (ABT #2267): the sheets carry their window and winding; the regions say which window a point is in.
+    bool _multiWindow = false;
+    std::vector<WindowRegion> _regions;
+    size_t _numberWindings = 0;
+    std::vector<std::vector<double>> _returnedCurrentPerWindowPerWinding;
+    // One sheet's field at (x, y) for a current `scale` times its own (multipole form far from it).
+    std::pair<double, double> sheet_field(size_t sheetIndex, double scale, double pointX, double pointY) const;
+    // A round-post window (AxisymmetricWindow::applies): the MMF the gaps and the ferrite drop on the post face and
+    // the outer wall is the boundary data of the window's correction field; the plates' share is rings on the plates.
+    std::optional<AxisymmetricWindow> _axisymmetricWindow;
+    AxisymmetricWindow::WallSources _axisymmetricWallSources;
   public:
+    // One sheet with foil strips in the way of (x, y): taken out whole from `field` and put back piece by piece, each piece
+    // unscreened into `field` or screened into `screened` under `windingIndex` (ABT #1645). Also used for the gap slots'
+    // correction sheets (ABT #2384).
+    static void screen_sheet(const WindowWallSheet& sheet, double pointX, double pointY, const std::vector<ScreeningStrip>& strips, std::optional<int64_t> inducedTurn,
+                             size_t windingIndex, double& fieldX, double& fieldY, std::vector<ScreenedFieldSum>& screened);
     std::string methodName = "MmfBoundary";
     ComplexFieldPoint get_magnetic_field_strength_between_gap_and_point([[maybe_unused]] CoreGap gap, [[maybe_unused]] double magneticFieldStrengthGap,
                                                                         [[maybe_unused]] FieldPoint inducedFieldPoint) {
@@ -412,6 +571,12 @@ class MagneticFieldStrengthMmfBoundaryModel : public MagneticFieldStrengthFringi
     bool is_window_boundary_model() const override { return true; }
     void setup_window_boundary(Magnetic magnetic, std::optional<OperatingPoint> operatingPoint) override;
     std::pair<double, double> get_window_boundary_field(double pointX, double pointY, double netAmpereTurns) const override;
+    bool is_multi_window() const override { return _multiWindow; }
+    std::vector<std::pair<double, double>> get_window_boundary_field_per_winding(double pointX, double pointY) const override;
+    std::optional<size_t> get_window_of_point(double pointX, double pointY) const override;
+    std::vector<std::pair<double, double>> get_window_boundary_field_screened_per_winding(double pointX, double pointY, const std::vector<ScreeningStrip>& strips,
+                                                                                          std::optional<int64_t> inducedTurn, std::vector<ScreenedFieldSum>& screened) const override;
+    const std::vector<std::vector<double>>& get_returned_current_per_window_per_winding() const override { return _returnedCurrentPerWindowPerWinding; }
     std::pair<double, double> get_window_boundary_field_screened(double pointX, double pointY, const std::vector<ScreeningStrip>& strips,
                                                                  std::optional<int64_t> inducedTurn, std::vector<ScreenedFieldSum>& screened) const override;
     // Closed-form field of one uniform sheet (see the definition), Binns-Lawrenson sign convention.

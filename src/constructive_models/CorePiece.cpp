@@ -243,22 +243,10 @@ class CorePieceEtd : public CorePieceE {
 
     double get_lateral_leg_area() {
         auto dimensions = flatten_dimensions(get_shape().get_dimensions().value());
-        double tetha;
-        double aperture;
-        if ((dimensions.find("G") == dimensions.end()) || (dimensions["G"] == 0)) {
-            tetha = asin(dimensions["C"] / dimensions["E"]);
-            aperture = dimensions["E"] / 2 * cos(tetha);
-        }
-        else {
-            if (dimensions["G"] > 0) {
-                aperture = dimensions["G"] / 2;
-                tetha = acos(aperture / (dimensions["E"] / 2));
-            }
-            else {
-                tetha = asin(dimensions["C"] / dimensions["E"]);
-                aperture = dimensions["E"] / 2 * cos(tetha);
-            }
-        }
+        // The aperture rule is shared with the real winding's outside-link room (Coil.cpp).
+        const double aperture = round_post_lateral_leg_aperture(dimensions);
+        const bool flatAtG = dimensions.find("G") != dimensions.end() && dimensions["G"] > 0;
+        const double tetha = flatAtG ? acos(aperture / (dimensions["E"] / 2)) : asin(dimensions["C"] / dimensions["E"]);
         double segmentArea = pow(dimensions["E"] / 2, 2) / 2 * (2 * tetha - sin(2 * tetha));
         double area =
             dimensions["C"] * (dimensions["A"] / 2 - aperture) - segmentArea;
@@ -2811,10 +2799,16 @@ class CorePieceDrum : public CorePiece {
         double c1 = grooveHeight / postArea;
         double c2 = grooveHeight / pow(postArea, 2);
         // Two flanges: radial spreading discs from post edge to flange edge, plus the
-        // post-to-flange corners per IEC 60205 clause 4.6.
+        // post-to-flange corners per IEC 60205 clause 4.6. A disc of thickness t carrying radial
+        // flux from r to R has A(rho) = 2 pi rho t, so
+        //   c1 = integral drho / A   = ln(R/r) / (2 pi t)
+        //   c2 = integral drho / A^2 = (R - r) / (4 pi^2 t^2 R r).
+        // ABT #2414: c2 used to be 1/(2 (pi t)^2)..., copied from the pot core, whose IEC pair terms
+        // halve both c1 and c2 afterwards; here only c1 was halved, so c2 was doubled and Ae, Le came
+        // out 1-48 % low (Ae below minimumArea on 83 catalogue shapes). Same term in every drum class.
         for (auto flangeThickness : {dimensions["D"], dimensions["F"]}) {
             c1 += 1.0 / (2 * pi * flangeThickness) * log(flangeRadius / postRadius);
-            c2 += 1.0 / (2 * pow(pi * flangeThickness, 2)) * (flangeRadius - postRadius) / (flangeRadius * postRadius);
+            c2 += 1.0 / (4 * pow(pi * flangeThickness, 2)) * (flangeRadius - postRadius) / (flangeRadius * postRadius);
             areas.push_back(2 * pi * postRadius * flangeThickness);
             double s1 = postRadius - sqrt((pow(boreRadius, 2) + pow(postRadius, 2)) / 2);
             double cornerLength = pi / 4 * (2 * s1 + flangeThickness);
@@ -3046,7 +3040,7 @@ class CorePieceDrumRing : public CorePieceDrum {
         double drumC2 = grooveHeight / pow(postArea, 2);
         for (auto flangeThickness : {dimensions["D"], dimensions["F"]}) {
             drumC1 += 1.0 / (2 * pi * flangeThickness) * log(flangeRadius / postRadius);
-            drumC2 += 1.0 / (2 * pow(pi * flangeThickness, 2)) * (flangeRadius - postRadius) / (flangeRadius * postRadius);
+            drumC2 += 1.0 / (4 * pow(pi * flangeThickness, 2)) * (flangeRadius - postRadius) / (flangeRadius * postRadius);
             areas.push_back(2 * pi * postRadius * flangeThickness);
             double s1 = postRadius - sqrt((pow(boreRadius, 2) + pow(postRadius, 2)) / 2);
             double cornerLength = pi / 4 * (2 * s1 + flangeThickness);
@@ -3111,7 +3105,7 @@ class CorePieceDrumRing : public CorePieceDrum {
         // under the ring's mid-wall.
         for (auto [thickness, spreadRadius] : std::vector<std::pair<double, double>>{{topFlange, flangeRadius}, {plate, ringMeanRadius}}) {
             drumC1 += 1.0 / (2 * pi * thickness) * log(spreadRadius / postRadius);
-            drumC2 += 1.0 / (2 * pow(pi * thickness, 2)) * (spreadRadius - postRadius) / (spreadRadius * postRadius);
+            drumC2 += 1.0 / (4 * pow(pi * thickness, 2)) * (spreadRadius - postRadius) / (spreadRadius * postRadius);
             areas.push_back(2 * pi * postRadius * thickness);
             double s1 = postRadius - sqrt((pow(boreRadius, 2) + pow(postRadius, 2)) / 2);
             double cornerLength = pi / 4 * (2 * s1 + thickness);
@@ -3183,9 +3177,11 @@ std::pair<double, double> drum_ring_seat_plate(std::map<std::string, double> dim
 // get_shape_constants returns the GEOMETRIC single-material constants (vendor Ae/le/Ve
 // convention: geometry alone). Because the circuit crosses two materials, the piece also
 // exposes get_mixed_material_c1() — {c1 through the FERRITE drum, c1 through the SHELL} —
-// which MagnetizingInductance uses with the drum material's mu and the magneticEpoxy
-// coating material's mu (per-section reluctance). The shell material rides
-// functionalDescription.coating {type: magneticEpoxy, material: <core material name>}.
+// which MagnetizingInductance uses with the drum material's mu and the shell material's mu
+// (per-section reluctance). The shell material is the second entry of
+// functionalDescription.material ([drum material, shell material]), a core material of type
+// magneticEpoxy; Core::resolve_semishielded_shell_material reads it (and still accepts the
+// deprecated functionalDescription.coating {type: magneticEpoxy, material: <name>} form).
 class CorePieceDrumSemishielded : public CorePieceDrum {
   public:
     void process_extra_data() {
@@ -3226,7 +3222,7 @@ class CorePieceDrumSemishielded : public CorePieceDrum {
         double ferriteC2 = grooveHeight / pow(postArea, 2);
         for (auto flangeThickness : {dimensions["D"], dimensions["F"]}) {
             ferriteC1 += 1.0 / (2 * pi * flangeThickness) * log(flangeRadius / postRadius);
-            ferriteC2 += 1.0 / (2 * pow(pi * flangeThickness, 2)) * (flangeRadius - postRadius) / (flangeRadius * postRadius);
+            ferriteC2 += 1.0 / (4 * pow(pi * flangeThickness, 2)) * (flangeRadius - postRadius) / (flangeRadius * postRadius);
             areas.push_back(2 * pi * postRadius * flangeThickness);
             double s1 = postRadius - sqrt((pow(boreRadius, 2) + pow(postRadius, 2)) / 2);
             double cornerLength = pi / 4 * (2 * s1 + flangeThickness);
@@ -3556,7 +3552,7 @@ class CorePieceMolded : public CorePiece {
         auto plate = [&](std::string name) {
             RegionShapeConstants region{name, 0, 0, std::numeric_limits<double>::max()};
             region.c1 += 1.0 / (2 * pi * plateThickness) * log(cavityRadius / postRadius);
-            region.c2 += 1.0 / (2 * pow(pi * plateThickness, 2)) * (cavityRadius - postRadius) / (cavityRadius * postRadius);
+            region.c2 += 1.0 / (4 * pow(pi * plateThickness, 2)) * (cavityRadius - postRadius) / (cavityRadius * postRadius);
             double plateEntryArea = 2 * pi * postRadius * plateThickness;
             region.minimumArea = std::min(region.minimumArea, plateEntryArea);
             double s1 = postRadius - sqrt(pow(postRadius, 2) / 2);
@@ -3863,6 +3859,44 @@ CoreShapeFamily canonical_core_shape_family(CoreShapeFamily family) {
 CoreShape canonicalize_core_shape_family(CoreShape shape) {
     shape.set_family(canonical_core_shape_family(shape.get_family()));
     return shape;
+}
+
+CoreType core_type_for_shape_family(CoreShapeFamily declaredFamily) {
+    // Core type follows the FAMILY, not the shape's open/closed flag. That flag says whether a
+    // shape "can be combined with others" or "has to be used by itself" (MAS shape schema), which
+    // is a different question: a UI or PQI record describes a whole piece-and-plate assembly, so
+    // it is closed by that definition, yet it is obviously not a toroid.
+    switch (canonical_core_shape_family(declaredFamily)) {
+        case CoreShapeFamily::T:
+            return CoreType::TOROIDAL;
+        case CoreShapeFamily::UI:
+        case CoreShapeFamily::PQI:
+        case CoreShapeFamily::UT:
+        case CoreShapeFamily::EI:
+        case CoreShapeFamily::DRUM_RING:
+        case CoreShapeFamily::DRUM_SEMISHIELDED:
+        case CoreShapeFamily::DRUM_PLATE:
+            // A shaped piece closed by a bar, plate, ring or shell: the record describes the whole
+            // assembly and nothing is doubled.
+            //   EI: an E piece closed by an I bar, the family the records themselves name "E+I".
+            //       Mirrored as a two-piece set, ET 20 reports le 99.51 mm against 49.76 mm.
+            //   UT (ABT #995): a U piece closed by a flat bar. Mirrored, MAS's own UT 20 reported
+            //       le 106.41 mm where the supplier catalogues quote 53 (US 11,749,439 describes it
+            //       as "a U-shaped core and I-shaped core ... forming a closed magnetic path").
+            //   DRUM_RING (ABT #366) / DRUM_SEMISHIELDED (ABT #362): a drum closed by its shield
+            //       ring / magnetic-epoxy shell.
+            return CoreType::PIECE_AND_PLATE;
+        case CoreShapeFamily::DRUM:
+        case CoreShapeFamily::ROD:
+            // Single piece whose magnetic circuit closes through the surrounding air (drum
+            // ABT #331, rod ABT #933). As a two-piece set its effective length would double.
+            return CoreType::OPEN_SHAPE;
+        case CoreShapeFamily::MOLDED:
+            // Single pressed solid, circuit closed in the material (distributed gap, ABT #357).
+            return CoreType::CLOSED_SHAPE;
+        default:
+            return CoreType::TWO_PIECE_SET;
+    }
 }
 
 static std::string supported_shape_family_list() {

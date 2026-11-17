@@ -908,7 +908,12 @@ TEST_CASE("Test_CoilAdviser_Planar", "[adviser][coil-adviser][planar]") {
     CHECK_THAT(*noResultsReason, Catch::Matchers::ContainsSubstring("rejected by the temperature limit"));
     // Re-pinned 2026-11-04 (ABT #2226, approved by Alf): the example is the first rejected coil in loss order now (the
     // adviser orders its coils by losses, the score only breaking ties); it was "hot spot reaches 272 C with 23.4 W of losses".
-    CHECK_THAT(*noResultsReason, Catch::Matchers::ContainsSubstring("hot spot reaches 136 C with 9.17 W of losses"));
+    // Re-pinned 2026-11-06 (approved by Alf): the screened width-cell model books the flat turns' losses, which moves the
+    // loss order; it was "hot spot reaches 136 C with 9.17 W of losses". Re-pinned again the same day (approved by Alf) from
+    // 9.29 W to 9.28 W, same candidate: the cell solve's tolerance 1e-10 -> 1e-4 and cell growth x1.4 -> x2 (speed, 0.1 %).
+    // Re-pinned 2026-11-12 (approved by Alf): the planar redo sizes the tracks from the winding's layers, offers every
+    // etchable width and winds each, so the first rejected coil is another; it was "hot spot reaches 156 C with 9.28 W".
+    CHECK_THAT(*noResultsReason, Catch::Matchers::ContainsSubstring("hot spot reaches 231 C with 17.4 W of losses"));
     settings.reset();
 }
 
@@ -2369,15 +2374,9 @@ TEST_CASE("Test_CoilAdviser_Web_3", "[adviser][coil-adviser][bug][smoke-test]") 
     auto noResultsReason = coilAdviser.get_last_no_results_reason();
     REQUIRE(noResultsReason.has_value());
     CHECK_THAT(*noResultsReason, Catch::Matchers::ContainsSubstring("rejected by the temperature limit"));
-    // Re-pinned 2026-11-03 (Alf: confirm the cause, then re-pin). MAS e56be36 -> 6e288e9 moved it: with the old
-    // core_materials.ndjson the old text (564 C with 55.9 W) comes back, while Mix 70's own record restored alone
-    // (composition iron, no provenance) does not, so the move comes from other material records. The coil is
-    // still rejected by the temperature limit; its core now reaches Mix 70's Curie point and is held there.
-    // Re-pinned 2026-11-04 (ABT #2226, approved by Alf): the example is the first rejected coil in loss order now (the
-    // adviser orders its coils by losses, the score only breaking ties). It was a coil whose core reached Mix 70's Curie
-    // point: "hot spot reaches at least 566 C, above the 130 C limit" and "its losses were 55.4 W".
-    CHECK_THAT(*noResultsReason, Catch::Matchers::ContainsSubstring("hot spot reaches 407 C"));
-    CHECK_THAT(*noResultsReason, Catch::Matchers::ContainsSubstring("with 27.9 W of losses, above the 130 C limit"));
+    // The example coil's temperature and losses are no longer pinned (Alf 2026-11-14): they moved with every loss-model
+    // change (564 C / 55.9 W, 566 C / 55.4 W, 407 C / 27.9 W, then 387 C / 25.4 W with the round turns' eddy reaction),
+    // while what the test guards stayed the same: every coil the adviser winds is rejected by the temperature limit.
 
 }
 
@@ -3661,12 +3660,18 @@ TEST_CASE("Test_MagneticFilterAreaWithParallels_Reserves_Crossing_Stations_Only_
 
 TEST_CASE("Test_CoilAdviser_Real_Winding_Selection_Drops_What_The_Real_Winder_Refuses", "[adviser][coil-adviser][bug][abt-1699]") {
     // ABT #1699 (b): with real winding geometry on, the coils the adviser returns are vetted by the
-    // real winder on their stored form. A web-flyback candidate the real winder refuses when it is
-    // rebuilt from its stored form ('Secondary 0 section 0' cannot hold its turns once the
-    // connection corridors are blocked) is not returned; with the setting off the selection is the
-    // first maximumNumberResults, as before.
+    // real winder on their stored form. A wound coil the real winder refuses when it is rebuilt from
+    // its stored form (a section that cannot hold its turns once the connection corridors are
+    // blocked) is not returned; with the setting off the selection is the first
+    // maximumNumberResults, as before.
+    // The refused coil is the PQ 40/40 contiguous leakage reference (20 x 1 + 2 x 3, stored layout);
+    // the real winder says "section 'winding 1 section 0' cannot hold its 12 turns". It has no
+    // inputs of its own, so it runs at the web flyback's engine settings and operating point.
+    // It replaced the web flyback interleaved candidate (Alf, 2026-11-05) once ABT #2258 counted the
+    // parallels actually on a single-turn layer: that candidate is still refused, but now because
+    // Primary section 1 runs out of the window, no longer because a section cannot hold its turns.
     auto mas = load_web_flyback_advise_all(true);
-    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "web_adviser_flows/flyback_interleaved_candidate_stored.json");
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "leakage_omfem_reference_pq40_20_2_contiguous.json");
     std::ifstream file(path);
     REQUIRE(file.good());
     auto stored = json::parse(file).at("magnetic");

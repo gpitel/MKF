@@ -4,10 +4,12 @@
 #include "physical_models/MagnetizingInductance.h"
 #include "processors/MagneticSimulator.h"
 #include "support/Utils.h"
+#include "support/RideOverCoreRefusal.h"
 #include "constructive_models/CorePiece.h"
 #include "support/Logger.h"
 #include "json.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <math.h>
 #include <cmath>
@@ -234,16 +236,117 @@ std::string read_log() {
     return contents;
 }
 
-bool material_data_extrapolation_allowed(const std::string& summary, const std::string& detail) {
+namespace {
+
+std::string format_material_data_value(MaterialDataAskedQuantity quantity, double value) {
+    switch (quantity) {
+        case MaterialDataAskedQuantity::FREQUENCY:
+            return format_quantity(value, "Hz");
+        case MaterialDataAskedQuantity::TEMPERATURE:
+            return format_significant(value) + " C";
+        case MaterialDataAskedQuantity::MAGNETIC_FLUX_DENSITY_AMPLITUDE:
+            return format_quantity(value, "T");
+    }
+    throw std::logic_error("Unknown MaterialDataAskedQuantity " + std::to_string(static_cast<int>(quantity)));
+}
+
+// "asked at 6.4 MHz, above that range" for one value; "asked from 1.2 MHz to 6.4 MHz, above that range" for several.
+std::string describe_material_data_asked(MaterialDataAskedQuantity quantity, double minimum, double maximum,
+                                         const std::vector<std::string>& wheres) {
+    const bool flux = quantity == MaterialDataAskedQuantity::MAGNETIC_FLUX_DENSITY_AMPLITUDE;
+    std::string text;
+    if (minimum == maximum) {
+        text = std::string("asked at ") + (flux ? "a flux amplitude of " : "") + format_material_data_value(quantity, minimum);
+    }
+    else {
+        text = std::string("asked ") + (flux ? "at flux amplitudes " : "") + "from " + format_material_data_value(quantity, minimum) +
+               " to " + format_material_data_value(quantity, maximum);
+    }
+    for (size_t i = 0; i < wheres.size(); ++i) {
+        text += (i == 0 ? ", " : " and ") + wheres[i];
+    }
+    return text;
+}
+
+// The notices of the open LogOnceScope on this thread, one per level and summary, logged when it closes (ABT #2410).
+struct PendingMaterialDataNotice {
+    LogLevel level;
+    std::string summary;
+    MaterialDataAskedQuantity quantity;
+    double minimum;
+    double maximum;
+    // Where each value asked lies against the data ("below that range"), with the lowest value asked there; they are
+    // logged from the lowest value up, so the detail reads in the order of "from X to Y" whatever order they were asked.
+    std::vector<std::pair<double, std::string>> wheres;
+};
+thread_local std::vector<PendingMaterialDataNotice> pendingMaterialDataNotices;
+
+void log_pending_material_data_notices() {
+    auto notices = std::move(pendingMaterialDataNotices);
+    pendingMaterialDataNotices.clear();
+    for (auto& notice : notices) {
+        std::sort(notice.wheres.begin(), notice.wheres.end());
+        std::vector<std::string> wheres;
+        for (const auto& [lowest, where] : notice.wheres) {
+            wheres.push_back(where);
+        }
+        Logger::getInstance().log(notice.level, kMaterialDataExtrapolationModule, notice.summary,
+                                  describe_material_data_asked(notice.quantity, notice.minimum, notice.maximum, wheres));
+    }
+}
+
+void report_material_data_notice(LogLevel level, const std::string& summary, const MaterialDataAsked& asked) {
+    if (!LogOnceScope::is_open()) {
+        std::vector<std::string> wheres;
+        if (!asked.where.empty()) {
+            wheres.push_back(asked.where);
+        }
+        Logger::getInstance().log(level, kMaterialDataExtrapolationModule, summary,
+                                  describe_material_data_asked(asked.quantity, asked.value, asked.value, wheres));
+        return;
+    }
+    for (auto& notice : pendingMaterialDataNotices) {
+        if (notice.level != level || notice.summary != summary) {
+            continue;
+        }
+        if (notice.quantity != asked.quantity) {
+            throw std::logic_error("Material data notice '" + summary + "' was asked for two different quantities");
+        }
+        notice.minimum = std::min(notice.minimum, asked.value);
+        notice.maximum = std::max(notice.maximum, asked.value);
+        if (!asked.where.empty()) {
+            auto known = std::find_if(notice.wheres.begin(), notice.wheres.end(),
+                                      [&](const auto& entry) { return entry.second == asked.where; });
+            if (known == notice.wheres.end()) {
+                notice.wheres.emplace_back(asked.value, asked.where);
+            }
+            else {
+                known->first = std::min(known->first, asked.value);
+            }
+        }
+        return;
+    }
+    if (pendingMaterialDataNotices.empty()) {
+        LogOnceScope::at_close(log_pending_material_data_notices);
+    }
+    std::vector<std::pair<double, std::string>> wheres;
+    if (!asked.where.empty()) {
+        wheres.emplace_back(asked.value, asked.where);
+    }
+    pendingMaterialDataNotices.push_back({level, summary, asked.quantity, asked.value, asked.value, wheres});
+}
+
+} // namespace
+
+bool material_data_extrapolation_allowed(const std::string& summary, const MaterialDataAsked& asked) {
     if (!settings.get_allow_material_data_extrapolation()) {
         return false;
     }
-    if (summary.empty() || detail.empty()) {
+    if (summary.empty()) {
         throw std::invalid_argument("material_data_extrapolation_allowed needs a summary (material and the range its data "
-                                    "covers) and a detail (the value asked); got summary '" + summary + "', detail '" +
-                                    detail + "'");
+                                    "covers)");
     }
-    Logger::getInstance().warning(summary, kMaterialDataExtrapolationModule, detail);
+    report_material_data_notice(LogLevel::WARNING, summary, asked);
     return true;
 }
 
@@ -260,14 +363,20 @@ void warn_if_material_temperature_outside_data(const std::string& materialName, 
     if (temperature >= tableMinimum && temperature <= tableMaximum) {
         return;
     }
+    // The text is built only when the logger keeps it: formatting it on every out-of-range lookup cost Henry
+    // seconds per run for lines the logger then dropped.
+    const LogLevel level = material_data_outside_table_log_level();
+    if (!Logger::getInstance().keeps(level)) {
+        return;
+    }
     const std::string range = tableMinimum == tableMaximum
                                   ? "at " + format_significant(tableMinimum) + " C only"
                                   : "from " + format_significant(tableMinimum) + " C to " + format_significant(tableMaximum) + " C";
     const std::string side = temperature < tableMinimum ? "below" : "above";
-    Logger::getInstance().log(material_data_outside_table_log_level(), kMaterialDataExtrapolationModule,
-                              "Material " + materialName + ": its " + propertyName + " is tabulated " + range +
-                                  "; outside that the table is extrapolated",
-                              "asked at " + format_significant(temperature) + " C, " + side + " its data");
+    report_material_data_notice(level,
+                                "Material " + materialName + ": its " + propertyName + " is tabulated " + range +
+                                    "; outside that the table is extrapolated",
+                                {MaterialDataAskedQuantity::TEMPERATURE, temperature, side + " its data"});
 }
 
 void warn_if_material_frequency_outside_data(const std::string& materialName, const std::string& propertyName,
@@ -275,14 +384,19 @@ void warn_if_material_frequency_outside_data(const std::string& materialName, co
     if (frequency >= tableMinimum && frequency <= tableMaximum) {
         return;
     }
+    // Built only when the logger keeps it (see warn_if_material_temperature_outside_data).
+    const LogLevel level = material_data_outside_table_log_level();
+    if (!Logger::getInstance().keeps(level)) {
+        return;
+    }
     const std::string range = tableMinimum == tableMaximum
                                   ? "at " + format_quantity(tableMinimum, "Hz") + " only"
                                   : "from " + format_quantity(tableMinimum, "Hz") + " to " + format_quantity(tableMaximum, "Hz");
     const std::string side = frequency < tableMinimum ? "below" : "above";
-    Logger::getInstance().log(material_data_outside_table_log_level(), kMaterialDataExtrapolationModule,
-                              "Material " + materialName + ": its " + propertyName + " is tabulated " + range +
-                                  "; outside that range the table is extrapolated",
-                              "asked at " + format_quantity(frequency, "Hz") + ", " + side + " that range");
+    report_material_data_notice(level,
+                                "Material " + materialName + ": its " + propertyName + " is tabulated " + range +
+                                    "; outside that range the table is extrapolated",
+                                {MaterialDataAskedQuantity::FREQUENCY, frequency, side + " that range"});
 }
 
 void logEntry(std::string entry, std::string module, uint8_t entryVerbosity) {
@@ -1878,6 +1992,20 @@ CoreShape flatten_dimensions(CoreShape shape) {
     return flattenedShape;
 }
 
+double round_post_lateral_leg_aperture(const std::map<std::string, double>& dimensions) {
+    for (const std::string key : {"C", "E"}) {
+        if (!dimensions.contains(key) || !(dimensions.at(key) > 0)) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                                        "round_post_lateral_leg_aperture: the shape states no positive dimension " + key);
+        }
+    }
+    const auto g = dimensions.find("G");
+    if (g != dimensions.end() && g->second > 0) {
+        return g->second / 2;
+    }
+    return dimensions.at("E") / 2 * cos(asin(dimensions.at("C") / dimensions.at("E")));
+}
+
 std::map<std::string, double> flatten_dimensions(std::map<std::string, Dimension> dimensions) {
     std::map<std::string, double> flattenedDimensions;
     for (auto& dimension : dimensions) {
@@ -3374,6 +3502,7 @@ std::optional<std::string> real_winding_refusal(const Magnetic& woundMagnetic, s
                 case LeadFindingKind::LANES_COLLIDE: kind = "its lane collides with another lead"; break;
                 case LeadFindingKind::PIN_RUN_COLLIDES: kind = "its run to the pin collides"; break;
                 case LeadFindingKind::LIFT_TOO_SHORT: kind = "its lift off the face has no room for its bend"; break;
+                case LeadFindingKind::NO_CONSISTENT_RAMP: kind = "no ramp is consistent with its lane and no standoff moves it"; break;
             }
             return "real winding: the terminal lead of winding '" + route.winding + "' parallel " + std::to_string(route.parallel) +
                    " does not fit (" + kind + "): " + finding.witness;
@@ -3385,7 +3514,30 @@ std::optional<std::string> real_winding_refusal(const Magnetic& woundMagnetic, s
             << overlap.second << " (winding '" << overlap.secondWinding << "') by " << overlap.overlap * 1e3 << " mm";
         return out.str();
     }
-    return std::nullopt;
+    // ABT #2274 (Alf, 2026-11-05: "MKF counts the bump"): the turns lifted over the returns must fit the
+    // core too. An adviser accepts only what it can show fits.
+    return ride_over_core_refusal(coil);
+}
+
+std::optional<std::string> ride_over_core_refusal(Coil& coil) {
+    std::vector<RideOverCoreContact> contacts;
+    try {
+        contacts = coil.judge_ride_over_core_contacts();
+    }
+    catch (const CoilException& e) {
+        if (e.code() != ErrorCode::COIL_WINDING_ERROR) {
+            throw;
+        }
+        return std::string(e.what());
+    }
+    if (contacts.empty()) {
+        return std::nullopt;
+    }
+    // The contact of the turn lifted furthest: the one the bump drives deepest into the leg.
+    const auto worst = std::max_element(contacts.begin(), contacts.end(),
+                                        [](const RideOverCoreContact& a, const RideOverCoreContact& b) { return a.ride < b.ride; });
+    return "real winding: the turns lifted over the returns do not fit the core: " + worst->witness + " (" +
+           std::to_string(contacts.size()) + " turn" + (contacts.size() == 1 ? "" : "s") + " meet the core this way)";
 }
 
 Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optional<Inputs> inputs) {
@@ -3399,50 +3551,42 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optio
 
     // Core
     auto shape = magnetic.get_mutable_core().resolve_shape();
+    // ABT #2372: the type is checked against the family, never rewritten. This used to re-type the
+    // core from its family in place, behind the back of a processed description already built from
+    // the stated type, and it was the third copy of the family -> type rule.
+    check_core_type_follows_shape_family(magnetic.get_core().get_functional_description().get_type(), shape,
+                                         magnetic.get_core().get_name());
 
-    if (magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::T) {
-        magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::TOROIDAL);
+    const auto coreType = core_type_for_shape_family(shape.get_family());
+    if (coreType == CoreType::TOROIDAL) {
         shape.set_magnetic_circuit(MagneticCircuit::CLOSED);
         magnetic.get_mutable_core().get_mutable_functional_description().get_mutable_gapping().clear();
     }
-    else if (magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::DRUM ||
-             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::ROD) {
+    else if (coreType == CoreType::OPEN_SHAPE) {
         // Open-circuit single piece (drum ABT #331, rod ABT #933): honest type, and gapping is
         // meaningless — the return path is already air. Drop it like the toroid branch does:
         // a core carried over from a gapped two-piece set (the web builder swaps the shape and
         // keeps the rest) otherwise reaches the inductance model with that stale gap and is
         // refused as "an open-circuit core cannot be gapped" (ABT #1071).
-        magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::OPEN_SHAPE);
         shape.set_magnetic_circuit(MagneticCircuit::OPEN);
         magnetic.get_mutable_core().get_mutable_functional_description().get_mutable_gapping().clear();
     }
-    else if (magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::MOLDED) {
+    else if (coreType == CoreType::CLOSED_SHAPE) {
         // Molded composite body (ABT #357): single pressed solid, closed in-material —
         // the distributed gap lives in the material law, so discrete gapping is meaningless.
-        magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::CLOSED_SHAPE);
         shape.set_magnetic_circuit(MagneticCircuit::CLOSED);
     }
-    else if (magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::UI ||
-             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::PQI ||
-             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::UT ||
-             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::EI ||
-             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::DRUM_RING ||
-             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::DRUM_SEMISHIELDED ||
-             magnetic.get_mutable_core().get_shape_family() == CoreShapeFamily::DRUM_PLATE) {
+    else if (coreType == CoreType::PIECE_AND_PLATE) {
         // Piece-and-plate: the record already describes the whole assembly, so it is "closed" in
         // the MAS sense of having to be used by itself (ABT #274/#275; drumRing per ABT #366 —
         // its two structural annular gaps are synthesized by Core::process_gap, not listed here).
         //
-        // The family list is the one the Core constructor and create_quick_core classify as
-        // piece-and-plate. UT, EI and DRUM_PLATE were missing here, so a core that arrived as an
-        // explicit pieceAndPlate fell to the else branch and was re-typed TWO_PIECE_SET: the
-        // E/U piece was mirrored, which doubles le, the column height and the window height.
-        // On an ET 20 choke that halves L = N^2 mu0 mu Ae / le exactly (le 50.6 -> 101.3 mm).
-        magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::PIECE_AND_PLATE);
+        // This branch used to carry its own family list, which lacked UT, EI and DRUM_PLATE: an
+        // explicit pieceAndPlate core of those families was re-typed TWO_PIECE_SET and mirrored
+        // (le 50.6 -> 101.3 mm on an ET 20). It now follows core_type_for_shape_family.
         shape.set_magnetic_circuit(MagneticCircuit::CLOSED);
     }
     else {
-        magnetic.get_mutable_core().get_mutable_functional_description().set_type(CoreType::TWO_PIECE_SET);
         shape.set_magnetic_circuit(MagneticCircuit::OPEN);
         for (size_t i = 0; i < magnetic.get_core().get_functional_description().get_gapping().size(); i++) {
             double gapLength = magnetic.get_core().get_functional_description().get_gapping()[i].get_length();
@@ -3899,6 +4043,7 @@ Magnetic magnetic_autocomplete(Magnetic magnetic, json configuration, std::optio
     // a pinName the design gave, and throws on a plan that breaks the rows or the creepage.
     // `bobbin` is the one set on the coil above; winding does not move its pins.
     // ABT #1237: only when Settings coil_connect_leads_to_pins asks for it (off by default).
+    // ABT #2268: this writes the assignment into MAS only; the leads' 3D runs to the pins are parked.
     if (settings.get_coil_connect_leads_to_pins() &&
         magnetic.get_mutable_coil().get_turns_description() && bobbin.get_processed_description() &&
         bobbin.get_processed_description()->get_pins() && !bobbin.get_processed_description()->get_pins()->empty() &&

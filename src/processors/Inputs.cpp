@@ -24,6 +24,7 @@
 #include <limits>
 #include <magic_enum.hpp>
 #include <numbers>
+#include <stdexcept>
 #include <streambuf>
 #include <string>
 #include <valarray>
@@ -203,6 +204,7 @@ std::string mean_voltage_warning_key(const std::string& context, double frequenc
 }
 
 thread_local std::unique_ptr<std::unordered_set<std::string>> activeLogOnceKeys;
+thread_local std::vector<std::function<void()>> logOnceCloseActions;
 
 } // namespace
 
@@ -216,7 +218,23 @@ LogOnceScope::LogOnceScope() {
 LogOnceScope::~LogOnceScope() {
     if (_owner) {
         activeLogOnceKeys.reset();
+        auto actions = std::move(logOnceCloseActions);
+        logOnceCloseActions.clear();
+        for (auto& action : actions) {
+            action();
+        }
     }
+}
+
+bool LogOnceScope::is_open() {
+    return static_cast<bool>(activeLogOnceKeys);
+}
+
+void LogOnceScope::at_close(std::function<void()> action) {
+    if (!activeLogOnceKeys) {
+        throw std::logic_error("LogOnceScope::at_close called with no scope open");
+    }
+    logOnceCloseActions.push_back(std::move(action));
 }
 
 bool LogOnceScope::first_time(const std::string& key) {
@@ -2596,7 +2614,7 @@ double Inputs::calculate_steady_state_mean_voltage(const OperatingPointExcitatio
         })) {
         for (const auto& warning : hit->warnings) {
             if (LogOnceScope::first_time(mean_voltage_warning_key(context, frequency, givenVoltage, voltageSampledWaveform, warning))) {
-                Logger::getInstance().warning(warning, "Inputs");
+                Logger::getInstance().info(warning, "Inputs");  // ABT #2302: MKF removed the mean; a note, not a warning
             }
         }
         return hit->meanVoltage;
@@ -2648,7 +2666,7 @@ double Inputs::calculate_steady_state_mean_voltage(const OperatingPointExcitatio
     }();
     for (const auto& warning : warnings) {
         if (LogOnceScope::first_time(mean_voltage_warning_key(context, frequency, givenVoltage, voltageSampledWaveform, warning))) {
-            Logger::getInstance().warning(warning, "Inputs");
+            Logger::getInstance().info(warning, "Inputs");  // ABT #2302: MKF removed the mean; a note, not a warning
         }
     }
     memo.insert(SteadyStateMeanVoltageEntry{givenVoltage ? std::optional<ExactWaveformKey>(ExactWaveformKey(givenVoltage.value())) : std::nullopt,
@@ -4306,6 +4324,40 @@ std::optional<std::vector<size_t>> Inputs::find_switching_cycle_valleys(const st
         }
     }
     return valleys;
+}
+
+// The envelope at each switching cycle: the record's time average over the cycles centred on it,
+// 2h + 1 of them with h = (number of cycles) / 128 (fewer at the record's edges, keeping the window
+// centred). The record's valleys are samples, not the flux's true valleys, so one cycle's span differs
+// from its period by up to a sample and its own average keeps a residue of its ripple (a few percent
+// of the ripple at ~15 samples per cycle). That residue changes from cycle to cycle, and the dB/dt
+// models would price it as a switching-rate jitter on the envelope (twice the envelope's iGSE loss on
+// a 16384-sample record). Averaging over 2h + 1 cycles divides it by about 2h + 1. The window, 1/64 of
+// the record, rounds the envelope's own extremes: a rectified line's zero-crossing cusp rises by
+// about 2.5 % of its peak (pi / 128), a smooth extreme moves by less than 0.1 %.
+std::vector<double> Inputs::calculate_switching_cycles_envelope(const std::vector<double>& time, const std::vector<double>& data,
+                                                                const std::vector<size_t>& valleys) {
+    if (data.size() != time.size() || valleys.size() < 2 || valleys.back() >= data.size()) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "Switching cycles envelope: the record has " + std::to_string(data.size()) + " samples, " + std::to_string(time.size()) +
+            " time points and " + std::to_string(valleys.size()) + " valleys");
+    }
+    // Running integral of the piecewise-linear record.
+    std::vector<double> integral(data.size(), 0.0);
+    for (size_t i = 1; i < data.size(); ++i) {
+        integral[i] = integral[i - 1] + (data[i - 1] + data[i]) / 2 * (time[i] - time[i - 1]);
+    }
+    size_t numberCycles = valleys.size() - 1;
+    size_t halfWindow = static_cast<size_t>(std::floor(static_cast<double>(numberCycles) / 128.0));
+    std::vector<double> averages;
+    for (size_t cycleIndex = 0; cycleIndex < numberCycles; ++cycleIndex) {
+        size_t cyclesAfter = numberCycles - 1 - cycleIndex;
+        size_t h = std::min({halfWindow, cycleIndex, cyclesAfter});
+        size_t start = valleys[cycleIndex - h];
+        size_t end = valleys[cycleIndex + h + 1];
+        averages.push_back((integral[end] - integral[start]) / (time[end] - time[start]));
+    }
+    return averages;
 }
 
 double Inputs::get_switching_frequency(const OperatingPointExcitation& excitation) {

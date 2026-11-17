@@ -49,6 +49,12 @@ struct CoreLeadExitGeometry {
     std::optional<LeadFrame> leadFrame;   // set for LEAD_FRAME only
 };
 
+// Fill factor of a tape-wound core with the source it was taken from (see Core::get_tape_wound_fill_factor).
+struct TapeWoundFillFactor {
+    double value;
+    std::string source;
+};
+
 class Core : public MAS::MagneticCore {
   private:
     bool _includeMaterialData = false;
@@ -155,6 +161,14 @@ class Core : public MAS::MagneticCore {
     // a list longer than the body has regions. Families other than molded get one entry per
     // listed piece, exactly as resolve_materials().
     std::vector<std::optional<CoreMaterial>> resolve_region_materials();
+
+    // ABT #2410/#2413: the magnetic-epoxy shell of a semi-shielded drum (drumSemishielded). Its
+    // grade is the SECOND entry of functionalDescription.material ([drum ferrite, shell grade], the
+    // list two-grade drumRing uses), and that entry must be a core material of type magneticEpoxy.
+    // The deprecated form, a coating {type: magneticEpoxy, material: <core material name>}, is still
+    // read. When both are present they must name the same material; when neither is, or the core is
+    // not a drumSemishielded, this throws. Read-only: nothing is stored into the core.
+    CoreMaterial resolve_semishielded_shell_material() const;
     CoreShape resolve_shape();
     CoreShape resolve_shape() const;
     static CoreShape resolve_shape(CoreShapeDataOrNameUnion coreShape);
@@ -230,6 +244,10 @@ class Core : public MAS::MagneticCore {
     // the core is not tape-wound (ferrite, powder, laminated electrical steel stacks). Throws when a tape-wound core
     // cannot be placed in any of those sources.
     static std::optional<double> get_tape_wound_fill_factor(const CoreMaterial& coreMaterial, CoreShapeFamily shapeFamily);
+    // The same fill factor together with where it comes from (the maker's datasheet, the VAC table and ribbon
+    // thickness, or the estimate and the values it averages), so a UI can show the user the k_f behind the Ae.
+    static std::optional<TapeWoundFillFactor> get_tape_wound_fill_factor_with_source(const CoreMaterial& coreMaterial,
+                                                                                      CoreShapeFamily shapeFamily);
     double get_resistivity(double temperature);
     static double get_resistivity(CoreMaterial coreMaterial, double temperature);
     double get_curie_temperature();
@@ -305,6 +323,10 @@ class Core : public MAS::MagneticCore {
 // base-class one, so every json -> Core path migrates first. It also rejects a family string that
 // survives migration without matching the enum, rather than letting it become value 0.
 void from_json(const json& j, Core& x);
+
+// ABT #2372: throws InvalidInputException when `type` is not the type `shape`'s family is built as
+// (core_type_for_shape_family). Never corrects it: a contradictory type is a defect in the input.
+void check_core_type_follows_shape_family(CoreType type, const CoreShape& shape, const std::optional<std::string>& coreName);
 
 // ABT #1218: the generated MAS serialiser cannot write a schema-valid core. quicktype merges the
 // geometricalDescription oneOf(core/piece.json, core/spacer.json) into ONE struct,

@@ -1992,7 +1992,9 @@ namespace {
             CHECK(hasParallels == (filename == "03_buck_inductor_pq3230_n95.json"));
             if (hasParallels) {
                 CHECK(std::fabs(lossesFieldAtSolved - lossesFieldAtAmbient) > 1e-7 * lossesFieldAtAmbient);
-                CHECK(std::fabs(lossesFieldAtSolved - lossesFieldAtAmbient) < 1e-4 * lossesFieldAtAmbient);
+                // 1e-2 (Alf, 2026-11-06): the flat wire's width cells react through the slab, which follows the skin depth
+                // at the iterate, so the ambient field is 0.23 % off the solved one; it was under 1e-4 before the cells.
+                CHECK(std::fabs(lossesFieldAtSolved - lossesFieldAtAmbient) < 1e-2 * lossesFieldAtAmbient);
             }
         }
     }
@@ -3548,9 +3550,62 @@ TEST_CASE("Analyze_results states a winding above its coating's thermal class in
     }
     INFO("findings:" << all);
     REQUIRE(!windingFindings.empty());
+    // ABT #2302: the windings over their limit share one finding; this design's Secondary is over its class too.
+    CHECK_THAT(windingFindings[0].message, Catch::Matchers::ContainsSubstring(
+        ": the hottest point, 2474 C, is above the 155 C thermal class of the coating material (Polyurethane 155) of winding 'Primary'"));
     CHECK_THAT(windingFindings[0].message, Catch::Matchers::EndsWith(
-        ": the hottest point, 2474 C, is above the 155 C thermal class of the coating material (Polyurethane 155) of winding 'Primary'. "
+        ". Lower the losses, improve the cooling, or use a wire rated for a higher temperature."));
+}
+
+// ABT #2302 (Alf, 2026-11-07): the hottest point is one number for the whole coil, so a coil whose windings all
+// exceed their coatings got the same temperature repeated in one finding per winding (three for a user's forward
+// transformer, at each operating point). It is one finding per operating point, naming every winding over its limit.
+TEST_CASE("Analyze_results names every winding above its coating's limit in one finding", "[processor][magnetic-simulator][abt-2302]") {
+    settings.reset();
+    auto path = std::filesystem::path{std::source_location::current().file_name()}
+                    .parent_path().append("..").append("MAS").append("examples").append("02_flyback_efd25_3c95.json");
+    REQUIRE(std::filesystem::exists(path));
+    auto mas = OpenMagneticsTesting::mas_loader(path.string());
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+    auto& windings = magnetic.get_mutable_coil().get_mutable_functional_description();
+    REQUIRE(windings.size() >= 2);
+    for (auto& winding : windings) {
+        json wireJson;
+        to_json(wireJson, OpenMagnetics::Coil::resolve_wire(winding));
+        REQUIRE(wireJson.contains("coating"));
+        wireJson["coating"]["material"] = "Polyurethane 155";
+        wireJson["coating"].erase("temperatureRating");
+        winding.set_wire(OpenMagnetics::Wire(wireJson));
+    }
+
+    MagneticSimulator magneticSimulator;
+    OpenMagnetics::Mas simulated;
+    REQUIRE_NOTHROW(simulated = magneticSimulator.simulate(mas.get_inputs(), magnetic));
+    REQUIRE(simulated.get_outputs().size() == 1);
+    auto output = simulated.get_outputs()[0];
+    REQUIRE(output.get_temperature());
+    auto temperature = output.get_temperature().value();
+    temperature.set_maximum_temperature(2474.39);
+    output.set_temperature(temperature);
+
+    auto findings = ResultsAnalyzer::analyze_temperature(simulated.get_magnetic(), simulated.get_inputs().get_operating_points()[0], output, 0);
+    std::vector<ResultFinding> windingFindings;
+    std::string all;
+    for (const auto& finding : findings) {
+        all += "\n" + to_string(finding.code) + ": " + finding.message;
+        if (finding.code == ResultFindingCode::WINDING_TEMPERATURE_ABOVE_LIMIT) {
+            windingFindings.push_back(finding);
+        }
+    }
+    INFO("findings:" << all);
+    REQUIRE(windingFindings.size() == 1);
+    for (const auto& winding : simulated.get_magnetic().get_coil().get_functional_description()) {
+        CHECK_THAT(windingFindings[0].message, Catch::Matchers::ContainsSubstring("of winding '" + winding.get_name() + "'"));
+    }
+    CHECK_THAT(windingFindings[0].message, Catch::Matchers::ContainsSubstring("; and the 155 C thermal class"));
+    CHECK_THAT(windingFindings[0].message, Catch::Matchers::EndsWith(
         "Lower the losses, improve the cooling, or use a wire rated for a higher temperature."));
+    settings.reset();
 }
 
 namespace {
@@ -3746,7 +3801,7 @@ TEST_CASE("A powder driven past the field its saturation is tabulated at is not 
 namespace {
 // A two-piece set whose data states its gapping as catalogue exports write an ungapped part: a subtractive gap of
 // length 0 on the centre column and the residual gaps of the outer columns (five Wurth catalogue parts carry it).
-OpenMagnetics::Magnetic zero_length_subtractive_gap_magnetic(const std::string& coreType) {
+OpenMagnetics::Magnetic zero_length_subtractive_gap_magnetic(const std::string& coreType, const std::string& shapeName = "EFD 20/10/7") {
     json gapping = json::array();
     gapping.push_back({{"type", "subtractive"}, {"length", 0.0}});
     gapping.push_back({{"type", "residual"}, {"length", 5e-6}});
@@ -3755,7 +3810,7 @@ OpenMagnetics::Magnetic zero_length_subtractive_gap_magnetic(const std::string& 
     coreJson["functionalDescription"]["name"] = "Zero length gap";
     coreJson["functionalDescription"]["type"] = coreType;
     coreJson["functionalDescription"]["material"] = "3C95";
-    coreJson["functionalDescription"]["shape"] = "EFD 20/10/7";
+    coreJson["functionalDescription"]["shape"] = shapeName;
     coreJson["functionalDescription"]["gapping"] = gapping;
     coreJson["functionalDescription"]["numberStacks"] = 1;
     OpenMagnetics::Core core(coreJson);
@@ -3820,6 +3875,96 @@ TEST_CASE("Test_Simulate_Two_Piece_Set_With_Zero_Length_Subtractive_Gap_Is_Ungap
 TEST_CASE("Test_Zero_Length_Subtractive_Gap_Outside_A_Two_Piece_Set_Is_Refused",
           "[simulator][gapping][zero-length-gap]") {
     settings.reset();
-    REQUIRE_THROWS_WITH(zero_length_subtractive_gap_magnetic("pieceAndPlate"), Catch::Matchers::ContainsSubstring("subtractive gap of length zero"));
+    REQUIRE_THROWS_WITH(zero_length_subtractive_gap_magnetic("pieceAndPlate", "EI 12.7/3.4/1.25/12.7/2.77/7.11/3.56"), Catch::Matchers::ContainsSubstring("subtractive gap of length zero"));
     settings.reset();
+}
+
+// Settings::simulatorSkipLeakageInductance (Alf, 2026-11-05): off by default, and off simulate computes the leakage
+// inductance as it always did; on, the output has no leakage inductance at all (absent, not zero) and every other
+// value in it is bit for bit the one simulate gives with the setting off.
+TEST_CASE("Test_Simulator_Skip_Leakage_Inductance_Leaves_Every_Other_Output_As_It_Is",
+          "[processor][magnetic-simulator][simulator-skip-leakage]") {
+    settings.reset();
+    REQUIRE_FALSE(settings.get_simulator_skip_leakage_inductance());
+
+    auto mas = OpenMagneticsTesting::mas_loader((get_examples_dir() / "02_flyback_efd25_3c95.json").string());
+    auto magnetic = OpenMagnetics::magnetic_autocomplete(mas.get_magnetic());
+    auto inputs = OpenMagnetics::inputs_autocomplete(mas.get_inputs(), magnetic);
+    REQUIRE(magnetic.get_coil().get_functional_description().size() == 2);
+
+    auto simulate = [&]() {
+        MagneticSimulator simulator;
+        return simulator.simulate(inputs, magnetic);
+    };
+
+    const std::string fingerprintOff = settings.fingerprint();
+    auto simulatedOff = simulate();
+    REQUIRE_FALSE(simulatedOff.get_outputs().empty());
+    for (auto& output : simulatedOff.get_outputs()) {
+        REQUIRE(output.get_inductance());
+        REQUIRE(output.get_inductance()->get_leakage_inductance());
+        CHECK(output.get_inductance()->get_leakage_inductance()->get_leakage_inductance_per_winding().size() == 2);
+    }
+    // Off, the leakage is MKF's leakage function's own answer at the point's frequency.
+    {
+        double frequency = inputs.get_operating_points()[0].get_excitations_per_winding()[0].get_frequency();
+        json expected;
+        to_json(expected, MagneticSimulator().calculate_leakage_inductance(magnetic, frequency));
+        json simulatedLeakage;
+        to_json(simulatedLeakage, simulatedOff.get_outputs()[0].get_inductance()->get_leakage_inductance().value());
+        CHECK(simulatedLeakage == expected);
+    }
+
+    settings.set_simulator_skip_leakage_inductance(true);
+    CHECK(settings.get_simulator_skip_leakage_inductance());
+    CHECK(settings.fingerprint() != fingerprintOff);
+    auto simulatedOn = simulate();
+    REQUIRE(simulatedOn.get_outputs().size() == simulatedOff.get_outputs().size());
+    for (auto& output : simulatedOn.get_outputs()) {
+        REQUIRE(output.get_inductance());
+        CHECK_FALSE(output.get_inductance()->get_leakage_inductance());
+    }
+
+    // Every other output, and the operating points simulate hands back, are identical (json equality is exact on
+    // doubles).
+    json outputsOff, outputsOn, inputsOff, inputsOn;
+    to_json(outputsOff, simulatedOff.get_outputs());
+    to_json(outputsOn, simulatedOn.get_outputs());
+    to_json(inputsOff, simulatedOff.get_inputs());
+    to_json(inputsOn, simulatedOn.get_inputs());
+    // An absent optional is written as null.
+    for (auto& output : outputsOff) {
+        REQUIRE(output.at("inductance").contains("leakageInductance"));
+        REQUIRE_FALSE(output.at("inductance").at("leakageInductance").is_null());
+        output.at("inductance").erase("leakageInductance");
+    }
+    for (auto& output : outputsOn) {
+        REQUIRE(output.at("inductance").contains("leakageInductance"));
+        CHECK(output.at("inductance").at("leakageInductance").is_null());
+        output.at("inductance").erase("leakageInductance");
+    }
+    CHECK(outputsOn == outputsOff);
+    CHECK(inputsOn == inputsOff);
+
+    settings.reset();
+    CHECK_FALSE(settings.get_simulator_skip_leakage_inductance());
+}
+
+// Settings::fingerprint says every setting's value (ABT #838); the loss-solve memo and the core adviser's candidate
+// memo key on it. The mirroring lattice of the MMF-boundary model and the winding-loss model set used to be left out.
+TEST_CASE("Test_Settings_Fingerprint_Covers_Neutral_Cells_And_Winding_Losses_Model_Set",
+          "[processor][magnetic-simulator][settings-fingerprint]") {
+    settings.reset();
+    const std::string defaults = settings.fingerprint();
+
+    settings.set_magnetic_field_mirroring_neutral_cells(!settings.get_magnetic_field_mirroring_neutral_cells());
+    CHECK(settings.fingerprint() != defaults);
+    settings.reset();
+    REQUIRE(settings.fingerprint() == defaults);
+
+    REQUIRE(settings.get_winding_losses_model_set() == WindingLossesModelSets::CUSTOM);
+    settings.set_winding_losses_model_set(WindingLossesModelSets::MARTINEZ);
+    CHECK(settings.fingerprint() != defaults);
+    settings.reset();
+    CHECK(settings.fingerprint() == defaults);
 }

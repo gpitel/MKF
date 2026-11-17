@@ -229,9 +229,10 @@ double MagnetizingInductance::calculate_rod_magnetizing_inductance(Core core, do
 
 // ABT #362: semi-shielded drum — a ferrite drum closed by a MAGNETIC-EPOXY shell. The circuit
 // crosses TWO materials, so neither the closed-circuit path (one mu over le/Ae) nor a gap
-// model fits: reluctance is applied PER SECTION using the piece's c1 split. The shell material
-// rides the core coating {type: magneticEpoxy, material: <core material NAME>}; per the
-// no-fallbacks rule every missing link throws — the model never assumes air or guesses a mu.
+// model fits: reluctance is applied PER SECTION using the piece's c1 split. The shell material is
+// the second entry of functionalDescription.material, a magneticEpoxy grade (ABT #2410/#2413; the
+// older magneticEpoxy coating form is still read); per the no-fallbacks rule every missing link
+// throws — the model never assumes air or guesses a mu.
 double MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance(Core core, double numberTurns, double temperature) {
     auto corePiece = CorePiece::factory(core.resolve_shape());
     auto mixedConstants = corePiece->get_mixed_material_constants();
@@ -243,26 +244,9 @@ double MagnetizingInductance::calculate_semishielded_drum_magnetizing_inductance
     double shellMaterialC1 = (*mixedConstants)[2];
     double drumPermeability = InitialPermeability::get_initial_permeability(core.resolve_material(), temperature);
 
-    auto coatingUnion = core.get_functional_description().get_coating();
-    if (!coatingUnion) {
-        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
-            "Semi-shielded drum requires a magneticEpoxy coating carrying the shell material — none present");
-    }
-    if (!std::holds_alternative<CoreCoating>(coatingUnion.value())) {
-        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
-            "Semi-shielded drum coating must be an explicit CoreCoating object (type magneticEpoxy + "
-            "shell material name), not a name-only coating");
-    }
-    auto coating = std::get<CoreCoating>(coatingUnion.value());
-    if (!coating.get_type() || coating.get_type().value() != CoatingType::MAGNETIC_EPOXY) {
-        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
-            "Semi-shielded drum requires coating type 'magneticEpoxy' (the glue shell IS the return path)");
-    }
-    if (!coating.get_material() || !std::holds_alternative<std::string>(coating.get_material().value())) {
-        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
-            "Semi-shielded drum magneticEpoxy coating must reference the shell CORE material by name");
-    }
-    auto shellMaterial = find_core_material_by_name(std::get<std::string>(coating.get_material().value()));
+    // The shell grade is material[1] (or the deprecated magneticEpoxy coating); see
+    // Core::resolve_semishielded_shell_material, which throws when it is missing or contradictory.
+    auto shellMaterial = core.resolve_semishielded_shell_material();
     double shellPermeability = InitialPermeability::get_initial_permeability(shellMaterial, temperature);
 
     double vacuumPermeability = Constants().vacuumPermeability;
@@ -653,6 +637,64 @@ SignalDescriptor MagnetizingInductance::calculate_magnetic_flux_density_from_ind
     return OpenMagnetics::MagneticField::calculate_magnetic_flux_density(magneticFlux, fluxCarryingArea);
 }
 
+// ABT #2394. The DC is the time average of B, which is its zero-frequency harmonic. The processed offset is the
+// waveform's midpoint, (max + min) / 2, which differs from the average for any asymmetric ripple: a zero-mean
+// duty-0.25 triangle has a midpoint far from zero and no DC at all, and read as a bias it drove the solve into
+// saturation. The harmonics come from the exact samples or knots (ABT #1460); the stored waveform may be compressed
+// to its corners, whose trapezoid average is not exact.
+// A line-frequency swing under the switching cycles biases the core like DC, at its peak: the inductance the circuit
+// can count on is the one at the largest line bias. That peak is read on the record's envelope, its cycle-averaged
+// flux density. The model used to take the largest harmonic below the switching frequency (or the DC, when larger):
+// the envelope's peak for a sine, but for a rectified sine (a CCM PFC choke, 0 -> peak at twice the line frequency)
+// the DC is 2/pi of the peak and every harmonic is smaller, so the choke was judged at 64 % of its peak line current
+// (a High Flux 60 toroid at 22.5 A peak: 92.4 uH reported, 77.2 uH at the peak). The gap solve took the processed
+// offset: ~0 for a sine line swing and half the peak for a rectified one, so a gap it had just solved missed its
+// target under the model.
+double MagnetizingInductance::calculate_bias_flux_density(const SignalDescriptor& magneticFluxDensity, double switchingFrequency) {
+    if (!mas_access::harmonics_ref(magneticFluxDensity)) {
+        throw std::runtime_error("magneticFluxDensity has no harmonics — upstream magnetizing_current must provide a populated harmonics block (preset waveform missing harmonics?)");
+    }
+    const auto& harmonics = mas_access::harmonics_ref(magneticFluxDensity).value();
+    if (harmonics.get_amplitudes().empty() || harmonics.get_frequencies().size() != harmonics.get_amplitudes().size()) {
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+            "DC-bias flux density: the flux density has " + std::to_string(harmonics.get_amplitudes().size()) + " harmonic amplitudes and " +
+            std::to_string(harmonics.get_frequencies().size()) + " harmonic frequencies");
+    }
+    const double timeAverageMagnitude = harmonics.get_amplitudes()[0];
+    // Switching cycles ride on a slower swing only when the signal's fundamental lies below the switching frequency.
+    if (harmonics.get_frequencies().size() < 2 || !(harmonics.get_frequencies()[1] < switchingFrequency)) {
+        return timeAverageMagnitude;
+    }
+    if (!mas_access::waveform_ref(magneticFluxDensity) || !mas_access::time_ref(mas_access::waveform_ref(magneticFluxDensity).value())) {
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
+            "DC-bias flux density: the flux density of a line-cycle record (switching at " + std::to_string(switchingFrequency) +
+            " Hz on a " + std::to_string(harmonics.get_frequencies()[1]) + " Hz swing) needs a waveform with a time axis");
+    }
+    const auto& waveform = mas_access::waveform_ref(magneticFluxDensity).value();
+    const auto& time = mas_access::time_ref(waveform).value();
+    const auto& data = waveform.get_data();
+    auto valleys = Inputs::find_switching_cycle_valleys(time, data);
+    if (!valleys) {
+        // The excitation switches above this signal's fundamental, but the flux density itself carries no switching
+        // cycles to average (a DMC's magnetizing current is its line swing alone): the swing is the envelope. Its
+        // largest component below the switching frequency, or the time average when that is larger, as before
+        // ABT #2394.
+        double lowFrequencyBias = timeAverageMagnitude;
+        for (size_t i = 1; i + 1 < harmonics.get_frequencies().size(); ++i) {
+            if (harmonics.get_frequencies()[i] >= switchingFrequency) {
+                break;
+            }
+            lowFrequencyBias = std::max(lowFrequencyBias, harmonics.get_amplitudes()[i]);
+        }
+        return lowFrequencyBias;
+    }
+    double envelopePeak = std::numeric_limits<double>::lowest();
+    for (auto cycleAverage : Inputs::calculate_switching_cycles_envelope(time, data, valleys.value())) {
+        envelopePeak = std::max(envelopePeak, fabs(cycleAverage));
+    }
+    return envelopePeak;
+}
+
 std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::calculate_inductance_and_magnetic_flux_density(Core core, Coil coil, OperatingPoint* operatingPoint) {
     _lastDcBiasPoint.reset();
     // Every path below reads the effective area / columns from the processed
@@ -993,32 +1035,18 @@ std::pair<MagnetizingInductanceOutput, SignalDescriptor> MagnetizingInductance::
                 // #1093's inversion), or on the load line when the MMF is. Never as B / (mu0 * mu_rev):
                 // mu_rev is the small-signal slope at the bias, not B/H, and dividing by it ran the
                 // fixed point into a spurious saturated root (ABT #1223).
-                // The DC is the time average of B, which is its zero-frequency harmonic. The processed offset is the
-                // waveform's midpoint, (max + min) / 2, which differs from the average for any asymmetric ripple: a
-                // zero-mean duty-0.25 triangle has a midpoint far from zero and no DC at all, and read as a bias it
-                // drove the solve into saturation. The harmonics come from the exact samples or knots (ABT #1460);
-                // the stored waveform may be compressed to its corners, whose trapezoid average is not exact, so it
-                // only gives the sign.
-                if (!mas_access::harmonics_ref(magneticFluxDensity)) {
-                    throw std::runtime_error("magneticFluxDensity has no harmonics — upstream magnetizing_current must provide a populated harmonics block (preset waveform missing harmonics?)");
-                }
+                // The DC is the time average of B, its zero-frequency harmonic (not the processed offset, the waveform's
+                // midpoint); under a line-cycle record the bias is the peak of the record's envelope instead. One
+                // definition, shared with the gap solve: calculate_bias_flux_density (ABT #2394). The stored waveform
+                // may be compressed to its corners, whose trapezoid average is not exact, so it only gives the sign.
                 const auto& fluxDensityWaveform = mas_access::waveform_ref(magneticFluxDensity).value();
                 if (!mas_access::time_ref(fluxDensityWaveform) || fluxDensityWaveform.get_data().size() < 2) {
                     throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT,
                         "Magnetizing inductance under DC bias: the flux density waveform needs a time axis and two points");
                 }
+                double bFieldDcBias = calculate_bias_flux_density(magneticFluxDensity, switchingFrequency);
                 double fluxDensityDcMagnitude = mas_access::harmonics_ref(magneticFluxDensity).value().get_amplitudes()[0];
                 double fluxDensityAverage = std::copysign(fluxDensityDcMagnitude, Inputs::calculate_waveform_average(fluxDensityWaveform));
-                double bFieldDcBias = fluxDensityDcMagnitude;
-                const auto& fluxDensityHarmonics = mas_access::harmonics_ref(magneticFluxDensity).value();
-                if (fluxDensityHarmonics.get_frequencies()[1] < switchingFrequency) {
-                    for (size_t i = 0; i < fluxDensityHarmonics.get_frequencies().size() - 1; ++i) {
-                        if (fluxDensityHarmonics.get_frequencies()[i] >= switchingFrequency) {
-                            break;
-                        }
-                        bFieldDcBias = std::max(bFieldDcBias, fluxDensityHarmonics.get_amplitudes()[i]);
-                    }
-                }
                 double hFieldDcBias;
                 if (biasFluxImposed) {
                     hFieldDcBias = InitialPermeability::get_magnetic_field_dc_bias_for_flux_density(core.resolve_material_unstored(resolvedMaterialStorage), bFieldDcBias, temperature, frequency, false);
@@ -2156,7 +2184,9 @@ std::vector<CoreGap> MagnetizingInductance::calculate_gapping_from_number_turns_
     if (excitationHasMagnetizingCurrent) {
         auto magneticFlux = OpenMagnetics::MagneticField::calculate_magnetic_flux(mas_access::magnetizing_current_ref(operatingPoint.get_excitations_per_winding()[0]).value(), neededTotalReluctance, numberTurnsPrimary, operatingPoint.get_excitations_per_winding()[0].get_frequency());
         auto magneticFluxDensity = OpenMagnetics::MagneticField::calculate_magnetic_flux_density(magneticFlux, effectiveArea);
-        double biasFluxDensity = fabs(magneticFluxDensity.get_processed().value().get_offset());
+        // The bias point the inductance model evaluates the gapped core at (ABT #2394): the time average of B, or
+        // the envelope's peak of a line-cycle record. Not the processed offset, the waveform's midpoint.
+        double biasFluxDensity = calculate_bias_flux_density(magneticFluxDensity, Inputs::get_switching_frequency(operatingPoint.get_excitations_per_winding()[0]));
         auto material = core.resolve_material();
         std::optional<DcBiasPoint> dcBiasPoint;
         if (biasFluxDensity > 0) {

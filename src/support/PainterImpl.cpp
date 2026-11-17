@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <iostream>
 #include "support/Exceptions.h"
+#include <magic_enum.hpp>
 
 namespace OpenMagnetics {
 
@@ -120,6 +121,76 @@ void Painter::paint_round_wire(double xCoordinate, double yCoordinate, Wire wire
             currentLineDiameter += lineRadiusIncrease;
         }
     }
+}
+
+void Painter::paint_rounded_rectangle(double xCoordinate, double yCoordinate, double width, double height, double cornerRadius,
+                                      std::string cssClassName, SVG::Group* group, std::optional<std::string> label) {
+    if (!(width > 0) || !(height > 0) || !(cornerRadius >= 0) || 2 * cornerRadius > std::min(width, height) * (1 + 1e-9)) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT,
+            "Painter: a rounded rectangle needs positive sides and a corner radius of at most half its short side (" +
+            std::to_string(width * 1e3) + " x " + std::to_string(height * 1e3) + " mm, radius " + std::to_string(cornerRadius * 1e3) + " mm)");
+    }
+    const double radius = std::min(cornerRadius, std::min(width, height) / 2);
+    const size_t samplesPerCorner = 16;
+    const double halfWidth = width / 2 - radius;
+    const double halfHeight = height / 2 - radius;
+    // Corner centres counter-clockwise from the top right, each arc a quarter turn on from the last.
+    const double centres[4][2] = {{halfWidth, halfHeight}, {-halfWidth, halfHeight}, {-halfWidth, -halfHeight}, {halfWidth, -halfHeight}};
+    std::vector<SVG::Point> points;
+    for (size_t corner = 0; corner < 4; ++corner) {
+        for (size_t k = 0; k <= samplesPerCorner; ++k) {
+            const double angle = std::numbers::pi / 2 * (double(corner) + double(k) / double(samplesPerCorner));
+            points.push_back(SVG::Point(xCoordinate + centres[corner][0] + radius * std::cos(angle),
+                                        yCoordinate + centres[corner][1] + radius * std::sin(angle)));
+        }
+    }
+    if (group == nullptr) {
+        group = _root.add_child<SVG::Group>();
+    }
+    auto shape = group->add_child<SVG::Polygon>(scale_points(points, 0, _scale));
+    shape->set_attr("class", cssClassName);
+    if (label) {
+        shape->add_child<SVG::Title>(escape_xml(label.value()));
+    }
+}
+
+void Painter::paint_compressed_litz_wire(double xCoordinate, double yCoordinate, Wire wire, double width, double height,
+                                         double cornerRadius, std::optional<std::string> label) {
+    const double serving = Wire::litz_serving_thickness(wire);
+    if (!(width - 2 * serving > 0) || !(height - 2 * serving > 0) || cornerRadius < serving) {
+        throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA,
+            "Painter: litz turn '" + label.value_or("unnamed") + "' is compressed into a " + std::to_string(width * 1e3) + " x " +
+            std::to_string(height * 1e3) + " mm shape with corner radius " + std::to_string(cornerRadius * 1e3) +
+            " mm, which does not hold its serving of " + std::to_string(serving * 1e3) + " mm a side");
+    }
+    auto coating = wire.resolve_coating();
+    std::string coatingColor = settings.get_painter_color_insulation();
+    if (serving > 0) {
+        coatingColor = process_coating(serving, coating.value()).coatingColor;
+    }
+    coatingColor = std::regex_replace(std::string(coatingColor), std::regex("0x"), "#");
+    auto shapes = _root.add_child<SVG::Group>();
+    std::string cssClassName = generate_random_string();
+    _root.style("." + cssClassName).set_attr("opacity", _opacity).set_attr("fill", coatingColor);
+    paint_rounded_rectangle(xCoordinate, yCoordinate, width, height, cornerRadius, cssClassName, shapes, label);
+    paint_rounded_rectangle(xCoordinate, yCoordinate, width - 2 * serving, height - 2 * serving, cornerRadius - serving, "copper", shapes, label);
+}
+
+void Painter::paint_litz_turn(double xCoordinate, double yCoordinate, const Wire& wire, const Turn& turn, const std::string& label) {
+    const auto shape = turn.get_cross_sectional_shape();
+    if (shape && (shape.value() == TurnCrossSectionalShape::RECTANGULAR || shape.value() == TurnCrossSectionalShape::OVAL)) {
+        if (!turn.get_dimensions() || turn.get_dimensions()->size() < 2) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT,
+                "Painter: litz turn '" + turn.get_name() + "' is compressed but states no dimensions");
+        }
+        const double width = turn.get_dimensions().value()[0];
+        const double height = turn.get_dimensions().value()[1];
+        const double cornerRadius = shape.value() == TurnCrossSectionalShape::OVAL ? std::min(width, height) / 2
+                                                                                  : Wire::compressed_litz_corner_radius(Wire::round_litz_outer_diameter(wire), width, height);
+        paint_compressed_litz_wire(xCoordinate, yCoordinate, wire, width, height, cornerRadius, label);
+        return;
+    }
+    paint_litz_wire(xCoordinate, yCoordinate, wire, label);
 }
 
 void Painter::paint_litz_wire(double xCoordinate, double yCoordinate, Wire wire, std::optional<std::string> label) {
@@ -307,10 +378,13 @@ void Painter::paint_rectangle(double xCoordinate, double yCoordinate, double xDi
     if (group == nullptr) {
         group = _root.add_child<SVG::Group>();
     }
-    *group << SVG::Polygon(scale_points(turnPoints, 0, _scale));
-    auto turnSvg = _root.get_children<SVG::Polygon>().back();
+    // The polygon is taken from add_child directly: looking it up again through _root.get_children walks the whole
+    // drawing, which made painting n field points cost n^2.
+    auto turnSvg = group->add_child<SVG::Polygon>(scale_points(turnPoints, 0, _scale));
     turnSvg->set_attr("class", cssClassName);
-    turnSvg->set_attr("transform", "rotate( " + std::to_string(-(angle)) + " " + std::to_string(center[0] * _scale) + " " + std::to_string(center[1] * _scale) + ") ");
+    if (angle != 0) {
+        turnSvg->set_attr("transform", "rotate( " + std::to_string(-(angle)) + " " + std::to_string(center[0] * _scale) + " " + std::to_string(center[1] * _scale) + ") ");
+    }
     if (label) {
         turnSvg->add_child<SVG::Title>(escape_xml(label.value()));
     }
@@ -324,9 +398,7 @@ void Painter::paint_circle(double xCoordinate, double yCoordinate, double radius
     if (group == nullptr) {
         group = _root.add_child<SVG::Group>();
     }
-    *group << SVG::Circle(xCoordinate * _scale, -yCoordinate * _scale, radius * _scale);
-    auto turnSvg = _root.get_children<SVG::Circle>().back();
-    turnSvg = _root.get_children<SVG::Circle>().back();
+    auto turnSvg = group->add_child<SVG::Circle>(xCoordinate * _scale, -yCoordinate * _scale, radius * _scale);
     turnSvg->set_attr("class", cssClassName);
 
     // auto group = _root.add_child<SVG::Group>();
@@ -540,8 +612,28 @@ void Painter::paint_coil_connections(Magnetic magnetic) {
     // DASHED OUTLINES so the declined state is unmistakable at a glance.
     const bool blockingDeclined = settings.get_coil_use_real_winding_geometry() &&
                                   !coil.is_real_winding_blocking_applied();
+    // Spec section 17 (Alf, 2026-11-04, "Draw them in red"): a terminal lead whose route carries
+    // findings (it meets a core leg, another lead, does not fit its lanes, ...) is painted RED, with
+    // every finding's witness as its title, so the picture shows which leads a real part cannot have.
+    _root.style(".connection_terminal_finding").set_attr("opacity", "0.6").set_attr("fill", "#E53935");   // red
+    std::map<std::tuple<std::string, int64_t, ConnectionKind, std::string, std::string>, std::string> findingsOfLead;
+    if (!terminalLeadsHaveNoRoute &&
+        std::any_of(reservedSpaces.begin(), reservedSpaces.end(), [](const auto& space) { return space.isTerminal; })) {
+        for (const auto& route : coil.get_connection_layout().routes) {
+            if (route.findings.empty() ||
+                (route.kind != ConnectionKind::TERMINAL_ENTRANCE && route.kind != ConnectionKind::TERMINAL_EXIT)) {
+                continue;
+            }
+            std::string witness = route.winding + " parallel " + std::to_string(route.parallel) +
+                                  (route.kind == ConnectionKind::TERMINAL_ENTRANCE ? " entrance" : " exit") + " lead:";
+            for (const auto& finding : route.findings) {
+                witness += "\n" + std::string(magic_enum::enum_name(finding.kind)) + ": " + finding.witness;
+            }
+            findingsOfLead[{route.winding, route.parallel, route.kind, route.fromTurn, route.toTurn}] = witness;
+        }
+    }
     if (blockingDeclined) {
-        for (const char* cls : {".connection_transition", ".connection_terminal"}) {
+        for (const char* cls : {".connection_transition", ".connection_terminal", ".connection_terminal_finding"}) {
             _root.style(cls)
                 .set_attr("opacity", "0.85")
                 .set_attr("fill", "none")
@@ -566,9 +658,17 @@ void Painter::paint_coil_connections(Magnetic magnetic) {
             continue;
         }
         std::string cssClassName = space.isTerminal ? "connection_terminal" : "connection_transition";
+        std::optional<std::string> label;
+        if (space.isTerminal) {
+            const auto found = findingsOfLead.find({space.winding, space.parallel, space.kind, space.fromTurn, space.toTurn});
+            if (found != findingsOfLead.end()) {
+                cssClassName = "connection_terminal_finding";
+                label = found->second;
+            }
+        }
         // paint_rectangle rotates around center*_scale while scale_points flips y (y -> -y*_scale), so
         // the rotation pivot's y must be negated to match the drawn polygon's centre.
-        paint_rectangle(space.coordinates[0], space.coordinates[1], space.dimensions[0], space.dimensions[1], cssClassName, shapes, space.rotation, {space.coordinates[0], -space.coordinates[1]});
+        paint_rectangle(space.coordinates[0], space.coordinates[1], space.dimensions[0], space.dimensions[1], cssClassName, shapes, space.rotation, {space.coordinates[0], -space.coordinates[1]}, label);
     }
     // Spec section 15 (Alf, 2026-10-26: "The sleeve goes only until the winding layers start"): a
     // sleeved terminal lead's sleeve is drawn, as an outline of its outer diameter, only over the
@@ -856,7 +956,7 @@ void Painter::paint_two_piece_set_coil_turns(Magnetic magnetic, bool skipMarginA
                 paint_round_wire(turnX, turnY, wirePerWinding[windingIndex], label);
             }
             else if (wirePerWinding[windingIndex].get_type() == WireType::LITZ) {
-                paint_litz_wire(turnX, turnY, wirePerWinding[windingIndex], label);
+                paint_litz_turn(turnX, turnY, wirePerWinding[windingIndex], turns[i], label);
             }
             else {
                 {
@@ -926,7 +1026,7 @@ void Painter::paint_two_piece_set_coil_turns(Magnetic magnetic, bool skipMarginA
                     paint_round_wire(additionalCoordinates[0], additionalCoordinates[1], wirePerWinding[windingIndex], turns[i].get_name());
                 }
                 else if (wirePerWinding[windingIndex].get_type() == WireType::LITZ) {
-                    paint_litz_wire(additionalCoordinates[0], additionalCoordinates[1], wirePerWinding[windingIndex], turns[i].get_name());
+                    paint_litz_turn(additionalCoordinates[0], additionalCoordinates[1], wirePerWinding[windingIndex], turns[i], turns[i].get_name());
                 }
                 else if (wire.get_outer_width() && wire.get_outer_height()) {
                     paint_rectangle(additionalCoordinates[0], additionalCoordinates[1],
@@ -1306,8 +1406,7 @@ void Painter::paint_two_piece_set_bobbin(Magnetic magnetic) {
                                       bobbinCoordinates[1] - bobbinOuterHeight / 2));
 
     auto addBobbinPolygon = [&](const std::vector<SVG::Point>& points) {
-        *shapes << SVG::Polygon(scale_points(points, 0, _scale));
-        auto polygon = _root.get_children<SVG::Polygon>().back();
+        auto polygon = shapes->add_child<SVG::Polygon>(scale_points(points, 0, _scale));
         polygon->set_attr("class", _fieldPainted ? "bobbin_translucent" : "bobbin");
     };
     auto reflectAcross = [](const std::vector<SVG::Point>& points, double axisX) {
@@ -1523,8 +1622,7 @@ void Painter::paint_two_piece_set_core(Core core) {
 
     auto shapes = _root.add_child<SVG::Group>();
     auto addFerritePolygon = [&](const std::vector<SVG::Point>& points) {
-        *shapes << SVG::Polygon(scale_points(points, 0, _scale));
-        auto polygon = _root.get_children<SVG::Polygon>().back();
+        auto polygon = shapes->add_child<SVG::Polygon>(scale_points(points, 0, _scale));
         polygon->set_attr("class", "ferrite");
     };
     addFerritePolygon(topPiecePoints);
@@ -1820,10 +1918,139 @@ void Painter::paint_core(Magnetic magnetic) {
             // Single-solid / piece-and-closer families: no mirrored halves to reconstruct.
             return paint_drum_family_core(core);
             break;
+        case CoreShapeFamily::EI:
+        case CoreShapeFamily::UI:
+        case CoreShapeFamily::PQI:
+            // A shaped piece closed by a flat bar (ABT #2372): drawn as the piece plus its plate, not
+            // as a mirrored half-set.
+            if (core.get_functional_description().get_type() == CoreType::PIECE_AND_PLATE) {
+                return paint_piece_and_plate_core(core);
+            }
+            return paint_two_piece_set_core(core);
+            break;
         default:
             return paint_two_piece_set_core(core);
             break;
     }
+}
+
+// ABT #2372: the 2D cross-section of a piece-and-plate core (EI, UI, PQI) in the processed frame. The
+// columns span -D/2..+D/2 (Core::create_geometrical_description), the leg tips meet the plate at +D/2
+// and the plate, B2 thick, lies above them; the piece's back is at D/2 - B. Gaps are drawn where MKF
+// placed them: a ground gap at the centre leg tip (between the leg and the plate), a residual gap at
+// each leg tip, distributed gaps as chunks down the leg; a spacer lifts the plate off the legs.
+void Painter::paint_piece_and_plate_core(Core core) {
+    CoreShape shape = core.resolve_shape();
+    auto dimensions = flatten_dimensions(shape.get_dimensions().value());
+    if (dimensions.find("B2") == dimensions.end() || !(dimensions["B2"] > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+            "Painter: piece-and-plate shape '" + shape.get_name().value_or("?") + "' has no positive plate thickness B2");
+    }
+    double plateThickness = dimensions["B2"];
+    auto processedDescription = core.get_processed_description().value();
+    auto rightColumn = core.find_closest_column_by_coordinates(std::vector<double>({processedDescription.get_width() / 2, 0, -processedDescription.get_depth() / 2}));
+    auto mainColumn = core.find_closest_column_by_coordinates({0, 0, 0});
+    auto family = core.get_shape_family();
+    const bool uShaped = family == MAS::CoreShapeFamily::UI;
+    double showingMainColumnWidth = mainColumn.get_width() / 2;
+    double showingCoreWidth = uShaped ? processedDescription.get_width() - mainColumn.get_width() / 2 : processedDescription.get_width() / 2;
+    double mainLegLeftEdge = uShaped ? -showingMainColumnWidth : 0;
+    double legTip = mainColumn.get_coordinates()[1] + mainColumn.get_height() / 2;
+    double pieceBack = legTip - (processedDescription.get_height() - plateThickness);
+
+    double spacer = 0;
+    for (auto& gap : core.get_functional_description().get_gapping()) {
+        if (gap.get_type() == GapType::ADDITIVE) {
+            spacer = std::max(spacer, gap.get_length());
+        }
+    }
+    double pieceOffset = -spacer / 2;
+    double plateOffset = spacer / 2;
+
+    struct PieceHalf {
+        std::vector<SVG::Point> piece;
+        std::vector<std::vector<SVG::Point>> chunks;
+    };
+    // The top of a leg's piece material and the chunks a column's gaps leave above it.
+    auto legTopAndChunks = [&](ColumnElement column, double left, double right, std::vector<std::vector<SVG::Point>>& chunks) {
+        auto gaps = core.find_gaps_by_column(column);
+        std::vector<CoreGap> cutGaps;
+        for (auto& gap : gaps) {
+            if (gap.get_type() != GapType::ADDITIVE) {
+                cutGaps.push_back(gap);
+            }
+        }
+        std::sort(cutGaps.begin(), cutGaps.end(), [](const CoreGap& lhs, const CoreGap& rhs) { return lhs.get_coordinates().value()[1] < rhs.get_coordinates().value()[1];});
+        double columnTip = column.get_coordinates()[1] + column.get_height() / 2;
+        if (cutGaps.empty()) {
+            return columnTip;
+        }
+        double top = cutGaps.front().get_coordinates().value()[1] - cutGaps.front().get_length() / 2;
+        for (size_t i = 0; i < cutGaps.size(); ++i) {
+            double chunkBottom = cutGaps[i].get_coordinates().value()[1] + cutGaps[i].get_length() / 2;
+            double chunkTop = i + 1 < cutGaps.size() ? cutGaps[i + 1].get_coordinates().value()[1] - cutGaps[i + 1].get_length() / 2 : columnTip;
+            if (chunkTop > chunkBottom) {
+                chunks.push_back({SVG::Point(left, pieceOffset + chunkBottom), SVG::Point(right, pieceOffset + chunkBottom),
+                                  SVG::Point(right, pieceOffset + chunkTop), SVG::Point(left, pieceOffset + chunkTop)});
+            }
+        }
+        return top;
+    };
+    auto buildHalf = [&](ColumnElement lateralColumn) {
+        PieceHalf half;
+        double lateralColumnWidth = lateralColumn.get_minimum_width() ? lateralColumn.get_minimum_width().value() : lateralColumn.get_width();
+        double mainTop = legTopAndChunks(mainColumn, mainLegLeftEdge, showingMainColumnWidth, half.chunks);
+        double lateralTop = legTopAndChunks(lateralColumn, showingCoreWidth - lateralColumnWidth, showingCoreWidth, half.chunks);
+        double lateralBottom = lateralColumn.get_coordinates()[1] - lateralColumn.get_height() / 2;
+        double mainBottom = mainColumn.get_coordinates()[1] - mainColumn.get_height() / 2;
+        half.piece = {SVG::Point(mainLegLeftEdge, pieceOffset + pieceBack), SVG::Point(showingCoreWidth, pieceOffset + pieceBack),
+                      SVG::Point(showingCoreWidth, pieceOffset + lateralTop), SVG::Point(showingCoreWidth - lateralColumnWidth, pieceOffset + lateralTop),
+                      SVG::Point(showingCoreWidth - lateralColumnWidth, pieceOffset + lateralBottom), SVG::Point(showingMainColumnWidth, pieceOffset + mainBottom),
+                      SVG::Point(showingMainColumnWidth, pieceOffset + mainTop), SVG::Point(mainLegLeftEdge, pieceOffset + mainTop)};
+        return half;
+    };
+    auto mirrorPoints = [](const std::vector<SVG::Point>& points) {
+        std::vector<SVG::Point> mirroredPoints;
+        for (auto& point : points) {
+            mirroredPoints.push_back(SVG::Point(-point.first, point.second));
+        }
+        return mirroredPoints;
+    };
+
+    auto shapes = _root.add_child<SVG::Group>();
+    auto addFerritePolygon = [&](const std::vector<SVG::Point>& points) {
+        *shapes << SVG::Polygon(scale_points(points, 0, _scale));
+        _root.get_children<SVG::Polygon>().back()->set_attr("class", "ferrite");
+    };
+    auto rightHalf = buildHalf(rightColumn);
+    addFerritePolygon(rightHalf.piece);
+    for (auto& chunk : rightHalf.chunks) {
+        addFerritePolygon(chunk);
+    }
+    // The +x half of the plate (the whole plate for a U piece, drawn whole like the U itself).
+    std::vector<SVG::Point> plate = {SVG::Point(mainLegLeftEdge, plateOffset + legTip), SVG::Point(showingCoreWidth, plateOffset + legTip),
+                                     SVG::Point(showingCoreWidth, plateOffset + legTip + plateThickness), SVG::Point(mainLegLeftEdge, plateOffset + legTip + plateThickness)};
+    addFerritePolygon(plate);
+
+    // The -x half, as paint_two_piece_set_core does: with per-column winding windows, or under real
+    // winding (the whole magnetic), from the lateral column nearest -x. A U piece is already whole.
+    bool drawLeftHalf = !uShaped && (processedDescription.get_winding_windows().size() > 1 || settings.get_coil_use_real_winding_geometry());
+    if (drawLeftHalf) {
+        if (mainColumn.get_coordinates()[0] != 0) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA,
+                "Painter: the whole-magnetic view draws the -x half about the main column's axis, but the main column sits at x = " +
+                    std::to_string(mainColumn.get_coordinates()[0]) + " m, not at x = 0");
+        }
+        auto leftColumn = core.find_closest_column_by_coordinates(std::vector<double>({-processedDescription.get_width() / 2, 0, -processedDescription.get_depth() / 2}));
+        auto leftHalf = buildHalf(leftColumn);
+        addFerritePolygon(mirrorPoints(leftHalf.piece));
+        for (auto& chunk : leftHalf.chunks) {
+            addFerritePolygon(mirrorPoints(chunk));
+        }
+        addFerritePolygon(mirrorPoints(plate));
+    }
+
+    _root.autoscale();
 }
 
 // ABT #366/#362/#357: 2D cross-section for the drum family and molded bodies, drawn directly
@@ -1843,14 +2070,12 @@ void Painter::paint_drum_family_core(Core core) {
     auto addRectangle = [&](double innerRadius, double outerRadius, double bottom, double top) {
         std::vector<SVG::Point> points = {
             {innerRadius, bottom}, {outerRadius, bottom}, {outerRadius, top}, {innerRadius, top}};
-        *shapes << SVG::Polygon(scale_points(points, 0, _scale));
-        auto polygon = _root.get_children<SVG::Polygon>().back();
+        auto polygon = shapes->add_child<SVG::Polygon>(scale_points(points, 0, _scale));
         polygon->set_attr("class", "ferrite");
         if (wholeBodyDrawn) {
             std::vector<SVG::Point> farSide = {
                 {-innerRadius, bottom}, {-outerRadius, bottom}, {-outerRadius, top}, {-innerRadius, top}};
-            *shapes << SVG::Polygon(scale_points(farSide, 0, _scale));
-            _root.get_children<SVG::Polygon>().back()->set_attr("class", "ferrite");
+            shapes->add_child<SVG::Polygon>(scale_points(farSide, 0, _scale))->set_attr("class", "ferrite");
         }
     };
 
@@ -2055,19 +2280,25 @@ std::string Painter::get_color(double minimumValue, double maximumValue, std::st
 
 void Painter::paint_field_point(double xCoordinate, double yCoordinate, double xDimension, double yDimension, std::string color, std::string label) {
 
-    SVG::Group* shapes = _root.add_child<SVG::Group>();
-
-    std::string cssClassName = generate_random_string();
-
-    // _root.style("." + cssClassName).set_attr("opacity", 0.5).set_attr("fill", color).set_attr("stroke", color);
-    _root.style("." + cssClassName).set_attr("opacity", _opacity).set_attr("fill", color).set_attr("stroke", color);
-    paint_rectangle(xCoordinate, yCoordinate, xDimension, yDimension, cssClassName, shapes, 0, {0, 0}, label);
+    // One group for the points of a field and one CSS class per colour: a class and a group per point made a 200 x 200
+    // plot 11 MB of 40000 style rules.
+    if (_fieldPointGroup == nullptr) {
+        _fieldPointGroup = _root.add_child<SVG::Group>();
+    }
+    auto cssClass = _fieldPointClasses.find(color);
+    if (cssClass == _fieldPointClasses.end()) {
+        std::string cssClassName = generate_random_string();
+        _root.style("." + cssClassName).set_attr("opacity", _opacity).set_attr("fill", color).set_attr("stroke", color);
+        cssClass = _fieldPointClasses.emplace(color, cssClassName).first;
+    }
+    paint_rectangle(xCoordinate, yCoordinate, xDimension, yDimension, cssClass->second, _fieldPointGroup, 0, {0, 0}, label);
 }
 
 
 void Painter::paint_magnetic_field(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex, std::optional<ComplexField> inputField) {
     set_image_size(magnetic);
     _fieldPainted = true;
+    _fieldPointGroup = nullptr;
     bool logarithmicScale = settings.get_painter_logarithmic_scale();
 
     // One field, painted the same way for every core. A toroid's field comes from
@@ -2122,6 +2353,7 @@ void Painter::paint_magnetic_field(OperatingPoint operatingPoint, Magnetic magne
 
 void Painter::paint_electric_field(OperatingPoint operatingPoint, Magnetic magnetic, size_t harmonicIndex, std::optional<Field> inputField, ElectricFieldVisualizationModel model, ColorPalette colorPalette) {
     set_image_size(magnetic);
+    _fieldPointGroup = nullptr;
     double minimumModule = DBL_MAX;
     double maximumModule = 0;
     _fieldPainted = true;
@@ -4946,8 +5178,7 @@ void Painter::paint_copper_overlaps(Magnetic magnetic) {
         for (const auto& point : overlap.region) {
             points.push_back(SVG::Point(point[0], point[1]));
         }
-        *shapes << SVG::Polygon(scale_points(points, 0, _scale));
-        auto polygon = _root.get_children<SVG::Polygon>().back();
+        auto polygon = shapes->add_child<SVG::Polygon>(scale_points(points, 0, _scale));
         polygon->set_attr("class", "copper_overlap");
         std::ostringstream label;
         // A turn is named in quotes; a lead's name already quotes its turn ("exit lead of '<turn>'").
@@ -4977,8 +5208,7 @@ void Painter::paint_copper_outside_window(Magnetic magnetic) {
             for (const auto& point : region) {
                 points.push_back(SVG::Point(point[0], point[1]));
             }
-            *shapes << SVG::Polygon(scale_points(points, 0, _scale));
-            auto polygon = _root.get_children<SVG::Polygon>().back();
+            auto polygon = shapes->add_child<SVG::Polygon>(scale_points(points, 0, _scale));
             polygon->set_attr("class", "copper_outside_window");
             std::ostringstream label;
             label << "'" << turn.turn << "' lies outside the winding window by " << std::setprecision(3) << turn.overrun * 1000 << " mm";

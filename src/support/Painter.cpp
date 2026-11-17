@@ -110,8 +110,12 @@ ComplexField PainterInterface::calculate_magnetic_field(OperatingPoint operating
     // image lattice (the magnetic-field mirroring, exactly as WindingLosses solves them) BEFORE the painter's display
     // settings are applied below. The painter mirroring only decides which images of those currents the plot draws: it
     // used to reach the split too, which a display mirroring of 0 made throw (no lattice to solve the strands on).
+    // The flat turns the losses resolve into width cells are resolved here too, so the plot draws their cells' field.
+    const WindingLossesModelSet* modelSetForCells = modelSetId != WindingLossesModelSets::CUSTOM ? &get_winding_losses_model_set(modelSetId) : nullptr;
+    const auto resolveFlatTurnsPerWinding = resolve_flat_cell_windings(magnetic, magneticFieldModel, fringingEffectModel, modelSetForCells, std::nullopt);
     const auto parallelCurrentSplit = MagneticField::calculate_parallel_current_split(magnetic, operatingPoint,
-                                                                                      operatingPoint.get_conditions().get_ambient_temperature());
+                                                                                      operatingPoint.get_conditions().get_ambient_temperature(),
+                                                                                      std::nullopt, resolveFlatTurnsPerWinding);
     // RAII: restore the global magnetic-field settings on scope exit. They used to be
     // overwritten permanently, leaking the painter's fringing/mirroring choice into
     // every later physics computation in the process.
@@ -123,23 +127,9 @@ ComplexField PainterInterface::calculate_magnetic_field(OperatingPoint operating
         field = windingWindowMagneticStrengthFieldOutput.get_field_per_frequency()[0];
 
     }
-    auto turns = magnetic.get_coil().get_turns_description().value();
-
-    if (turns[0].get_additional_coordinates()) {
-        for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
-            if (turns[turnIndex].get_additional_coordinates()) {
-                turns[turnIndex].set_coordinates(turns[turnIndex].get_additional_coordinates().value()[0]);
-            }
-        }
-        magnetic.get_mutable_coil().set_turns_description(turns);
-        auto windingWindowMagneticStrengthFieldOutput = magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic, inducedField, std::nullopt, std::nullopt, parallelCurrentSplit);
-        auto additionalField = windingWindowMagneticStrengthFieldOutput.get_field_per_frequency()[0];
-        for (size_t pointIndex = 0; pointIndex < field.get_data().size(); ++pointIndex) {
-            field.get_mutable_data()[pointIndex].set_real(field.get_mutable_data()[pointIndex].get_real() + additionalField.get_mutable_data()[pointIndex].get_real());
-            field.get_mutable_data()[pointIndex].set_imaginary(field.get_mutable_data()[pointIndex].get_imaginary() + additionalField.get_mutable_data()[pointIndex].get_imaginary());
-        }
-    }
-
+    // A turn's second crossing (additionalCoordinates) is meshed by the field step itself (each crossing imaged in its own
+    // window, ABT #2267), so the field above is the whole field. A second pass with every turn moved onto its second
+    // crossing used to be added here: there each turn's two crossings coincide with opposite currents.
 
     return field;
 }

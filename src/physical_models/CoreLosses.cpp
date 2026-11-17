@@ -282,7 +282,7 @@ static void throw_if_above_curie_temperature(const CoreMaterial& coreMaterial, d
                 "Material " + coreMaterial.get_name() + ": core losses at or above its Curie temperature of " +
                     format_significant(curieTemperature.value()) + " C are computed with its ferromagnetic loss model, "
                     "which no longer describes the material there",
-                "asked at " + format_significant(temperature) + " C")) {
+                {MaterialDataAskedQuantity::TEMPERATURE, temperature, ""})) {
             return;
         }
         throw aboveCurie;
@@ -413,19 +413,14 @@ CoreLossesOutput CoreLosses::calculate_semishielded_core_losses(Core core, Opera
     double totalLosses = drumVolumetricLosses * coreMaterialVolume;
 
     bool shellLossesPriced = false;
-    auto coatingUnion = core.get_functional_description().get_coating();
-    if (coatingUnion && std::holds_alternative<CoreCoating>(coatingUnion.value())) {
-        auto coating = std::get<CoreCoating>(coatingUnion.value());
-        if (coating.get_type() && coating.get_type().value() == CoatingType::MAGNETIC_EPOXY &&
-            coating.get_material() && std::holds_alternative<std::string>(coating.get_material().value())) {
-            auto shellMaterial = find_core_material_by_name(std::get<std::string>(coating.get_material().value()));
-            if (shellMaterial.get_volumetric_losses().size() > 0) {
-                double shellVolumetricLosses = get_periodic_core_volumetric_losses(
-                    shellMaterial, excitationForArea(shellMaterialEffectiveArea), temperature);
-                totalLosses += shellVolumetricLosses * shellMaterialVolume;
-                shellLossesPriced = true;
-            }
-        }
+    // The shell grade: material[1], or the deprecated magneticEpoxy coating (ABT #2410/#2413). A
+    // core with neither, or with both naming different materials, throws there.
+    auto shellMaterial = core.resolve_semishielded_shell_material();
+    if (shellMaterial.get_volumetric_losses().size() > 0) {
+        double shellVolumetricLosses = get_periodic_core_volumetric_losses(
+            shellMaterial, excitationForArea(shellMaterialEffectiveArea), temperature);
+        totalLosses += shellVolumetricLosses * shellMaterialVolume;
+        shellLossesPriced = true;
     }
 
     CoreLossesOutput coreLossesOutput;
@@ -901,8 +896,8 @@ SteinmetzCoreLossesMethodRangeDatum CoreLossesModel::get_steinmetz_coefficients(
                 "Material " + materialData.get_name() + ": its Steinmetz loss coefficients are fitted from " +
                     format_quantity(minimumMaterialFrequency, "Hz") + " to " + format_quantity(maximumMaterialFrequency, "Hz") +
                     "; core losses outside that span are extrapolated from the nearest fitted range",
-                "asked at " + format_quantity(frequency, "Hz") + ", " +
-                    (frequency < minimumMaterialFrequency ? "below" : "above") + " that span")) {
+                {MaterialDataAskedQuantity::FREQUENCY, frequency,
+                 std::string(frequency < minimumMaterialFrequency ? "below" : "above") + " that span"})) {
             return nearestRange();
         }
         throw outOfSpan;
@@ -912,7 +907,7 @@ SteinmetzCoreLossesMethodRangeDatum CoreLossesModel::get_steinmetz_coefficients(
             "Material " + materialData.get_name() + ": its Steinmetz loss coefficients, fitted from " +
                 format_quantity(minimumMaterialFrequency, "Hz") + " to " + format_quantity(maximumMaterialFrequency, "Hz") +
                 ", leave gaps between their ranges; core losses in a gap are extrapolated from the nearest fitted range",
-            "asked at " + format_quantity(frequency, "Hz") + ", in a gap")) {
+            {MaterialDataAskedQuantity::FREQUENCY, frequency, "in a gap"})) {
         return nearestRange();
     }
     throw CalculationException(ErrorCode::CALCULATION_INVALID_INPUT,
@@ -1454,35 +1449,6 @@ double loop_signal_offset(const std::vector<double>& time, const std::vector<dou
     return (summary.maximum + summary.minimum) / 2;
 }
 
-// The envelope at each switching cycle: the record's time average over the cycles centred on it,
-// 2h + 1 of them with h = (number of cycles) / 128 (fewer at the record's edges, keeping the window
-// centred). The record's valleys are samples, not the flux's true valleys, so one cycle's span differs
-// from its period by up to a sample and its own average keeps a residue of its ripple (a few percent
-// of the ripple at ~15 samples per cycle). That residue changes from cycle to cycle, and the dB/dt
-// models would price it as a switching-rate jitter on the envelope (twice the envelope's iGSE loss on
-// a 16384-sample record). Averaging over 2h + 1 cycles divides it by about 2h + 1. The window, 1/64 of
-// the record, rounds the envelope's own extremes: a rectified line's zero-crossing cusp rises by
-// about 2.5 % of its peak (pi / 128), a smooth extreme moves by less than 0.1 %.
-std::vector<double> average_over_neighbouring_cycles(const std::vector<double>& time, const std::vector<double>& data,
-                                                     const std::vector<size_t>& valleys) {
-    // Running integral of the piecewise-linear record.
-    std::vector<double> integral(data.size(), 0.0);
-    for (size_t i = 1; i < data.size(); ++i) {
-        integral[i] = integral[i - 1] + (data[i - 1] + data[i]) / 2 * (time[i] - time[i - 1]);
-    }
-    size_t numberCycles = valleys.size() - 1;
-    size_t halfWindow = static_cast<size_t>(std::floor(static_cast<double>(numberCycles) / 128.0));
-    std::vector<double> averages;
-    for (size_t cycleIndex = 0; cycleIndex < numberCycles; ++cycleIndex) {
-        size_t cyclesAfter = numberCycles - 1 - cycleIndex;
-        size_t h = std::min({halfWindow, cycleIndex, cyclesAfter});
-        size_t start = valleys[cycleIndex - h];
-        size_t end = valleys[cycleIndex + h + 1];
-        averages.push_back((integral[end] - integral[start]) / (time[end] - time[start]));
-    }
-    return averages;
-}
-
 // A periodic record read at `time` by linear interpolation, wrapping from its last sample to its first
 // one period later. Both records must lie inside one period. The period is the line record's duration,
 // not 1 / the excitation's frequency: a line-cycle excitation may carry the switching frequency.
@@ -1770,9 +1736,9 @@ std::optional<SwitchingCyclesRecord> split_into_switching_cycles_uncached(const 
         record.durations.push_back(duration);
     }
 
-    envelopeFluxDensity = average_over_neighbouring_cycles(fluxDensityTime, fluxDensityData, valleys);
+    envelopeFluxDensity = Inputs::calculate_switching_cycles_envelope(fluxDensityTime, fluxDensityData, valleys);
     if (magnetizingCurrentData) {
-        envelopeMagnetizingCurrent = average_over_neighbouring_cycles(fluxDensityTime, magnetizingCurrentData.value(), valleys);
+        envelopeMagnetizingCurrent = Inputs::calculate_switching_cycles_envelope(fluxDensityTime, magnetizingCurrentData.value(), valleys);
     }
 
     // The envelope repeats once per record: the record spans one period of the excitation's frequency
@@ -4312,7 +4278,7 @@ static void throw_if_loss_factor_above_small_signal_flux(const CoreLossesLossFac
                 "Material " + aboveSmallSignal.material_name() + ": its loss factor (tan(delta)/mu_i) is small-signal data, "
                     "defined up to " + format_quantity(aboveSmallSignal.maximum_magnetic_flux_density(), "T") +
                     "; core losses at a larger flux are computed from it anyway and leave out the hysteresis loss",
-                "asked at a flux amplitude of " + format_quantity(aboveSmallSignal.magnetic_flux_density_amplitude(), "T"))) {
+                {MaterialDataAskedQuantity::MAGNETIC_FLUX_DENSITY_AMPLITUDE, aboveSmallSignal.magnetic_flux_density_amplitude(), ""})) {
             return;
         }
         throw;
@@ -4467,8 +4433,8 @@ double CoreLossesLossFactorModel::get_loss_factor(const CoreMaterial& coreMateri
         if (!material_data_extrapolation_allowed(
                 "Material " + coreMaterial.get_name() + ": its loss factor is tabulated " + range +
                     "; outside that range it is held at its nearest tabulated value",
-                "asked at " + format_quantity(frequency, "Hz") + ", " + (frequency < minimumFrequency ? "below" : "above") +
-                    " that range")) {
+                {MaterialDataAskedQuantity::FREQUENCY, frequency,
+                 std::string(frequency < minimumFrequency ? "below" : "above") + " that range"})) {
             throw MaterialException(ErrorCode::MATERIAL_FREQUENCY_OUT_OF_SPAN,
                 "Material " + coreMaterial.get_name() + ": its loss factor is tabulated " + range + "; " +
                 format_quantity(frequency, "Hz") + " is " + (frequency < minimumFrequency ? "below" : "above") +

@@ -10,6 +10,7 @@
 #include <MAS.hpp>
 #include "support/Exceptions.h"
 #include "support/NumberFormat.h"
+#include "support/LogOnceScope.h"
 
 #include <algorithm>
 #include <memory>
@@ -27,6 +28,9 @@ Mas MagneticSimulator::simulate(Mas mas, bool fastMode){
     return simulate(mas.get_mutable_inputs(), mas.get_mutable_magnetic(), fastMode);
 }
 Mas MagneticSimulator::simulate(const Inputs& inputs, const Magnetic& magnetic, bool fastMode){
+    // One simulation is one calculation: a material used outside its data is reported once per material and quantity,
+    // with the extremes asked, not once per harmonic and thermal iteration (ABT #2410).
+    LogOnceScope logOnceScope;
     set_topology(magnetizing_model_topology(inputs));
     Mas mas;
     std::vector<Outputs> outputs;
@@ -99,7 +103,9 @@ Mas MagneticSimulator::simulate(const Inputs& inputs, const Magnetic& magnetic, 
             simulateSaturatedPoint();
             continue;
         }
-        if (!fastMode) {
+        // Settings::simulatorSkipLeakageInductance (Alf, 2026-11-05): a caller that reads no leakage asks for none;
+        // the output then has no leakage inductance at all, and nothing else in it changes.
+        if (!fastMode && !Settings::GetInstance().get_simulator_skip_leakage_inductance()) {
             if (magnetic.get_coil().get_functional_description().size() > 1) {
                 inductanceOutput.set_leakage_inductance(calculate_leakage_inductance(operatingPoint, magnetic));
             }

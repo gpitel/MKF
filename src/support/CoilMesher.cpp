@@ -1,6 +1,8 @@
 #include "support/CoilMesher.h"
+#include "physical_models/AxisymmetricWindow.h"
 #include "support/MasAccess.h"
 #include "physical_models/Reluctance.h"
+#include "physical_models/ReluctanceNetwork.h"
 #include "physical_models/WindingOhmicLosses.h"
 #include "processors/Inputs.h"
 #include "processors/WaveformProcessor.h"
@@ -378,7 +380,7 @@ std::complex<double> CoilMesher::calculate_harmonic_phasor(const Waveform& wavef
 
 std::vector<std::vector<double>> CoilMesher::calculate_current_phase_per_winding(Coil coil, OperatingPoint operatingPoint, const std::vector<size_t>& harmonicIndexes, std::vector<std::optional<double>>* gaugePhasePerHarmonic, std::vector<std::vector<double>>* currentAmplitudePerHarmonic) {
     size_t numberWindings = coil.get_functional_description().size();
-    auto excitations = operatingPoint.get_excitations_per_winding();
+    const auto& excitations = operatingPoint.get_excitations_per_winding();
     if (excitations.size() < numberWindings) {
         throw InvalidInputException(ErrorCode::MISSING_DATA, "The operating point has " + std::to_string(excitations.size()) +
                                     " excitations for a coil with " + std::to_string(numberWindings) + " windings");
@@ -386,6 +388,8 @@ std::vector<std::vector<double>> CoilMesher::calculate_current_phase_per_winding
     size_t referenceWindingIndex = get_reference_winding_index(coil);
     // Each winding's Fourier series, computed once, on first use (ABT #1880).
     std::vector<std::optional<WaveformProcessor::FourierSeries>> seriesPerWinding(numberWindings);
+    // And its largest harmonic, the scale is_zero_harmonic reads, taken with it.
+    std::vector<double> largestHarmonicAmplitudePerWinding(numberWindings, 0.0);
 
     std::vector<std::vector<double>> phasePerHarmonicPerWinding;
     for (auto harmonicIndex : harmonicIndexes) {
@@ -393,17 +397,18 @@ std::vector<std::vector<double>> CoilMesher::calculate_current_phase_per_winding
         std::vector<double> amplitudePerWinding(numberWindings, 0.0);
         std::vector<bool> excitedPerWinding(numberWindings, false);
         for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
-            auto current = excitations[windingIndex].get_current();
-            if (!current || !current->get_harmonics()) {
+            // Read in place: the current (its waveform included) and its harmonics were copied per harmonic.
+            const auto& current = mas_access::current_ref(excitations[windingIndex]);
+            if (!current || !mas_access::harmonics_ref(*current)) {
                 throw InvalidInputException(ErrorCode::MISSING_DATA, "Current for winding " + std::to_string(windingIndex) + " is missing harmonics in Coil Mesher");
             }
-            auto harmonics = current->get_harmonics().value();
+            const auto& harmonics = mas_access::harmonics_ref(*current).value();
             if (harmonicIndex >= harmonics.get_amplitudes().size() || harmonics.get_amplitudes()[harmonicIndex] == 0) {
                 continue;  // no current at this harmonic: its phase is irrelevant
             }
             double amplitude = harmonics.get_amplitudes()[harmonicIndex];
             double harmonicFrequency = harmonics.get_frequencies()[harmonicIndex];
-            if (!current->get_waveform()) {
+            if (!mas_access::waveform_ref(*current)) {
                 throw InvalidInputException(ErrorCode::MISSING_DATA, "Current for winding " + std::to_string(windingIndex) +
                                             " has a harmonic at " + std::to_string(harmonicFrequency) +
                                             " Hz but no waveform to take its phase from");
@@ -416,10 +421,11 @@ std::vector<std::vector<double>> CoilMesher::calculate_current_phase_per_winding
                 }
                 seriesPerWinding[windingIndex] = WaveformProcessor::calculate_fourier_series(waveform, excitations[windingIndex].get_frequency(),
                                                                                              settings.get_inputs_number_points_sampled_waveforms());
+                largestHarmonicAmplitudePerWinding[windingIndex] = WaveformProcessor::calculate_largest_harmonic_amplitude(seriesPerWinding[windingIndex].value());
             }
             auto phasor = WaveformProcessor::calculate_harmonic_phasor(seriesPerWinding[windingIndex].value(), excitations[windingIndex].get_frequency(), harmonicFrequency);
             double phasorAmplitude = std::abs(phasor);
-            if (WaveformProcessor::is_zero_harmonic(seriesPerWinding[windingIndex].value(), amplitude, phasor)) {
+            if (WaveformProcessor::is_zero_harmonic(largestHarmonicAmplitudePerWinding[windingIndex], amplitude, phasor)) {
                 continue;  // zero in the list and in the waveform (a symmetric wave's even harmonics): no current, no phase (ABT #1880)
             }
             if (!(phasorAmplitude >= WaveformProcessor::harmonicConsistencyTolerance * amplitude)) {
@@ -567,6 +573,14 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
     // Hoisted: the MAS getter copies the whole Core (cached material datasets included);
     // fetching it per turn dominated this loop's cost.
     auto meshCore = magnetic.get_core();
+    // One window frame for the whole coil (AxisymmetricWindow::applies), as the field step and the split decide it.
+    const bool axisymmetricWindow = OpenMagnetics::Settings::GetInstance().get_magnetic_field_mirroring_neutral_cells() &&
+                                    AxisymmetricWindow::applies(meshCore, coil);
+    for (auto& model : breakdownModelPerWinding) {
+        if (auto centerModel = std::dynamic_pointer_cast<CoilMesherCenterModel>(model)) {
+            centerModel->axisymmetricWindow = axisymmetricWindow;
+        }
+    }
     for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
         // Read in place: the turn and the winding's current were copied per turn; the mesher models only read
         // the wire (its type), so they get the winding's wire itself.
@@ -579,6 +593,13 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
         }
 
         auto fieldPoints = breakdownModelPerWinding[windingIndex]->generate_mesh_inducing_turn(turn, wire, turnIndex, turn.get_length(), meshCore);
+        // MAS classes declare a destructor, so they have no move constructor: every reallocation of a harmonic's
+        // point list copies each point. Room for every turn meshed like the first one is made once.
+        if (turnIndex == 0) {
+            for (auto& [harmonicIndex, field] : tempFieldPerHarmonic) {
+                field.get_mutable_data().reserve(turns.size() * fieldPoints.size());
+            }
+        }
 
         for (size_t commonPosition = 0; commonPosition < commonHarmonicIndexes.size(); ++commonPosition) {
             auto harmonicIndex = commonHarmonicIndexes[commonPosition];
@@ -592,10 +613,11 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
                 throw NaNResultException("NaN found in harmonicCurrentPeakInTurn value");
             }
             harmonicCurrentPeakInTurn *= currentDirectionPerWinding[windingIndex];
+            auto& harmonicData = tempFieldPerHarmonic[harmonicIndex].get_mutable_data();
             for (auto& fieldPoint : fieldPoints) {
                 FieldPoint fieldPointThisHarmonic(fieldPoint);
                 fieldPointThisHarmonic.set_value(fieldPoint.get_value() * harmonicCurrentPeakInTurn);
-                tempFieldPerHarmonic[harmonicIndex].get_mutable_data().push_back(fieldPointThisHarmonic);
+                harmonicData.push_back(std::move(fieldPointThisHarmonic));
             }
         }
     }
@@ -604,9 +626,14 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
     std::vector<std::optional<double>> gaugePhasePerHarmonic;
     std::vector<std::vector<double>> amplitudePerHarmonicPerWinding;
     std::vector<std::vector<double>> currentAmplitudePerHarmonicPerWinding;
-    for (size_t harmonicIndex = 0; harmonicIndex < tempFieldPerHarmonic.size(); ++harmonicIndex){
-        if (tempFieldPerHarmonic[harmonicIndex].get_data().size() > 0) {
-            fieldPerHarmonic.push_back(std::move(tempFieldPerHarmonic[harmonicIndex]));
+    // In ascending harmonic order. A Field has no move constructor (see above): its points are handed over by swapping
+    // the point lists, into a list with room for every harmonic.
+    fieldPerHarmonic.reserve(tempFieldPerHarmonic.size());
+    for (auto& [harmonicIndex, meshedField] : tempFieldPerHarmonic) {
+        if (meshedField.get_data().size() > 0) {
+            fieldPerHarmonic.emplace_back();
+            fieldPerHarmonic.back().set_frequency(meshedField.get_frequency());
+            fieldPerHarmonic.back().get_mutable_data().swap(meshedField.get_mutable_data());
             auto commonPosition = std::find(commonHarmonicIndexes.begin(), commonHarmonicIndexes.end(), harmonicIndex);
             if (commonPosition == commonHarmonicIndexes.end()) {
                 throw CalculationException(ErrorCode::CALCULATION_ERROR, "generate_mesh_inducing_coil: meshed harmonic " + std::to_string(harmonicIndex) +
@@ -637,7 +664,8 @@ InducingCoilMesh CoilMesher::generate_mesh_inducing_coil_phasors(Magnetic magnet
         }
     }
 
-    return {fieldPerHarmonic, phasePerHarmonicPerWinding, gaugePhasePerHarmonic, amplitudePerHarmonicPerWinding, currentAmplitudePerHarmonicPerWinding};
+    return {std::move(fieldPerHarmonic), std::move(phasePerHarmonicPerWinding), std::move(gaugePhasePerHarmonic), std::move(amplitudePerHarmonicPerWinding),
+            std::move(currentAmplitudePerHarmonicPerWinding)};
 }
 
 std::vector<Field> CoilMesher::generate_mesh_induced_coil(Magnetic magnetic, OperatingPoint operatingPoint, double windingLossesHarmonicAmplitudeThreshold) {
@@ -688,9 +716,11 @@ std::vector<Field> CoilMesher::generate_mesh_induced_coil(Magnetic magnetic, Ope
     std::map<size_t, Field> tempFieldPerHarmonic;
     for (auto harmonicIndex : commonHarmonicIndexes) {
         Field field;
-        for (auto excitation : operatingPoint.get_excitations_per_winding()) {
-            if (harmonicIndex < excitation.get_current()->get_harmonics().value().get_frequencies().size()) {
-                field.set_frequency(excitation.get_current()->get_harmonics().value().get_frequencies()[harmonicIndex]);
+        // Read in place: each excitation (its waveforms included) was copied per harmonic.
+        for (const auto& excitation : operatingPoint.get_excitations_per_winding()) {
+            const auto& frequencies = mas_access::harmonics_ref(*mas_access::current_ref(excitation)).value().get_frequencies();
+            if (harmonicIndex < frequencies.size()) {
+                field.set_frequency(frequencies[harmonicIndex]);
                 break;
             }
         }
@@ -700,28 +730,40 @@ std::vector<Field> CoilMesher::generate_mesh_induced_coil(Magnetic magnetic, Ope
     // Hoisted like the inducing loop: one Core copy for the whole mesh, not one per turn.
     auto meshCore = magnetic.get_core();
     for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
-        auto turn = turns[turnIndex];
+        // Read in place, as in the inducing loop: the turn, its wire and its winding's current were copied per turn.
+        const auto& turn = turns[turnIndex];
         int windingIndex = coil.get_winding_index_by_name(turn.get_winding());
-        auto wire = wirePerWinding[windingIndex];
-        auto excitationCurrent = operatingPoint.get_excitations_per_winding()[windingIndex].get_current();
+        auto& wire = wirePerWinding[windingIndex];
+        const auto& excitationCurrent = mas_access::current_ref(operatingPoint.get_excitations_per_winding()[windingIndex]);
         if (!excitationCurrent || !excitationCurrent->get_harmonics()) {
             throw InvalidInputException(ErrorCode::MISSING_DATA, "Current for winding " + std::to_string(windingIndex) + " is missing harmonics in Coil Mesher");
         }
-        auto harmonics = excitationCurrent->get_harmonics().value();
 
         auto fieldPoints = breakdownModelPerWinding[windingIndex]->generate_mesh_induced_turn(turn, wire, turnIndex, &meshCore);
+        // A FieldPoint has no move constructor (MAS classes declare a destructor): room for every turn meshed like the
+        // first one is made once, so the lists are not copied as they grow.
+        if (turnIndex == 0) {
+            for (auto& [harmonicIndex, field] : tempFieldPerHarmonic) {
+                field.get_mutable_data().reserve(turns.size() * fieldPoints.size());
+            }
+        }
 
         for (auto harmonicIndex : commonHarmonicIndexes) {
+            auto& harmonicData = tempFieldPerHarmonic[harmonicIndex].get_mutable_data();
             for (auto& fieldPoint : fieldPoints) {
-                tempFieldPerHarmonic[harmonicIndex].get_mutable_data().push_back(fieldPoint);
+                harmonicData.push_back(fieldPoint);
             }
         }
     }
 
+    // In ascending harmonic order; the point lists are handed over by swapping them (a Field has no move constructor).
     std::vector<Field> fieldPerHarmonic;
-    for (size_t harmonicIndex = 0; harmonicIndex < tempFieldPerHarmonic.size(); ++harmonicIndex){
-        if (tempFieldPerHarmonic[harmonicIndex].get_data().size() > 0) {
-            fieldPerHarmonic.push_back(tempFieldPerHarmonic[harmonicIndex]);
+    fieldPerHarmonic.reserve(tempFieldPerHarmonic.size());
+    for (auto& [harmonicIndex, meshedField] : tempFieldPerHarmonic) {
+        if (meshedField.get_data().size() > 0) {
+            fieldPerHarmonic.emplace_back();
+            fieldPerHarmonic.back().set_frequency(meshedField.get_frequency());
+            fieldPerHarmonic.back().get_mutable_data().swap(meshedField.get_mutable_data());
         }
     }
     return fieldPerHarmonic;
@@ -764,13 +806,54 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(const
         }
     }
 
+    if (!axisymmetricWindow) {
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Coil mesher: the window frame (planar or axisymmetric) was not decided for this coil");
+    }
     if (coreFamily != CoreShapeFamily::T) {
         double A = windingWindow.get_width().value();
         double B = windingWindow.get_height().value();
 
+        // Multi-window cores (ABT #2267): the window regions between x-adjacent legs, the same frames the neutral window's
+        // wall sheets are imaged in. The core's per-column window entries carry no coordinates, and the regions they
+        // stand for are these: each crossing is imaged in the region that contains it.
+        std::vector<WindowRegion> regions;
+        if (windingWindows.size() > 1) {
+            regions = CoilMesher::window_regions(core);
+        }
+        auto region_index_containing = [&](const std::vector<double>& point) -> std::optional<size_t> {
+            for (size_t regionIndex = 0; regionIndex < regions.size(); ++regionIndex) {
+                const auto& region = regions[regionIndex];
+                if (point[0] >= region.x0 && point[0] <= region.x1 && point[1] >= region.y0 && point[1] <= region.y1) {
+                    return regionIndex;
+                }
+            }
+            return std::nullopt;
+        };
+        auto region_containing = [&](const std::vector<double>& point) -> std::optional<WindowRegion> {
+            auto index = region_index_containing(point);
+            if (!index) {
+                return std::nullopt;
+            }
+            return regions[index.value()];
+        };
+
         double windowLeftEdgeX;
         double windowBottomY;
-        if (windingWindows.size() > 1 && windingWindow.get_coordinates()) {
+        bool outsideTheCore = false;
+        if (!regions.empty()) {
+            auto region = region_containing(turn.get_coordinates());
+            if (!region) {
+                // A conductor of the parallel split that is a lateral turn's return crossing outside the core (ABT #2267):
+                // a lone filament in open air, as its additional crossing is when the whole turn is meshed.
+                outsideTheCore = true;
+                region = regions.front();
+            }
+            A = region->x1 - region->x0;
+            B = region->y1 - region->y0;
+            windowLeftEdgeX = region->x0;
+            windowBottomY = region->y0;
+        }
+        else if (windingWindows.size() > 1 && windingWindow.get_coordinates()) {
             windowLeftEdgeX = windingWindow.get_coordinates().value()[0] - A / 2;
             windowBottomY = windingWindow.get_coordinates().value()[1] - B / 2;
         }
@@ -783,8 +866,9 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(const
             windowBottomY = -B / 2;
         }
 
+        // On a multi-window core every point is labelled with the window it belongs to (window_label): it acts only there.
         auto appendImageLattice = [&](const std::vector<double>& crossingPoint, double frameA, double frameB,
-                                      double frameLeftEdgeX, double frameBottomY, double signMultiplier) {
+                                      double frameLeftEdgeX, double frameBottomY, double signMultiplier, std::optional<size_t> window = std::nullopt) {
             double crossingA = crossingPoint[0] - frameLeftEdgeX;
             double crossingB = crossingPoint[1] - frameBottomY;
             // Image index m places the conductor at m*A + a (m even) or m*A + A - a (m odd), |m| reflections
@@ -810,6 +894,24 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(const
             int mMaximum = completeCells && cellsX > 0 ? 2 * cellsX : cellsX;
             int nMinimum = completeCells && cellsY > 0 ? -2 * cellsY - 1 : -cellsY;
             int nMaximum = completeCells && cellsY > 0 ? 2 * cellsY : cellsY;
+            // A round-post window on the neutral path is a solid of revolution (AxisymmetricWindow): a turn is a ring,
+            // imaged exactly in the two plates only. The cylinders (post face, outer wall) have no ring image; the
+            // field model meets their condition with its wall correction instead.
+            if (axisymmetricWindow.value()) {
+                mMinimum = 0;
+                mMaximum = 0;
+                nMinimum = -AxisymmetricWindow::planeImages;
+                nMaximum = AxisymmetricWindow::planeImages;
+            }
+            // A drum's window has no outer wall: the post face and the two flanges are ferrite, the outside is air. The
+            // conductor is imaged once in the post face (m = -1) and in the flanges (every n), and never across the open
+            // side. Against 2D OMFEM (DR 7.8/9.5, 30 turns of 0.25 mm in two layers, N87) the four-wall lattice read the
+            // winding 0.71x at 1 MHz and 0.79x at 200 kHz, the outer layer down to 0.38x; post and flanges only, 0.93x and
+            // 0.97x, the outer layer 0.93-1.01x (Alf 2026-11-15).
+            if (coreFamily == CoreShapeFamily::DRUM) {
+                mMinimum = std::max(mMinimum, -1);
+                mMaximum = std::min(mMaximum, 0);
+            }
             for (int m = mMinimum; m <= mMaximum; ++m)
             {
                 for (int n = nMinimum; n <= nMaximum; ++n)
@@ -831,7 +933,10 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(const
                     // (MMF_BOUNDARY) keeps a turn's own images when it evaluates that turn, so it must tell them apart.
                     // Only the Wang field model reads inducing labels, and it refuses image points outright.
                     if (m != 0 || n != 0) {
-                        mirroredFieldPoint.set_label("image");
+                        mirroredFieldPoint.set_label(window_label(true, window));
+                    }
+                    else if (window) {
+                        mirroredFieldPoint.set_label(window_label(false, window));
                     }
                     if (turnLength) {
                         mirroredFieldPoint.set_turn_length(turnLength.value());
@@ -859,7 +964,22 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(const
             }
         };
 
-        appendImageLattice(turn.get_coordinates(), A, B, windowLeftEdgeX, windowBottomY, 1.0);
+        if (outsideTheCore) {
+            FieldPoint conductorPoint;
+            conductorPoint.set_value(1.0);  // Will be multiplied later
+            if (turnLength) {
+                conductorPoint.set_turn_length(turnLength.value());
+            }
+            if (turnIndex) {
+                conductorPoint.set_turn_index(turnIndex.value());
+            }
+            conductorPoint.set_point(std::vector<double>{turn.get_coordinates()[0], turn.get_coordinates()[1]});
+            fieldPoints.push_back(conductorPoint);
+        }
+        else {
+            appendImageLattice(turn.get_coordinates(), A, B, windowLeftEdgeX, windowBottomY, 1.0,
+                               regions.empty() ? std::nullopt : region_index_containing(turn.get_coordinates()));
+        }
 
         // Multi-column winding: the turn's SECOND cross-section crossing carries the
         // same current with the opposite out-of-plane direction. A crossing inside
@@ -873,24 +993,10 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(const
                 if (additionalCoordinates.size() < 2) {
                     continue;
                 }
-                std::optional<WindingWindowElement> containingWindow;
-                for (auto& candidate : windingWindows) {
-                    if (!candidate.get_coordinates() || !candidate.get_width() || !candidate.get_height()) {
-                        continue;
-                    }
-                    if (std::abs(additionalCoordinates[0] - candidate.get_coordinates().value()[0]) <= candidate.get_width().value() / 2 &&
-                        std::abs(additionalCoordinates[1] - candidate.get_coordinates().value()[1]) <= candidate.get_height().value() / 2) {
-                        containingWindow = candidate;
-                        break;
-                    }
-                }
-                if (containingWindow) {
-                    appendImageLattice(additionalCoordinates,
-                                       containingWindow->get_width().value(),
-                                       containingWindow->get_height().value(),
-                                       containingWindow->get_coordinates().value()[0] - containingWindow->get_width().value() / 2,
-                                       containingWindow->get_coordinates().value()[1] - containingWindow->get_height().value() / 2,
-                                       -1.0);
+                auto containingRegion = region_containing(additionalCoordinates);
+                if (containingRegion) {
+                    appendImageLattice(additionalCoordinates, containingRegion->x1 - containingRegion->x0, containingRegion->y1 - containingRegion->y0,
+                                       containingRegion->x0, containingRegion->y0, -1.0, region_index_containing(additionalCoordinates));
                 }
                 else {
                     FieldPoint returnConductorPoint;
@@ -952,54 +1058,59 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(const
             throw CoilNotProcessedException("CoilMesher: Turn coordinates are not in cartesian");
         }
 
+        // The ring is two separate regions for the field: the bore (r < R_inner) and the outside (r > R_outer). With
+        // the ferrite at mu -> inf, each region sees its own conductors plus the core's reply to them, and nothing of
+        // the other region's conductors:
+        //  - a bore crossing is seen in the bore with its Kelvin image in R_inner (same sign, attenuated). Outside the
+        //    core it appears as a line current of its full value at the centre (the ring carries its MMF around).
+        //  - an outside crossing is seen outside with its Kelvin image in R_outer (same sign, attenuated) plus a
+        //    centre line of -attenuation times its current, so the outside field has zero net image current.
+        // Hence outside the core the circulation is the enclosed bore current and the far field of a complete winding
+        // is zero, as for a real toroid. The label carries the region; MagneticField applies each source only in its
+        // region. Without mirroring the conductors are bare filaments in free space, seen everywhere.
+        auto emit = [&](double pointX, double pointY, double value, std::optional<std::string> label) {
+            FieldPoint point;
+            point.set_value(value);
+            point.set_rotation(turn.get_rotation().value());
+            if (turnLength) {
+                point.set_turn_length(turnLength.value());
+            }
+            if (turnIndex) {
+                point.set_turn_index(turnIndex.value());
+            }
+            point.set_point({pointX, pointY});
+            if (label) {
+                point.set_label(label.value());
+            }
+            fieldPoints.push_back(point);
+        };
         for (const auto& [coords, direction] : coordinatesToProcess) {
             double x = coords[0];
             double y = coords[1];
             double r_k_sq = x * x + y * y;
-
-            // Real conductor
-            FieldPoint realPoint;
-            realPoint.set_value(direction);
-            realPoint.set_rotation(turn.get_rotation().value());
-            if (turnLength) {
-                realPoint.set_turn_length(turnLength.value());
+            if (mirroringDimension < 1) {
+                emit(x, y, direction, std::nullopt);
+                continue;
             }
-            if (turnIndex) {
-                realPoint.set_turn_index(turnIndex.value());
+            if (r_k_sq < R_inner * R_inner) {
+                emit(x, y, direction, std::string(toroidBoreConductorLabel));
+                // A crossing at the very centre has its image at infinity, which adds nothing.
+                if (r_k_sq > 0) {
+                    double scale = (R_inner * R_inner) / r_k_sq;
+                    emit(x * scale, y * scale, direction * attenuation, std::string(toroidBoreReplyLabel));
+                }
+                emit(0, 0, direction, std::string(toroidExteriorReplyLabel));
             }
-            realPoint.set_point({x, y});
-            fieldPoints.push_back(realPoint);
-
-            // Kelvin images (only if mirroring is enabled and conductor is not at origin)
-            if (mirroringDimension >= 1 && r_k_sq > 1e-24) {
-                // Inner boundary image: z_img = R_inner² / conj(z_k)
-                // In Cartesian: scale = R_inner² / |z_k|²
-                double scale_inner = (R_inner * R_inner) / r_k_sq;
-                FieldPoint innerImage;
-                innerImage.set_value(direction * attenuation);
-                innerImage.set_rotation(turn.get_rotation().value());
-                if (turnLength) {
-                    innerImage.set_turn_length(turnLength.value());
-                }
-                if (turnIndex) {
-                    innerImage.set_turn_index(turnIndex.value());
-                }
-                innerImage.set_point({x * scale_inner, y * scale_inner});
-                fieldPoints.push_back(innerImage);
-
-                // Outer boundary image: z_img = R_outer² / conj(z_k)
-                double scale_outer = (R_outer * R_outer) / r_k_sq;
-                FieldPoint outerImage;
-                outerImage.set_value(direction * attenuation);
-                outerImage.set_rotation(turn.get_rotation().value());
-                if (turnLength) {
-                    outerImage.set_turn_length(turnLength.value());
-                }
-                if (turnIndex) {
-                    outerImage.set_turn_index(turnIndex.value());
-                }
-                outerImage.set_point({x * scale_outer, y * scale_outer});
-                fieldPoints.push_back(outerImage);
+            else if (r_k_sq > R_outer * R_outer) {
+                emit(x, y, direction, std::string(toroidExteriorConductorLabel));
+                double scale = (R_outer * R_outer) / r_k_sq;
+                emit(x * scale, y * scale, direction * attenuation, std::string(toroidExteriorReplyLabel));
+                emit(0, 0, -direction * attenuation, std::string(toroidExteriorReplyLabel));
+            }
+            else {
+                throw InvalidInputException(ErrorCode::INVALID_COIL_CONFIGURATION, "CoilMesher: a crossing of turn " + turn.get_name() +
+                                            " lies inside the toroid's ferrite (r = " + std::to_string(std::sqrt(r_k_sq)) + " m, between " +
+                                            std::to_string(R_inner) + " and " + std::to_string(R_outer) + " m)");
             }
         }
     }
@@ -1013,14 +1124,14 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_inducing_turn(const
 // crossing and billing the WHOLE turn length (both halves) at that single density
 // overestimates the out-of-core half's loss. The models sample both crossings and let
 // WindingProximityEffectLosses weight each by its own length share instead.
-// Toroidal turns are excluded: their outer-return crossing already gets dedicated
-// Kelvin-image handling on the inducing side (see generate_mesh_inducing_turn) and an
-// induced-side split would double-touch behavior that many toroidal characterisation
-// tests already pin. Shared by the Center AND Wang models (the Wang half of the ticket
-// was originally missed, leaving foil/rectangular/planar wires on single-crossing).
+// Toroidal turns too: the bore crossing and the outside crossing sit in different regions of
+// the ring's field (see generate_mesh_inducing_turn) and see very different fields (the bore
+// is crowded, the outside is open), so each books its own half of the turn. Shared by the
+// Center AND Wang models (the Wang half of the ticket was originally missed, leaving
+// foil/rectangular/planar wires on single-crossing).
 // Returns the secondary crossing's {x, y} when the split applies.
 static std::optional<std::vector<double>> lateral_multi_column_secondary_crossing(const Turn& turn, const Core* core) {
-    if (core == nullptr || core->get_shape_family() == CoreShapeFamily::T) {
+    if (core == nullptr) {
         return std::nullopt;
     }
     // Bind once: the MAS getter returns the nested vectors BY VALUE.
@@ -1066,27 +1177,44 @@ std::vector<FieldPoint> CoilMesherCenterModel::generate_mesh_induced_turn(const 
 std::vector<FieldPoint> CoilMesherWangModel::generate_mesh_induced_turn(const Turn& turn, Wire& wire, std::optional<size_t> turnIndex, const Core* core) {
     std::vector<FieldPoint> fieldPoints;
 
+    // A toroid's turns are laid radially: the turn's rotation is its polar angle, and its width and height are read in
+    // that rotated frame (WindingProximityEffectLosses reads the field in the same frame). Elsewhere the cluster is
+    // axis-aligned.
+    const bool toroidal = core != nullptr && core->get_shape_family() == CoreShapeFamily::T;
+    double frameAngle = 0;
+    if (toroidal) {
+        if (!turn.get_rotation()) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Toroidal cores should have rotation in the turn, even if it is 0");
+        }
+        frameAngle = turn.get_rotation().value() / 180 * std::numbers::pi;
+    }
+    const double frameCos = std::cos(frameAngle);
+    const double frameSin = std::sin(frameAngle);
+
     // One full surface cluster per crossing, centred on {centerX, centerY}.
     auto emitCluster = [&](double centerX, double centerY) {
+        auto place = [&](double offsetX, double offsetY) {
+            return std::vector<double>{centerX + offsetX * frameCos - offsetY * frameSin, centerY + offsetX * frameSin + offsetY * frameCos};
+        };
         FieldPoint fieldPoint;
         fieldPoint.set_value(0);
         if (turnIndex) {
             fieldPoint.set_turn_index(turnIndex.value());
         }
 
-        fieldPoint.set_point({centerX + wire.get_maximum_conducting_width() / 2, centerY});
+        fieldPoint.set_point(place(wire.get_maximum_conducting_width() / 2, 0));
         fieldPoint.set_label("right");
         fieldPoints.push_back(fieldPoint);
 
-        fieldPoint.set_point({centerX - wire.get_maximum_conducting_width() / 2, centerY});
+        fieldPoint.set_point(place(-wire.get_maximum_conducting_width() / 2, 0));
         fieldPoint.set_label("left");
         fieldPoints.push_back(fieldPoint);
 
-        fieldPoint.set_point({centerX, centerY + wire.get_maximum_conducting_height() / 2});
+        fieldPoint.set_point(place(0, wire.get_maximum_conducting_height() / 2));
         fieldPoint.set_label("top");
         fieldPoints.push_back(fieldPoint);
 
-        fieldPoint.set_point({centerX, centerY - wire.get_maximum_conducting_height() / 2});
+        fieldPoint.set_point(place(0, -wire.get_maximum_conducting_height() / 2));
         fieldPoint.set_label("bottom");
         fieldPoints.push_back(fieldPoint);
 
@@ -1096,9 +1224,11 @@ std::vector<FieldPoint> CoilMesherWangModel::generate_mesh_induced_turn(const Tu
         // a wide flat conductor, so the 4 lumped surface points cannot represent
         // integral(Hperp(x)^2 dx); these samples make the superposed total field
         // (proximity + fringing, including their cross term) available along the width.
-        // Only generated when fringing is enabled: without a gap field the lumped
-        // mesh is sufficient and much cheaper.
-        if (settings.get_magnetic_field_include_fringing()) {
+        // Generated when fringing is enabled, and always on toroids: there the bore walls
+        // and the neighbouring crossings make the field vary across a thick bar's width
+        // with no gap at all. Elsewhere, without a gap field, the lumped mesh is
+        // sufficient and much cheaper.
+        if (settings.get_magnetic_field_include_fringing() || toroidal) {
             bool wideAlongY = (wire.get_type() == WireType::FOIL);
             double wideDimension = wideAlongY ? wire.get_maximum_conducting_height() : wire.get_maximum_conducting_width();
             double thinDimension = wideAlongY ? wire.get_maximum_conducting_width() : wire.get_maximum_conducting_height();
@@ -1109,10 +1239,10 @@ std::vector<FieldPoint> CoilMesherWangModel::generate_mesh_induced_turn(const Tu
             for (size_t sampleIndex = 0; sampleIndex < numberSamples; ++sampleIndex) {
                 double offset = -wideDimension / 2 + (sampleIndex + 0.5) * sampleStep;
                 if (wideAlongY) {
-                    fieldPoint.set_point({centerX, centerY + offset});
+                    fieldPoint.set_point(place(0, offset));
                 }
                 else {
-                    fieldPoint.set_point({centerX + offset, centerY});
+                    fieldPoint.set_point(place(offset, 0));
                 }
                 fieldPoint.set_label("widthsample");
                 fieldPoints.push_back(fieldPoint);
@@ -1208,7 +1338,52 @@ std::vector<FieldPoint> CoilMesherWangModel::generate_mesh_inducing_turn(const T
 }
 
 
-std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic magnetic, std::optional<OperatingPoint> operatingPoint) {
+namespace {
+void append_gap_mouth(std::vector<WindowWallSheet>& sheets, double wallX, double yStart, double yEnd, double wallStart, double wallEnd, double current,
+                      std::optional<size_t> winding, size_t window);
+
+// A window corner is the inner corner of a right-angle bend of the ferrite: the limb behind one wall (width w_i) turns
+// into the limb behind the other (width w_j). Measured from the corner, each limb's straight part has the limb's
+// uniform H; the bend adds an excess, crowded towards the inner corner. From the Schwarz-Christoffel map of the bend
+// (dz/dt = K sqrt(t - 1) / (t sqrt(t + c)), c = (w_i / w_j)^2, the inner corner at t = 1, the limb behind wall i at
+// t -> infinity, its end with u = sqrt((t - 1) / (t + c)):
+//     distance along wall i  d(u) / w_i = [2 artanh u - (2 / sqrt c) arctan(sqrt c u)] / pi,
+//     excess MMF up to there X(u) = ln t / pi - d(u) / w_i   (per unit flux over mu x depth),
+// and as u -> 1 the whole excess on wall i is
+//     E_i = [(2 w_j / w_i) arctan(w_i / w_j) - ln(4 w_j^2 / (w_i^2 + w_j^2))] / pi,
+// 0.2794 on each wall of an equal-width bend (the 0.559 squares of a right-angle corner).
+double corner_excess_squares(double wallLimbWidth, double otherLimbWidth) {
+    if (!(wallLimbWidth > 0) || !(otherLimbWidth > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Neutral window field: a window corner's limb has no positive width");
+    }
+    const double ratio = otherLimbWidth / wallLimbWidth;
+    return (2 * ratio * std::atan(1 / ratio) - std::log(4 * ratio * ratio / (1 + ratio * ratio))) / std::numbers::pi;
+}
+
+// Distances from the corner along wall i (in metres) that split the corner's excess on that wall into `pieces` parts of
+// equal MMF; the last part runs out to where 99.5 % of it is placed.
+std::vector<double> corner_excess_boundaries(double wallLimbWidth, double otherLimbWidth, size_t pieces) {
+    const double total = corner_excess_squares(wallLimbWidth, otherLimbWidth);
+    const double c = (wallLimbWidth / otherLimbWidth) * (wallLimbWidth / otherLimbWidth);
+    const double rootC = std::sqrt(c);
+    auto distance = [&](double u) { return (2 * std::atanh(u) - 2 / rootC * std::atan(rootC * u)) / std::numbers::pi; };
+    auto excess = [&](double u) { return std::log((1 + c * u * u) / (1 - u * u)) / std::numbers::pi - distance(u); };
+    std::vector<double> boundaries(pieces + 1, 0.0);
+    for (size_t k = 1; k <= pieces; ++k) {
+        const double target = (k == pieces ? 0.995 : static_cast<double>(k) / static_cast<double>(pieces)) * total;
+        double low = 0;
+        double high = 1 - 1e-15;
+        for (int iteration = 0; iteration < 200; ++iteration) {
+            const double middle = 0.5 * (low + high);
+            (excess(middle) < target ? low : high) = middle;
+        }
+        boundaries[k] = distance(0.5 * (low + high)) * wallLimbWidth;
+    }
+    return boundaries;
+}
+}  // namespace
+
+std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheet_sources(Magnetic magnetic, std::optional<OperatingPoint> operatingPoint) {
     auto core = magnetic.get_core();
     if (!core.get_processed_description()) {
         throw CoreNotProcessedException();
@@ -1219,8 +1394,7 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
     auto processedDescription = core.get_processed_description().value();
     auto windingWindows = processedDescription.get_winding_windows();
     if (windingWindows.size() != 1) {
-        throw NotImplementedException("Neutral window field: only single-window cores are described by this "
-                                      "frame; this core has " + std::to_string(windingWindows.size()) + " winding windows");
+        return generate_multi_window_wall_sheet_sources(magnetic, operatingPoint);
     }
     auto windingWindow = windingWindows[0];
     if (!windingWindow.get_width() || !windingWindow.get_height()) {
@@ -1308,7 +1482,8 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
         throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Neutral window field: the core has lateral gaps but none on the lateral limb this window faces");
     }
 
-    // A gap's slot mouth on the window boundary: its axial extent, clipped to the wall it opens onto.
+    // A gap's slot mouth on the window boundary: its axial extent, clipped to the wall it opens onto, carrying the gap's
+    // drop with the slot's own distribution (slot_mouth_boundaries).
     auto gapSheet = [&](double wallX, double gapY, double gapLength, double current) {
         double yStart = std::max(y0, gapY - gapLength / 2);
         double yEnd = std::min(y1, gapY + gapLength / 2);
@@ -1316,7 +1491,7 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
             throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Neutral window field: a gap at y = " + std::to_string(gapY) +
                                " opens nowhere onto the winding window (y in [" + std::to_string(y0) + ", " + std::to_string(y1) + "])");
         }
-        originals.push_back({{wallX, yStart}, {wallX, yEnd}, current});
+        append_gap_mouth(originals, wallX, yStart, yEnd, y0, y1, current, std::nullopt, 0);
     };
 
     double gapMmfFractionThisWindow = 0;
@@ -1365,12 +1540,66 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
         const double weightMain = B / mainArea;
         const double weightLateral = B * sideFluxShare / lateralAreaThisSide;
         const double weightPlate = A * sideFluxShare / plateArea;
-        const double weightTotal = weightMain + weightLateral + 2 * weightPlate;
+
+        // The four corners of the window are right-angle bends of the ferrite (corner_excess_squares): each adds to
+        // the two walls that meet there an excess equivalent to E_i w_i more of that limb, crowded at the corner. The
+        // limbs behind the walls: half the main column (its axis is a flux line of the section), the lateral limb
+        // this window faces, the plate.
+        double lateralLimbWidth = 0;
+        for (size_t columnIndex = 0; columnIndex < columns.size(); ++columnIndex) {
+            if (columnIndex != mainColumnIndex && facesThisWindow(columns[columnIndex].get_coordinates()[0])) {
+                lateralLimbWidth = std::max(lateralLimbWidth, columns[columnIndex].get_width());
+            }
+        }
+        const double mainLimbWidth = x0;
+        const double weightMainCorner = corner_excess_squares(mainLimbWidth, plateThickness) * mainLimbWidth / mainArea;
+        const double weightPlateAtMainCorner = corner_excess_squares(plateThickness, mainLimbWidth) * plateThickness * sideFluxShare / plateArea;
+        const double weightLateralCorner = corner_excess_squares(lateralLimbWidth, plateThickness) * lateralLimbWidth * sideFluxShare / lateralAreaThisSide;
+        const double weightPlateAtLateralCorner = corner_excess_squares(plateThickness, lateralLimbWidth) * plateThickness * sideFluxShare / plateArea;
+        const double weightTotal = weightMain + weightLateral + 2 * weightPlate +
+                                   2 * (weightMainCorner + weightPlateAtMainCorner + weightLateralCorner + weightPlateAtLateralCorner);
         // The whole wall carries the sheet; where a gap sits on it, the gap's own sheet adds the gap's drop.
         originals.push_back({{x0, y0}, {x0, y1}, -ferriteMmfFraction * weightMain / weightTotal});
         originals.push_back({{x1, y0}, {x1, y1}, -ferriteMmfFraction * weightLateral / weightTotal});
         originals.push_back({{x0, y0}, {x1, y0}, -ferriteMmfFraction * weightPlate / weightTotal});
         originals.push_back({{x0, y1}, {x1, y1}, -ferriteMmfFraction * weightPlate / weightTotal});
+
+        // Each corner's excess on a wall: equal-MMF pieces at the bend's own distribution, from the corner along it.
+        constexpr size_t cornerPieces = 8;
+        auto cornerSheets = [&](double cornerX, double cornerY, bool alongY, double direction, double wallLength, double wallLimbWidth, double otherLimbWidth,
+                                double weight) {
+            auto boundaries = corner_excess_boundaries(wallLimbWidth, otherLimbWidth, cornerPieces);
+            const double pieceCurrent = -ferriteMmfFraction * weight / weightTotal / static_cast<double>(cornerPieces);
+            // A wall shorter than the bend's spread (a wide limb on a short window side) ends it at the far corner: the
+            // pieces beyond the wall join the last one that starts on it, so the corner's whole excess stays on the wall.
+            size_t piecesOnWall = 0;
+            while (piecesOnWall < cornerPieces && boundaries[piecesOnWall] < wallLength) {
+                ++piecesOnWall;
+            }
+            for (size_t piece = 0; piece < piecesOnWall; ++piece) {
+                const bool last = piece + 1 == piecesOnWall;
+                const double near = boundaries[piece];
+                const double far = last ? std::min(boundaries[cornerPieces], wallLength) : boundaries[piece + 1];
+                const double current = last ? pieceCurrent * static_cast<double>(cornerPieces - piece) : pieceCurrent;
+                const double first = alongY ? cornerY + direction * near : cornerX + direction * near;
+                const double second = alongY ? cornerY + direction * far : cornerX + direction * far;
+                const double low = std::min(first, second);
+                const double high = std::max(first, second);
+                if (alongY) {
+                    originals.push_back({{cornerX, low}, {cornerX, high}, current});
+                }
+                else {
+                    originals.push_back({{low, cornerY}, {high, cornerY}, current});
+                }
+            }
+        };
+        for (double cornerY : {y0, y1}) {
+            const double inward = cornerY == y0 ? 1.0 : -1.0;
+            cornerSheets(x0, cornerY, true, inward, B, mainLimbWidth, plateThickness, weightMainCorner);
+            cornerSheets(x0, cornerY, false, 1.0, A, plateThickness, mainLimbWidth, weightPlateAtMainCorner);
+            cornerSheets(x1, cornerY, true, inward, B, lateralLimbWidth, plateThickness, weightLateralCorner);
+            cornerSheets(x1, cornerY, false, -1.0, A, plateThickness, lateralLimbWidth, weightPlateAtLateralCorner);
+        }
     }
 
     double sum = 0;
@@ -1381,6 +1610,497 @@ std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic ma
         throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field: the wall sources return " +
                                    std::to_string(-sum) + " of the winding MMF instead of all of it");
     }
+    return originals;
+}
+
+// The potential across a gap's slot mouth, from the Schwarz-Christoffel map of the slot onto the upper half t-plane
+// (unit slot width, the leg corner at z = 0 = z(1), the slot's far end at t = 0, the window at t -> infinity):
+//  - a slot between two leg corners, opening into the half-space: dz/dt = A sqrt(t - 1) sqrt(t + 1) / t;
+//  - a slot between a leg corner and a plate face flush with the window's end wall: dz/dt = A sqrt(t - 1) / t;
+// A = -j / pi. The irons are the real axis (the leg on t > 0, the other side on t < 0), so the magnetic scalar potential
+// is arg(t) / pi, 0 on the leg and 1 on the other side, and the mouth (the wall line x = 0 across the slot) is where the
+// equipotential ray arg t = pi psi crosses Re z = 0. Uniform pieces of equal current between those crossings reproduce
+// the exact window field to 0.9 % (two corners) and 0.6 % (one corner) at a quarter of the slot width from the mouth,
+// 0.2 % at one width; a uniform sheet over the whole mouth is 9 % and 14 % off there (checked against the exact field of
+// the same map).
+const std::vector<double>& CoilMesher::slot_mouth_boundaries(bool atWindowCorner) {
+    static const auto compute = [](bool corner) {
+        static_assert(slotMouthPieces % 2 == 0, "the two-corner mouth is computed on its half");
+        // Gauss-Legendre nodes and weights on [-1, 1].
+        constexpr size_t order = 64;
+        std::vector<double> nodes(order);
+        std::vector<double> weights(order);
+        for (size_t i = 0; i < order; ++i) {
+            double x = std::cos(std::numbers::pi * (static_cast<double>(i) + 0.75) / (static_cast<double>(order) + 0.5));
+            double derivative = 0;
+            for (int iteration = 0; iteration < 100; ++iteration) {
+                double p0 = 1;
+                double p1 = x;
+                for (size_t k = 2; k <= order; ++k) {
+                    const double p2 = ((2.0 * static_cast<double>(k) - 1) * x * p1 - (static_cast<double>(k) - 1) * p0) / static_cast<double>(k);
+                    p0 = p1;
+                    p1 = p2;
+                }
+                derivative = static_cast<double>(order) * (x * p1 - p0) / (x * x - 1);
+                const double step = p1 / derivative;
+                x -= step;
+                if (std::abs(step) < 1e-15) {
+                    break;
+                }
+            }
+            nodes[i] = x;
+            weights[i] = 2 / ((1 - x * x) * derivative * derivative);
+        }
+        const std::complex<double> j(0, 1);
+        const std::complex<double> scale = -j / std::numbers::pi;
+        auto slope = [&](std::complex<double> t) {
+            std::complex<double> value = scale * std::sqrt(t - 1.0) / t;
+            return corner ? value : value * std::sqrt(t + 1.0);
+        };
+        auto integrate = [&](std::complex<double> from, std::complex<double> to) {
+            std::complex<double> sum = 0;
+            for (size_t i = 0; i < order; ++i) {
+                sum += weights[i] * slope(from + (to - from) * (nodes[i] + 1.0) / 2.0);
+            }
+            return sum * (to - from) / 2.0;
+        };
+        // z(t) along a path inside the upper half plane: up from the corner, across, down to t.
+        auto z_of = [&](std::complex<double> t) {
+            const double height = t.imag() + 1;
+            const std::complex<double> up(1, height);
+            const std::complex<double> across(t.real(), height);
+            return integrate(1.0, up) + integrate(up, across) + integrate(across, t);
+        };
+        auto crossing = [&](double potential) {
+            const double angle = std::numbers::pi * potential;
+            double low = -25;
+            double high = 25;
+            if (!(z_of(std::polar(std::exp(low), angle)).real() < 0) || !(z_of(std::polar(std::exp(high), angle)).real() > 0)) {
+                throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Slot mouth: the equipotential " + std::to_string(potential) + " does not cross the mouth");
+            }
+            for (int iteration = 0; iteration < 90; ++iteration) {
+                const double middle = (low + high) / 2;
+                if (middle == low || middle == high) {
+                    break;  // adjacent doubles: every further step would leave low and high as they are
+                }
+                if (z_of(std::polar(std::exp(middle), angle)).real() < 0) {
+                    low = middle;
+                }
+                else {
+                    high = middle;
+                }
+            }
+            return z_of(std::polar(std::exp((low + high) / 2), angle)).imag();
+        };
+        std::vector<double> boundaries(slotMouthPieces + 1);
+        boundaries.front() = 0;
+        boundaries.back() = 1;
+        if (corner) {
+            for (size_t k = 1; k < slotMouthPieces; ++k) {
+                boundaries[k] = crossing(static_cast<double>(k) / static_cast<double>(slotMouthPieces));
+            }
+        }
+        else {
+            // Symmetric about the middle of the mouth, where the potential is 1/2.
+            for (size_t k = 1; k < slotMouthPieces / 2; ++k) {
+                boundaries[k] = crossing(static_cast<double>(k) / static_cast<double>(slotMouthPieces));
+                boundaries[slotMouthPieces - k] = 1 - boundaries[k];
+            }
+            boundaries[slotMouthPieces / 2] = 0.5;
+        }
+        for (size_t k = 0; k < slotMouthPieces; ++k) {
+            if (!(boundaries[k + 1] > boundaries[k])) {
+                throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Slot mouth: the pieces' boundaries are not increasing");
+            }
+        }
+        return boundaries;
+    };
+    static const std::vector<double> twoCorners = compute(false);
+    static const std::vector<double> oneCorner = compute(true);
+    return atWindowCorner ? oneCorner : twoCorners;
+}
+
+void CoilMesher::append_slot_mouth(std::vector<WindowWallSheet>& sheets, double wallX, double yStart, double yEnd, double current, bool atWindowCorner,
+                                   bool cornerAtStart, std::optional<size_t> winding, size_t window) {
+    const auto& boundaries = slot_mouth_boundaries(atWindowCorner);
+    const double length = yEnd - yStart;
+    auto position = [&](double fraction) {
+        return cornerAtStart ? yStart + fraction * length : yEnd - fraction * length;
+    };
+    for (size_t k = 0; k < slotMouthPieces; ++k) {
+        sheets.push_back({{wallX, position(boundaries[k])}, {wallX, position(boundaries[k + 1])}, current / static_cast<double>(slotMouthPieces), winding, window});
+    }
+}
+
+namespace {
+// A gap's mouth on a wall running from wallStart to wallEnd (y): the slot between two leg corners when it is inside the
+// wall, the slot between a leg corner and the window's end wall when it reaches one end (the gap sits at the window's
+// corner, as a piece-and-plate gap against its plate). A mouth reaching both ends has neither shape and is refused.
+void append_gap_mouth(std::vector<WindowWallSheet>& sheets, double wallX, double yStart, double yEnd, double wallStart, double wallEnd, double current,
+                      std::optional<size_t> winding, size_t window) {
+    const double tolerance = 1e-9 * (wallEnd - wallStart);
+    const bool reachesStart = yStart <= wallStart + tolerance;
+    const bool reachesEnd = yEnd >= wallEnd - tolerance;
+    if (reachesStart && reachesEnd) {
+        throw NotImplementedException("Neutral window field: a gap mouth spanning the whole window wall (y in [" + std::to_string(wallStart) + ", " +
+                                      std::to_string(wallEnd) + "]) has no slot shape");
+    }
+    if (!reachesStart && !reachesEnd) {
+        CoilMesher::append_slot_mouth(sheets, wallX, yStart, yEnd, current, false, true, winding, window);
+    }
+    else {
+        // The leg corner is the end away from the window's end wall.
+        CoilMesher::append_slot_mouth(sheets, wallX, yStart, yEnd, current, true, reachesEnd, winding, window);
+    }
+}
+}  // namespace
+
+std::complex<double> CoilMesher::slot_map(std::complex<double> t, bool atWindowCorner) {
+    const std::complex<double> j(0, 1);
+    const std::complex<double> A = -j / std::numbers::pi;
+    if (atWindowCorner) {
+        const std::complex<double> r = std::sqrt(t - 1.0);
+        return A * (2.0 * r - 2.0 * std::atan(r));
+    }
+    const std::complex<double> s = std::sqrt(t - 1.0) * std::sqrt(t + 1.0);
+    return A * (s + j * std::log((1.0 + j * s) / t));
+}
+
+std::complex<double> CoilMesher::slot_map_inverse(std::complex<double> z, bool atWindowCorner, std::optional<std::complex<double>> start) {
+    const std::complex<double> j(0, 1);
+    const std::complex<double> A = -j / std::numbers::pi;
+    auto derivative = [&](std::complex<double> t) {
+        return atWindowCorner ? A * std::sqrt(t - 1.0) / t : A * std::sqrt(t - 1.0) * std::sqrt(t + 1.0) / t;
+    };
+    // Far from the mouth the two-corner map is z ~ (t / (j pi)) + j / 2 and the window-corner one grows like sqrt(t):
+    // start on the imaginary axis at the matching size and take damped Newton steps that stay in the upper half plane.
+    std::vector<std::complex<double>> starts = {
+        atWindowCorner ? j * (1.0 + std::numbers::pi * std::abs(z)) : j * std::numbers::pi * (z - 0.5 * j),
+        j * (1.0 + std::numbers::pi * std::abs(z)), j * 0.5, std::complex<double>(2, 1), std::complex<double>(-2, 1)};
+    if (start && start->imag() > 0) {
+        starts.insert(starts.begin(), start.value());
+    }
+    for (auto t : starts) {
+        if (!(t.imag() > 0)) {
+            t = std::complex<double>(t.real(), 0.5);
+        }
+        for (int iteration = 0; iteration < 300; ++iteration) {
+            const std::complex<double> step = (slot_map(t, atWindowCorner) - z) / derivative(t);
+            double damping = 1;
+            while ((t - damping * step).imag() <= 0 && damping > 1e-12) {
+                damping /= 2;
+            }
+            t -= damping * step;
+            if (std::abs(step) <= 1e-13 * std::max(1.0, std::abs(t))) {
+                if (std::abs(slot_map(t, atWindowCorner) - z) <= 1e-10 * std::max(1.0, std::abs(z))) {
+                    return t;
+                }
+                break;
+            }
+        }
+    }
+    throw CalculationException(ErrorCode::CALCULATION_ERROR, "Slot map: no t-plane point found for z = (" + std::to_string(z.real()) + ", " + std::to_string(z.imag()) + ")");
+}
+
+std::vector<CoilMesher::SlotMouth> CoilMesher::slot_mouths(Magnetic magnetic) {
+    std::vector<SlotMouth> mouths;
+    auto core = magnetic.get_core();
+    if (!core.get_processed_description()) {
+        throw CoreNotProcessedException();
+    }
+    auto windingWindows = core.get_processed_description()->get_winding_windows();
+    if (windingWindows.size() != 1) {
+        throw NotImplementedException("Slot mouths: only single-window cores have their gap slots resolved");
+    }
+    const double A = windingWindows[0].get_width().value();
+    const double B = windingWindows[0].get_height().value();
+    auto columns = core.get_columns();
+    const size_t mainColumnIndex = core.get_main_column_index();
+    const double x0 = columns[mainColumnIndex].get_width() / 2;
+    const double y0 = -B / 2;
+    const double x1 = x0 + A;
+    const double y1 = y0 + B;
+    bool anyLateralInZOnly = false;
+    for (size_t columnIndex = 0; columnIndex < columns.size(); ++columnIndex) {
+        if (columnIndex != mainColumnIndex && columns[columnIndex].get_coordinates()[0] == 0) {
+            anyLateralInZOnly = true;
+        }
+    }
+    for (const auto& gap : core.get_functional_description().get_gapping()) {
+        if (gap.get_type() != GapType::SUBTRACTIVE && gap.get_type() != GapType::ADDITIVE) {
+            continue;  // residual mating surfaces open no slot (they carry no mouth sheet either)
+        }
+        if (!gap.get_coordinates()) {
+            throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Slot mouths: a gap has no coordinates");
+        }
+        const auto coordinates = gap.get_coordinates().value();
+        double wallX;
+        double towardsWindow;
+        if (static_cast<size_t>(core.find_closest_column_index_by_coordinates(coordinates)) == mainColumnIndex) {
+            wallX = x0;
+            towardsWindow = 1;
+        }
+        else if (anyLateralInZOnly ? coordinates[0] == 0 : coordinates[0] > 0) {
+            wallX = x1;
+            towardsWindow = -1;
+        }
+        else {
+            continue;  // the other side's lateral limb
+        }
+        const double yStart = std::max(y0, coordinates[1] - gap.get_length() / 2);
+        const double yEnd = std::min(y1, coordinates[1] + gap.get_length() / 2);
+        if (!(yEnd > yStart)) {
+            throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Slot mouths: a gap at y = " + std::to_string(coordinates[1]) + " opens nowhere onto the winding window");
+        }
+        const double tolerance = 1e-9 * B;
+        const bool reachesStart = yStart <= y0 + tolerance;
+        const bool reachesEnd = yEnd >= y1 - tolerance;
+        if (reachesStart && reachesEnd) {
+            throw NotImplementedException("Slot mouths: a gap mouth spanning the whole window wall has no slot shape");
+        }
+        SlotMouth mouth;
+        mouth.wallX = wallX;
+        mouth.towardsWindow = towardsWindow;
+        mouth.width = yEnd - yStart;
+        mouth.atWindowCorner = reachesStart || reachesEnd;
+        // The leg corner is the end away from the window's end wall (append_gap_mouth).
+        if (reachesStart) {
+            mouth.cornerY = yEnd;
+            mouth.alongSlot = -1;
+        }
+        else {
+            mouth.cornerY = yStart;
+            mouth.alongSlot = 1;
+        }
+        // Pieces graded towards both ends of the mouth (cosine spacing), where a conductor beside it moves the field most.
+        mouth.boundaryOffsets.resize(slotCorrectionPieces + 1);
+        mouth.boundaryT.resize(slotCorrectionPieces + 1);
+        for (size_t k = 0; k <= slotCorrectionPieces; ++k) {
+            const double fraction = 0.5 - 0.5 * std::cos(std::numbers::pi * static_cast<double>(k) / static_cast<double>(slotCorrectionPieces));
+            mouth.boundaryOffsets[k] = fraction * mouth.width;
+            // On the mouth line itself (Re z = 0), a hair inside the window; its ends a hair off the corners.
+            const double imaginary = std::clamp(fraction, 1e-9, 1 - 1e-9);
+            mouth.boundaryT[k] = slot_map_inverse(std::complex<double>(1e-9, imaginary), mouth.atWindowCorner);
+        }
+        mouths.push_back(std::move(mouth));
+    }
+    return mouths;
+}
+
+std::vector<double> CoilMesher::slot_correction_currents(const SlotMouth& mouth, double x, double y, std::optional<std::complex<double>>* preimage) {
+    const double mapX = mouth.towardsWindow * (x - mouth.wallX) / mouth.width;
+    const double mapY = mouth.alongSlot * (y - mouth.cornerY) / mouth.width;
+    if (!(mapX > 0)) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Slot correction: a conductor at (" + std::to_string(x) + ", " + std::to_string(y) +
+                                    ") is not on the window side of the column face x = " + std::to_string(mouth.wallX));
+    }
+    const std::complex<double> t0 = slot_map_inverse(std::complex<double>(mapX, mapY), mouth.atWindowCorner, preimage ? *preimage : std::nullopt);
+    if (preimage) {
+        *preimage = t0;
+    }
+    std::vector<double> currents(slotCorrectionPieces);
+    for (size_t k = 0; k < slotCorrectionPieces; ++k) {
+        // The increment of arg(t - t0) + arg(t - conj t0) along the piece, taken as the angle between its two ends (pieces
+        // are short, so it stays below pi and never crosses the branch cut).
+        const double change = std::arg((mouth.boundaryT[k + 1] - t0) / (mouth.boundaryT[k] - t0)) +
+                              std::arg((mouth.boundaryT[k + 1] - std::conj(t0)) / (mouth.boundaryT[k] - std::conj(t0)));
+        currents[k] = change / (2 * std::numbers::pi);
+    }
+    return currents;
+}
+
+std::vector<WindowWallSheet> CoilMesher::slot_correction_pieces(const SlotMouth& mouth) {
+    std::vector<WindowWallSheet> pieces;
+    pieces.reserve(slotCorrectionPieces);
+    for (size_t k = 0; k < slotCorrectionPieces; ++k) {
+        const double first = mouth.cornerY + mouth.alongSlot * mouth.boundaryOffsets[k];
+        const double second = mouth.cornerY + mouth.alongSlot * mouth.boundaryOffsets[k + 1];
+        pieces.push_back({{mouth.wallX, std::min(first, second)}, {mouth.wallX, std::max(first, second)}, 1.0});
+    }
+    return pieces;
+}
+
+std::vector<WindowRegion> CoilMesher::window_regions(Core core) {
+    if (!core.get_processed_description()) {
+        throw CoreNotProcessedException();
+    }
+    auto windingWindows = core.get_processed_description()->get_winding_windows();
+    if (!windingWindows[0].get_height()) {
+        throw InvalidInputException(ErrorCode::MISSING_DATA, "Neutral window field: the winding window has no height");
+    }
+    const double B = windingWindows[0].get_height().value();
+    auto columns = core.get_columns();
+    std::vector<size_t> ordered(columns.size());
+    for (size_t columnIndex = 0; columnIndex < columns.size(); ++columnIndex) {
+        ordered[columnIndex] = columnIndex;
+        if (columnIndex != core.get_main_column_index() && columns[columnIndex].get_coordinates()[0] == 0) {
+            throw NotImplementedException("Neutral window field on a multi-window core with a leg displaced only in z");
+        }
+    }
+    std::sort(ordered.begin(), ordered.end(), [&](size_t left, size_t right) {
+        return columns[left].get_coordinates()[0] < columns[right].get_coordinates()[0];
+    });
+    std::vector<WindowRegion> regions;
+    for (size_t position = 0; position + 1 < ordered.size(); ++position) {
+        const auto& left = columns[ordered[position]];
+        const auto& right = columns[ordered[position + 1]];
+        WindowRegion region{left.get_coordinates()[0] + left.get_width() / 2, -B / 2, right.get_coordinates()[0] - right.get_width() / 2, B / 2};
+        if (!(region.x1 > region.x0)) {
+            throw InvalidInputException(ErrorCode::INVALID_CORE_DATA, "Neutral window field: two adjacent legs overlap");
+        }
+        regions.push_back(region);
+    }
+    return regions;
+}
+
+std::vector<WindowWallSheet> CoilMesher::generate_multi_window_wall_sheet_sources(Magnetic magnetic, std::optional<OperatingPoint> operatingPoint) {
+    auto core = magnetic.get_core();
+    if (!core.get_processed_description()) {
+        throw CoreNotProcessedException();
+    }
+    const auto regions = window_regions(core);
+    auto reluctanceModel = ReluctanceModel::factory();
+    auto reluctanceOutput = reluctanceModel->get_core_reluctance(core, operatingPoint);
+    if (!reluctanceOutput.get_ungapped_core_reluctance()) {
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field: the reluctance model returned no ferrite reluctance");
+    }
+    auto gapping = core.get_functional_description().get_gapping();
+    std::vector<AirGapReluctanceOutput> reluctancePerGap;
+    if (!gapping.empty()) {
+        if (!reluctanceOutput.get_reluctance_per_gap() || reluctanceOutput.get_reluctance_per_gap()->size() != gapping.size()) {
+            throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field: the reluctance model did not return one reluctance per gap");
+        }
+        reluctancePerGap = reluctanceOutput.get_reluctance_per_gap().value();
+    }
+    ReluctanceNetwork network(core, reluctanceOutput.get_ungapped_core_reluctance().value(), reluctancePerGap);
+    const auto& ordered = network.get_ordered_column_indexes();
+    const auto& legReluctances = network.get_column_reluctances();
+    const auto& yokeReluctances = network.get_yoke_segment_reluctances();
+    if (regions.size() + 1 != ordered.size() || yokeReluctances.size() != regions.size()) {
+        throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Neutral window field: the window regions do not match the reluctance network's loops");
+    }
+    // Each leg's gaps, and its ferrite share (the leg's branch reluctance without them).
+    std::vector<std::vector<size_t>> gapsPerColumn(core.get_columns().size());
+    std::vector<double> ferriteReluctancePerColumn = legReluctances;
+    for (size_t gapIndex = 0; gapIndex < gapping.size(); ++gapIndex) {
+        if (!gapping[gapIndex].get_coordinates()) {
+            throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Neutral window field: a gap has no coordinates");
+        }
+        size_t columnIndex = static_cast<size_t>(core.find_closest_column_index_by_coordinates(gapping[gapIndex].get_coordinates().value()));
+        gapsPerColumn[columnIndex].push_back(gapIndex);
+        ferriteReluctancePerColumn[columnIndex] -= reluctancePerGap[gapIndex].get_reluctance();
+    }
+
+    const size_t numberWindings = magnetic.get_coil().get_functional_description().size();
+    std::vector<WindowWallSheet> sources;
+    for (size_t windingIndex = 0; windingIndex < numberWindings; ++windingIndex) {
+        // The leg fluxes this winding drives with one ampere (its polarity and turns included, ReluctanceNetwork).
+        std::vector<double> currents(numberWindings, 0.0);
+        currents[windingIndex] = 1;
+        const auto legFlux = network.calculate_column_magnetic_fluxes(magnetic, currents);
+        // Mesh loop k circulates in the window between ordered legs k and k + 1 (ReluctanceNetwork's mesh solve): the
+        // drops round it are R_k phi_k on leg k, -R_{k+1} phi_{k+1} on leg k + 1 and Y_k sum_{j <= k} phi_j on the
+        // yoke segment, and they add up to the current the winding encloses in that window.
+        double cumulativeFlux = 0;
+        for (size_t windowIndex = 0; windowIndex < regions.size(); ++windowIndex) {
+            const auto& region = regions[windowIndex];
+            const size_t leftColumn = ordered[windowIndex];
+            const size_t rightColumn = ordered[windowIndex + 1];
+            cumulativeFlux += legFlux[leftColumn];
+            auto add = [&](std::vector<double> start, std::vector<double> end, double drop) {
+                if (drop != 0) {
+                    sources.push_back({start, end, -drop, windingIndex, windowIndex});
+                }
+            };
+            auto gapSheets = [&](size_t columnIndex, double wallX, double sign) {
+                for (size_t gapIndex : gapsPerColumn[columnIndex]) {
+                    if (gapping[gapIndex].get_type() == GapType::RESIDUAL) {
+                        // A residual gap's drop is spread along its leg's face with the ferrite (it opens onto no slot).
+                        continue;
+                    }
+                    const double gapY = gapping[gapIndex].get_coordinates().value()[1];
+                    const double gapLength = gapping[gapIndex].get_length();
+                    const double yStart = std::max(region.y0, gapY - gapLength / 2);
+                    const double yEnd = std::min(region.y1, gapY + gapLength / 2);
+                    if (!(yEnd > yStart)) {
+                        throw GapException(ErrorCode::GAP_INVALID_DIMENSIONS, "Neutral window field: a gap at y = " + std::to_string(gapY) +
+                                           " opens nowhere onto its winding window");
+                    }
+                    const double drop = sign * reluctancePerGap[gapIndex].get_reluctance() * legFlux[columnIndex];
+                    if (drop != 0) {
+                        append_gap_mouth(sources, wallX, yStart, yEnd, region.y0, region.y1, -drop, windingIndex, windowIndex);
+                    }
+                }
+            };
+            auto ferriteReluctance = [&](size_t columnIndex) {
+                double reluctance = ferriteReluctancePerColumn[columnIndex];
+                for (size_t gapIndex : gapsPerColumn[columnIndex]) {
+                    if (gapping[gapIndex].get_type() == GapType::RESIDUAL) {
+                        reluctance += reluctancePerGap[gapIndex].get_reluctance();
+                    }
+                }
+                return reluctance;
+            };
+            gapSheets(leftColumn, region.x0, 1.0);
+            gapSheets(rightColumn, region.x1, -1.0);
+            add({region.x0, region.y0}, {region.x0, region.y1}, ferriteReluctance(leftColumn) * legFlux[leftColumn]);
+            add({region.x1, region.y0}, {region.x1, region.y1}, -ferriteReluctance(rightColumn) * legFlux[rightColumn]);
+            const double yokeDrop = yokeReluctances[windowIndex] * cumulativeFlux;
+            add({region.x0, region.y0}, {region.x1, region.y0}, yokeDrop / 2);
+            add({region.x0, region.y1}, {region.x1, region.y1}, yokeDrop / 2);
+        }
+    }
+    return sources;
+}
+
+std::vector<WindowWallSheet> CoilMesher::generate_window_wall_sheets(Magnetic magnetic, std::optional<OperatingPoint> operatingPoint) {
+    auto originals = generate_window_wall_sheet_sources(magnetic, operatingPoint);
+    auto core = magnetic.get_core();
+    if (core.get_processed_description()->get_winding_windows().size() != 1) {
+        // Each window's sheets in that window's complete-cell lattice, as CoilMesherCenterModel images the conductors
+        // of the window that contains them.
+        const auto regions = window_regions(core);
+        const int M = settings.get_magnetic_field_mirroring_dimension();
+        if (M < 1) {
+            throw InvalidInputException(ErrorCode::INVALID_INPUT, "Neutral window field: needs the image lattice (mirroring dimension >= 1)");
+        }
+        const double corePermeability = core.get_initial_permeability(defaults.ambientTemperature);
+        std::vector<WindowWallSheet> sheets;
+        for (const auto& source : originals) {
+            const auto& region = regions[source.window];
+            const double A = region.x1 - region.x0;
+            const double B = region.y1 - region.y0;
+            const bool neutralCells = settings.get_magnetic_field_mirroring_neutral_cells();
+            const int cellsX = neutralCells ? M : M * static_cast<int>(std::max(1.0, std::ceil(B / A)));
+            const int cellsY = neutralCells ? M : M * static_cast<int>(std::max(1.0, std::ceil(A / B)));
+            auto imagePosition = [&](const std::vector<double>& point, int m, int n) {
+                double a = point[0] - region.x0;
+                double b = point[1] - region.y0;
+                double imageA = (m % 2 == 0) ? m * A + a : m * A + A - a;
+                double imageB = (n % 2 == 0) ? n * B + b : n * B + B - b;
+                return std::vector<double>{imageA + region.x0, imageB + region.y0};
+            };
+            for (int m = -2 * cellsX - 1; m <= 2 * cellsX; ++m) {
+                for (int n = -2 * cellsY - 1; n <= 2 * cellsY; ++n) {
+                    double imageFactor = std::pow((corePermeability - 1.0) / (corePermeability + 1.0), std::abs(m) + std::abs(n));
+                    sheets.push_back({imagePosition(source.start, m, n), imagePosition(source.end, m, n), source.current * imageFactor, source.winding, source.window});
+                }
+            }
+        }
+        return sheets;
+    }
+    return image_window_wall_sheets(originals, core);
+}
+
+std::vector<WindowWallSheet> CoilMesher::image_window_wall_sheets(const std::vector<WindowWallSheet>& originals, Core core) {
+    if (!core.get_processed_description() || core.get_processed_description()->get_winding_windows().size() != 1) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Neutral window field: the single-window lattice needs a processed core with one winding window");
+    }
+    auto windingWindow = core.get_processed_description().value().get_winding_windows()[0];
+    const double A = windingWindow.get_width().value();
+    const double B = windingWindow.get_height().value();
+    const double x0 = core.get_columns()[core.get_main_column_index()].get_width() / 2;
+    const double y0 = -B / 2;
 
     // The complete-cell lattice of #1240, the same index ranges and positions CoilMesherCenterModel uses for the
     // conductors, so conductors and wall sources are imaged identically.

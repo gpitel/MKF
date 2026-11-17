@@ -421,6 +421,7 @@ class Painter : public PainterInterface {
         _opacity = opacity;
     }
     void paint_two_piece_set_core(Core core);
+    void paint_piece_and_plate_core(Core core);
     void paint_toroidal_core(Core core);
     // Drum-family + molded single-solid cross-sections (ABT #366/#362/#357): these have no
     // mirrored halves, so the two-piece-set reconstruction draws them wrong.
@@ -456,10 +457,27 @@ class Painter : public PainterInterface {
     void set_image_size(Magnetic magnetic);
     void paint_round_wire(double xCoordinate, double yCoordinate, Wire wire, std::optional<std::string> label = std::nullopt);
     void paint_litz_wire(double xCoordinate, double yCoordinate, Wire wire, std::optional<std::string> label = std::nullopt);
+    // A litz turn the wind compressed (Coil::wind, litz deformation): a rectangle with rounded corners of
+    // the turn's own dimensions in the coating colour -- for a rectangular turn the corner radius that keeps
+    // the round bundle's area (Wire::compressed_litz_corner_radius), half its short side for an oval one --
+    // and inside its serving
+    // (Wire::litz_serving_thickness) the bundle's copper.
+    void paint_compressed_litz_wire(double xCoordinate, double yCoordinate, Wire wire, double width, double height,
+                                    double cornerRadius, std::optional<std::string> label = std::nullopt);
+    // A litz turn as the wind laid it: compressed when the turn says so (rectangular or oval), the
+    // round bundle otherwise, labelled with the given label.
+    void paint_litz_turn(double xCoordinate, double yCoordinate, const Wire& wire, const Turn& turn, const std::string& label);
+    // A rectangle with rounded corners of these outer sides and corner radius, sampled along the arcs.
+    void paint_rounded_rectangle(double xCoordinate, double yCoordinate, double width, double height, double cornerRadius,
+                                 std::string cssClassName, SVG::Group* group, std::optional<std::string> label = std::nullopt);
     void paint_rectangular_wire(double xCoordinate, double yCoordinate, Wire wire, double angle, std::vector<double> center, std::optional<std::string> label = std::nullopt);
     void paint_rectangle(double xCoordinate, double yCoordinate, double xDimension, double yDimension, std::string cssClassName, SVG::Group* group = nullptr, double angle = 0, std::vector<double> center = {0, 0}, std::optional<std::string> label = std::nullopt);
     void paint_circle(double xCoordinate, double yCoordinate, double radius, std::string cssClassName, SVG::Group* group = nullptr, double fillAngle=360, double angle = 0, std::vector<double> center = {0, 0}, std::optional<std::string> label = std::nullopt);
     void paint_field_point(double xCoordinate, double yCoordinate, double xDimension, double yDimension, std::string color, std::string label);
+    // The group the current field's points go into (a new one per painted field, so a field keeps its place in the
+    // drawing order) and the CSS class of each colour used by field points.
+    SVG::Group* _fieldPointGroup = nullptr;
+    std::map<std::string, std::string> _fieldPointClasses;
 
  public:
     // Colour of value on the linear scale [minimumValue, maximumValue] between the two end colours

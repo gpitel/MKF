@@ -7,17 +7,27 @@
 #include <cmath>
 #include <complex>
 #include <optional>
+#include <string>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <numbers>
 #include <streambuf>
+#include <string_view>
 #include <vector>
 
 using namespace MAS;
 
 namespace OpenMagnetics {
+
+// Labels of the toroid inducing points (CoilMesherCenterModel::generate_mesh_inducing_turn). The ring splits the plane
+// into the bore and the outside; each point acts only in its region (MagneticField). A "reply" is the core's answer to
+// a conductor (its Kelvin image, or the centre line current that carries a bore crossing's MMF outside the core).
+inline constexpr std::string_view toroidBoreConductorLabel = "toroid bore conductor";
+inline constexpr std::string_view toroidBoreReplyLabel = "toroid bore reply";
+inline constexpr std::string_view toroidExteriorConductorLabel = "toroid exterior conductor";
+inline constexpr std::string_view toroidExteriorReplyLabel = "toroid exterior reply";
 
 
 enum class CoilMesherModels : int {
@@ -34,7 +44,40 @@ struct WindowWallSheet {
     // Total current of the sheet per ampere-turn of NET winding MMF in the window, sign included. The sheets of one
     // window (images excluded) sum to exactly -1: they return the winding's MMF, which is what makes each lattice
     // cell neutral.
+    // Multi-window cores (ABT #2267): per ampere-turn of the MMF of winding `winding` (N_w I_w, its polarity included),
+    // and the sheets of window `window` sum to minus the current that winding encloses in that window.
     double current;
+    std::optional<size_t> winding = std::nullopt;
+    size_t window = 0;
+};
+
+// Labels of the CENTER mesher's points: "image" marks the core's reply to a conductor (an image), and on a multi-window
+// core (ABT #2267) "@k" the window k the point belongs to ("image@k" an image in it). A point acts only in its window.
+inline std::string window_label(bool image, std::optional<size_t> window) {
+    return std::string(image ? "image" : "") + (window ? "@" + std::to_string(window.value()) : std::string());
+}
+inline bool is_image_label(const std::optional<std::string>& label) {
+    return label && label->rfind("image", 0) == 0;
+}
+inline std::optional<size_t> window_of_label(const std::optional<std::string>& label) {
+    if (!label) {
+        return std::nullopt;
+    }
+    const auto at = label->find('@');
+    if (at == std::string::npos) {
+        return std::nullopt;
+    }
+    return static_cast<size_t>(std::stoul(label->substr(at + 1)));
+}
+
+// A winding-window region of a multi-window core (ABT #2267): the air between two x-adjacent legs, the frame its
+// conductors and wall sheets are imaged in.
+struct WindowRegion {
+    double x0;
+    double y0;
+    double x1;
+    double y1;
+    bool contains(double x, double y) const { return x > x0 && x < x1 && y > y0 && y < y1; }
 };
 
 
@@ -114,6 +157,66 @@ class CoilMesher {
     // the four walls in proportion to length x tangential H, H = B / mu with B from the flux through that wall's
     // limb. Throws for toroids and multi-window cores, whose boundary this frame does not describe.
     static std::vector<WindowWallSheet> generate_window_wall_sheets(Magnetic magnetic, std::optional<OperatingPoint> operatingPoint);
+    // The same sources before imaging: one sheet per gap mouth and per wall's ferrite share, currents per ampere-turn
+    // of net MMF summing to -1 (AxisymmetricWindow uses them as the window's boundary data).
+    static std::vector<WindowWallSheet> generate_window_wall_sheet_sources(Magnetic magnetic, std::optional<OperatingPoint> operatingPoint);
+    // Multi-window cores (ABT #2267): the window regions between x-adjacent legs, in leg order, and the wall sheet
+    // sources per winding and window from the column reluctance network (ReluctanceNetwork): each gap's drop is its
+    // reluctance times its column's flux, each leg face carries the leg's ferrite drop and the two plates the yoke
+    // segment's, so the sources of window k for winding w sum to minus the current w encloses there.
+    static std::vector<WindowRegion> window_regions(Core core);
+    // A gap's slot mouth on the window wall carries the gap's MMF drop as slotMouthPieces sheets of equal current, at the
+    // boundaries this returns: fractions of the mouth from its leg corner (0) to its far end (1). A mouth inside the wall
+    // (atWindowCorner false) is the slot between two leg corners, opening into the half-space; one at the window's end
+    // (atWindowCorner true) is the slot between a leg corner and a plate face flush with the window's end wall.
+    static constexpr size_t slotMouthPieces = 8;
+    static const std::vector<double>& slot_mouth_boundaries(bool atWindowCorner);
+
+    // ABT #2384: a gap's slot as a conductor near its mouth sees it. The lattice images a conductor in the column face as
+    // if the face were ferrite across the mouth too; the slot lets the conductor's own field into it. The map of the slot
+    // (gap length g) onto the upper half t-plane with the irons on the real axis and the leg corner at t = 1,
+    //     z = A [s + j ln((1 + j s) / t)],  s = sqrt(t - 1) sqrt(t + 1)   (two leg corners, dz/dt = A s / t),
+    //     z = A [2 r - 2 atan r],           r = sqrt(t - 1)               (a leg corner and the window's end wall),
+    // A = -j g / pi, z measured from the leg corner with the window at Re z > 0 and the slot along 0 < Im z < g, carries
+    // the exact field of a line current I at t0: the same current at conj(t0) is its image. That field differs from the
+    // lattice's by the field of a sheet on the mouth (with the coincident image the lattice gives it) whose current
+    // between two of its points is the change of I (arg(t - t0) + arg(t - conj t0)) / (2 pi) between them: within 0.2-0.7 %
+    // of the exact field on 32 pieces (scratch check against the map's own field, 2026-11-15). The legs stay at one
+    // potential, so a mouth's pieces carry no net current.
+    struct SlotMouth {
+        double wallX = 0;
+        // The leg corner the map puts at t = 1, and the gap's length along the wall.
+        double cornerY = 0;
+        double width = 0;
+        // +1 when the window is at x > wallX (a column face on the window's left), -1 when it is at x < wallX.
+        double towardsWindow = 1;
+        // +1 when the slot runs from cornerY to cornerY + width, -1 when it runs to cornerY - width.
+        double alongSlot = 1;
+        // The far side of the mouth is a plate face flush with the window's end wall, not a second leg corner.
+        bool atWindowCorner = false;
+        // The pieces' ends from the corner (0) to the far side (width), and their images in the t-plane.
+        std::vector<double> boundaryOffsets;
+        std::vector<std::complex<double>> boundaryT;
+    };
+    static constexpr size_t slotCorrectionPieces = 32;
+    // The mouths of a single-window core's gaps on its two walls, as generate_window_wall_sheet_sources opens them.
+    static std::vector<SlotMouth> slot_mouths(Magnetic magnetic);
+    // The map of a slot of unit width, and its inverse (Newton, kept in the upper half plane; throws if it does not converge).
+    // `start`, the preimage of a nearby point, is tried before the far-field starts.
+    static std::complex<double> slot_map(std::complex<double> t, bool atWindowCorner);
+    static std::complex<double> slot_map_inverse(std::complex<double> z, bool atWindowCorner, std::optional<std::complex<double>> start = std::nullopt);
+    // Per piece of the mouth, its sheet current per ampere of a line current at (x, y) in the window. `preimage` (in/out):
+    // a nearby point's preimage to start from, replaced by this point's.
+    static std::vector<double> slot_correction_currents(const SlotMouth& mouth, double x, double y, std::optional<std::complex<double>>* preimage = nullptr);
+    // The mouth's pieces as sheets of unit current, before imaging, in piece order.
+    static std::vector<WindowWallSheet> slot_correction_pieces(const SlotMouth& mouth);
+    // Sheets of a single-window core imaged in its complete-cell lattice, as generate_window_wall_sheets images the walls.
+    static std::vector<WindowWallSheet> image_window_wall_sheets(const std::vector<WindowWallSheet>& originals, Core core);
+    // Appends the mouth of a gap on the wall x = wallX, from yStart to yEnd, as those pieces. cornerAtStart says which end
+    // is the leg corner when the mouth is at a window corner.
+    static void append_slot_mouth(std::vector<WindowWallSheet>& sheets, double wallX, double yStart, double yEnd, double current, bool atWindowCorner,
+                                  bool cornerAtStart, std::optional<size_t> winding = std::nullopt, size_t window = 0);
+    static std::vector<WindowWallSheet> generate_multi_window_wall_sheet_sources(Magnetic magnetic, std::optional<OperatingPoint> operatingPoint);
     // meshAllWindows: mesh every distinct winding-window region (multi-column cores)
     // instead of only window 0. Painting wants it; the leakage energy integrator must
     // NOT use it — its revolution bookkeeping already accounts for the full turn from
@@ -149,6 +252,9 @@ class CoilMesherModel {
 
 class CoilMesherCenterModel : public CoilMesherModel {
   public:
+    // A round-post window seen as a solid of revolution (AxisymmetricWindow::applies, decided once per coil by
+    // CoilMesher::generate_mesh_inducing_coil on the neutral path): turns imaged in the plates only.
+    std::optional<bool> axisymmetricWindow;
     std::vector<FieldPoint> generate_mesh_inducing_turn(const Turn& turn, [[maybe_unused]] Wire& wire, std::optional<size_t> turnIndex, std::optional<double> turnLength, Core& core);
     std::vector<FieldPoint> generate_mesh_induced_turn(const Turn& turn, [[maybe_unused]] Wire& wire, std::optional<size_t> turnIndex = std::nullopt, const Core* core = nullptr);
 };

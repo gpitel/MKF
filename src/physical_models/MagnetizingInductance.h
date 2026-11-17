@@ -80,6 +80,19 @@ class MagnetizingInductance {
     std::map<std::string, std::string> get_models() const { return _models; }
     // The DC point of the last calculate_inductance_and_magnetic_flux_density (see _lastDcBiasPoint).
     std::optional<DcBiasPoint> get_last_dc_bias_point() const { return _lastDcBiasPoint; }
+    // The DC-bias flux density of a flux density signal: the one definition the inductance model and the gap solve
+    // read the material's biased permeability at (ABT #2394).
+    //  - A line-cycle record (switching cycles riding on a slower swing: the signal's fundamental lies below
+    //    switchingFrequency and its waveform is a record of repeated switching cycles,
+    //    Inputs::find_switching_cycle_valleys): the peak magnitude of its low-frequency envelope, the largest
+    //    |cycle-averaged B| over the record (Inputs::calculate_switching_cycles_envelope, the envelope the core
+    //    losses price). The amplitude of a sine line swing (an active front end), the peak of a rectified one (a
+    //    PFC choke), whose time average is only 2/pi of it.
+    //  - Any other signal: the magnitude of its time average, its zero-frequency harmonic.
+    // switchingFrequency is Inputs::get_switching_frequency of the excitation the flux density belongs to. Throws
+    // when the signal has no harmonics, or when a line-cycle record has no waveform with a time axis.
+    static double calculate_bias_flux_density(const SignalDescriptor& magneticFluxDensity, double switchingFrequency);
+
     MagnetizingInductanceOutput calculate_inductance_from_number_turns_and_gapping(Core core,
                                                                                    Coil coil,
                                                                                    OperatingPoint* operatingPoint = nullptr);
@@ -169,8 +182,9 @@ class MagnetizingInductance {
     // Semi-shielded drum (ABT #362): ferrite drum closed by a magnetic-epoxy shell — mixed-
     // material sectioned reluctance (drum mu + glue mu applied per section via the piece's c1
     // split); routed automatically for CoreShapeFamily::DRUM_SEMISHIELDED. The shell material
-    // comes from the core coating {type: magneticEpoxy, material: <core material name>};
-    // throws when the coating, its type, its material, or the material record is missing.
+    // is functionalDescription.material[1], a magneticEpoxy grade (Core::resolve_semishielded_
+    // shell_material; the deprecated magneticEpoxy coating is still read); throws when the shell
+    // is missing, contradictory, or its material record is not found.
     static double calculate_semishielded_drum_magnetizing_inductance(Core core, double numberTurns, double temperature);
 
     // Shielded drum whose ring is a DIFFERENT grade from the drum (ABT #576): the drum sections

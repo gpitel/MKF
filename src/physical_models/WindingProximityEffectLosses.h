@@ -19,6 +19,8 @@ using namespace MAS; // QUAL-001 TODO: qualify types and remove
 
 namespace OpenMagnetics {
 
+struct ParallelCurrentSplit;
+
 // Width-resolved samples across a flat conductor's wide face. "widthsample" points carry the gap-fringing field only
 // (turn fields at them are filament artefacts, ABT #182); "fullwidthsample" points carry the COMPLETE field of every
 // other turn, its images and the gap, which MagneticField emits only when each flat turn is one exact Binns-Lawrenson
@@ -62,9 +64,9 @@ class WindingProximityEffectLosses {
     static std::shared_ptr<WindingProximityEffectLossesModel> get_model(WireType wireType, std::optional<WindingProximityEffectLossesModels> modelOverride = std::nullopt);
     // Phasor field (MagneticField::calculate_magnetic_field_strength_field): the loss of every
     // harmonic is that of the in-phase plus the quadrature field.
-    static WindingLossesOutput calculate_proximity_effect_losses(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, WindingWindowMagneticStrengthFieldPhasorOutput windingWindowMagneticStrengthFieldOutput, std::optional<WindingProximityEffectLossesModels> modelOverride = std::nullopt, std::optional<std::map<WireType, WindingProximityEffectLossesModels>> modelPerWireType = std::nullopt);
+    static WindingLossesOutput calculate_proximity_effect_losses(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, WindingWindowMagneticStrengthFieldPhasorOutput windingWindowMagneticStrengthFieldOutput, std::optional<WindingProximityEffectLossesModels> modelOverride = std::nullopt, std::optional<std::map<WireType, WindingProximityEffectLossesModels>> modelPerWireType = std::nullopt, const ParallelCurrentSplit* parallelCurrentSplit = nullptr);
     // A plain (real, single-phase) field: there is no quadrature component.
-    static WindingLossesOutput calculate_proximity_effect_losses(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, WindingWindowMagneticStrengthFieldOutput windingWindowMagneticStrengthFieldOutput, std::optional<WindingProximityEffectLossesModels> modelOverride = std::nullopt, std::optional<std::map<WireType, WindingProximityEffectLossesModels>> modelPerWireType = std::nullopt);
+    static WindingLossesOutput calculate_proximity_effect_losses(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, WindingWindowMagneticStrengthFieldOutput windingWindowMagneticStrengthFieldOutput, std::optional<WindingProximityEffectLossesModels> modelOverride = std::nullopt, std::optional<std::map<WireType, WindingProximityEffectLossesModels>> modelPerWireType = std::nullopt, const ParallelCurrentSplit* parallelCurrentSplit = nullptr);
     // quadratureFields, when given, must match fields harmonic by harmonic and point by point.
     static std::pair<double, std::vector<std::pair<double, double>>> calculate_proximity_effect_losses_per_meter(const Wire& wire, double temperature, std::vector<ComplexField> fields, std::optional<WindingProximityEffectLossesModels> modelOverride = std::nullopt, std::optional<std::vector<ComplexField>> quadratureFields = std::nullopt, std::optional<double> perpendicularOutlineFactor = std::nullopt, std::optional<double> stackSharingNumber = std::nullopt);
   private:
@@ -72,7 +74,7 @@ class WindingProximityEffectLosses {
     // model instance, so its proximity-factor memo serves that winding's turns (one wire, so one key per frequency
     // and temperature) instead of starting empty for each turn.
     static std::pair<double, std::vector<std::pair<double, double>>> calculate_proximity_effect_losses_per_meter(const std::shared_ptr<WindingProximityEffectLossesModel>& model, const Wire& wire, double temperature, std::vector<ComplexField> fields, std::optional<std::vector<ComplexField>> quadratureFields, std::optional<double> perpendicularOutlineFactor, std::optional<double> stackSharingNumber);
-    static WindingLossesOutput calculate_proximity_effect_losses_impl(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, const std::vector<ComplexField>& fieldPerFrequency, const std::optional<std::vector<ComplexField>>& quadratureFieldPerFrequency, std::optional<WindingProximityEffectLossesModels> modelOverride, std::optional<std::map<WireType, WindingProximityEffectLossesModels>> modelPerWireType);
+    static WindingLossesOutput calculate_proximity_effect_losses_impl(Coil coil, double temperature, WindingLossesOutput windingLossesOutput, const std::vector<ComplexField>& fieldPerFrequency, const std::optional<std::vector<ComplexField>>& quadratureFieldPerFrequency, std::optional<WindingProximityEffectLossesModels> modelOverride, std::optional<std::map<WireType, WindingProximityEffectLossesModels>> modelPerWireType, const ParallelCurrentSplit* parallelCurrentSplit);
 
 };
 
@@ -244,11 +246,11 @@ class WindingProximityEffectLossesEwaldModel : public WindingProximityEffectLoss
 // (median 0.99) at 10 kHz, 100 kHz and 1 MHz. The Ewald model above reads 0.17-1.15 (median
 // 0.44) over the same six points.
 //
-// WHAT IT DOES NOT YET DO, stated so nobody assumes otherwise: the MUTUAL reaction. Each
-// conductor excludes the field from its own volume, but the field its induced currents throw
-// back at its neighbours is not fed round a second time. That is a coupled solve over the
-// induced dipole moments, and it is the natural next step; without it, closely packed turns are
-// still charged more field than they really see.
+// The MUTUAL reaction (the field each conductor's induced currents throw back at its neighbours) is not in this kernel
+// alone: under the Martinez method (WindingLossesModelSets::MARTINEZ, the whole winding-loss approach this kernel is the
+// flat-conductor part of) each flat turn is resolved into width cells whose currents are solved together with every other
+// cell, the walls and the parallel split (calculate_flat_cell_losses books them), and round turns react as induced dipoles.
+// Used on its own, outside that frame, closely packed flat turns are still charged more field than they really see.
 class WindingProximityEffectLossesMartinezModel : public WindingProximityEffectLossesModel {
   public:
     // Sets the INHERITED methodName: a redeclared member shadowed the base one, which is what
@@ -285,8 +287,23 @@ class WindingProximityEffectLossesMartinezModel : public WindingProximityEffectL
     static std::vector<double> calculate_stack_sharing_numbers(Coil coil);
     // The turn's n_k; unset means the conductor is evaluated alone in the given field (n = 1, the per-meter API).
     void set_stack_sharing_number(std::optional<double> stackSharingNumber) { _stackSharingNumber = stackSharingNumber; }
+    // A flat turn resolved across its width (FlatTurnCells, the screened width-cell model): the split that solved its
+    // cell currents and its index among the split's flat turns. Unset for every other turn. A resolved turn is booked
+    // from its "cellsample" points and its cell currents, cell by cell (calculate_flat_cell_losses), and nothing else.
+    void set_flat_turn(const ParallelCurrentSplit* parallelCurrentSplit, std::optional<size_t> flatTurnIndex) {
+        _parallelCurrentSplit = parallelCurrentSplit;
+        _flatTurnIndex = flatTurnIndex;
+    }
+    // The end term of a resolved flat turn's end cell, E(t/delta): the loss the end face and the corners add over the
+    // cell's two flat faces, in units of t * 2|H|^2 / (2 sigma delta), H the field along the faces at the end cell.
+    // Tabulated from a 2D finite-difference solve of an isolated conductor in a uniform field along its faces
+    // (scripts/flat_cell_end_term.py); beyond the table the corner series 2.728 - 3.413 nu^(-1/3) + 1.655 nu^(-2/3).
+    static double calculate_flat_cell_end_term(double thicknessInSkinDepths);
   private:
     std::optional<double> _stackSharingNumber;
+    const ParallelCurrentSplit* _parallelCurrentSplit = nullptr;
+    std::optional<size_t> _flatTurnIndex;
+    double calculate_flat_cell_losses(double frequency, double resistivity, const std::vector<ComplexFieldPoint>& data, const std::vector<ComplexFieldPoint>* quadratureData) const;
     double calculate_turn_losses_impl(const Wire& wire, double frequency, const std::vector<ComplexFieldPoint>& data, const std::vector<ComplexFieldPoint>* quadratureData, double temperature);
 };
 

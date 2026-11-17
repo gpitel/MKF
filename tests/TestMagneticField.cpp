@@ -1,10 +1,17 @@
 #include <source_location>
 #include "support/Painter.h"
 #include "physical_models/MagneticField.h"
+#include "physical_models/AxisymmetricWindow.h"
 #include "physical_models/Reluctance.h"
+#include "constructive_models/Bobbin.h"
+#include "support/CoilMesher.h"
+#include "physical_models/WindingLosses.h"
+#include "constructive_models/Mas.h"
 #include "json.hpp"
 #include "TestingUtils.h"
 #include "Models.h"
+#include "support/HierarchicalMatrix.h"
+#include "support/Exceptions.h"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -14,6 +21,7 @@
 #include <map>
 #include <string>
 #include <cmath>
+#include <complex>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -517,6 +525,89 @@ namespace {
         }
     }
 
+    // ABT #1463: foil on a round post. The neutral window of a gapped PQ is a solid of revolution (AxisymmetricWindow),
+    // and each foil turn is a strip that screens the field crossing it -- the wall correction too, split by the wall it
+    // answers. At 10 Hz a foil barely screens (W t / (pi delta^2) ~ 1e-4), so it must read the field of the same turns
+    // as rectangles (no strips); at 1 MHz the field between two foils is the screened one, and differs.
+    TEST_CASE("Test_Magnetic_Field_Foil_Screening_On_A_Round_Post", "[physical-model][magnetic-field][axisymmetric]") {
+        auto fieldBetweenFoils = [&](WireType wireType, double testFrequency) {
+            numberTurns = {3};
+            numberParallels = {1};
+            turnsRatios = {};
+            interleavingLevel = 1;
+            numberStacks = 1;
+            voltagePeakToPeak = 2000;
+            frequency = testFrequency;
+            coreShape = "PQ 26/25";
+            coreMaterial = "3C97";
+            gapping = OpenMagneticsTesting::get_ground_gap(0.001);
+            sectionOrientation = WindingOrientation::OVERLAPPING;
+            layersOrientation = WindingOrientation::OVERLAPPING;
+            sectionsAlignment = CoilAlignment::INNER_OR_TOP;
+            turnsAlignment = CoilAlignment::CENTERED;
+            setup();
+            std::vector<OpenMagnetics::Wire> wires;
+            OpenMagnetics::Wire wire;
+            wire.set_nominal_value_conducting_width(0.0001);
+            wire.set_nominal_value_conducting_height(0.0076);
+            wire.set_nominal_value_outer_height(0.0076);
+            // The coil lays a foil turn out 0.125 mm wide (its interlayer insulation); the rectangles take that outer
+            // width so that both sets of turns sit at the same place with the same copper.
+            wire.set_nominal_value_outer_width(wireType == WireType::FOIL ? 0.0001 : 0.000125);
+            wire.set_number_conductors(1);
+            wire.set_material("copper");
+            wire.set_type(wireType);
+            wires.push_back(wire);
+            coil = OpenMagneticsTesting::get_quick_coil(numberTurns, numberParallels, coreShape, interleavingLevel, sectionOrientation, layersOrientation,
+                                                        turnsAlignment, sectionsAlignment, wires);
+            coil.delimit_and_compact();
+            const auto turns = coil.get_turns_description().value();
+            REQUIRE(turns.size() == 3);
+            OpenMagnetics::Magnetic magnetic;
+            magnetic.set_core(core);
+            magnetic.set_coil(coil);
+            REQUIRE(AxisymmetricWindow::applies(magnetic.get_core(), magnetic.get_coil()));
+
+            // Midway between the first two foils, and beyond the last one, at the foils' mid-height.
+            std::vector<FieldPoint> points;
+            FieldPoint point;
+            point.set_point(std::vector<double>{0.5 * (turns[0].get_coordinates()[0] + turns[1].get_coordinates()[0]), turns[0].get_coordinates()[1]});
+            points.push_back(point);
+            point.set_point(std::vector<double>{turns[2].get_coordinates()[0] + 0.3e-3, turns[2].get_coordinates()[1]});
+            points.push_back(point);
+            Field inducedField;
+            inducedField.set_data(points);
+            inducedField.set_frequency(frequency);
+            settings.reset();
+            MagneticField magneticField(MagneticFieldStrengthModels::BINNS_LAWRENSON, MagneticFieldStrengthFringingEffectModels::MMF_BOUNDARY);
+            auto field = magneticField.calculate_magnetic_field_strength_field(inputs.get_operating_point(0), magnetic, inducedField).get_field_per_frequency()[0];
+            REQUIRE(field.get_data().size() == 2);
+            std::vector<std::complex<double>> values;
+            for (const auto& datum : field.get_data()) {
+                values.push_back({datum.get_real(), datum.get_imaginary()});
+            }
+            return values;
+        };
+
+        for (double testFrequency : {10.0, 1e6}) {
+            std::vector<std::complex<double>> foil;
+            REQUIRE_NOTHROW(foil = fieldBetweenFoils(WireType::FOIL, testFrequency));
+            auto rectangular = fieldBetweenFoils(WireType::RECTANGULAR, testFrequency);
+            for (size_t index = 0; index < foil.size(); ++index) {
+                INFO("f = " << testFrequency << " Hz, point " << index << ": foil " << foil[index] << ", rectangles " << rectangular[index]);
+                REQUIRE(std::abs(rectangular[index]) > 0);
+                const double difference = std::abs(foil[index] - rectangular[index]) / std::abs(rectangular[index]);
+                if (testFrequency < 100) {
+                    CHECK(difference < 1e-3);
+                }
+                else if (index == 0) {
+                    CHECK(difference > 0.05);
+                }
+            }
+        }
+        settings.reset();
+    }
+
 
     // ABT #376: DOWELL's field model. It was declared in MagneticFieldStrengthModels but the
     // factory had no branch for it, so selecting it threw MODEL_NOT_AVAILABLE — and the
@@ -805,7 +896,9 @@ namespace {
                     if (key[0] == nx0 && key[1] == ny0 && key[3] == ny1) {
                         columnSheet = current;
                     }
-                    else if (key[0] == nx0) {
+                    else if (key[0] == nx0 && key[1] >= std::lround((gapY - gapLength / 2) * 1e9) - 1 && key[3] <= std::lround((gapY + gapLength / 2) * 1e9) + 1) {
+                        // The gap's slot-mouth pieces; the column wall also carries the window corners' bend excess
+                        // (CoilMesher corner_excess_squares), which lies outside the gap's span.
                         mouthSheet += current;
                     }
                 }
@@ -889,22 +982,43 @@ namespace {
         // are filtered to the window's height (the lattice's y images fall outside it); along x the cell's own source
         // and its nearest x image coincide on each wall, with the same factor for both walls.
         const double halfHeight = core.get_processed_description()->get_winding_windows()[0].get_height().value() / 2;
+        // A gap's mouth is several sheets (CoilMesher::slotMouthPieces, the slot's own distribution, Alf 2026-11-14): its
+        // sheets are those lying within the gap's extent on a wall, shorter than the gap.
+        std::optional<CoreGap> residualGap;
+        std::optional<CoreGap> mainGap;
+        for (const auto& gap : core.get_functional_description().get_gapping()) {
+            if (static_cast<size_t>(core.find_closest_column_index_by_coordinates(gap.get_coordinates().value())) == mainColumnIndex) {
+                mainGap = gap;
+            }
+            else {
+                residualGap = gap;
+            }
+        }
+        REQUIRE(residualGap);
+        REQUIRE(mainGap);
+        REQUIRE(residualGap->get_type() == GapType::RESIDUAL);
+        auto inMouth = [](const WindowWallSheet& sheet, const CoreGap& gap) {
+            const double gapY = gap.get_coordinates().value()[1];
+            const double halfLength = gap.get_length() / 2;
+            const double length = std::hypot(sheet.end[0] - sheet.start[0], sheet.end[1] - sheet.start[1]);
+            return length <= gap.get_length() + 1e-12 && std::min(sheet.start[1], sheet.end[1]) >= gapY - halfLength - 1e-12 &&
+                   std::max(sheet.start[1], sheet.end[1]) <= gapY + halfLength + 1e-12;
+        };
         double backLegGapSheet = 0;
         double mainGapSheet = 0;
         double backLegGapOnColumnWall = 0;
         for (auto& sheet : sheets) {
-            const double length = std::hypot(sheet.end[0] - sheet.start[0], sheet.end[1] - sheet.start[1]);
             if (std::abs(sheet.start[1]) > halfHeight + 1e-12 || std::abs(sheet.end[1]) > halfHeight + 1e-12) {
                 continue;
             }
-            const bool residualMouth = std::abs(length - 5e-6) < 1e-9;
+            const bool residualMouth = inMouth(sheet, residualGap.value());
             if (sheet.start[0] == x1 && sheet.end[0] == x1 && residualMouth) {
                 backLegGapSheet += sheet.current;
             }
             if (sheet.start[0] == x0 && sheet.end[0] == x0 && residualMouth) {
                 backLegGapOnColumnWall += sheet.current;
             }
-            if (sheet.start[0] == x0 && sheet.end[0] == x0 && std::abs(length - 0.000414) < 1e-9) {
+            if (sheet.start[0] == x0 && sheet.end[0] == x0 && inMouth(sheet, mainGap.value())) {
                 mainGapSheet += sheet.current;
             }
         }
@@ -1046,8 +1160,101 @@ namespace {
         magnetic.set_coil(coil);
         auto operatingPoint = inputs.get_operating_point(0);
 
+        // ABT #2267: LAMMERANER too, now that its images keep the pure 2-D field (its finite-turn-length factor scaled
+        // them, and the far cells were not neutral).
+        for (auto fieldModel : {MagneticFieldStrengthModels::BINNS_LAWRENSON, MagneticFieldStrengthModels::LAMMERANER}) {
+            INFO("field model " << magic_enum::enum_name(fieldModel));
+            auto fieldWithCells = [&](int cells) {
+                settings.reset();
+                settings.set_magnetic_field_mirroring_dimension(cells);
+                MagneticField magneticField(fieldModel, MagneticFieldStrengthFringingEffectModels::MMF_BOUNDARY);
+                return magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic).get_field_per_frequency()[0];
+            };
+            auto one = fieldWithCells(1);
+            auto two = fieldWithCells(2);
+            REQUIRE(one.get_data().size() == two.get_data().size());
+            double scale = 0;
+            for (auto& point : two.get_data()) {
+                scale = std::max(scale, hypot(point.get_real(), point.get_imaginary()));
+            }
+            for (size_t index = 0; index < one.get_data().size(); ++index) {
+                CHECK_THAT(one.get_data()[index].get_real(), Catch::Matchers::WithinAbs(two.get_data()[index].get_real(), 0.01 * scale));
+                CHECK_THAT(one.get_data()[index].get_imaginary(), Catch::Matchers::WithinAbs(two.get_data()[index].get_imaginary(), 0.01 * scale));
+            }
+        }
+        settings.reset();
+    }
+
+    // ABT #2267: the neutral window on a multi-window core (E 42/21/20 with per-column windows, 1 mm ground gap): a primary
+    // on the centre leg and a secondary on the left lateral leg. Each window's walls return, per winding, what that winding
+    // encloses there (its gaps' and ferrite drops from the column reluctance network), so every lattice cell is neutral
+    // (one and two mirror cells agree) and just inside a gapless wall the tangential H is that wall's ferrite sheet.
+    // ABT #2267: LAMMERANER's finite-turn-length factor L / hypot(L, d) is the conductor's own; an image (label "image",
+    // the core's reply) keeps the pure 2-D field I / (2 pi d), so the image lattice stays neutral with the wall sheets.
+    TEST_CASE("Test_Magnetic_Field_Lammeraner_Images_Are_Two_Dimensional", "[physical-model][magnetic-field][mmf-boundary]") {
+        MagneticFieldStrengthLammeranerModel model;
+        const double turnLength = 0.02;
+        const double distance = 0.01;
+        FieldPoint inducing;
+        inducing.set_point({0.0, 0.0});
+        inducing.set_value(1.0);
+        inducing.set_turn_length(turnLength);
+        FieldPoint induced;
+        induced.set_point({distance, 0.0});
+        auto [conductorX, conductorY] = model.get_magnetic_field_strength_components_between_two_points(inducing, induced);
+        CHECK_THAT(hypot(conductorX, conductorY), Catch::Matchers::WithinRel(1 / (2 * std::numbers::pi * distance) * turnLength / hypot(turnLength, distance), 1e-12));
+        inducing.set_label("image");
+        auto [imageX, imageY] = model.get_magnetic_field_strength_components_between_two_points(inducing, induced);
+        CHECK_THAT(hypot(imageX, imageY), Catch::Matchers::WithinRel(1 / (2 * std::numbers::pi * distance), 1e-12));
+        inducing.set_label("image@1");  // an image of a multi-window core's window 1
+        auto [windowImageX, windowImageY] = model.get_magnetic_field_strength_components_between_two_points(inducing, induced);
+        CHECK_THAT(hypot(windowImageX, windowImageY), Catch::Matchers::WithinRel(1 / (2 * std::numbers::pi * distance), 1e-12));
+    }
+
+    TEST_CASE("Test_Magnetic_Field_Mmf_Boundary_Multi_Window", "[physical-model][magnetic-field][mmf-boundary][multi-column]") {
+        settings.reset();
+        settings.set_core_per_column_winding_windows(true);
+        auto core = OpenMagneticsTesting::get_quick_core("E 42/21/20", OpenMagneticsTesting::get_ground_gap(1e-3), 1, "3C97");
+        auto bobbin = OpenMagnetics::Bobbin::create_quick_bobbin(core, 0.001, 0.001);
+        auto columns = core.get_processed_description()->get_columns();
+        REQUIRE(core.get_processed_description()->get_winding_windows().size() == 3);
+        json coilJson;
+        json bobbinJson;
+        to_json(bobbinJson, bobbin);
+        coilJson["bobbin"] = bobbinJson;
+        coilJson["functionalDescription"] = json::array();
+        coilJson["functionalDescription"].push_back(json{{"name", "Primary"}, {"numberTurns", 20}, {"numberParallels", 1},
+                                                         {"isolationSide", "primary"}, {"wire", "Round 0.475 - Grade 1"}});
+        coilJson["functionalDescription"].push_back(json{{"name", "Secondary"}, {"numberTurns", 10}, {"numberParallels", 1},
+                                                         {"isolationSide", "secondary"}, {"wire", "Round 0.475 - Grade 1"}});
+        OpenMagnetics::Coil coil(coilJson, false);
+        coil.get_mutable_functional_description()[1].set_winding_window(2);
+        coil.set_core_columns(columns);
+        REQUIRE(coil.wind());
+        OpenMagnetics::Magnetic magnetic;
+        magnetic.set_core(core);
+        magnetic.set_coil(coil);
+        auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(100000, 100e-6, 25, WaveformLabel::TRIANGULAR, 10, 0.5, 0, {2});
+        auto operatingPoint = inputs.get_operating_point(0);
+
+        auto regions = CoilMesher::window_regions(magnetic.get_core());
+        REQUIRE(regions.size() == 2);
+        // The sources: per window and winding they return exactly what the network says the winding encloses there.
+        auto sources = CoilMesher::generate_window_wall_sheet_sources(magnetic, operatingPoint);
+        std::vector<std::vector<double>> returned(2, std::vector<double>(2, 0.0));
+        for (auto& source : sources) {
+            REQUIRE(source.winding);
+            returned[source.window][source.winding.value()] -= source.current;
+        }
+        // The primary (20 turns round the centre leg) crosses both windows, in opposite senses; the secondary (10 turns
+        // round the left leg) only the left window.
+        CHECK_THAT(std::abs(returned[0][0]), Catch::Matchers::WithinRel(20.0, 1e-9));
+        CHECK_THAT(std::abs(returned[1][0]), Catch::Matchers::WithinRel(20.0, 1e-9));
+        CHECK(returned[0][0] * returned[1][0] < 0);
+        CHECK_THAT(std::abs(returned[0][1]), Catch::Matchers::WithinRel(10.0, 1e-9));
+        CHECK_THAT(returned[1][1], Catch::Matchers::WithinAbs(0.0, 1e-9));
+
         auto fieldWithCells = [&](int cells) {
-            settings.reset();
             settings.set_magnetic_field_mirroring_dimension(cells);
             MagneticField magneticField(MagneticFieldStrengthModels::BINNS_LAWRENSON, MagneticFieldStrengthFringingEffectModels::MMF_BOUNDARY);
             return magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic).get_field_per_frequency()[0];
@@ -1059,6 +1266,7 @@ namespace {
         for (auto& point : two.get_data()) {
             scale = std::max(scale, hypot(point.get_real(), point.get_imaginary()));
         }
+        REQUIRE(scale > 0);
         for (size_t index = 0; index < one.get_data().size(); ++index) {
             CHECK_THAT(one.get_data()[index].get_real(), Catch::Matchers::WithinAbs(two.get_data()[index].get_real(), 0.01 * scale));
             CHECK_THAT(one.get_data()[index].get_imaginary(), Catch::Matchers::WithinAbs(two.get_data()[index].get_imaginary(), 0.01 * scale));
@@ -1081,7 +1289,8 @@ namespace {
         magnetic.set_coil(coil);
         auto operatingPoint = inputs.get_operating_point(0);
         settings.reset();
-        for (auto fieldModel : {MagneticFieldStrengthModels::LAMMERANER, MagneticFieldStrengthModels::DOWELL, MagneticFieldStrengthModels::WANG, MagneticFieldStrengthModels::ALBACH}) {
+        // LAMMERANER left this list with ABT #2267 (its images are pure 2-D now; see the lattice test above).
+        for (auto fieldModel : {MagneticFieldStrengthModels::DOWELL, MagneticFieldStrengthModels::ALBACH}) {
             MagneticField magneticField(fieldModel, MagneticFieldStrengthFringingEffectModels::MMF_BOUNDARY);
             CHECK_THROWS_AS(magneticField.calculate_magnetic_field_strength_field(operatingPoint, magnetic), ModelNotAvailableException);
         }
@@ -1120,6 +1329,90 @@ TEST_CASE("Sullivan fringing field of a central-leg gap is not zero", "[physical
         CHECK(sullivan.get_real() * roshen.get_real() > 0);
         CHECK(sullivan.get_imaginary() * roshen.get_imaginary() > 0);
     }
+}
+
+// A round-post window is a solid of revolution (AxisymmetricWindow): the turns are rings, imaged in the plates, and a
+// correction field meets the post face and the outer wall. These pin the pieces against closed forms.
+TEST_CASE("Test_Axisymmetric_Window_Ring_Field_On_The_Axis_Is_The_Loop_Formula", "[physical-model][magnetic-field][axisymmetric]") {
+    // On the axis of a loop of radius R, H_z = I R^2 / (2 (R^2 + z^2)^(3/2)); approached from r = R/1e4.
+    const double radius = 5e-3;
+    for (double height : {0.0, 2e-3, 8e-3}) {
+        auto [fieldR, fieldZ] = AxisymmetricWindow::ring_field(1.0, radius, 0.0, radius * 1e-4, height);
+        const double expected = radius * radius / (2 * std::pow(radius * radius + height * height, 1.5));
+        CHECK_THAT(fieldZ, Catch::Matchers::WithinRel(expected, 1e-6));
+        CHECK(std::abs(fieldR) < 1e-3 * expected);
+    }
+}
+
+TEST_CASE("Test_Axisymmetric_Window_Large_Ring_Is_The_Planar_Line", "[physical-model][magnetic-field][axisymmetric]") {
+    // Close to a ring of large radius the field is MKF's planar line current: Hx = -I (ys - y) / (2 pi rho^2),
+    // Hy = I (xs - x) / (2 pi rho^2).
+    const double radius = 10.0;
+    for (auto [dr, dz] : std::vector<std::pair<double, double>>{{1e-3, 0}, {0, 1e-3}, {-7e-4, 7e-4}}) {
+        auto [fieldR, fieldZ] = AxisymmetricWindow::ring_field(1.0, radius, 0.0, radius + dr, dz);
+        const double rhoSquared = dr * dr + dz * dz;
+        const double lineX = dz / (2 * std::numbers::pi * rhoSquared);
+        const double lineY = -dr / (2 * std::numbers::pi * rhoSquared);
+        const double scale = 1 / (2 * std::numbers::pi * std::sqrt(rhoSquared));
+        CHECK(std::abs(fieldR - lineX) < 2e-3 * scale);
+        CHECK(std::abs(fieldZ - lineY) < 2e-3 * scale);
+    }
+}
+
+TEST_CASE("Test_Axisymmetric_Window_Correction_Clears_The_Cylinders", "[physical-model][magnetic-field][axisymmetric]") {
+    // A ring in the window with all its plate images and the correction: H_z on the post face and the outer wall is
+    // only what the uniform mode leaves. A lone ring's means (I / B inside it, 0 outside) cannot both be met by one
+    // uniform field, so it splits them: +I / 2B on the post face, -I / 2B on the outer wall. With the wall sources
+    // of a neutral window the means agree and this residue vanishes.
+    AxisymmetricWindow window(4.75e-3, 11.35e-3, -11e-3, 11e-3);
+    auto mismatch = window.empty_mismatch();
+    const double ringRadius = 7.1e-3;
+    const double ringHeight = 1.3e-3;
+    window.add_ring(mismatch, 1.0, ringRadius, ringHeight);
+    auto correction = window.solve(mismatch);
+    for (double wallRadius : {4.75e-3 + 1e-7, 11.35e-3 - 1e-7}) {
+        for (double height : {-9e-3, -3e-3, 0.0, 1.3e-3, 4e-3, 10e-3}) {
+            // Every plate image, far enough to converge (dipole decay).
+            double fieldZ = 0;
+            for (int n = -400; n <= 400; ++n) {
+                const double zImage = n * 22e-3 + ((n % 2 == 0) ? 1.0 : -1.0) * ringHeight;
+                fieldZ += AxisymmetricWindow::ring_field(1.0, ringRadius, zImage, wallRadius, height).second;
+            }
+            fieldZ += window.correction_field(correction, wallRadius, height).second;
+            const double expected = (wallRadius < 6e-3 ? 0.5 : -0.5) / 22e-3;
+            CHECK(std::abs(fieldZ - expected) < 0.02 / 22e-3);
+        }
+    }
+}
+
+TEST_CASE("Test_Axisymmetric_Window_Gap_Mouth_Is_Met_On_The_Post_Face", "[physical-model][magnetic-field][axisymmetric]") {
+    // A tangential H wanted on a band of the post face (a gap mouth): the correction gives it there and nothing elsewhere.
+    AxisymmetricWindow window(4.75e-3, 11.35e-3, -11e-3, 11e-3);
+    auto mismatch = window.empty_mismatch();
+    window.add_wall_field(mismatch, true, 0.0, 0.82e-3, 1000.0);
+    window.add_wall_field(mismatch, false, -11e-3, 11e-3, 1000.0 * 0.82e-3 / 22e-3);
+    auto correction = window.solve(mismatch);
+    const double nearPost = 4.75e-3 + 2e-6;
+    CHECK_THAT(window.correction_field(correction, nearPost, 0.41e-3).second, Catch::Matchers::WithinRel(1000.0, 0.03));
+    CHECK(std::abs(window.correction_field(correction, nearPost, 5e-3).second) < 0.01 * 1000.0);
+    CHECK_THAT(window.correction_field(correction, 11.35e-3 - 2e-6, 5e-3).second, Catch::Matchers::WithinRel(1000.0 * 0.82e-3 / 22e-3, 0.05));
+}
+
+TEST_CASE("Test_Gmres_Batch_Throws_When_The_Operator_Returns_NaN", "[magnetic-field][gmres]") {
+    // ABT #2384: an operator product that is NaN passed "nextNorm != 0" but not "nextNorm > 0", so the next Arnoldi step
+    // read a basis vector that was never stored (an out-of-bounds read, seen as a crash in the WASM engine). It must throw.
+    using Complex = std::complex<double>;
+    OpenMagnetics::GmresBatchApply apply = [](const std::vector<size_t>& systems, const std::vector<const std::vector<Complex>*>& inputs,
+                                              const std::vector<std::vector<Complex>*>& outputs) {
+        for (size_t index = 0; index < systems.size(); ++index) {
+            for (auto& value : *outputs[index]) {
+                value = Complex(std::numeric_limits<double>::quiet_NaN(), 0);
+            }
+        }
+    };
+    std::vector<OpenMagnetics::GmresPrecondition> identity = {[](const std::vector<Complex>& residual, std::vector<Complex>& result) { result = residual; }};
+    std::vector<std::vector<Complex>> rightHandSides = {{Complex(1, 0), Complex(2, 0)}};
+    CHECK_THROWS_AS(OpenMagnetics::solve_gmres_batch(apply, identity, rightHandSides, 1e-10, 10, 100), OpenMagnetics::NaNResultException);
 }
 
 }  // namespace
