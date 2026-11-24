@@ -1,4 +1,5 @@
 #include "physical_models/InitialPermeability.h"
+#include "physical_models/BhCycle.h"
 #include "support/MasAccess.h"
 #include "physical_models/AmplitudePermeability.h"
 #include "physical_models/CurveBuildScope.h"
@@ -227,6 +228,389 @@ class CurveBuildScopeGuard {
 } // namespace
 
 namespace {
+// ABT #2470: B(H) from the datasheet B-H loop (MAS bhCycle, written by MAS scripts/digitize-bh-loops.py). Integrating
+// mu_rev leaves out the irreversible wall motion: on ungapped 3C90 it gave 0.042 T at 15 A/m where the loop's midline
+// is at 0.16 T. The rules are Alf's, 2026-11-22:
+//  - the midline is the mean H of the two branches at equal B, centred: its lowest 50 mT extended straight to B = 0
+//    crosses at H = 0 (a major loop is symmetric; the figures are drawn up to a few A/m off centre);
+//  - past the tip, straight to the saturation point the record has at that temperature, if it has a higher one,
+//    then the vacuum's slope; without one, the vacuum's slope from the tip;
+//  - linear in T between two loops; outside their temperatures the nearest loop with B scaled by Bsat(T)/Bsat(T_loop);
+//  - data with no recorded source is used too, and the curve's method says so. Besides the digitiser's layout that
+//    data comes as a whole sampled cycle through both polarities, or as a single curve (powders).
+constexpr double loopCentringFluxDensitySpan = 0.05;  // T
+// A sampled cycle dithers by a count or two. Over all cycles of the advanced file the branches' backward steps stay
+// under 4.7 % of the tip, then jump past 10 % (Sinomag's cold ringing, a corrupt record): those are not one loop.
+constexpr double loopFoldTolerance = 0.05;
+// The thinned branch keeps a point per this fraction of path length in (H/H_tip, B/B_tip).
+constexpr double loopThinningStep = 0.01;
+// The datasheets tabulate B_sat at the loops' nominal temperatures, give or take a few C (as the digitiser matches them).
+constexpr double loopSaturationTemperatureTolerance = 5;  // C
+
+struct LoopCurve {
+    double temperature;
+    std::vector<double> fieldStrength;  // from 0, ascending
+    std::vector<double> fluxDensity;
+};
+
+using LoopSamples = std::vector<std::pair<double, double>>;  // (H, B)
+
+bool has_bh_cycle(const CoreMaterial& coreMaterial) {
+    const auto cycle = coreMaterial.get_bh_cycle();
+    return cycle && !cycle->empty();
+}
+
+bool has_recorded_bh_cycle_source(const CoreMaterial& coreMaterial) {
+    const auto provenance = coreMaterial.get_provenance();
+    if (!provenance) {
+        return false;
+    }
+    for (const auto& entry : provenance.value()) {
+        const auto fields = entry.get_fields();
+        if (fields && std::find(fields->begin(), fields->end(), "bhCycle") != fields->end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+double interpolate_ascending(const std::vector<double>& x, const std::vector<double>& y, double at) {
+    if (at <= x.front()) {
+        return y.front();
+    }
+    if (at >= x.back()) {
+        return y.back();
+    }
+    size_t upper = std::upper_bound(x.begin(), x.end(), at) - x.begin();
+    return y[upper - 1] + (at - x[upper - 1]) / (x[upper] - x[upper - 1]) * (y[upper] - y[upper - 1]);
+}
+
+MaterialException malformed_bh_cycle(const CoreMaterial& coreMaterial, double temperature, const std::string& what) {
+    return MaterialException(ErrorCode::MATERIAL_INVALID_PROPERTY,
+        "The B-H data (bhCycle) of material " + coreMaterial.get_name() + " at " + format_significant(temperature) + " C " + what +
+        ": no magnetisation curve can be built from it", coreMaterial.get_name());
+}
+
+// A single magnetisation curve: every H above the last, from H >= 0. Only a material that is not a ferrite has one
+// (powders): of a ferrite's loop, a lone branch is half the data, off by the coercive field.
+bool is_single_curve(const CoreMaterial& coreMaterial, const LoopSamples& samples) {
+    if (coreMaterial.get_material() == MaterialType::FERRITE) {
+        return false;
+    }
+    for (size_t index = 1; index < samples.size(); ++index) {
+        if (!(samples[index].first > samples[index - 1].first)) {
+            return false;
+        }
+    }
+    return samples.front().first >= 0;
+}
+
+// One temperature's samples in the layout the curve is built from: unchanged if they are a single curve or already
+// the upper half loop; a whole cycle is cut at its extremes of H into its two branches, from B = 0 up, thinned.
+LoopSamples normalise_loop(const CoreMaterial& coreMaterial, double temperature, const LoopSamples& samples) {
+    if (samples.size() < 2) {
+        throw malformed_bh_cycle(coreMaterial, temperature, "has fewer than two points");
+    }
+    for (const auto& [fieldStrength, fluxDensity] : samples) {
+        if (!std::isfinite(fieldStrength) || !std::isfinite(fluxDensity)) {
+            throw malformed_bh_cycle(coreMaterial, temperature, "has a point that is not a finite number");
+        }
+    }
+    if (is_single_curve(coreMaterial, samples)) {
+        return samples;
+    }
+    auto byFluxDensity = [](const auto& left, const auto& right) { return left.second < right.second; };
+    const double lowestFluxDensity = std::min_element(samples.begin(), samples.end(), byFluxDensity)->second;
+    const double highestFluxDensity = std::max_element(samples.begin(), samples.end(), byFluxDensity)->second;
+    if (lowestFluxDensity >= 0) {
+        return samples;
+    }
+    if (lowestFluxDensity > -loopCentringFluxDensitySpan || highestFluxDensity < loopCentringFluxDensitySpan) {
+        throw malformed_bh_cycle(coreMaterial, temperature, "has negative flux densities but is not a cycle through both polarities");
+    }
+    auto byFieldStrength = [](const auto& left, const auto& right) { return left.first < right.first; };
+    const size_t top = std::max_element(samples.begin(), samples.end(), byFieldStrength) - samples.begin();
+    const size_t bottom = std::min_element(samples.begin(), samples.end(), byFieldStrength) - samples.begin();
+    const double highestFieldStrength = samples[top].first;
+    if (!(highestFieldStrength > 0)) {
+        throw malformed_bh_cycle(coreMaterial, temperature, "never reaches a positive field strength");
+    }
+
+    LoopSamples rising, falling;
+    for (size_t index = bottom;; index = (index + 1) % samples.size()) {
+        rising.push_back(samples[index]);
+        if (index == top) {
+            break;
+        }
+    }
+    for (size_t index = top;; index = (index + 1) % samples.size()) {
+        falling.push_back(samples[index]);
+        if (index == bottom) {
+            break;
+        }
+    }
+    std::reverse(falling.begin(), falling.end());
+
+    auto upperHalf = [&](const LoopSamples& branch) {
+        double highestH = branch.front().first, highestB = branch.front().second;
+        LoopSamples envelope{branch.front()};  // the samples that raise B without taking H back
+        for (const auto& [fieldStrength, fluxDensity] : branch) {
+            highestH = std::max(highestH, fieldStrength);
+            highestB = std::max(highestB, fluxDensity);
+            if (highestH - fieldStrength > loopFoldTolerance * highestFieldStrength || highestB - fluxDensity > loopFoldTolerance * highestFluxDensity) {
+                throw malformed_bh_cycle(coreMaterial, temperature, "has a branch that folds back by more than 5 % of its tip");
+            }
+            if (fluxDensity > envelope.back().second && fieldStrength >= envelope.back().first) {
+                envelope.emplace_back(fieldStrength, fluxDensity);
+            }
+        }
+        if (envelope.front().second >= 0 || envelope.back().second <= 0) {
+            throw malformed_bh_cycle(coreMaterial, temperature, "has a branch that does not cross zero flux density");
+        }
+        size_t above = 1;
+        while (envelope[above].second <= 0) {
+            ++above;
+        }
+        const auto& [belowH, belowB] = envelope[above - 1];
+        LoopSamples upper{{belowH - belowB / (envelope[above].second - belowB) * (envelope[above].first - belowH), 0.}};
+        for (size_t index = above; index < envelope.size(); ++index) {
+            if (index + 1 == envelope.size() ||
+                (envelope[index].first - upper.back().first) / highestFieldStrength +
+                    (envelope[index].second - upper.back().second) / highestFluxDensity >= loopThinningStep) {
+                upper.push_back(envelope[index]);
+            }
+        }
+        return upper;
+    };
+    LoopSamples normalised = upperHalf(rising);
+    const auto tip = normalised.back();
+    // The tip is the one point at the largest H: both branches end on it.
+    while (normalised.size() > 1 && normalised[normalised.size() - 2].first >= tip.first) {
+        normalised.erase(normalised.end() - 2);
+    }
+    const LoopSamples upperFalling = upperHalf(falling);
+    for (size_t index = upperFalling.size(); index-- > 0;) {
+        if (upperFalling[index].first < tip.first && upperFalling[index].second < tip.second) {
+            normalised.push_back(upperFalling[index]);
+        }
+    }
+    return normalised;
+}
+
+// From the tip straight to the saturation point of that temperature, if the record has a higher one.
+void join_saturation_point(const CoreMaterial& coreMaterial, LoopCurve& curve) {
+    const double vacuumPermeability = Constants().vacuumPermeability;
+    const double tipFieldStrength = curve.fieldStrength.back();
+    const double tipFluxDensity = curve.fluxDensity.back();
+    std::optional<std::pair<double, double>> saturationPoint;
+    for (const auto& element : coreMaterial.get_saturation()) {
+        const double fieldStrength = element.get_magnetic_field();
+        const double fluxDensity = element.get_magnetic_flux_density();
+        if (std::abs(element.get_temperature() - curve.temperature) > loopSaturationTemperatureTolerance || fieldStrength <= tipFieldStrength ||
+            fluxDensity <= tipFluxDensity + vacuumPermeability * (fieldStrength - tipFieldStrength)) {
+            continue;
+        }
+        if (!saturationPoint || fieldStrength > saturationPoint->first) {
+            saturationPoint = {fieldStrength, fluxDensity};
+        }
+    }
+    if (saturationPoint) {
+        curve.fieldStrength.push_back(saturationPoint->first);
+        curve.fluxDensity.push_back(saturationPoint->second);
+    }
+}
+
+// One temperature's normalised samples: a single curve, taken from the origin as it is, or the rising branch up to
+// the tip (the largest H) then the falling branch back down.
+LoopCurve build_loop_curve(const CoreMaterial& coreMaterial, double temperature, const LoopSamples& traversal) {
+    auto malformed = [&](const std::string& what) { return malformed_bh_cycle(coreMaterial, temperature, what); };
+    if (is_single_curve(coreMaterial, traversal)) {
+        LoopCurve curve{temperature, {0}, {0}};
+        for (const auto& [fieldStrength, fluxDensity] : traversal) {
+            if (fieldStrength == 0 && fluxDensity == 0) {
+                continue;  // the origin
+            }
+            if (fieldStrength == 0 || !(fluxDensity > curve.fluxDensity.back())) {
+                throw malformed("is a single curve that does not rise from the origin");
+            }
+            curve.fieldStrength.push_back(fieldStrength);
+            curve.fluxDensity.push_back(fluxDensity);
+        }
+        if (curve.fieldStrength.size() < 2) {
+            throw malformed("holds only the origin");
+        }
+        join_saturation_point(coreMaterial, curve);
+        return curve;
+    }
+    size_t tip = std::max_element(traversal.begin(), traversal.end(),
+                                  [](const auto& left, const auto& right) { return left.first < right.first; }) - traversal.begin();
+    if (tip == 0 || tip + 1 == traversal.size()) {
+        throw malformed("does not hold a rising and a falling branch around its tip");
+    }
+    std::vector<double> risingFieldStrength, risingFluxDensity, fallingFieldStrength, fallingFluxDensity;
+    for (size_t index = 0; index <= tip; ++index) {
+        risingFieldStrength.push_back(traversal[index].first);
+        risingFluxDensity.push_back(traversal[index].second);
+    }
+    for (size_t index = traversal.size(); index-- > tip;) {
+        fallingFieldStrength.push_back(traversal[index].first);
+        fallingFluxDensity.push_back(traversal[index].second);
+    }
+    auto isMonotone = [](const std::vector<double>& fieldStrength, const std::vector<double>& fluxDensity) {
+        for (size_t index = 1; index < fieldStrength.size(); ++index) {
+            if (fieldStrength[index] < fieldStrength[index - 1] || fluxDensity[index] <= fluxDensity[index - 1]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!isMonotone(risingFieldStrength, risingFluxDensity) || !isMonotone(fallingFieldStrength, fallingFluxDensity)) {
+        throw malformed("has a branch that does not rise monotonically to its tip");
+    }
+
+    const double lowest = std::max(risingFluxDensity.front(), fallingFluxDensity.front());
+    if (lowest < 0 || lowest + loopCentringFluxDensitySpan > traversal[tip].second) {
+        throw malformed("does not cover 50 mT of positive flux density on both branches, which its centring needs");
+    }
+    auto midline = [&](double fluxDensity) {
+        return 0.5 * (interpolate_ascending(risingFluxDensity, risingFieldStrength, fluxDensity) +
+                      interpolate_ascending(fallingFluxDensity, fallingFieldStrength, fluxDensity));
+    };
+    const double slope = (midline(lowest + loopCentringFluxDensitySpan) - midline(lowest)) / loopCentringFluxDensitySpan;
+    if (!(slope > 0)) {
+        throw malformed("has a midline whose lowest 50 mT does not rise");
+    }
+    const double centre = midline(lowest) - slope * lowest;
+
+    std::vector<double> levels{lowest};
+    for (const auto* branch : {&risingFluxDensity, &fallingFluxDensity}) {
+        std::copy_if(branch->begin(), branch->end(), std::back_inserter(levels), [&](double level) { return level > lowest; });
+    }
+    std::sort(levels.begin(), levels.end());
+    // One flux level read on both branches can differ in its last bits: below 1e-9 T apart is one level.
+    levels.erase(std::unique(levels.begin(), levels.end(), [](double left, double right) { return right - left < 1e-9; }), levels.end());
+
+    LoopCurve curve{temperature, {0}, {0}};
+    for (double level : levels) {
+        if (level == 0) {
+            continue;  // the origin
+        }
+        const double fieldStrength = midline(level) - centre;
+        if (!(fieldStrength > curve.fieldStrength.back())) {
+            throw malformed("has a centred midline that does not rise at " + format_significant(level) + " T");
+        }
+        curve.fieldStrength.push_back(fieldStrength);
+        curve.fluxDensity.push_back(level);
+    }
+
+    join_saturation_point(coreMaterial, curve);
+    return curve;
+}
+
+void fill_magnetisation_curve_from_loops(const CoreMaterial& coreMaterial, double temperature,
+                                         InitialPermeability::MagnetisationCurve& curve, double firstFieldStrength,
+                                         double lastFieldStrength, double ratio) {
+    const auto cycle = coreMaterial.get_bh_cycle().value();
+    std::map<double, std::vector<std::pair<double, double>>> traversals;
+    for (const auto& element : cycle) {
+        traversals[element.get_temperature()].emplace_back(element.get_magnetic_field(), element.get_magnetic_flux_density());
+    }
+    if (traversals.empty()) {
+        throw MaterialDataMissingException(coreMaterial.get_name(), "points in its bhCycle to build its magnetisation curve");
+    }
+    std::vector<LoopCurve> loops;
+    for (const auto& [loopTemperature, traversal] : traversals) {
+        loops.push_back(build_loop_curve(coreMaterial, loopTemperature, normalise_loop(coreMaterial, loopTemperature, traversal)));
+    }
+
+    const LoopCurve* lower = &loops.front();
+    const LoopCurve* upper = &loops.front();
+    double fraction = 0;
+    double scale = 1;
+    if (temperature <= loops.front().temperature || temperature >= loops.back().temperature) {
+        lower = upper = temperature <= loops.front().temperature ? &loops.front() : &loops.back();
+        if (temperature != lower->temperature) {
+            scale = curve.saturationFluxDensity / Core::get_magnetic_flux_density_saturation(coreMaterial, lower->temperature, false);
+        }
+    }
+    else {
+        size_t index = 1;
+        while (loops[index].temperature < temperature) {
+            ++index;
+        }
+        lower = &loops[index - 1];
+        upper = &loops[index];
+        fraction = (temperature - lower->temperature) / (upper->temperature - lower->temperature);
+    }
+
+    std::string loopTemperatures = format_significant(lower->temperature);
+    if (upper != lower) {
+        loopTemperatures += " and " + format_significant(upper->temperature);
+    }
+    const bool singleCurve = is_single_curve(coreMaterial, traversals.at(lower->temperature));
+    curve.method = std::string(singleCurve ? "single B-H magnetisation curve" : "centred midline of the B-H loop") + " at " + loopTemperatures + " C";
+    if (!has_recorded_bh_cycle_source(coreMaterial)) {
+        curve.method += ", source not recorded";
+    }
+    if (upper != lower) {
+        curve.method += ", interpolated linearly in temperature";
+    }
+    else if (temperature != lower->temperature) {
+        curve.method += ", EXTRAPOLATED to " + format_significant(temperature) + " C with B scaled by Bsat(T)/Bsat(T_loop) = " + format_significant(scale);
+    }
+
+    const double vacuumPermeability = Constants().vacuumPermeability;
+    curve.vacuumSlopeFieldStrength = std::max(lower->fieldStrength.back(), upper->fieldStrength.back());
+    auto read = [&](const LoopCurve& loop, double fieldStrength) {
+        if (fieldStrength >= loop.fieldStrength.back()) {
+            return scale * loop.fluxDensity.back() + vacuumPermeability * (fieldStrength - loop.fieldStrength.back());
+        }
+        return scale * interpolate_ascending(loop.fieldStrength, loop.fluxDensity, fieldStrength);
+    };
+    auto append = [&](double fieldStrength) {
+        curve.fieldStrength.push_back(fieldStrength);
+        curve.fluxDensity.push_back((1 - fraction) * read(*lower, fieldStrength) + fraction * read(*upper, fieldStrength));
+    };
+    append(0);
+    // The integrated curve's geometric grid, so both kinds of curve resolve the same fields.
+    double fieldStrength = firstFieldStrength;
+    append(fieldStrength);
+    while (fieldStrength < lastFieldStrength) {
+        fieldStrength *= ratio;
+        append(fieldStrength);
+    }
+}
+} // namespace
+
+std::vector<BhCycleElement> normalise_bh_cycle(const CoreMaterial& coreMaterial, const std::vector<BhCycleElement>& cycle) {
+    std::map<double, LoopSamples> traversals;
+    for (const auto& element : cycle) {
+        traversals[element.get_temperature()].emplace_back(element.get_magnetic_field(), element.get_magnetic_flux_density());
+    }
+    std::vector<BhCycleElement> normalised;
+    for (const auto& [temperature, samples] : traversals) {
+        LoopSamples kept;
+        try {
+            kept = normalise_loop(coreMaterial, temperature, samples);
+            build_loop_curve(coreMaterial, temperature, kept);  // kept only if the curve builder takes it
+        }
+        catch (const MaterialException& refusal) {
+            // Alf, 2026-11-22: the advanced file's data is used where it can be parsed. Only this refusal is caught.
+            OM_WARNING_M("Material data", std::string("Advanced materials data not used: ") + refusal.what());
+            continue;
+        }
+        for (const auto& [fieldStrength, fluxDensity] : kept) {
+            BhCycleElement element;
+            element.set_magnetic_field(fieldStrength);
+            element.set_magnetic_flux_density(fluxDensity);
+            element.set_temperature(temperature);
+            normalised.push_back(element);
+        }
+    }
+    return normalised;
+}
+
+namespace {
 void append_key_bits(std::string& key, double value) {
     key.append(reinterpret_cast<const char*>(&value), sizeof(double));
 }
@@ -285,6 +669,19 @@ std::string magnetisation_curve_key(const CoreMaterial& coreMaterial, double tem
         append_key_bits(key, element.get_magnetic_flux_density());
         append_key_bits(key, element.get_temperature());
     }
+    if (has_bh_cycle(coreMaterial)) {
+        const auto cycle = coreMaterial.get_bh_cycle().value();
+        key.push_back(has_recorded_bh_cycle_source(coreMaterial) ? 'L' : 'U');
+        append_key_size(key, cycle.size());
+        for (const auto& element : cycle) {
+            append_key_bits(key, element.get_magnetic_field());
+            append_key_bits(key, element.get_magnetic_flux_density());
+            append_key_bits(key, element.get_temperature());
+        }
+    }
+    else {
+        key.push_back('N');
+    }
     append_key_bits(key, temperature);
     append_key_optional(key, frequency);
     return key;
@@ -299,7 +696,7 @@ size_t InitialPermeability::get_magnetisation_curve_cache_size() {
 
 std::shared_ptr<const InitialPermeability::MagnetisationCurve> InitialPermeability::get_magnetisation_curve(const CoreMaterial& coreMaterial, double temperature, std::optional<double> frequency) {
     // Keyed on the data the curve is built from, not the name alone (a custom material may reuse a catalogue
-    // name): the initial permeability with its modifiers, and the saturation points that set Hsat.
+    // name): the initial permeability with its modifiers, the saturation points that set Hsat, and the B-H loops.
     // The key holds that data bit for bit (stricter than the json dump it replaced, which printed a NaN and an
     // absent value alike as null); only a point's modifiers, a formula, go in as their json dump.
     std::string key = magnetisation_curve_key(coreMaterial, temperature, frequency);
@@ -331,22 +728,28 @@ std::shared_ptr<const InitialPermeability::MagnetisationCurve> InitialPermeabili
     const double firstFieldStrength = 1e-6 * saturationFieldStrength;
     const double lastFieldStrength = 1000 * saturationFieldStrength;
     const double ratio = 1.008;
-    // From 0 to the first grid point mu_rev is its zero-field value.
-    double previousPermeability = reversiblePermeabilityAt(0);
-    curve->fieldStrength.push_back(0);
-    curve->fluxDensity.push_back(0);
-    double fieldStrength = firstFieldStrength;
-    double permeability = reversiblePermeabilityAt(fieldStrength);
-    curve->fieldStrength.push_back(fieldStrength);
-    curve->fluxDensity.push_back(vacuumPermeability * 0.5 * (previousPermeability + permeability) * fieldStrength);
-    previousPermeability = permeability;
-    while (fieldStrength < lastFieldStrength) {
-        double nextFieldStrength = fieldStrength * ratio;
-        double nextPermeability = reversiblePermeabilityAt(nextFieldStrength);
-        curve->fluxDensity.push_back(curve->fluxDensity.back() + vacuumPermeability * 0.5 * (previousPermeability + nextPermeability) * (nextFieldStrength - fieldStrength));
-        curve->fieldStrength.push_back(nextFieldStrength);
-        fieldStrength = nextFieldStrength;
-        previousPermeability = nextPermeability;
+    if (!curve->paramagnetic && has_bh_cycle(coreMaterial)) {
+        fill_magnetisation_curve_from_loops(coreMaterial, temperature, *curve, firstFieldStrength, lastFieldStrength, ratio);
+    }
+    else {
+        curve->method = "mu0 times the integral of the reversible permeability";
+        // From 0 to the first grid point mu_rev is its zero-field value.
+        double previousPermeability = reversiblePermeabilityAt(0);
+        curve->fieldStrength.push_back(0);
+        curve->fluxDensity.push_back(0);
+        double fieldStrength = firstFieldStrength;
+        double permeability = reversiblePermeabilityAt(fieldStrength);
+        curve->fieldStrength.push_back(fieldStrength);
+        curve->fluxDensity.push_back(vacuumPermeability * 0.5 * (previousPermeability + permeability) * fieldStrength);
+        previousPermeability = permeability;
+        while (fieldStrength < lastFieldStrength) {
+            double nextFieldStrength = fieldStrength * ratio;
+            double nextPermeability = reversiblePermeabilityAt(nextFieldStrength);
+            curve->fluxDensity.push_back(curve->fluxDensity.back() + vacuumPermeability * 0.5 * (previousPermeability + nextPermeability) * (nextFieldStrength - fieldStrength));
+            curve->fieldStrength.push_back(nextFieldStrength);
+            fieldStrength = nextFieldStrength;
+            previousPermeability = nextPermeability;
+        }
     }
 
     std::lock_guard<std::mutex> lock(cache.mutex);
@@ -487,12 +890,26 @@ std::pair<double, double> InitialPermeability::get_magnetomotive_force_for_flux_
     const auto& fieldStrengths = curve.fieldStrength;
     const auto& fluxDensities = curve.fluxDensity;
     if (fluxDensity > fluxDensities.back()) {
-        // No extrapolation past the table (1000 Hsat, Alf 2026-10-18): the curve says nothing there.
-        // The numbers as ResultsAnalyzer's findings print them (ABT #2001): these messages are the CORE_SATURATES
-        // finding's reason for a point past the curve at ambient (ABT #2052).
+        // Past the table's last point (1000 Hsat) the curve says nothing (Alf, 2026-10-18). With
+        // Settings::allowCorePastMagnetisationCurve (a design the user or a MAS file supplies, the web; never an
+        // adviser, whose MaterialDataExtrapolationBarrier reads it false, nor Henry, which turns it off) the core is
+        // taken as fully saturated: B continues on the vacuum's slope, as get_dc_operating_point_for_magnetomotive_force
+        // continues it, of which this is then the exact inverse; a WARNING names the material, and analyze_results
+        // reports CORE_SATURATES for the point (Alf, 2026-11-20: "it should be calculated and allowed with a
+        // warning when the user or a MAS file request it ... not allowed in advisers and automatic design").
+        // Otherwise it is refused, as below. The numbers as ResultsAnalyzer's findings print them (ABT #2001): these
+        // messages are the CORE_SATURATES finding's reason for a point past the curve at ambient (ABT #2052).
         auto number = [](double value) {
             return format_significant(value);
         };
+        if (core_past_magnetisation_curve_allowed(
+                "Material " + curve.materialName + ": its magnetisation curve ends at " + number(fluxDensities.back()) + " T, at " +
+                    format_quantity(fieldStrengths.back(), "A/m") + " (1000 times its saturation field strength); past it the core "
+                    "is taken as fully saturated, its flux density growing as in vacuum",
+                {MaterialDataAskedQuantity::MAGNETIC_FLUX_DENSITY_AMPLITUDE, fluxDensity, ""})) {
+            double fieldStrength = fieldStrengths.back() + (fluxDensity - fluxDensities.back()) / constants.vacuumPermeability;
+            return {fieldStrength, fieldStrength * effectiveLength + fluxDensity * effectiveArea * gapReluctance};
+        }
         if (fluxDensity > curve.saturationFluxDensity) {
             throw SaturationException(
                 "It would need a flux density of " + number(fluxDensity) + " T, beyond the end of the magnetisation curve of " +
@@ -1758,6 +2175,22 @@ double InitialPermeability::get_initial_permeability_model_value(const CoreMater
 
     if (std::isnan(initialPermeabilityValue)) {
         throw NaNResultException("get_initial_permeability, Initial Permeability must be a number, not NaN");
+    }
+
+    // ABT #2470 (Alf, 2026-11-22): past the end of a loop-based magnetisation curve the incremental permeability is
+    // that curve's slope there, the vacuum's. The datasheet fits are still above 1 at such fields (3C95: 6x the air
+    // core's inductance where B was already past B_sat). This is a ceiling on the model's value, applied after it:
+    // what the model refuses stays refused, and a value below 1 stays the formula's, which get_initial_permeability
+    // reads to tell saturation from a model outside its frequency or temperature range (ABT #1740). A paramagnetic
+    // material has no loop-based curve, and its integrated curve is built on this function, so it is not asked for one.
+    if (initialPermeabilityValue > 1 && magneticFieldDcBias && magneticFieldDcBias.value() != 0 && has_bh_cycle(coreMaterial)) {
+        const double curveTemperature = temperature.value_or(defaults.ambientTemperature);
+        if (!is_paramagnetic(coreMaterial, curveTemperature)) {
+            const auto curve = get_magnetisation_curve(coreMaterial, curveTemperature, frequency);
+            if (std::fabs(magneticFieldDcBias.value()) > curve->vacuumSlopeFieldStrength.value()) {
+                return 1;
+            }
+        }
     }
 
     return initialPermeabilityValue;

@@ -18,6 +18,7 @@
 #include "physical_models/WindingProximityEffectLosses.h"
 #include "physical_models/Resistivity.h"
 #include "physical_models/WindingLossesPeec2D.h"
+#include "processors/CircuitSimulatorInterface.h"
 #include <numbers>
 
 #include <catch2/catch_test_macros.hpp>
@@ -1080,8 +1081,9 @@ namespace TestWindingLossesToroidalCores {
         // Alf 2026-11-09: run under MKF's TOROID model set (BINNS_LAWRENSON field with the ring's Kelvin images, MARTINEZ
         // for flat wire), the set meant for toroids, and no longer [!mayfail]. Before, the test asked for the ALBACH field
         // with fringing off, which left the bars on the default WANG proximity: 0.77-0.65x OMFEM. MARTINEZ reads
-        // 0.90-0.83x (the 5.8 x 2 mm bars are under FlatTurnCells::minimumAspectRatio, so each is one MARTINEZ turn; as
-        // width cells in the ring frame they read 0.92-0.86x). Design and OMFEM numbers unchanged.
+        // 0.90-0.83x with each 5.8 x 2 mm bar one MARTINEZ turn (they were under the old 4:1 FlatTurnCells threshold); as
+        // width cells in the ring frame, every flat turn's default since 2026-11-21, they read 0.92-0.86x. Design and OMFEM
+        // numbers unchanged.
         // Alf 2026-11-04: R_ac/R_dc against 2D OMFEM of the same design, not watts. OMFEM: OMFEM-1588 build-efa5113
         // omfem_mas, 2D (ring in the XY plane), on the MAS exported by Debug_Martinez_Flat_Scorecard at the config's
         // 20 C; inputs and logs in /home/alf/OpenMagnetics/.mkf-triage-runs/green/wl2/fem
@@ -4743,6 +4745,22 @@ TEST_CASE("Test_Winding_Losses_Foil_Width_Cells_E42_Ungapped_Every_Foil_Vs_OMFEM
     }
 }
 
+// The MagneticBuilder's own test coil (MagneticBuilder/src/public/test_wound_coil.json, 2026-05-05): ER 25/6/15 3C94,
+// 15 turns of a 1.04 x 0.313 mm planar trace and 4 x 3 of 1.30 x 0.278 mm. Its SPICE subcircuit export fits the winding
+// resistance up to several MHz, where the end cells of a trace carry the crowded current; at 6.24 MHz (nu = 10.6) the
+// Poisson-smoothed face sheet integrated to 1.739 A of the trace's 1.774 A, the cell loss fell below the uniform sheet the
+// skin step books, and the export threw "Width cells: negative proximity loss -0.000325 W/m" (MKF d67c9c1c, 2026-11-20).
+TEST_CASE("Test_Winding_Losses_Flat_Cells_Planar_Trace_Export_Has_No_Negative_Proximity", "[winding-losses][martinez-flat][physical-model]") {
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "Test_Winding_Losses_Planar_ER25_Web_Test_Coil.json");
+    std::ifstream in(path);
+    json masJson = json::parse(in);
+    OpenMagnetics::Magnetic magnetic(masJson["magnetic"]);
+    std::string subcircuit;
+    REQUIRE_NOTHROW(subcircuit = OpenMagnetics::CircuitSimulatorExporter(OpenMagnetics::CircuitSimulatorExporterModels::NGSPICE)
+                                     .export_magnetic_as_subcircuit(magnetic, OpenMagnetics::Defaults().measurementFrequency, 25));
+    CHECK_THAT(subcircuit, Catch::Matchers::ContainsSubstring(".subckt"));
+}
+
 TEST_CASE("Test_Winding_Losses_Flat_Cells_Frequency_Interpolation_Matches_Direct_Solves","[winding-losses][martinez-flat][parallel-split][physical-model]") {
     // FlatTurnCells::frequencyInterpolationSamples (Alf 2026-11-07): with more harmonics than samples per winding, the split
     // solves each winding's unit current at the samples and splines every harmonic's solution in log f. The E 42 foil stack
@@ -6171,6 +6189,9 @@ TEST_CASE("Test_Winding_Losses_Multi_Window_E42_Rectangular_Vs_OMFEM", "[winding
     // 2026-11-13: ask OMFEM for per-winding DC). Before, the per-winding watts were divided by DC losses estimated outside
     // OMFEM (0.743 / 1.472 mW): 1.8185 / 1.0126 at 1 kHz, 55.256 / 5.758 at 100 kHz. Inputs and logs:
     // /home/alf/OpenMagnetics/.mkf-triage-runs/gap/fem/mwr_<f>.json, mwr_<f>.g.omfem.*.
+    // ABT #2384 (Alf 2026-11-20, "find a converging kernel"): green since the width cells resolve half a skin depth at the
+    // conductor ends and book only the face-wrapping part of a cell's current as face-crowded; per turn at 100 kHz the
+    // primary reads 0.92-1.07x OMFEM, the secondary 0.87-0.96x. Before that:
     // Known red, landed so by Alf (2026-11-13): the primary beside the gap reads 0.73x OMFEM at 100 kHz (0.91x at 1 kHz;
     // the secondary 1.00x at 1 kHz, 0.93x at 100 kHz). It is the width-cell model on 0.8 mm bars beside a gap (the multi-window frame matches
     // the single-window one there, Test_Winding_Losses_Multi_Window_Cells_Match_Single_Window), the same family as the E 42
@@ -6191,6 +6212,33 @@ TEST_CASE("Test_Winding_Losses_Multi_Window_E42_Rectangular_Vs_OMFEM", "[winding
         INFO(frequency << " Hz: primary MKF " << ratios[0] << " vs OMFEM " << primary << ", secondary MKF " << ratios[1] << " vs OMFEM " << secondary);
         CHECK_THAT(ratios[0], Catch::Matchers::WithinRel(primary, WindingLossesTestHelpers::maximumError));
         CHECK_THAT(ratios[1], Catch::Matchers::WithinRel(secondary, WindingLossesTestHelpers::maximumError));
+    }
+    // ABT #2384 (2026-11-20): the primary turn just above the gap (y = +0.44 mm), per turn, against OMFEM's own R_ac/R_dc of
+    // that turn at 100 kHz from the same dump, booked over its own length as above: 123.02. The winding total alone does not
+    // guard the cell kernel: with the cells' whole current booked face-crowded this turn reads 1.28x (0.71x with
+    // one-thickness cells) while the winding stays inside 25 %. The converged kernel reads 1.06x.
+    {
+        auto inputs = OpenMagnetics::Inputs::create_quick_operating_point_only_current(100000, 100e-6, 20, WaveformLabel::SINUSOIDAL, 2, 0.5, 0, {2});
+        auto output = WindingLosses().calculate_losses(magnetic, inputs.get_operating_point(0), 20);
+        const auto perTurn = output.get_winding_losses_per_turn().value();
+        const auto turns = magnetic.get_coil().get_turns_description().value();
+        REQUIRE(perTurn.size() == turns.size());
+        std::optional<size_t> gapSideTurn;
+        for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
+            if (turns[turnIndex].get_winding() == "Primary" && std::abs(turns[turnIndex].get_coordinates()[1] - 0.4425e-3) < 1e-6) {
+                gapSideTurn = turnIndex;
+            }
+        }
+        REQUIRE(gapSideTurn);
+        const auto& turn = perTurn[gapSideTurn.value()];
+        double loss = turn.get_ohmic_losses()->get_losses();
+        const auto skinLosses = turn.get_skin_effect_losses().value();
+        const auto proximityLosses = turn.get_proximity_effect_losses().value();
+        for (auto harmonicLoss : skinLosses.get_losses_per_harmonic()) loss += harmonicLoss;
+        for (auto harmonicLoss : proximityLosses.get_losses_per_harmonic()) loss += harmonicLoss;
+        const double factor = loss / turn.get_ohmic_losses()->get_losses();
+        INFO("gap-side primary turn R_ac/R_dc MKF " << factor << " vs OMFEM 123.02");
+        CHECK_THAT(factor, Catch::Matchers::WithinRel(123.02, 0.15));
     }
     settings.reset();
 }
@@ -6266,6 +6314,11 @@ TEST_CASE("Test_Winding_Losses_Abt2384_Isolated_Strip_Keeps_Its_Edge_Loss", "[wi
     // from the width cells' currents; together they must still give the isolated strip's classical R_ac/R_dc, which
     // KUTKUT's 2D fit (1.80 here) states. MKF reads 1.93 (the closed window's images add a little field a free strip
     // does not see; 15 % allows for that and for the fit); before ABT #2384 it read 2.56, KUTKUT plus the cells' edge loss.
+    // Moved to the window centre (Alf 2026-11-20): wound, the strip's end touched the centre leg at the mouth of the core's
+    // 5 um residual gap, whose near field the cells resolve once they are half a skin depth wide at the ends (2.19 there; an
+    // exact 2-D filament solve of the strip in the window gives 2.08-2.42 for 0.10-0.15 A across that gap, 2.00 without
+    // it). At the centre its ends are 2.9 mm from the walls and the gap mouths, and only its own images act on it: MKF
+    // 1.93, the exact 2-D solve 1.78, KUTKUT 1.80.
     settings.reset();
     clear_databases();
     OpenMagnetics::Wire wire;
@@ -6280,6 +6333,13 @@ TEST_CASE("Test_Winding_Losses_Abt2384_Isolated_Strip_Keeps_Its_Edge_Loss", "[wi
     auto coil = OpenMagneticsTesting::get_quick_coil({1}, {1}, shapeName, 1, WindingOrientation::OVERLAPPING, WindingOrientation::OVERLAPPING,
                                                     CoilAlignment::CENTERED, CoilAlignment::CENTERED, {wire}, false);
     auto core = OpenMagneticsTesting::get_quick_core(shapeName, OpenMagneticsTesting::get_residual_gap(), 1, "3C97");
+    {
+        // The window of E 65/32/27 spans x = 9.825 .. 22.475 mm: its centre, 2.9 mm from either wall at the strip's ends.
+        auto turns = coil.get_turns_description().value();
+        REQUIRE(turns.size() == 1);
+        turns[0].set_coordinates({0.01615, 0.0});
+        coil.set_turns_description(turns);
+    }
     OpenMagnetics::Magnetic magnetic;
     magnetic.set_core(core);
     magnetic.set_coil(coil);
@@ -6324,11 +6384,44 @@ TEST_CASE("Test_Winding_Losses_Abt2384_Interleaved_Litz_And_Strips_Vs_OMFEM", "[
              << ", total MKF " << mkfTotal << " vs OMFEM " << total);
         // Tolerances: the AC excess is a small difference of two large numbers on the FEM side (its DC part moves
         // 0.158 -> 0.163 W between the equal and the solved split, 8 % of the DAB excess), so 25 %; the strip and winding
-        // totals 10 %. With the fix: excess -10 % / -14 %, strips -1.5 % / -1.3 %, total -2.3 % / +1.2 %. Before it
+        // totals 10 %. ABT #2384 (2026-11-20, converging width-cell kernel): the DAB strip excess reads 0.227 W (-23 %; -29 %
+        // with one-thickness cells, the test red since 2026-11-15). With the fix: excess -10 % / -14 %, strips -1.5 % / -1.3 %, total -2.3 % / +1.2 %. Before it
         // (KUTKUT): excess +147 % / +216 %, strips +45 % / +36 %, total +33 % / +32 %.
         CHECK_THAT(strips.skin + strips.proximity, Catch::Matchers::WithinRel(stripAcExcess, 0.25));
         CHECK_THAT(strips.total(), Catch::Matchers::WithinRel(stripTotal, 0.1));
         CHECK_THAT(mkfTotal, Catch::Matchers::WithinRel(total, 0.1));
+    }
+    settings.reset();
+}
+
+TEST_CASE("Width cells: a flat-wire arc on a toroid loses the same at mirrored turns", "[physical-model][winding-losses][toroid][abt-2498]") {
+    // ABT #2498, the reported design: T 85.7/55.5/19.05, one evenly spaced arc of 67 turns of 4 x 0.9 mm wire. The arc is its
+    // own mirror image, so turn i and turn N-1-i lose the same, whatever the model. A compressed block of the cells' matrices
+    // that held both the bore's and the exterior's crossings was accepted up to 95 % wrong, and turn 62 booked 4.43 W where
+    // its mirror, turn 4, booked 0.24 W (the whole coil 2.1x the exact matrices' proximity loss).
+    settings.reset();
+    auto path = OpenMagneticsTesting::get_test_data_path(std::source_location::current(), "abt2498_toroid_67_flat_turns.json");
+    auto mas = OpenMagneticsTesting::mas_loader(path);
+    auto magnetic = mas.get_magnetic();
+    auto inputs = mas.get_inputs();
+    auto output = WindingLosses().calculate_losses(magnetic, inputs.get_operating_point(0), 25);
+    json outputJson;
+    to_json(outputJson, output);
+    const json& perTurn = outputJson.at("windingLossesPerTurn");
+    const size_t numberTurns = perTurn.size();
+    REQUIRE(numberTurns == 67);
+    std::vector<double> proximity;
+    for (const auto& turn : perTurn) {
+        double total = 0;
+        for (const auto& loss : turn.at("proximityEffectLosses").at("lossesPerHarmonic")) {
+            total += loss.get<double>();
+        }
+        REQUIRE(total > 0);
+        proximity.push_back(total);
+    }
+    for (size_t turn = 0; turn < numberTurns / 2; ++turn) {
+        INFO("turn " << turn << " against its mirror " << numberTurns - 1 - turn);
+        CHECK_THAT(proximity[turn], Catch::Matchers::WithinRel(proximity[numberTurns - 1 - turn], 0.01));
     }
     settings.reset();
 }

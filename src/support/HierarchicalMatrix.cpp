@@ -20,12 +20,18 @@ constexpr double admissibility = 2.0;
 constexpr size_t checkedEntries = 12;
 } // namespace
 
-std::vector<HierarchicalMatrix::Cluster> HierarchicalMatrix::build_clusters(const std::vector<std::array<double, 2>>& points, std::vector<size_t>& order) {
+std::vector<HierarchicalMatrix::Cluster> HierarchicalMatrix::build_clusters(const std::vector<std::array<double, 2>>& points, std::vector<size_t>& order, const PointForm& form) {
     order.resize(points.size());
     std::iota(order.begin(), order.end(), 0);
     std::vector<Cluster> clusters;
     if (points.empty()) {
         return clusters;
+    }
+    std::vector<size_t> formPerPoint(points.size(), 0);
+    if (form) {
+        for (size_t point = 0; point < points.size(); ++point) {
+            formPerPoint[point] = form(points[point]);
+        }
     }
     std::function<int(size_t, size_t)> build = [&](size_t begin, size_t end) -> int {
         Cluster cluster;
@@ -43,8 +49,24 @@ std::vector<HierarchicalMatrix::Cluster> HierarchicalMatrix::build_clusters(cons
             cluster.minimumY = std::min(cluster.minimumY, point[1]);
             cluster.maximumY = std::max(cluster.maximumY, point[1]);
         }
+        const auto first = order.begin() + static_cast<std::ptrdiff_t>(begin);
+        const auto last = order.begin() + static_cast<std::ptrdiff_t>(end);
+        const auto [lowestForm, highestForm] =
+            std::minmax_element(first, last, [&](size_t a, size_t b) { return formPerPoint[a] < formPerPoint[b]; });
+        const size_t splitForm = formPerPoint[*lowestForm];
+        cluster.mixedForms = splitForm != formPerPoint[*highestForm];
         const int index = static_cast<int>(clusters.size());
         clusters.push_back(cluster);
+        if (cluster.mixedForms) {
+            // Cut by form before by position, down to clusters of one form.
+            const auto cut = std::stable_partition(first, last, [&](size_t point) { return formPerPoint[point] == splitForm; });
+            const size_t middle = static_cast<size_t>(cut - order.begin());
+            const int firstChild = build(begin, middle);
+            const int secondChild = build(middle, end);
+            clusters[static_cast<size_t>(index)].first = firstChild;
+            clusters[static_cast<size_t>(index)].second = secondChild;
+            return index;
+        }
         const double extentX = cluster.maximumX - cluster.minimumX;
         const double extentY = cluster.maximumY - cluster.minimumY;
         if (end - begin > leafSize && (extentX > 0 || extentY > 0)) {
@@ -64,11 +86,14 @@ std::vector<HierarchicalMatrix::Cluster> HierarchicalMatrix::build_clusters(cons
     return clusters;
 }
 
-// The kernel's entries of one block, kept as they are evaluated (in block coordinates, `count` values per entry), so no
-// entry is evaluated twice. `keep` false keeps nothing (every get evaluates).
+// The kernel's entries of one block, kept as they are evaluated (`count` values per entry), so no entry is evaluated twice.
+// The block spans the rows [rowBegin, rowBegin + rows) and the columns [columnBegin, columnBegin + columns) in cluster
+// order. A block split after a failed approximation is the `enclosing` one of its parts: they take the entries it
+// evaluated instead of evaluating them again. `keep` false keeps nothing (every get evaluates, or reads the enclosing).
 class BlockEntries {
   public:
-    BlockEntries(size_t rows, size_t columns, size_t count, bool keep) : _columns(columns), _count(count), _keep(keep) {
+    BlockEntries(size_t rowBegin, size_t rows, size_t columnBegin, size_t columns, size_t count, bool keep, const BlockEntries* enclosing)
+        : _rowBegin(rowBegin), _columnBegin(columnBegin), _columns(columns), _count(count), _keep(keep), _enclosing(enclosing) {
         _scratch.resize(count);
         // A large block keeps the entries it evaluates by index (an approximation evaluates a few of its rows and columns).
         _dense = _keep && rows * columns <= maximumDenseEntries;
@@ -79,30 +104,60 @@ class BlockEntries {
     }
     template <typename Evaluate> double get(size_t i, size_t j, size_t index, const Evaluate& evaluate) {
         if (!_keep) {
-            evaluate(_scratch.data());
+            fill(i, j, _scratch.data(), evaluate);
             return _scratch[index];
         }
         const size_t entry = i * _columns + j;
         if (_dense) {
             if (!_known[entry]) {
-                evaluate(_values.data() + entry * _count);
+                fill(i, j, _values.data() + entry * _count, evaluate);
                 _known[entry] = true;
             }
             return _values[entry * _count + index];
         }
         auto found = _sparse.find(entry);
         if (found == _sparse.end()) {
-            evaluate(_scratch.data());
+            fill(i, j, _scratch.data(), evaluate);
             found = _sparse.emplace(entry, _scratch).first;
         }
         return found->second[index];
     }
+    // The entry at row `row` and column `column` (cluster order) when this block or an enclosing one evaluated it.
+    const double* find(size_t row, size_t column) const {
+        if (_keep) {
+            const size_t entry = (row - _rowBegin) * _columns + (column - _columnBegin);
+            if (_dense) {
+                if (_known[entry]) {
+                    return _values.data() + entry * _count;
+                }
+            }
+            else {
+                auto found = _sparse.find(entry);
+                if (found != _sparse.end()) {
+                    return found->second.data();
+                }
+            }
+        }
+        return _enclosing ? _enclosing->find(row, column) : nullptr;
+    }
 
   private:
+    template <typename Evaluate> void fill(size_t i, size_t j, double* values, const Evaluate& evaluate) const {
+        if (_enclosing) {
+            if (const double* known = _enclosing->find(_rowBegin + i, _columnBegin + j)) {
+                std::copy(known, known + _count, values);
+                return;
+            }
+        }
+        evaluate(values);
+    }
     static constexpr size_t maximumDenseEntries = size_t(1) << 20;
+    size_t _rowBegin;
+    size_t _columnBegin;
     size_t _columns;
     size_t _count;
     bool _keep;
+    const BlockEntries* _enclosing;
     bool _dense = false;
     std::vector<bool> _known;
     std::vector<double> _values;
@@ -111,21 +166,24 @@ class BlockEntries {
 };
 
 HierarchicalMatrix::HierarchicalMatrix(const std::vector<std::array<double, 2>>& rowPoints, const std::vector<std::array<double, 2>>& columnPoints,
-                                       const Entry& entry, double tolerance)
+                                       const Entry& entry, double tolerance, const PointForm& form)
     : _rows(rowPoints.size()), _columns(columnPoints.size()), _tolerance(tolerance) {
     if (!(tolerance > 0) || !(tolerance < 1)) {
         throw InvalidInputException(ErrorCode::INVALID_INPUT, "Hierarchical matrix: the tolerance must lie between 0 and 1");
     }
-    _rowClusters = build_clusters(rowPoints, _rowOrder);
-    _columnClusters = build_clusters(columnPoints, _columnOrder);
+    _rowClusters = build_clusters(rowPoints, _rowOrder, form);
+    _columnClusters = build_clusters(columnPoints, _columnOrder, form);
     if (_rows > 0 && _columns > 0) {
-        build_blocks(0, 0, entry);
+        build_blocks(0, 0, entry, nullptr);
     }
 }
 
 bool HierarchicalMatrix::admissible(size_t rowCluster, size_t columnCluster) const {
     const Cluster& rows = _rowClusters[rowCluster];
     const Cluster& columns = _columnClusters[columnCluster];
+    if (rows.mixedForms || columns.mixedForms) {
+        return false;
+    }
     const double rowDiagonal = std::hypot(rows.maximumX - rows.minimumX, rows.maximumY - rows.minimumY);
     const double columnDiagonal = std::hypot(columns.maximumX - columns.minimumX, columns.maximumY - columns.minimumY);
     const double gapX = std::max({0.0, rows.minimumX - columns.maximumX, columns.minimumX - rows.maximumX});
@@ -143,18 +201,20 @@ bool HierarchicalMatrix::split_rows(size_t rowCluster, size_t columnCluster) con
     return rows.first >= 0 && (columns.first < 0 || rowDiagonal >= columnDiagonal);
 }
 
-void HierarchicalMatrix::build_blocks(size_t rowCluster, size_t columnCluster, const Entry& entry) {
+void HierarchicalMatrix::build_blocks(size_t rowCluster, size_t columnCluster, const Entry& entry, const BlockEntries* enclosing) {
     const Cluster& rows = _rowClusters[rowCluster];
     const Cluster& columns = _columnClusters[columnCluster];
     const size_t numberRows = rows.end - rows.begin;
     const size_t numberColumns = columns.end - columns.begin;
     const bool leaves = rows.first < 0 && columns.first < 0;
+    const bool admissiblePair = admissible(rowCluster, columnCluster);
     // A pair of leaves that does not compress is stored dense: the entries its approximation evaluated are kept for that.
-    BlockEntries entries(numberRows, numberColumns, 1, leaves);
+    // A larger pair that does not compress is split: its blocks take the entries it evaluated.
+    BlockEntries entries(rows.begin, numberRows, columns.begin, numberColumns, 1, leaves || admissiblePair, enclosing);
     auto block_entry = [&](size_t i, size_t j) {
         return entries.get(i, j, 0, [&](double* values) { values[0] = entry(_rowOrder[rows.begin + i], _columnOrder[columns.begin + j]); });
     };
-    if (admissible(rowCluster, columnCluster)) {
+    if (admissiblePair) {
         Block block;
         block.rowCluster = rowCluster;
         block.columnCluster = columnCluster;
@@ -179,19 +239,19 @@ void HierarchicalMatrix::build_blocks(size_t rowCluster, size_t columnCluster, c
     if (split_rows(rowCluster, columnCluster)) {
         const int first = rows.first;
         const int second = rows.second;
-        build_blocks(static_cast<size_t>(first), columnCluster, entry);
-        build_blocks(static_cast<size_t>(second), columnCluster, entry);
+        build_blocks(static_cast<size_t>(first), columnCluster, entry, &entries);
+        build_blocks(static_cast<size_t>(second), columnCluster, entry, &entries);
     }
     else {
         const int first = columns.first;
         const int second = columns.second;
-        build_blocks(rowCluster, static_cast<size_t>(first), entry);
-        build_blocks(rowCluster, static_cast<size_t>(second), entry);
+        build_blocks(rowCluster, static_cast<size_t>(first), entry, &entries);
+        build_blocks(rowCluster, static_cast<size_t>(second), entry, &entries);
     }
 }
 
 std::vector<HierarchicalMatrix> HierarchicalMatrix::build_set(const std::vector<std::array<double, 2>>& rowPoints, const std::vector<std::array<double, 2>>& columnPoints,
-                                                              const MultiEntry& entry, size_t count, double tolerance) {
+                                                              const MultiEntry& entry, size_t count, double tolerance, const PointForm& form) {
     if (count == 0) {
         throw InvalidInputException(ErrorCode::INVALID_INPUT, "Hierarchical matrix: a set needs at least one matrix");
     }
@@ -202,16 +262,17 @@ std::vector<HierarchicalMatrix> HierarchicalMatrix::build_set(const std::vector<
     shape._rows = rowPoints.size();
     shape._columns = columnPoints.size();
     shape._tolerance = tolerance;
-    shape._rowClusters = build_clusters(rowPoints, shape._rowOrder);
-    shape._columnClusters = build_clusters(columnPoints, shape._columnOrder);
+    shape._rowClusters = build_clusters(rowPoints, shape._rowOrder, form);
+    shape._columnClusters = build_clusters(columnPoints, shape._columnOrder, form);
     std::vector<HierarchicalMatrix> matrices(count, shape);
     if (shape._rows > 0 && shape._columns > 0) {
-        build_set_blocks(matrices, 0, 0, entry);
+        build_set_blocks(matrices, 0, 0, entry, nullptr);
     }
     return matrices;
 }
 
-void HierarchicalMatrix::build_set_blocks(std::vector<HierarchicalMatrix>& matrices, size_t rowCluster, size_t columnCluster, const MultiEntry& entry) {
+void HierarchicalMatrix::build_set_blocks(std::vector<HierarchicalMatrix>& matrices, size_t rowCluster, size_t columnCluster, const MultiEntry& entry,
+                                          const BlockEntries* enclosing) {
     const HierarchicalMatrix& shape = matrices.front();
     const Cluster& rows = shape._rowClusters[rowCluster];
     const Cluster& columns = shape._columnClusters[columnCluster];
@@ -222,7 +283,7 @@ void HierarchicalMatrix::build_set_blocks(std::vector<HierarchicalMatrix>& matri
     // The kernel gives every matrix's entry at once: the entries one approximation evaluates serve the others, and a pair
     // of leaves stored dense reuses them all.
     const bool admissiblePair = shape.admissible(rowCluster, columnCluster);
-    BlockEntries entries(numberRows, numberColumns, count, leaves || (admissiblePair && count > 1));
+    BlockEntries entries(rows.begin, numberRows, columns.begin, numberColumns, count, leaves || admissiblePair, enclosing);
     auto evaluate = [&](size_t i, size_t j) {
         return [&, i, j](double* values) { entry(shape._rowOrder[rows.begin + i], shape._columnOrder[columns.begin + j], values); };
     };
@@ -262,12 +323,12 @@ void HierarchicalMatrix::build_set_blocks(std::vector<HierarchicalMatrix>& matri
         return;
     }
     if (shape.split_rows(rowCluster, columnCluster)) {
-        build_set_blocks(matrices, static_cast<size_t>(rows.first), columnCluster, entry);
-        build_set_blocks(matrices, static_cast<size_t>(rows.second), columnCluster, entry);
+        build_set_blocks(matrices, static_cast<size_t>(rows.first), columnCluster, entry, &entries);
+        build_set_blocks(matrices, static_cast<size_t>(rows.second), columnCluster, entry, &entries);
     }
     else {
-        build_set_blocks(matrices, rowCluster, static_cast<size_t>(columns.first), entry);
-        build_set_blocks(matrices, rowCluster, static_cast<size_t>(columns.second), entry);
+        build_set_blocks(matrices, rowCluster, static_cast<size_t>(columns.first), entry, &entries);
+        build_set_blocks(matrices, rowCluster, static_cast<size_t>(columns.second), entry, &entries);
     }
 }
 

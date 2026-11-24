@@ -200,9 +200,13 @@ struct FlatTurnCells {
     // The conductor's own length over the turn's (WindingOhmicLosses::calculate_turn_conductor_length): the length its DC
     // and skin losses are booked over. The cells' lengths combine to it as their conductances do.
     double conductorLengthRatio = 0;
-    // The cuts: the end cells and every cell from the ends inwards are one thickness wide for endCellCount cells, then
+    // The cuts: the end cells and every cell from the ends inwards are edgeCellWidth wide for endCellCount cells, then
     // each grows by cellGrowth up to maximumCellWidthInThicknesses thicknesses. The innermost remainder joins the last cell
-    // when it is under half of it. Fixed geometry, the same at every harmonic.
+    // when it is under half of it. Fixed geometry, the same at every harmonic. edgeCellWidth is one thickness, or half a
+    // skin depth at the operating point's fundamental when that is less (ABT #2384, Alf 2026-11-20, "find a converging
+    // kernel"): the current a field perpendicular to the conductor drives peaks within a skin depth of its ends, and the
+    // cells must resolve it. On the multi-window E 42 primary (0.8 mm bars, 3.9 skin depths at 100 kHz) the loss stops
+    // moving at a quarter skin depth; half a skin depth is within 3 % of that at about 2.5x the cost of one thickness.
     static constexpr size_t endCellCount = 3;
     // x2 (Alf 2026-11-06, within 3 % of the full model): against x1.4 the planar OMFEM fixtures move at most 0.63 % and the
     // planar adviser candidates 0.08 %. The end cells are the physics (one end cell, or end cells 2t wide, move Sixteen by
@@ -217,12 +221,21 @@ struct FlatTurnCells {
     // allowed against the full model): on the planar adviser candidates and the planar OMFEM fixtures the total loss moves
     // under 0.03 % from 1e-10 and the solve is ~1.4x faster (sweep in .mkf-triage-runs/wlfem/speed).
     static constexpr double operatorTolerance = 1e-4;
-    // A flat turn is resolved when its wide side is at least this many thicknesses.
-    static constexpr double minimumAspectRatio = 4;
+    // A flat turn is resolved when its wide side is at least this many thicknesses: every rectangular, foil and planar
+    // turn (Alf 2026-11-21). The threshold was 4, which left every catalogue rectangular wire (2-3.5:1) on the closed-form
+    // MARTINEZ path. That path misreads a column of bars stacked along the field: at a few skin depths the bars expel the
+    // field normal to their wide faces and its flux crosses between them along those faces, which only the cells
+    // resolve. On the catalogue FEM sweep (40 random catalogue designs against 2-D OMFEM, 2026-11-21) the winding
+    // R_ac/R_dc mean error fell from 13.4 % to 7.1 % and 93 % of windings now land within 20 % (rectangular wire 21.9 %
+    // to 10.7 %, 0.4-0.85x low before). Its runtime, timed in-process on the same designs (200 kHz, 2026-11-22): 23x the
+    // 4:1 threshold's per evaluation on the coils with rectangular wire, up to 47x (0.02 s to 1.0 s on 28 + 19 bars of an
+    // ETD 49). In the adviser cases timed, 1.0x with the default settings (they evaluate no such wire) and up to 6.1x
+    // restricted to rectangular wire.
+    static constexpr double minimumAspectRatio = 1;
     // The face sheets' own thickness, in conductor thicknesses (a sheet is a thin uniform rectangle inside the face).
     static constexpr double faceSheetThicknessInThicknesses = 1.0 / 20;
     // The cell cuts of a conductor of this width and thickness: cell widths in order along the wide axis.
-    static std::vector<double> calculate_cell_widths(double width, double thickness);
+    static std::vector<double> calculate_cell_widths(double width, double thickness, double edgeCellWidth);
     // A gap mouth on its column face, in the window frame: the face's x and the gap's extent y0..y1.
     struct GapMouth {
         double x = 0;

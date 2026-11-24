@@ -198,6 +198,7 @@ namespace {
         add_to_fingerprint(text, _coreAdviserSaturationDeratingTemperature);
         add_to_fingerprint(text, _thermalNetworkStrictGeometry);
         add_to_fingerprint(text, _allowMaterialDataExtrapolation);
+        add_to_fingerprint(text, _allowCorePastMagnetisationCurve);
         add_to_fingerprint(text, _simulatorLossTemperatureLoop);
         add_to_fingerprint(text, _simulatorSkipLeakageInductance);
         add_to_fingerprint(text, _gappingStrategy);
@@ -213,6 +214,8 @@ namespace {
         add_to_fingerprint(text, _magneticFieldTurnSumsCacheBytes);
         add_to_fingerprint(text, _coreLossesModelNames);
         add_to_fingerprint(text, _coreLossesRequestedModel);
+        add_to_fingerprint(text, _coreLossesDcBiasEnabled);
+        add_to_fingerprint(text, _coreLossesFluxDensityDistribution);
         add_to_fingerprint(text, _magneticFieldStrengthModel);
         add_to_fingerprint(text, _magneticFieldStrengthFringingEffectModel);
         add_to_fingerprint(text, _leakageInductanceMagneticFieldStrengthModel);
@@ -362,6 +365,8 @@ namespace {
         _thermalNetworkStrictGeometry = true;
         // Alf, 2026-10-25: user/MAS data extrapolates with a WARNING; advisers never (barrier).
         _allowMaterialDataExtrapolation = true;
+        // Alf, 2026-11-20: a user/MAS design driven past its magnetisation curve is calculated with a WARNING.
+        _allowCorePastMagnetisationCurve = true;
         _simulatorLossTemperatureLoop = true;
         _simulatorSkipLeakageInductance = false;
 
@@ -402,6 +407,8 @@ namespace {
         // tests/sessions (one cause of order-dependent adviser test results)
         _coreLossesModelNames = {Defaults().coreLossesModelDefault, CoreLossesModels::PROPRIETARY, CoreLossesModels::LOSS_FACTOR, CoreLossesModels::LOSS_FACTOR_HYSTERESIS, CoreLossesModels::STEINMETZ, CoreLossesModels::ROSHEN};
         _coreLossesRequestedModel = std::nullopt;
+        _coreLossesDcBiasEnabled = true;
+        _coreLossesFluxDensityDistribution = CoreLossesFluxDensityDistribution::EFFECTIVE_PARAMETERS;
         _circuitSimulatorCurveFittingMode = 0;
         _circuitSimulatorFracpoleOptions = std::nullopt;
         _circuitSimulatorIncludeSaturation = false;
@@ -1224,6 +1231,13 @@ namespace {
         _allowMaterialDataExtrapolation = value;
     }
 
+    bool Settings::get_allow_core_past_magnetisation_curve() const {
+        return _allowCorePastMagnetisationCurve && materialDataExtrapolationBarriers.load() == 0;
+    }
+    void Settings::set_allow_core_past_magnetisation_curve(bool value) {
+        _allowCorePastMagnetisationCurve = value;
+    }
+
     // Depth of CatalogueSearchOnePassScope on this thread (ABT #2124, Alf 2026-10-28).
     static thread_local int catalogueFilterOnePassScopes = 0;
 
@@ -1256,6 +1270,20 @@ namespace {
     }
     void Settings::set_simulator_skip_leakage_inductance(bool value) {
         _simulatorSkipLeakageInductance = value;
+    }
+
+    bool Settings::get_core_losses_dc_bias_enabled() const {
+        return _coreLossesDcBiasEnabled;
+    }
+    void Settings::set_core_losses_dc_bias_enabled(bool value) {
+        _coreLossesDcBiasEnabled = value;
+    }
+
+    CoreLossesFluxDensityDistribution Settings::get_core_losses_flux_density_distribution() const {
+        return _coreLossesFluxDensityDistribution;
+    }
+    void Settings::set_core_losses_flux_density_distribution(CoreLossesFluxDensityDistribution value) {
+        _coreLossesFluxDensityDistribution = value;
     }
 
     GappingOptimizationStrategy Settings::get_gapping_strategy() const {

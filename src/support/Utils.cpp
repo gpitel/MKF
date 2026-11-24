@@ -1,3 +1,4 @@
+#include "physical_models/BhCycle.h"
 #include "support/LogOnceScope.h"
 #include "constructive_models/MasMigration.h"
 #include "support/FastJsonParse.h"
@@ -350,6 +351,18 @@ bool material_data_extrapolation_allowed(const std::string& summary, const Mater
     return true;
 }
 
+bool core_past_magnetisation_curve_allowed(const std::string& summary, const MaterialDataAsked& asked) {
+    if (!settings.get_allow_core_past_magnetisation_curve()) {
+        return false;
+    }
+    if (summary.empty()) {
+        throw std::invalid_argument("core_past_magnetisation_curve_allowed needs a summary (material and where its "
+                                    "magnetisation curve ends)");
+    }
+    report_material_data_notice(LogLevel::WARNING, summary, asked);
+    return true;
+}
+
 // Alf, 2026-11-03: an adviser tries hundreds of materials the user never chose, so what it reads outside a material's
 // tables is a trace of the search, not a warning about the user's design: while an adviser runs (a
 // MaterialDataExtrapolationBarrier exists) these records are DEBUG. The design the user then adopts is evaluated
@@ -533,10 +546,15 @@ void load_advanced_core_materials(std::string fileToLoad, bool onlyDataFromManuf
         // mutated the copy, and assigned it back, costing two whole-object
         // copies per advanced-material record.
         auto& material = it->second;
-        if (jf.contains("bhCycle")) {
+        // ABT #2470 (Alf, 2026-11-22): B-H data enters MKF when this file is loaded, as its loss points do, converted
+        // and thinned for the magnetisation curve. A record's own loop, the datasheet's, is never replaced.
+        if (jf.contains("bhCycle") && !material.get_bh_cycle()) {
             std::vector<BhCycleElement> bhCycle;
             from_json(jf["bhCycle"], bhCycle);
-            material.set_bh_cycle(bhCycle);
+            auto normalised = normalise_bh_cycle(material, bhCycle);
+            if (!normalised.empty()) {
+                material.set_bh_cycle(normalised);
+            }
         }
         if (jf.contains("volumetricLosses")) {
             if (!jf["volumetricLosses"].contains("default") || jf["volumetricLosses"]["default"].empty()) {

@@ -234,10 +234,12 @@ struct RectangleFieldKernel {
     double a = 0;
     double b = 0;
     double farRadiusSquared = 0;
+    double halfDiagonal = 0;  // std::hypot(a, b): a round-post window reads the ring's curvature part no closer than this
     double moments[numberMoments] = {};
     RectangleFieldKernel() = default;
     RectangleFieldKernel(double halfWidth, double halfHeight) : a(halfWidth), b(halfHeight) {
         farRadiusSquared = 16.0 * (a * a + b * b);
+        halfDiagonal = std::hypot(a, b);
         for (size_t index = 0; index < numberMoments; ++index) {
             const int k = 2 * static_cast<int>(index);
             double moment = 0;
@@ -5016,6 +5018,120 @@ struct SplitSection {
     }
 };
 
+// The even complex moments <(x + j y)^k>, k = 0, 2, ..., 2 (splitSeriesMoments - 1), of a uniform axis-aligned section
+// about its centre (a disk's vanish past k = 0). With <x^n> = a^n / (n + 1) over [-a, a] (n even):
+// <(x + j y)^k> = sum over even i of C(k, i) (-1)^(i / 2) <x^(k - i)> <y^i>.
+constexpr size_t splitSeriesMoments = 9;  // k up to 16
+// C(2 index, 2 q), and 1 / (2 q + 1).
+constexpr auto splitSeriesBinomials = [] {
+    std::array<std::array<double, splitSeriesMoments>, splitSeriesMoments> binomials{};
+    for (size_t index = 0; index < splitSeriesMoments; ++index) {
+        double binomial = 1;  // C(k, j), j = 0 .. k
+        const size_t k = 2 * index;
+        for (size_t j = 0; j <= k; ++j) {
+            if (j > 0) {
+                binomial = binomial * static_cast<double>(k - j + 1) / static_cast<double>(j);
+            }
+            if (j % 2 == 0) {
+                binomials[index][j / 2] = binomial;
+            }
+        }
+    }
+    return binomials;
+}();
+constexpr auto splitSeriesOddReciprocals = [] {
+    std::array<double, splitSeriesMoments> reciprocals{};
+    for (size_t q = 0; q < splitSeriesMoments; ++q) {
+        reciprocals[q] = 1.0 / static_cast<double>(2 * q + 1);
+    }
+    return reciprocals;
+}();
+constexpr auto splitSeriesHalfReciprocals = [] {  // 1 / (2 index)
+    std::array<double, splitSeriesMoments> reciprocals{};
+    for (size_t index = 1; index < splitSeriesMoments; ++index) {
+        reciprocals[index] = 1.0 / static_cast<double>(2 * index);
+    }
+    return reciprocals;
+}();
+std::array<double, splitSeriesMoments> split_even_moments_of(const SplitSection& section);
+// The moments depend on the half sizes alone, and a winding's sections repeat a few sizes: the last ones are kept per thread.
+std::array<double, splitSeriesMoments> split_even_moments(const SplitSection& section) {
+    if (section.round) {
+        std::array<double, splitSeriesMoments> moments{};
+        moments[0] = 1;
+        return moments;
+    }
+    struct Entry {
+        double halfWidth = -1;
+        double halfHeight = -1;
+        std::array<double, splitSeriesMoments> moments{};
+    };
+    constexpr size_t slots = 64;
+    thread_local std::array<Entry, slots> cache;
+    uint64_t widthBits, heightBits;
+    std::memcpy(&widthBits, &section.halfWidth, sizeof widthBits);
+    std::memcpy(&heightBits, &section.halfHeight, sizeof heightBits);
+    const uint64_t mixed = (widthBits ^ (heightBits * 0x9e3779b97f4a7c15ULL)) * 0xff51afd7ed558ccdULL;
+    Entry& entry = cache[(mixed >> 58) % slots];
+    if (std::memcmp(&entry.halfWidth, &section.halfWidth, sizeof(double)) != 0 || std::memcmp(&entry.halfHeight, &section.halfHeight, sizeof(double)) != 0) {
+        entry.halfWidth = section.halfWidth;
+        entry.halfHeight = section.halfHeight;
+        entry.moments = split_even_moments_of(section);
+    }
+    return entry.moments;
+}
+std::array<double, splitSeriesMoments> split_even_moments_of(const SplitSection& section) {
+    std::array<double, splitSeriesMoments> moments{};
+    moments[0] = 1;
+    std::array<double, splitSeriesMoments> meanPowerX{};  // <x^(2q)>
+    std::array<double, splitSeriesMoments> meanPowerY{};  // <y^(2q)>
+    double powerX = 1;
+    double powerY = 1;
+    const double squaredX = section.halfWidth * section.halfWidth;
+    const double squaredY = section.halfHeight * section.halfHeight;
+    for (size_t q = 0; q < splitSeriesMoments; ++q) {
+        meanPowerX[q] = powerX * splitSeriesOddReciprocals[q];
+        meanPowerY[q] = (q % 2 == 0 ? powerY : -powerY) * splitSeriesOddReciprocals[q];  // with (-1)^q: (j y)^(2q)
+        powerX *= squaredX;
+        powerY *= squaredY;
+    }
+    for (size_t index = 1; index < splitSeriesMoments; ++index) {
+        double moment = 0;
+        for (size_t q = 0; q <= index; ++q) {
+            moment += splitSeriesBinomials[index][q] * meanPowerX[index - q] * meanPowerY[q];
+        }
+        moments[index] = moment;
+    }
+    return moments;
+}
+
+// The mean of ln |p - q| over two axis-aligned sections whose centres are (dx, dy) apart, more than twice their summed
+// half-diagonals rho: ln |D + e| = ln |D| + Re sum (-1)^(k + 1) e^k / (k D^k), e = (p - c_target) - (q - c_source), whose odd
+// moments vanish, to k = 16. The remainder is below (rho / |D|)^18 / (18 (1 - (rho / |D|)^2)) <= 2.8e-7 of ln (the 4th-order
+// series it replaces beyond 8 rho stops at 6.5e-7); against the exact 16-corner form, 4e-9 at worst on 2e5 random pairs
+// at 2 to 8 rho, the exact form's own rounding.
+double split_log_series_sum(double dx, double dy, const SplitSection& target, const SplitSection& source) {
+    const auto targetMoments = split_even_moments(target);
+    const auto sourceMoments = split_even_moments(source);
+    // 1 / D^2, D = dx + j dy.
+    const std::complex<double> inverseSquared = 1.0 / std::complex<double>(dx * dx - dy * dy, 2 * dx * dy);
+    std::complex<double> power = inverseSquared;
+    double sum = 0;
+    for (size_t index = 1; index < splitSeriesMoments; ++index) {
+        // <e^k> = sum over even i of C(k, i) <target^i> <source^(k - i)>.
+        double moment = 0;
+        for (size_t q = 0; q <= index; ++q) {
+            moment += splitSeriesBinomials[index][q] * targetMoments[q] * sourceMoments[index - q];
+        }
+        sum += moment * power.real() * splitSeriesHalfReciprocals[index];
+        power *= inverseSquared;
+    }
+    return sum;
+}
+double split_mean_log_series(double dx, double dy, double d2, const SplitSection& target, const SplitSection& source) {
+    return 0.5 * std::log(d2) - split_log_series_sum(dx, dy, target, source);
+}
+
 // The four corner differences of the ranges [p0, p1] and [q0, q1], with their signs in the double integral.
 std::array<std::pair<double, double>, 4> split_corners(double p0, double p1, double q0, double q1) {
     return {{{p1 - q0, 1.0}, {p1 - q1, -1.0}, {p0 - q0, -1.0}, {p0 - q1, 1.0}}};
@@ -5104,6 +5220,9 @@ double split_mean_log_aligned(const SplitSection& target, const SplitSection& so
         const double m4 = target.moment4() + 6 * target.moment2() * source.moment2() + source.moment4();
         return 0.5 * std::log(d2) - m2 * real2 / 2 - m4 * real4 / 4;
     }
+    if (d2 > 4 * reach * reach && !(target.round && source.round)) {
+        return split_mean_log_series(dx, dy, d2, target, source);
+    }
     if (target.round && source.round) {
         // Distinct uniform disks act on each other as their centre filaments when they do not overlap. A crossing and its
         // own (m = 0) image coincide, and touching bundles overlap by the rounding of their coordinates: those take the
@@ -5154,6 +5273,27 @@ double split_mean_log_aligned(const SplitSection& target, const SplitSection& so
         }
     }
     return sum / ((sx1 - sx0) * (sy1 - sy0) * area);
+}
+
+// ln |D| less the mean of ln |p - q| over two axis-aligned sections (D the difference of their centres), where
+// split_mean_log_aligned takes a far series (it is that series without its ln |D|); nullopt where it takes an exact form.
+std::optional<double> split_log_excess_far(const SplitSection& target, const SplitSection& source) {
+    const double dx = target.x - source.x;
+    const double dy = target.y - source.y;
+    const double d2 = dx * dx + dy * dy;
+    const double reach = target.reach() + source.reach();
+    if (d2 > 64 * reach * reach) {
+        const double inverse4 = 1.0 / (d2 * d2);
+        const double real2 = (dx * dx - dy * dy) * inverse4;
+        const double real4 = (dx * dx * dx * dx - 6 * dx * dx * dy * dy + dy * dy * dy * dy) * inverse4 * inverse4;
+        const double m2 = target.moment2() + source.moment2();
+        const double m4 = target.moment4() + 6 * target.moment2() * source.moment2() + source.moment4();
+        return m2 * real2 / 2 + m4 * real4 / 4;
+    }
+    if (d2 > 4 * reach * reach && !(target.round && source.round)) {
+        return split_log_series_sum(dx, dy, target, source);
+    }
+    return std::nullopt;
 }
 
 // The section seen in a frame turned by `angle`: its centre's coordinates there, and its own angle less `angle`.
@@ -5238,6 +5378,242 @@ double split_mean_log(const SplitSection& target, const SplitSection& source) {
     return mean / (4.0 * static_cast<double>(pieces * pieces));
 }
 
+// The far images of a rectangular window's lattice (the CENTER mesher's), summed once per design. An image k of a source at
+// s lies at shift_k + sigma_k(s), sigma_k one of four mirrors (x -> +-x, y -> +-y), with the weight f_k times the source's
+// own; so the far series of the mean log (split_mean_log_aligned beyond 8 reaches) summed over the images of one mirror,
+//   sum_k f_k [ln|d_k| - m2 Re(d_k^-2) / 2 - m4 Re(d_k^-4) / 4],  d_k = r - shift_k - sigma(s) = q - shift_k,  q = r - sigma(s),
+// is three functions of q alone, tabulated on a grid over every q the window's sections reach and interpolated (cubic, per
+// axis). An image is far, and enters the tables, when every pair of sections is beyond 8 reaches of it and the grid is
+// fine against its distance; the others (the walls next to the window) are summed per entry as before.
+struct FarLattice {
+    struct Table {
+        std::array<double, 2> origin{};  // q at node (0, 0)
+        double step = 0;
+        size_t nodesX = 0;
+        size_t nodesY = 0;
+        std::vector<double> values;  // per node: the three potential sums (log, second, fourth), then Re, Im of sum f (shift - q)^-(n+1), n = 0, 2, 4
+    };
+    std::array<int, 2> mirrorPerClass[4] = {{1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
+    std::vector<int> classPerImage;    // per image index: its mirror class, or -1 when not far (the conductor among them)
+    static constexpr size_t valuesPerNode = 9;
+    std::array<Table, 4> tables;
+    std::array<bool, 4> used{};
+    bool valid = false;
+
+    // `positions` and `imagesPerSource` (x, y, weight per image) of every source; `conductorIndexPerSource`; the largest reach
+    // of any section; the operator tolerance.
+    // `targets`: every point the lattice is read at (the q box spans targets minus mirrored sources).
+    static FarLattice build(const std::vector<std::array<double, 2>>& positions, const std::vector<std::vector<std::array<double, 3>>>& imagesPerSource,
+                            const std::vector<size_t>& conductorIndexPerSource, double maximumReach, double tolerance,
+                            const std::vector<std::array<double, 2>>& targets) {
+        FarLattice lattice;
+        const size_t sources = positions.size();
+        if (sources < 2) {
+            return lattice;
+        }
+        const size_t images = imagesPerSource[0].size();
+        for (const auto& list : imagesPerSource) {
+            if (list.size() != images) {
+                return lattice;
+            }
+        }
+        double minimumX = std::numeric_limits<double>::max(), maximumX = std::numeric_limits<double>::lowest();
+        double minimumY = minimumX, maximumY = maximumX;
+        for (const auto& p : positions) {
+            minimumX = std::min(minimumX, p[0]);
+            maximumX = std::max(maximumX, p[0]);
+            minimumY = std::min(minimumY, p[1]);
+            maximumY = std::max(maximumY, p[1]);
+        }
+        double targetMinimumX = std::numeric_limits<double>::max(), targetMaximumX = std::numeric_limits<double>::lowest();
+        double targetMinimumY = targetMinimumX, targetMaximumY = targetMaximumX;
+        for (const auto& p : targets) {
+            targetMinimumX = std::min(targetMinimumX, p[0]);
+            targetMaximumX = std::max(targetMaximumX, p[0]);
+            targetMinimumY = std::min(targetMinimumY, p[1]);
+            targetMaximumY = std::max(targetMaximumY, p[1]);
+        }
+        if (targets.empty()) {
+            return lattice;
+        }
+        const double scale = std::max({maximumX - minimumX, maximumY - minimumY, targetMaximumX - targetMinimumX, targetMaximumY - targetMinimumY, maximumReach, 1e-12});
+        lattice.classPerImage.assign(images, -1);
+        std::vector<std::array<double, 2>> shiftPerImage(images);
+        std::vector<double> factorPerImage(images, 0.0);
+        for (size_t k = 0; k < images; ++k) {
+            if (k == conductorIndexPerSource[0]) {
+                continue;
+            }
+            int found = -1;
+            for (int c = 0; c < 4 && found < 0; ++c) {
+                const auto& sigma = lattice.mirrorPerClass[c];
+                const std::array<double, 2> shift{imagesPerSource[0][k][0] - sigma[0] * positions[0][0], imagesPerSource[0][k][1] - sigma[1] * positions[0][1]};
+                const double factor = imagesPerSource[0][k][2] / imagesPerSource[0][conductorIndexPerSource[0]][2];
+                bool all = true;
+                for (size_t source = 1; source < sources && all; ++source) {
+                    if (conductorIndexPerSource[source] != conductorIndexPerSource[0]) {
+                        return lattice;
+                    }
+                    const auto& image = imagesPerSource[source][k];
+                    all = std::abs(image[0] - shift[0] - sigma[0] * positions[source][0]) <= 1e-9 * scale &&
+                          std::abs(image[1] - shift[1] - sigma[1] * positions[source][1]) <= 1e-9 * scale &&
+                          std::abs(image[2] - factor * imagesPerSource[source][conductorIndexPerSource[source]][2]) <= 1e-12 * std::abs(image[2]);
+                }
+                if (all) {
+                    found = c;
+                    shiftPerImage[k] = shift;
+                    factorPerImage[k] = factor;
+                }
+            }
+            if (found < 0) {
+                return lattice;  // not a mirror lattice: every image is summed per entry
+            }
+            lattice.classPerImage[k] = found;
+        }
+        // Per class, the q box: r over the sections' box, sigma(s) over its mirror.
+        std::array<std::array<double, 4>, 4> boxPerClass;  // minX, maxX, minY, maxY
+        for (int c = 0; c < 4; ++c) {
+            const auto& sigma = lattice.mirrorPerClass[c];
+            boxPerClass[c][0] = sigma[0] > 0 ? targetMinimumX - maximumX : targetMinimumX + minimumX;
+            boxPerClass[c][1] = sigma[0] > 0 ? targetMaximumX - minimumX : targetMaximumX + maximumX;
+            boxPerClass[c][2] = sigma[1] > 0 ? targetMinimumY - maximumY : targetMinimumY + minimumY;
+            boxPerClass[c][3] = sigma[1] > 0 ? targetMaximumY - minimumY : targetMaximumY + maximumY;
+        }
+        // Far: beyond 8 summed reaches (the far series is what the entries take there) and at least `nodesPerDistance` grid
+        // steps from the box at the class's step. The step is set by the nearest far image of the class.
+        constexpr double nodesPerDistance = 24;
+        std::array<double, 4> nearestFar;
+        nearestFar.fill(std::numeric_limits<double>::max());
+        const double minimumDistance = std::max(16 * maximumReach, 0.25 * scale);
+        for (size_t k = 0; k < images; ++k) {
+            const int c = lattice.classPerImage[k];
+            if (c < 0) {
+                continue;
+            }
+            const auto& box = boxPerClass[c];
+            const double gapX = std::max({0.0, box[0] - shiftPerImage[k][0], shiftPerImage[k][0] - box[1]});
+            const double gapY = std::max({0.0, box[2] - shiftPerImage[k][1], shiftPerImage[k][1] - box[3]});
+            const double distance = std::hypot(gapX, gapY);
+            if (distance < minimumDistance) {
+                lattice.classPerImage[k] = -1;
+                continue;
+            }
+            nearestFar[c] = std::min(nearestFar[c], distance);
+        }
+        (void) tolerance;
+        for (int c = 0; c < 4; ++c) {
+            if (nearestFar[c] == std::numeric_limits<double>::max()) {
+                continue;
+            }
+            auto& table = lattice.tables[c];
+            const auto& box = boxPerClass[c];
+            table.step = nearestFar[c] / nodesPerDistance;
+            // One node beyond each side, for the cubic stencil.
+            table.origin = {box[0] - table.step, box[2] - table.step};
+            table.nodesX = static_cast<size_t>(std::ceil((box[1] - box[0]) / table.step)) + 3;
+            table.nodesY = static_cast<size_t>(std::ceil((box[3] - box[2]) / table.step)) + 3;
+            table.values.assign(valuesPerNode * table.nodesX * table.nodesY, 0.0);
+            for (size_t j = 0; j < table.nodesY; ++j) {
+                for (size_t i = 0; i < table.nodesX; ++i) {
+                    const double qx = table.origin[0] + i * table.step;
+                    const double qy = table.origin[1] + j * table.step;
+                    double* node = &table.values[valuesPerNode * (j * table.nodesX + i)];
+                    for (size_t k = 0; k < images; ++k) {
+                        if (lattice.classPerImage[k] != c) {
+                            continue;
+                        }
+                        const double dx = qx - shiftPerImage[k][0];
+                        const double dy = qy - shiftPerImage[k][1];
+                        const double d2 = dx * dx + dy * dy;
+                        const double inverse4 = 1.0 / (d2 * d2);
+                        node[0] += factorPerImage[k] * 0.5 * std::log(d2);
+                        node[1] += factorPerImage[k] * (dx * dx - dy * dy) * inverse4;
+                        node[2] += factorPerImage[k] * (dx * dx * dx * dx - 6 * dx * dx * dy * dy + dy * dy * dy * dy) * inverse4 * inverse4;
+                        // D = shift - q = -(dx + j dy); 1 / D^(n+1) for n = 0, 2, 4.
+                        const std::complex<double> inverse = 1.0 / std::complex<double>(-dx, -dy);
+                        const std::complex<double> inverseSquared = inverse * inverse;
+                        std::complex<double> term = inverse;
+                        for (size_t order = 0; order < 3; ++order) {
+                            node[3 + 2 * order] += factorPerImage[k] * term.real();
+                            node[4 + 2 * order] += factorPerImage[k] * term.imag();
+                            term *= inverseSquared;
+                        }
+                    }
+                }
+            }
+            lattice.used[c] = true;
+        }
+        lattice.valid = true;
+        return lattice;
+    }
+
+    // Sum over the far images (all classes) of the far mean log between the target (at r, moments) and the source (at s), per
+    // unit of the source's own weight.
+    // The table values of class c at q, `first` to `first + count`, into out.
+    void interpolate(int c, double qx, double qy, size_t first, size_t count, double* out) const {
+        const auto& table = tables[c];
+        const double u = (qx - table.origin[0]) / table.step;
+        const double v = (qy - table.origin[1]) / table.step;
+        if (!(u >= 1 - 1e-9 && u <= static_cast<double>(table.nodesX - 2) + 1e-9 && v >= 1 - 1e-9 && v <= static_cast<double>(table.nodesY - 2) + 1e-9)) {
+            throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Width cells: a point outside the far-lattice table");
+        }
+        const size_t i0 = std::min(static_cast<size_t>(std::max(1.0, std::floor(u))), table.nodesX - 3);
+        const size_t j0 = std::min(static_cast<size_t>(std::max(1.0, std::floor(v))), table.nodesY - 3);
+        const double tu = u - static_cast<double>(i0);
+        const double tv = v - static_cast<double>(j0);
+        const double wu[4] = {-tu * (tu - 1) * (tu - 2) / 6, (tu + 1) * (tu - 1) * (tu - 2) / 2, -(tu + 1) * tu * (tu - 2) / 2, (tu + 1) * tu * (tu - 1) / 6};
+        const double wv[4] = {-tv * (tv - 1) * (tv - 2) / 6, (tv + 1) * (tv - 1) * (tv - 2) / 2, -(tv + 1) * tv * (tv - 2) / 2, (tv + 1) * tv * (tv - 1) / 6};
+        for (size_t index = 0; index < count; ++index) {
+            out[index] = 0;
+        }
+        for (size_t b = 0; b < 4; ++b) {
+            const double* row = &table.values[valuesPerNode * ((j0 - 1 + b) * table.nodesX + (i0 - 1)) + first];
+            for (size_t a = 0; a < 4; ++a) {
+                const double weight = wu[a] * wv[b];
+                for (size_t index = 0; index < count; ++index) {
+                    out[index] += weight * row[valuesPerNode * a + index];
+                }
+            }
+        }
+    }
+
+    // (Hx, Hy) at the target point (x, y) of the far images of a source at s with the field moments `moments` (the
+    // RectangleFieldKernel's, k = 0, 2, 4; a filament: 1, 0, 0), per unit of the source's own weight.
+    std::pair<double, double> field(double x, double y, double sx, double sy, const double* moments) const {
+        double sumRe = 0;
+        double sumIm = 0;
+        for (int c = 0; c < 4; ++c) {
+            if (!used[c]) {
+                continue;
+            }
+            double values[6];
+            interpolate(c, x - mirrorPerClass[c][0] * sx, y - mirrorPerClass[c][1] * sy, 3, 6, values);
+            for (size_t order = 0; order < 3; ++order) {
+                sumRe += moments[order] * values[2 * order];
+                sumIm += moments[order] * values[2 * order + 1];
+            }
+        }
+        const double prefactor = 1.0 / (2.0 * std::numbers::pi);
+        return {prefactor * sumIm, prefactor * sumRe};
+    }
+
+    double mean_log(const SplitSection& target, const SplitSection& source) const {
+        const double m2 = target.moment2() + source.moment2();
+        const double m4 = target.moment4() + 6 * target.moment2() * source.moment2() + source.moment4();
+        double sum = 0;
+        for (int c = 0; c < 4; ++c) {
+            if (!used[c]) {
+                continue;
+            }
+            double values[3];
+            interpolate(c, target.x - mirrorPerClass[c][0] * source.x, target.y - mirrorPerClass[c][1] * source.y, 0, 3, values);
+            sum += values[0] - m2 * values[1] / 2 - m4 * values[2] / 4;
+        }
+        return sum;
+    }
+};
+
+
 // A rectangle's field in the window frame: its kernel read in the rectangle's own frame (turned by `angle`), turned back.
 std::pair<double, double> turned_rectangle_field(const RectangleFieldKernel& kernel, double angle, double dx, double dy, double current) {
     if (angle == 0) {
@@ -5321,6 +5697,12 @@ struct ToroidRegions {
     bool reaches(const Source& source, double x, double y) const {
         return reaches(source.region, x, y) && (windows.empty() || source.window == window_at(x, y));
     }
+    // The form a kernel gated by `reaches` takes at a point (HierarchicalMatrix::PointForm): all that `reaches` reads of it.
+    size_t form_at(const std::array<double, 2>& point) const {
+        constexpr size_t numberRegions = static_cast<size_t>(ToroidRegion::FERRITE) + 1;
+        const auto window = windows.empty() ? std::nullopt : window_at(point[0], point[1]);
+        return static_cast<size_t>(at(point[0], point[1])) + numberRegions * (window ? window.value() + 1 : 0);
+    }
 };
 
 // A source of the screened width-cell model (FlatTurnCells): a cell of a flat turn, or one of its two face sheets, with
@@ -5352,9 +5734,10 @@ struct FlatCellSource {
 // The face sheet's sign: a section wide along x carries -D on its +y face and +D on its -y face; one wide along y carries
 // +D on its +x face and -D on its -x face (in the conductor's own frame). In the field kernels' own sign convention
 // (RectangleFieldKernel: a filament I at z0 gives Hy + j Hx = I / (2 pi (z0 - z)), opposite to the right-hand rule) both
-// put +D / w of field along the faces inside the cell. The slab's reaction screens, -g H inside, so D = -g H w. (Until
-// 2026-11-09 D was g H w, which reinforced the field instead: the foil beside the column-side one of the E 42 foil
-// stacks read 2.1-2.5x 2D OMFEM, and 1.00x with the screening sign.)
+// put +D / w of field along the faces inside the cell. The slab's reaction screens: D / w = -(s coth s - 1) H, H the field
+// inside the cell from every source including its own turn's sheets (see reaction_per_field_at). (Until 2026-11-09 D
+// reinforced the field instead: the foil beside the column-side one of the E 42 foil stacks read 2.1-2.5x 2D OMFEM, and
+// 1.00x with the screening sign.)
 double flat_face_sign(bool wideAlongX, int kind) {
     return wideAlongX ? -static_cast<double>(kind) : static_cast<double>(kind);
 }
@@ -5538,6 +5921,33 @@ std::shared_ptr<const FlatCellFieldOperator> build_flat_cell_field_operator(cons
             }
         }
     }
+    // A rectangular window's far lattice images, summed once (FarLattice), for the operator's entries.
+    FarLattice farLattice;
+    if (!axisymmetricWindow && !toroidRegions.toroid) {
+        bool plain = true;
+        double maximumReach = 0;
+        std::vector<std::array<double, 2>> positions;
+        std::vector<std::vector<std::array<double, 3>>> imagesPerSource;
+        std::vector<size_t> conductorIndex;
+        for (const auto& source : sources) {
+            plain = plain && source.section.angle == 0;
+            maximumReach = std::max(maximumReach, source.section.reach());
+            positions.push_back({source.section.x, source.section.y});
+            imagesPerSource.emplace_back();
+            size_t conductor = source.images.size();
+            for (size_t k = 0; k < source.images.size(); ++k) {
+                plain = plain && !source.images[k].window;
+                imagesPerSource.back().push_back({source.images[k].x, source.images[k].y, source.images[k].weight});
+                if (!source.images[k].isImage) {
+                    conductor = k;
+                }
+            }
+            conductorIndex.push_back(conductor);
+        }
+        if (plain && std::none_of(conductorIndex.begin(), conductorIndex.end(), [&](size_t k) { return k >= imagesPerSource.front().size(); })) {
+            farLattice = FarLattice::build(positions, imagesPerSource, conductorIndex, maximumReach, tolerance, rowPoints);
+        }
+    }
     // The field at a point of the sources of a column. `include` picks the images taken (all of them for the operator,
     // which alone takes the wall correction: it is the core's reply, never taken back out).
     auto column_field = [&](size_t row, size_t column, const auto& include, bool withCorrection = false) {
@@ -5546,9 +5956,20 @@ std::shared_ptr<const FlatCellFieldOperator> build_flat_cell_field_operator(cons
         const double y = point.get_point()[1];
         double fieldX = 0;
         double fieldY = 0;
+        // The operator itself (withCorrection) takes the far images from the lattice's tables.
+        const bool farTable = withCorrection && farLattice.valid;
         auto add_source = [&](size_t sourceIndex) {
             const auto& source = sources[sourceIndex];
-            for (const auto& image : source.images) {
+            for (size_t k = 0; k < source.images.size(); ++k) {
+                const auto& image = source.images[k];
+                if (farTable && !image.isImage) {
+                    const auto [farX, farY] = farLattice.field(x, y, source.section.x, source.section.y, source.kernel.moments);
+                    fieldX += image.weight * source.sign * farX;
+                    fieldY += image.weight * source.sign * farY;
+                }
+                if (farTable && farLattice.classPerImage[k] >= 0) {
+                    continue;
+                }
                 const double dx = x - image.x;
                 const double dy = y - image.y;
                 if (!toroidRegions.reaches(image, x, y) || !include(source, image, dx, dy)) {
@@ -5559,7 +5980,7 @@ std::shared_ptr<const FlatCellFieldOperator> build_flat_cell_field_operator(cons
                 fieldY += hy;
                 if (axisymmetricWindow) {
                     auto [curvatureX, curvatureY] = axisymmetric_curvature_field(image.weight * source.sign, image.x, image.y, x, y,
-                                                                                 std::hypot(source.kernel.a, source.kernel.b));
+                                                                                 source.kernel.halfDiagonal);
                     fieldX += curvatureX;
                     fieldY += curvatureY;
                 }
@@ -5589,7 +6010,7 @@ std::shared_ptr<const FlatCellFieldOperator> build_flat_cell_field_operator(cons
             const auto [fieldX, fieldY] = column_field(row, column, every_image, true);
             values[0] = fieldX;
             values[1] = fieldY;
-        }, 2, tolerance);
+        }, 2, tolerance, [&](const std::array<double, 2>& point) { return toroidRegions.form_at(point); });
         result->fieldX = std::move(components[0]);
         result->fieldY = std::move(components[1]);
     }
@@ -5641,7 +6062,7 @@ std::pair<double, double> FlatTurnCells::position(double alongCoordinate) const 
                       : std::pair<double, double>{centreX - offset * sine, centreY + offset * cosine};
 }
 
-std::vector<double> FlatTurnCells::calculate_cell_widths(double width, double thickness) {
+std::vector<double> FlatTurnCells::calculate_cell_widths(double width, double thickness, double edgeCellWidth) {
     if (!(width > 0) || !(thickness > 0)) {
         throw InvalidInputException(ErrorCode::INVALID_WIRE_DATA, "Width cells: a flat conductor needs a positive width and thickness");
     }
@@ -5649,11 +6070,15 @@ std::vector<double> FlatTurnCells::calculate_cell_widths(double width, double th
         throw InvalidInputException(ErrorCode::INVALID_INPUT, "Width cells: a conductor " + std::to_string(width) + " m wide and " + std::to_string(thickness) +
                                     " m thick is not flat (its width is under " + std::to_string(minimumAspectRatio) + " thicknesses)");
     }
+    if (!(edgeCellWidth > 0) || edgeCellWidth > thickness) {
+        throw InvalidInputException(ErrorCode::INVALID_INPUT, "Width cells: the edge cell width " + std::to_string(edgeCellWidth) +
+                                    " m is not between 0 and the conductor's thickness " + std::to_string(thickness) + " m");
+    }
     const double halfWidth = width / 2;
     const double maximumCellWidth = maximumCellWidthInThicknesses * thickness;
     std::vector<double> half;
     double accumulated = 0;
-    double cellWidth = thickness;
+    double cellWidth = edgeCellWidth;
     while (accumulated + cellWidth < halfWidth) {
         half.push_back(cellWidth);
         accumulated += cellWidth;
@@ -5914,6 +6339,14 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
         }
     }
     if (impedanceModel && resolveFlatTurnsPerWinding) {
+        // The highest fundamental of the windings: the edge cells' skin depth (calculate_cell_widths).
+        double fundamentalFrequency = 0;
+        for (const auto& excitation : operatingPoint.get_excitations_per_winding()) {
+            fundamentalFrequency = std::max(fundamentalFrequency, excitation.get_frequency());
+        }
+        if (!(fundamentalFrequency > 0)) {
+            throw InvalidInputException(ErrorCode::MISSING_DATA, "Width cells: the operating point has no positive excitation frequency");
+        }
         const bool toroidalCoil = magnetic.get_mutable_coil().resolve_bobbin().get_winding_window_shape() == WindingWindowShape::ROUND;
         std::map<std::string, double> columnAxisPerSection;
         for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
@@ -5957,7 +6390,9 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
             flat.width = wide;
             flat.centreX = turns[turnIndex].get_coordinates()[0];
             flat.centreY = turns[turnIndex].get_coordinates()[1];
-            flat.cellWidths = FlatTurnCells::calculate_cell_widths(wide, thin);
+            // The edge cells resolve half a skin depth at the fundamental when that is under a thickness (calculate_cell_widths).
+            const double edgeCellWidth = std::min(thin, WindingSkinEffectLosses::calculate_skin_depth(wire, fundamentalFrequency, temperature) / 2);
+            flat.cellWidths = FlatTurnCells::calculate_cell_widths(wide, thin, edgeCellWidth);
             const double alongCentre = flat.along(flat.centreX, flat.centreY);
             if (!ringModel) {
                 flat.cellWidths = FlatTurnCells::refine_cell_widths_near_gaps(flat.cellWidths, alongCentre - wide / 2,
@@ -6017,6 +6452,7 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
     // Each crossing's section and its core images (the CENTER mesher's lattice and image factors), and the wall sources.
     std::vector<SplitSection> sectionPerTurn(turns.size());
     std::vector<std::vector<std::pair<SplitSection, double>>> sourcesPerTurn(turns.size());
+    std::vector<std::vector<char>> imageFlagsPerTurn(turns.size());  // per source of sourcesPerTurn: an image (not the conductor)
     std::vector<WindowWallSheet> sheets;
     // Multi-window frame (ABT #2267): each window's walls answer each winding's current. A winding's current is read from
     // its conductors in its reference window (where its walls return the most), so the walls stay linear in the strand
@@ -6093,6 +6529,7 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
                 image.region = region_of_inducing_label(point.get_label()).first;
                 image.window = window_of_label(point.get_label());
                 sourcesPerTurn[turnIndex].push_back({image, point.get_value()});
+                imageFlagsPerTurn[turnIndex].push_back(is_image_label(point.get_label()));
             }
         }
 
@@ -6349,7 +6786,7 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
         HierarchicalMatrix elementPotential;          // mu0 / (2 pi) x minus mean log of the images, per unit J_e'
         HierarchicalMatrix elementReactionPotential;  // per unit D of a cell's face sheets
         HierarchicalMatrix cellFieldPerElement;       // H along the faces at each cell, per unit J_e (walls apart)
-        HierarchicalMatrix cellFieldPerReaction;      // per unit D of a cell's face sheets (own turn's sheets left out)
+        HierarchicalMatrix cellFieldPerReaction;      // per unit D of a cell's face sheets (own turn's sheets included)
         // The preconditioner's groups: turns that lie together (neighbours couple the most), with their elements and cells.
         // Per group, its exact blocks with itself, row-major: elements x elements, elements x cells, cells x elements,
         // cells x cells, in the order of the group's elements and cells.
@@ -6359,6 +6796,8 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
         std::vector<std::vector<double>> reactionPotentialPerGroup;
         std::vector<std::vector<double>> fieldPerElementPerGroup;
         std::vector<std::vector<double>> fieldPerReactionPerGroup;
+        // Per cell, the field its own turn's face sheets (not their images) put at it, per unit D of each: (cell, value).
+        std::vector<std::vector<std::pair<size_t, double>>> ownFaceFieldPerCell;
         size_t stored_values() const {
             size_t values = elementPotential.stored_values() + elementReactionPotential.stored_values() + cellFieldPerElement.stored_values() +
                             cellFieldPerReaction.stored_values() + key.size();
@@ -6474,12 +6913,19 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
         std::optional<AxisymmetricWindow::WallSources> elementWallSources;
         const double referenceRadius = elementWindow ? elementWindow->post_radius() : 0.0;
         const double referenceHeight = elementWindow ? elementWindow->bottom() : 0.0;
+        // Read once: this lambda runs per operator entry and image, and a Constants holds the painter's colour strings.
+        const double mu0 = Constants().vacuumPermeability;
         auto ring_flux_of_section = [&](const SplitSection& target, const SplitSection& source, bool self) {
-            const double mu0 = Constants().vacuumPermeability;
             if (self) {
                 return mu0 * target.x * (std::log(8 * target.x) - 2 - split_mean_log(target, target));
             }
             double flux = AxisymmetricWindow::ring_flux(source.x, source.y, target.x, target.y);
+            // Far apart, ln d - <ln> is the far series alone: no square root or logarithm of d to cancel.
+            if (target.angle == 0 && source.angle == 0) {
+                if (const auto excess = split_log_excess_far(target, source)) {
+                    return flux + mu0 * std::sqrt(target.x * source.x) * excess.value();
+                }
+            }
             const double centreDistance = std::hypot(target.x - source.x, target.y - source.y);
             if (centreDistance > 0) {
                 flux += mu0 * std::sqrt(target.x * source.x) * (std::log(centreDistance) - split_mean_log(target, source));
@@ -6707,11 +7153,24 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
             auto [correctionR, correctionZ] = AxisymmetricWindow::correction_field(correction, basisPerCell[cell].value());
             return along_faces(cell, {cellX[cell] < 0 ? -correctionR : correctionR, correctionZ});
         };
-        // Flux linked per unit length of the target's turn: Lambda / (2 pi r_t).
-        auto ring_potential = [&](size_t target, const SplitSection& image, double weight, bool self) {
+        // Flux linked per unit length of the target's turn: Lambda / (2 pi r_t). The image's flux through the reference circle
+        // depends on the image alone: read once per image (referenceFlux), on its first use.
+        auto ring_potential = [&](size_t target, const SplitSection& image, double weight, bool self, std::optional<double>& referenceFlux) {
             const auto& section = elements[target].section;
-            return weight * (ring_flux_of_section(section, image, self) - AxisymmetricWindow::ring_flux(image.x, image.y, referenceRadius, referenceHeight));
+            const double linked = ring_flux_of_section(section, image, self);
+            if (!referenceFlux) {
+                referenceFlux = AxisymmetricWindow::ring_flux(image.x, image.y, referenceRadius, referenceHeight);
+            }
+            return weight * (linked - referenceFlux.value());
         };
+        std::vector<std::vector<std::optional<double>>> referenceFluxPerElementImage(elementWindow ? numberElements : 0);
+        for (size_t elementIndex = 0; elementIndex < referenceFluxPerElementImage.size(); ++elementIndex) {
+            referenceFluxPerElementImage[elementIndex].assign(elements[elementIndex].images.size(), std::nullopt);
+        }
+        std::vector<std::vector<std::optional<double>>> referenceFluxPerSourceImage(elementWindow ? cellSources.size() : 0);
+        for (size_t sourceIndex = 0; sourceIndex < referenceFluxPerSourceImage.size(); ++sourceIndex) {
+            referenceFluxPerSourceImage[sourceIndex].assign(cellSources[sourceIndex].images.size(), std::nullopt);
+        }
         // Per target element, its correction flux basis (read against the reference circle), built once.
         std::vector<std::optional<AxisymmetricWindow::FluxBasis>> fluxBasisPerElement(elementWindow ? elements.size() : 0);
         auto correction_potential = [&](size_t target, const AxisymmetricWindow::Correction& correction) {
@@ -6721,6 +7180,90 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
             }
             return AxisymmetricWindow::correction_flux(correction, fluxBasisPerElement[target].value());
         };
+        // A rectangular window's far lattice images, summed once (FarLattice): the elements' and the face sheets'.
+        FarLattice elementFarLattice;
+        FarLattice sheetFarLattice;
+        std::vector<char> farImagesPerElement;  // per element: its far images come from elementFarLattice
+        if (!elementWindow && !toroidRegions.toroid) {
+            bool plain = true;
+            double maximumReach = 0;
+            for (const auto& element : elements) {
+                plain = plain && element.section.angle == 0;
+                maximumReach = std::max(maximumReach, element.section.reach());
+                for (const auto& [image, weight] : element.images) {
+                    plain = plain && !image.window && image.angle == 0;
+                }
+            }
+            for (const auto& source : cellSources) {
+                plain = plain && source.section.angle == 0;
+                maximumReach = std::max(maximumReach, source.section.reach());
+                for (const auto& image : source.images) {
+                    plain = plain && !image.window;
+                }
+            }
+            if (plain) {
+                std::vector<std::array<double, 2>> positions;
+                std::vector<std::vector<std::array<double, 3>>> imagesPerSource;
+                std::vector<size_t> conductorIndex;
+                for (const auto& element : elements) {
+                    positions.push_back({element.section.x, element.section.y});
+                    imagesPerSource.emplace_back();
+                    size_t conductor = element.images.size();
+                    for (size_t k = 0; k < element.images.size(); ++k) {
+                        imagesPerSource.back().push_back({element.images[k].first.x, element.images[k].first.y, element.images[k].second});
+                        const bool isImage = element.isImage.empty() ? imageFlagsPerTurn[element.turnIndex].at(k) : element.isImage[k];
+                        if (!isImage) {
+                            conductor = k;
+                        }
+                    }
+                    conductorIndex.push_back(conductor);
+                }
+                const bool conductors = std::none_of(conductorIndex.begin(), conductorIndex.end(), [&](size_t k) { return k >= imagesPerSource[0].size(); });
+                // Read at the elements (potentials) and at the cells' centres (fields).
+                std::vector<std::array<double, 2>> targets = positions;
+                for (size_t cell = 0; cell < numberCells; ++cell) {
+                    targets.push_back({cellX[cell], cellY[cell]});
+                }
+                if (conductors) {
+                    elementFarLattice = FarLattice::build(positions, imagesPerSource, conductorIndex, maximumReach, splitOperatorTolerance, targets);
+                }
+                positions.clear();
+                imagesPerSource.clear();
+                conductorIndex.clear();
+                for (const auto& source : cellSources) {
+                    if (source.kind == 0) {
+                        continue;
+                    }
+                    positions.push_back({source.section.x, source.section.y});
+                    imagesPerSource.emplace_back();
+                    size_t conductor = source.images.size();
+                    for (size_t k = 0; k < source.images.size(); ++k) {
+                        imagesPerSource.back().push_back({source.images[k].x, source.images[k].y, source.images[k].weight});
+                        if (!source.images[k].isImage) {
+                            conductor = k;
+                        }
+                    }
+                    conductorIndex.push_back(conductor);
+                }
+                if (!positions.empty() && std::none_of(conductorIndex.begin(), conductorIndex.end(), [&](size_t k) { return k >= imagesPerSource[0].size(); })) {
+                    sheetFarLattice = FarLattice::build(positions, imagesPerSource, conductorIndex, maximumReach, splitOperatorTolerance, targets);
+                }
+            }
+        }
+        // The conductor's own weight per element and per face sheet (the lattice's factors are relative to it).
+        auto conductor_weight_of_element = [&](size_t element) {
+            for (size_t k = 0; k < elements[element].images.size(); ++k) {
+                if (elementFarLattice.classPerImage[k] < 0 &&
+                    !(elements[element].isImage.empty() ? imageFlagsPerTurn[elements[element].turnIndex].at(k) : elements[element].isImage[k])) {
+                    return elements[element].images[k].second;
+                }
+            }
+            throw CalculationException(ErrorCode::CALCULATION_INVALID_RESULT, "Parallel current split: an element has no conductor among its images");
+        };
+        std::vector<double> conductorWeightPerElement(elementFarLattice.valid ? numberElements : 0);
+        for (size_t element = 0; element < conductorWeightPerElement.size(); ++element) {
+            conductorWeightPerElement[element] = conductor_weight_of_element(element);
+        }
         auto potential_entry = [&](size_t target, size_t source) {
             if (elementWindow) {
                 double linkage = 0;
@@ -6729,17 +7272,25 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
                     const auto& [image, weight] = images[imageIndex];
                     const bool conductor = elements[source].isImage.empty() ? imageIndex == static_cast<size_t>(AxisymmetricWindow::planeImages)
                                                                             : !elements[source].isImage[imageIndex];
-                    linkage += ring_potential(target, image, weight, target == source && conductor);
+                    linkage += ring_potential(target, image, weight, target == source && conductor, referenceFluxPerElementImage[source][imageIndex]);
                 }
                 linkage += correction_potential(target, correctionPerElement[source]);
                 return linkage / (2 * std::numbers::pi * turnRadiusPerElement[target]);
             }
             double potential = 0;
             const auto& targetSection = elements[target].section;
-            for (const auto& [image, weight] : elements[source].images) {
+            const auto& images = elements[source].images;
+            for (size_t k = 0; k < images.size(); ++k) {
+                if (elementFarLattice.valid && elementFarLattice.classPerImage[k] >= 0) {
+                    continue;
+                }
+                const auto& [image, weight] = images[k];
                 if (toroidRegions.reaches(image, targetSection.x, targetSection.y)) {
                     potential -= weight * split_mean_log(targetSection, image);
                 }
+            }
+            if (elementFarLattice.valid) {
+                potential -= conductorWeightPerElement[source] * elementFarLattice.mean_log(targetSection, elements[source].section);
             }
             return mu0Over2Pi * potential;
         };
@@ -6748,11 +7299,12 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
                 double linkage = 0;
                 for (size_t face : faceSourcesPerCell[cell]) {
                     const auto& source = cellSources[face];
-                    for (const auto& image : source.images) {
+                    for (size_t imageIndex = 0; imageIndex < source.images.size(); ++imageIndex) {
+                        const auto& image = source.images[imageIndex];
                         SplitSection imaged = source.section;
                         imaged.x = image.x;
                         imaged.y = image.y;
-                        linkage += source.sign * ring_potential(target, imaged, image.weight, false);
+                        linkage += source.sign * ring_potential(target, imaged, image.weight, false, referenceFluxPerSourceImage[face][imageIndex]);
                     }
                 }
                 linkage += correction_potential(target, correctionPerFacePair[cell]);
@@ -6763,7 +7315,15 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
                 const auto& source = cellSources[face];
                 double potential = 0;
                 const auto& targetSection = elements[target].section;
-                for (const auto& image : source.images) {
+                double conductorWeight = 0;
+                for (size_t k = 0; k < source.images.size(); ++k) {
+                    const auto& image = source.images[k];
+                    if (!image.isImage) {
+                        conductorWeight = image.weight;
+                    }
+                    if (sheetFarLattice.valid && sheetFarLattice.classPerImage[k] >= 0) {
+                        continue;
+                    }
                     if (!toroidRegions.reaches(image, targetSection.x, targetSection.y)) {
                         continue;
                     }
@@ -6772,6 +7332,9 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
                     imaged.y = image.y;
                     potential -= image.weight * split_mean_log(targetSection, imaged);
                 }
+                if (sheetFarLattice.valid) {
+                    potential -= conductorWeight * sheetFarLattice.mean_log(targetSection, source.section);
+                }
                 total += mu0Over2Pi * source.sign * potential;
             }
             return total;
@@ -6779,7 +7342,16 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
         auto field_per_element_entry = [&](size_t cell, size_t source) {
             const auto& element = elements[source];
             double field = 0;
+            if (elementFarLattice.valid) {
+                const double filament[3] = {1.0, 0.0, 0.0};
+                const auto [farX, farY] = elementFarLattice.field(cellX[cell], cellY[cell], element.section.x, element.section.y,
+                                                                  element.rectangle ? element.kernel.moments : filament);
+                field += along_faces(cell, {conductorWeightPerElement[source] * farX, conductorWeightPerElement[source] * farY});
+            }
             for (size_t imageIndex = 0; imageIndex < element.images.size(); ++imageIndex) {
+                if (elementFarLattice.valid && elementFarLattice.classPerImage[imageIndex] >= 0) {
+                    continue;
+                }
                 const auto& [image, weight] = element.images[imageIndex];
                 // A rectangle's own field vanishes at its centre: the cell itself adds nothing there.
                 if (element.globalCell && element.globalCell.value() == cell && !element.isImage[imageIndex]) {
@@ -6792,7 +7364,7 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
                     field += along_faces(cell, turned_rectangle_field(element.kernel, image.angle, cellX[cell] - image.x, cellY[cell] - image.y, weight));
                     if (elementWindow) {
                         field += along_faces(cell, axisymmetric_curvature_field(weight, image.x, image.y, cellX[cell], cellY[cell],
-                                                                                std::hypot(element.kernel.a, element.kernel.b)));
+                                                                                element.kernel.halfDiagonal));
                     }
                 }
                 else {
@@ -6813,23 +7385,31 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
             }
             return field;
         };
-        // The face sheets of a cell at another: with `own`, only the conductor's own sheets (not their images), which a
-        // cell of the same turn does not see (their field inside the conductor is the slab's own screening, held by the
-        // loss kernel's slab formula). The operator takes every sheet, a smooth kernel, and the own-turn ones are taken
-        // back out as sparse corrections.
+        // The face sheets of a cell at another: with `own`, only the conductor's own sheets (not their images). The split
+        // takes every sheet, its own turn's included (the slab relation holds the field inside the conductor, see
+        // reaction_per_field_at); the own sheets are kept apart only to report the field from outside the slab.
         auto face_field = [&](size_t cell, size_t other, bool ownOnly) {
             double total = 0;
             for (size_t face : faceSourcesPerCell[other]) {
                 const auto& source = cellSources[face];
                 double field = 0;
-                for (const auto& image : source.images) {
+                const bool farTable = sheetFarLattice.valid && !ownOnly;
+                for (size_t k = 0; k < source.images.size(); ++k) {
+                    const auto& image = source.images[k];
+                    if (farTable && !image.isImage) {
+                        const auto [farX, farY] = sheetFarLattice.field(cellX[cell], cellY[cell], source.section.x, source.section.y, source.kernel.moments);
+                        field += along_faces(cell, {image.weight * farX, image.weight * farY});
+                    }
+                    if (farTable && sheetFarLattice.classPerImage[k] >= 0) {
+                        continue;
+                    }
                     if ((ownOnly && image.isImage) || !toroidRegions.reaches(image, cellX[cell], cellY[cell])) {
                         continue;
                     }
                     field += along_faces(cell, turned_rectangle_field(source.kernel, source.section.angle, cellX[cell] - image.x, cellY[cell] - image.y, image.weight));
                     if (elementWindow) {
                         field += along_faces(cell, axisymmetric_curvature_field(image.weight, image.x, image.y, cellX[cell], cellY[cell],
-                                                                                std::hypot(source.kernel.a, source.kernel.b)));
+                                                                                source.kernel.halfDiagonal));
                     }
                 }
                 total += source.sign * field;
@@ -6840,14 +7420,6 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
             }
             return total;
         };
-        auto field_per_reaction_entry = [&](size_t cell, size_t other) {
-            double field = face_field(cell, other, false);
-            if (cellTurn[cell] == cellTurn[other]) {
-                field -= face_field(cell, other, true);
-            }
-            return field;
-        };
-
         // The cache key: every input the operators are computed from.
         std::vector<double> geometryKey;
         {
@@ -6893,18 +7465,6 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
             std::vector<std::array<double, 2>> cellPoints(numberCells);
             for (size_t cell = 0; cell < numberCells; ++cell) {
                 cellPoints[cell] = {cellX[cell], cellY[cell]};
-            }
-            freshOperators.elementPotential = HierarchicalMatrix(elementPoints, elementPoints, potential_entry, splitOperatorTolerance);
-            freshOperators.elementReactionPotential = HierarchicalMatrix(elementPoints, cellPoints, reaction_potential_entry, splitOperatorTolerance);
-            freshOperators.cellFieldPerElement = HierarchicalMatrix(cellPoints, elementPoints, field_per_element_entry, splitOperatorTolerance);
-            freshOperators.cellFieldPerReaction = HierarchicalMatrix(cellPoints, cellPoints, [&](size_t cell, size_t other) { return face_field(cell, other, false); },
-                                                                     splitOperatorTolerance);
-            for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
-                for (size_t cell : cellsPerTurn[turnIndex]) {
-                    for (size_t other : cellsPerTurn[turnIndex]) {
-                        freshOperators.cellFieldPerReaction.add_sparse(cell, other, -face_field(cell, other, true));
-                    }
-                }
             }
             {
                 std::vector<size_t> order(turns.size());
@@ -6953,7 +7513,100 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
                     }
                 }
             }
+            // The preconditioner's blocks are pairs within a group: the operators evaluate most of them (their near blocks are
+            // dense), so each entry of a group pair is kept as it is evaluated and the blocks take it from there.
             const size_t numberGroups = freshOperators.elementsPerGroup.size();
+            constexpr size_t noGroup = std::numeric_limits<size_t>::max();
+            std::vector<size_t> groupPerElement(numberElements, noGroup);
+            std::vector<size_t> slotPerElement(numberElements, 0);
+            std::vector<size_t> groupPerCell(numberCells, noGroup);
+            std::vector<size_t> slotPerCell(numberCells, 0);
+            for (size_t group = 0; group < numberGroups; ++group) {
+                for (size_t slot = 0; slot < freshOperators.elementsPerGroup[group].size(); ++slot) {
+                    groupPerElement[freshOperators.elementsPerGroup[group][slot]] = group;
+                    slotPerElement[freshOperators.elementsPerGroup[group][slot]] = slot;
+                }
+                for (size_t slot = 0; slot < freshOperators.cellsPerGroup[group].size(); ++slot) {
+                    groupPerCell[freshOperators.cellsPerGroup[group][slot]] = group;
+                    slotPerCell[freshOperators.cellsPerGroup[group][slot]] = slot;
+                }
+            }
+            // Per group, row-major like the blocks: the value of each pair, and whether it was evaluated.
+            struct GroupRecord {
+                std::vector<double> values;
+                std::vector<char> known;
+                void resize(size_t size) {
+                    values.assign(size, 0.0);
+                    known.assign(size, 0);
+                }
+                void keep(size_t index, double value) {
+                    values[index] = value;
+                    known[index] = 1;
+                }
+            };
+            std::vector<GroupRecord> potentialRecords(numberGroups);
+            std::vector<GroupRecord> reactionPotentialRecords(numberGroups);
+            std::vector<GroupRecord> fieldPerElementRecords(numberGroups);
+            std::vector<GroupRecord> faceFieldRecords(numberGroups);     // face_field(cell, other, false)
+            std::vector<GroupRecord> ownFaceFieldRecords(numberGroups);  // face_field(cell, other, true), same turn
+            for (size_t group = 0; group < numberGroups; ++group) {
+                const size_t groupElements = freshOperators.elementsPerGroup[group].size();
+                const size_t groupCells = freshOperators.cellsPerGroup[group].size();
+                potentialRecords[group].resize(groupElements * groupElements);
+                reactionPotentialRecords[group].resize(groupElements * groupCells);
+                fieldPerElementRecords[group].resize(groupCells * groupElements);
+                faceFieldRecords[group].resize(groupCells * groupCells);
+                ownFaceFieldRecords[group].resize(groupCells * groupCells);
+            }
+            auto recorded_potential_entry = [&](size_t target, size_t source) {
+                const double value = potential_entry(target, source);
+                const size_t group = groupPerElement[target];
+                if (group == groupPerElement[source]) {
+                    potentialRecords[group].keep(slotPerElement[target] * freshOperators.elementsPerGroup[group].size() + slotPerElement[source], value);
+                }
+                return value;
+            };
+            auto recorded_reaction_potential_entry = [&](size_t target, size_t cell) {
+                const double value = reaction_potential_entry(target, cell);
+                const size_t group = groupPerElement[target];
+                if (group == groupPerCell[cell]) {
+                    reactionPotentialRecords[group].keep(slotPerElement[target] * freshOperators.cellsPerGroup[group].size() + slotPerCell[cell], value);
+                }
+                return value;
+            };
+            auto recorded_field_per_element_entry = [&](size_t cell, size_t source) {
+                const double value = field_per_element_entry(cell, source);
+                const size_t group = groupPerCell[cell];
+                if (group == groupPerElement[source]) {
+                    fieldPerElementRecords[group].keep(slotPerCell[cell] * freshOperators.elementsPerGroup[group].size() + slotPerElement[source], value);
+                }
+                return value;
+            };
+            auto recorded_face_field = [&](size_t cell, size_t other, bool ownOnly) {
+                const double value = face_field(cell, other, ownOnly);
+                const size_t group = groupPerCell[cell];
+                if (group == groupPerCell[other]) {
+                    auto& records = ownOnly ? ownFaceFieldRecords : faceFieldRecords;
+                    records[group].keep(slotPerCell[cell] * freshOperators.cellsPerGroup[group].size() + slotPerCell[other], value);
+                }
+                return value;
+            };
+            // Every kernel below is gated by toroidRegions.reaches, so it changes form with the point's region or window.
+            const HierarchicalMatrix::PointForm form = [&](const std::array<double, 2>& point) { return toroidRegions.form_at(point); };
+            freshOperators.elementPotential = HierarchicalMatrix(elementPoints, elementPoints, recorded_potential_entry, splitOperatorTolerance, form);
+            freshOperators.elementReactionPotential =
+                HierarchicalMatrix(elementPoints, cellPoints, recorded_reaction_potential_entry, splitOperatorTolerance, form);
+            freshOperators.cellFieldPerElement = HierarchicalMatrix(cellPoints, elementPoints, recorded_field_per_element_entry, splitOperatorTolerance, form);
+            freshOperators.cellFieldPerReaction = HierarchicalMatrix(cellPoints, cellPoints, [&](size_t cell, size_t other) { return recorded_face_field(cell, other, false); },
+                                                                     splitOperatorTolerance, form);
+            freshOperators.ownFaceFieldPerCell.assign(numberCells, {});
+            for (size_t turnIndex = 0; turnIndex < turns.size(); ++turnIndex) {
+                for (size_t cell : cellsPerTurn[turnIndex]) {
+                    for (size_t other : cellsPerTurn[turnIndex]) {
+                        freshOperators.ownFaceFieldPerCell[cell].emplace_back(other, recorded_face_field(cell, other, true));
+                    }
+                }
+            }
             freshOperators.potentialPerGroup.assign(numberGroups, {});
             freshOperators.reactionPotentialPerGroup.assign(numberGroups, {});
             freshOperators.fieldPerElementPerGroup.assign(numberGroups, {});
@@ -6965,20 +7618,28 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
                 auto& reactionPotential = freshOperators.reactionPotentialPerGroup[group];
                 auto& fieldPerElement = freshOperators.fieldPerElementPerGroup[group];
                 auto& fieldPerReaction = freshOperators.fieldPerReactionPerGroup[group];
+                // An entry the operators did not evaluate is evaluated here (a group pair in one of their low-rank blocks).
                 for (size_t target : groupElements) {
                     for (size_t source : groupElements) {
-                        potential.push_back(potential_entry(target, source));
+                        const size_t index = potential.size();
+                        potential.push_back(potentialRecords[group].known[index] ? potentialRecords[group].values[index] : potential_entry(target, source));
                     }
                     for (size_t cell : cells) {
-                        reactionPotential.push_back(reaction_potential_entry(target, cell));
+                        const size_t index = reactionPotential.size();
+                        reactionPotential.push_back(reactionPotentialRecords[group].known[index] ? reactionPotentialRecords[group].values[index]
+                                                                                                   : reaction_potential_entry(target, cell));
                     }
                 }
                 for (size_t cell : cells) {
                     for (size_t source : groupElements) {
-                        fieldPerElement.push_back(field_per_element_entry(cell, source));
+                        const size_t index = fieldPerElement.size();
+                        fieldPerElement.push_back(fieldPerElementRecords[group].known[index] ? fieldPerElementRecords[group].values[index]
+                                                                                             : field_per_element_entry(cell, source));
                     }
                     for (size_t other : cells) {
-                        fieldPerReaction.push_back(field_per_reaction_entry(cell, other));
+                        // The face sheets of `other`, its own turn's included.
+                        const size_t index = fieldPerReaction.size();
+                        fieldPerReaction.push_back(faceFieldRecords[group].known[index] ? faceFieldRecords[group].values[index] : face_field(cell, other, false));
                     }
                 }
             }
@@ -7258,8 +7919,14 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
                 const auto& flat = split.flatTurns[flatTurnPerCell[cell]];
                 const double skinDepth = WindingSkinEffectLosses::calculate_skin_depth(wires[windingPerTurn[flat.turnIndex]], frequency, temperature);
                 const std::complex<double> slab = std::complex<double>(1, 1) * flat.thickness / (2 * skinDepth);
-                const std::complex<double> reaction = (slab - std::tanh(slab)) / slab;
-                // D = -g H w: the face sheets screen (see flat_face_sign).
+                // A slab whose faces carry H_s screens its inside to H_s tanh(s) / s on average: the face sheets, D / w = H_s - H
+                // apart, hold D / w = (s coth s - 1) H with H the field inside, which counts the conductor's own sheets. The
+                // relation held before, D = (1 - tanh(s) / s) w H with H from everything but its own sheets, is the same only
+                // for a strip much wider than thick, whose own sheets put exactly D / w inside: a catalogue rectangular wire
+                // (2-3.5:1) screened the field along its faces too weakly and its flux crossed the bars (ETD 49 stacks
+                // 0.64x 2-D OMFEM, the field between their bars 0.56-0.77x; 0.79x and 0.92-0.97x with this relation).
+                const std::complex<double> reaction = slab / std::tanh(slab) - 1.0;
+                // The face sheets screen (see flat_face_sign).
                 reactionPerField[cell] = -reaction * cellWidth[cell];
             }
             return reactionPerField;
@@ -7327,7 +7994,7 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
                 const double angularFrequency = 2 * std::numbers::pi * frequency;
                 system.jOmega = Complex(0, angularFrequency);
                 const Complex jOmega = system.jOmega;
-                // Per cell, g w: D = g w H.
+                // Per cell, D per unit of the field inside it.
                 system.reactionPerField = reaction_per_field_at(frequency);
                 const auto& reactionPerField = system.reactionPerField;
                 // The system is solved by GMRES: its product goes through the operators, and its preconditioner is the
@@ -7665,13 +8332,18 @@ std::optional<ParallelCurrentSplit> MagneticField::calculate_parallel_current_sp
                     }
                     const size_t cell = elements[element].globalCell.value();
                     const size_t flatIndex = flatTurnPerCell[cell];
-                    const std::complex<double> field = solution[offsetField + cell];
+                    // The field it reports is the one from outside its own slab, as the loss kernel reads it: its own turn's
+                    // sheets taken back out of the solved field.
+                    std::complex<double> field = solution[offsetField + cell];
+                    for (const auto& [other, ownFaceField] : operators->ownFaceFieldPerCell[cell]) {
+                        field -= ownFaceField * reactionPerField[other] * solution[offsetField + other];
+                    }
                     if (std::isnan(solution[element].real()) || std::isnan(solution[element].imag()) || std::isnan(field.real()) || std::isnan(field.imag())) {
                         throw NaNResultException("Width cells: NaN cell current or field at " + std::to_string(frequency) + " Hz");
                     }
                     cellCurrent[flatIndex].push_back(solution[element]);
                     cellField[flatIndex].push_back(field);
-                    cellReaction[flatIndex].push_back(reactionPerField[cell] * field);
+                    cellReaction[flatIndex].push_back(reactionPerField[cell] * solution[offsetField + cell]);
                 }
                 split.frequencies.push_back(frequency);
                 split.listedFrequenciesPerFrequency.push_back(std::move(harmonic.listedFrequencies));

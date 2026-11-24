@@ -2249,10 +2249,12 @@ TEST_CASE("Only_Current_With_Dc", "[physical-model][core-losses][smoke-test]") {
     auto coreLossesModel = CoreLossesModel::factory(models);
     auto coreLosses = coreLossesModel->get_core_losses(core, excitation, temperature);
 
-    // 165 A of DC MMF through a 0.2 mm gap drives 3C97 (Bsat about 0.52 T at 37 C) into saturation: the
-    // DC point is the load line on the magnetisation curve, 0.492 T (ABT #1223). The 1.0 T pinned before
-    // was N*I/(R*Ae) with the unbiased permeability, which no 3C97 core can carry.
-    REQUIRE_THAT(magneticFluxDensity.get_processed().value().get_offset(), Catch::Matchers::WithinAbs(0.49, 0.01));
+    // 165 A of DC MMF through a 0.2 mm gap drives 3C97 into saturation: the DC point is the load line on the
+    // magnetisation curve (ABT #1223). The 1.0 T pinned before that was N*I/(R*Ae) with the unbiased permeability,
+    // which no 3C97 core can carry. The expectation is the material table's B at 1200 A/m interpolated to 37 C,
+    // 0.53 T at 25 C and 0.41 T at 100 C: 0.5108 T (Alf, 2026-11-22, ABT #2470; was 0.49 T, read on the integrated
+    // permeability curve, which the datasheet loop replaced).
+    REQUIRE_THAT(magneticFluxDensity.get_processed().value().get_offset(), Catch::Matchers::WithinAbs(0.5108, 0.01));
 }
 
 TEST_CASE("Crash_Voltage_Sin", "[physical-model][core-losses][bug][smoke-test]") {
@@ -4567,6 +4569,257 @@ OperatingPointExcitation build_sinusoidal_flux_excitation(double frequency, doub
 }
 }  // namespace
 
+// ABT #2208/#2467: the DC-bias core-loss factor F = mu(0)/mu(H_dc) (CoreLosses::calculate_dc_bias_factor).
+namespace {
+// The sinusoid of build_sinusoidal_flux_excitation shifted by a DC flux density `offset`.
+OperatingPointExcitation build_biased_sinusoidal_flux_excitation(double frequency, double peak, double offset) {
+    auto excitation = build_sinusoidal_flux_excitation(frequency, peak);
+    auto flux = excitation.get_magnetic_flux_density().value();
+    auto waveform = flux.get_waveform().value();
+    auto data = waveform.get_data();
+    for (auto& value : data) {
+        value += offset;
+    }
+    waveform.set_data(data);
+    flux.set_waveform(waveform);
+    auto processed = flux.get_processed().value();
+    processed.set_offset(offset);
+    processed.set_peak(offset + peak);
+    flux.set_processed(processed);
+    auto harmonics = flux.get_harmonics().value();
+    auto amplitudes = harmonics.get_amplitudes();
+    amplitudes[0] = offset;
+    harmonics.set_amplitudes(amplitudes);
+    flux.set_harmonics(harmonics);
+    excitation.set_magnetic_flux_density(flux);
+    return excitation;
+}
+
+// H_dc as the code reads it: |B_dc| on the material's magnetisation curve.
+double dc_bias_field_strength(const CoreMaterial& material, double magneticFluxDensityDcBias, double temperature, double frequency) {
+    auto curve = InitialPermeability::get_magnetisation_curve(material, temperature, frequency);
+    return InitialPermeability::get_magnetomotive_force_for_flux_density(*curve, magneticFluxDensityDcBias, 1.0, 1.0, 0.0).first;
+}
+
+// The (H, mu) points of one MAS permeability field that carry magneticFieldDcBias, H ascending.
+std::vector<std::pair<double, double>> dc_bias_curve_points(const std::optional<Permeability>& data) {
+    std::vector<std::pair<double, double>> points;
+    REQUIRE(data);
+    REQUIRE(std::holds_alternative<std::vector<PermeabilityPoint>>(data.value()));
+    for (const auto& point : std::get<std::vector<PermeabilityPoint>>(data.value())) {
+        if (point.get_magnetic_field_dc_bias()) {
+            points.emplace_back(point.get_magnetic_field_dc_bias().value(), point.get_value());
+        }
+    }
+    std::sort(points.begin(), points.end());
+    return points;
+}
+
+// mu at H on those points, log(mu) linear in H between the two around it.
+double read_dc_bias_curve(const std::vector<std::pair<double, double>>& points, double fieldStrength) {
+    REQUIRE(fieldStrength >= points.front().first);
+    REQUIRE(fieldStrength <= points.back().first);
+    for (size_t index = 1; index < points.size(); ++index) {
+        if (fieldStrength <= points[index].first) {
+            double fraction = (fieldStrength - points[index - 1].first) / (points[index].first - points[index - 1].first);
+            return std::exp(std::log(points[index - 1].second) + fraction * (std::log(points[index].second) - std::log(points[index - 1].second)));
+        }
+    }
+    return points.back().second;
+}
+
+// mu(0)/mu = (1 + (b/b0)^c)^k: the estimate's law, constants from notes/abt-2208/universal/REPORT.md.
+double dc_bias_law(double saturationRatio, double b0, double c, double k) {
+    return std::pow(1 + std::pow(saturationRatio / b0, c), k);
+}
+
+// Whether a WARNING about `materialName` was collected since the collector was (re)started.
+bool dc_bias_warning_collected(const std::string& materialName) {
+    for (const auto& record : Logger::getInstance().drainCollected()) {
+        if (record.level == LogLevel::WARNING && record.message.find("'" + materialName + "'") != std::string::npos &&
+            record.message.find("DC-bias") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+}  // namespace
+
+TEST_CASE("Test_Core_Losses_Dc_Bias_Factor_Disabled_Is_One", "[physical-model][core-losses][dc-bias]") {
+    settings.reset();
+    clear_databases();
+    double temperature = 25;
+    auto excitation = build_biased_sinusoidal_flux_excitation(100000, 0.05, 0.1);
+    for (const std::string name : {"N87", "DMR96"}) {
+        auto material = Core::resolve_material(name);
+        settings.set_core_losses_dc_bias_enabled(true);
+        auto enabled = CoreLosses::calculate_dc_bias_factor(material, excitation, temperature);
+        CHECK(enabled.value > 1);
+        double lossesEnabled = CoreLosses().get_core_volumetric_losses(material, excitation, temperature);
+        settings.set_core_losses_dc_bias_enabled(false);
+        auto disabled = CoreLosses::calculate_dc_bias_factor(material, excitation, temperature);
+        CHECK(disabled.value == 1);
+        CHECK(disabled.unboundedValue == 1);
+        CHECK(disabled.source == CoreLossesDcBiasFactorSource::DISABLED);
+        double lossesDisabled = CoreLosses().get_core_volumetric_losses(material, excitation, temperature);
+        // The factor multiplies the whole loss.
+        CHECK_THAT(lossesEnabled / lossesDisabled, Catch::Matchers::WithinRel(enabled.value, 1e-9));
+    }
+    settings.reset();
+}
+
+TEST_CASE("Test_Core_Losses_Dc_Bias_Factor_N87_Reversible_Curve", "[physical-model][core-losses][dc-bias]") {
+    settings.reset();
+    clear_databases();
+    double temperature = 25;
+    double frequency = 100000;
+    // 0.2 T (Alf, 2026-11-22, ABT #2470; was 0.1 T): on the datasheet loop 0.1 T sits at 15 A/m, where the factor is 1.0004.
+    double magneticFluxDensityDcBias = 0.2;
+    auto material = Core::resolve_material("N87");
+    auto excitation = build_biased_sinusoidal_flux_excitation(frequency, 0.05, magneticFluxDensityDcBias);
+
+    double fieldStrength = dc_bias_field_strength(material, magneticFluxDensityDcBias, temperature, frequency);
+    auto points = dc_bias_curve_points(material.get_permeability().get_reversible());
+    double expected = points.front().second / read_dc_bias_curve(points, fieldStrength);
+    REQUIRE(expected > 1.01);
+
+    auto factor = CoreLosses::calculate_dc_bias_factor(material, excitation, temperature);
+    CHECK(factor.source == CoreLossesDcBiasFactorSource::REVERSIBLE);
+    CHECK(!factor.is_estimated());
+    REQUIRE(factor.magneticFieldDcBias);
+    CHECK_THAT(factor.magneticFieldDcBias.value(), Catch::Matchers::WithinRel(fieldStrength, 1e-12));
+    CHECK_THAT(factor.value, Catch::Matchers::WithinRel(expected, 1e-9));
+    CHECK_THAT(factor.magneticFluxDensityDcBias, Catch::Matchers::WithinRel(magneticFluxDensityDcBias, 1e-12));
+}
+
+TEST_CASE("Test_Core_Losses_Dc_Bias_Factor_Fair_Rite_77_Incremental_Curve", "[physical-model][core-losses][dc-bias]") {
+    settings.reset();
+    clear_databases();
+    double temperature = 25;
+    double frequency = 100000;
+    double magneticFluxDensityDcBias = 0.1;
+    auto material = Core::resolve_material("77");
+    REQUIRE(!material.get_permeability().get_reversible());
+    auto excitation = build_biased_sinusoidal_flux_excitation(frequency, 0.05, magneticFluxDensityDcBias);
+
+    double fieldStrength = dc_bias_field_strength(material, magneticFluxDensityDcBias, temperature, frequency);
+    auto points = dc_bias_curve_points(material.get_permeability().get_incremental());
+    double expected = points.front().second / read_dc_bias_curve(points, fieldStrength);
+
+    auto factor = CoreLosses::calculate_dc_bias_factor(material, excitation, temperature);
+    CHECK(factor.source == CoreLossesDcBiasFactorSource::INCREMENTAL);
+    CHECK_THAT(factor.unboundedValue, Catch::Matchers::WithinRel(expected, 1e-9));
+}
+
+TEST_CASE("Test_Core_Losses_Dc_Bias_Factor_MnZn_Estimate", "[physical-model][core-losses][dc-bias]") {
+    settings.reset();
+    clear_databases();
+    double temperature = 25;
+    double magneticFluxDensityDcBias = 0.15;
+    auto excitation = build_biased_sinusoidal_flux_excitation(100000, 0.05, magneticFluxDensityDcBias);
+
+    struct Case {
+        std::string name;
+        CoreLossesDcBiasFactorSource source;
+        double b0, c, k;
+    };
+    // ACME publishes no DC-bias curves (universal law); TDK does, but not for PC47 (TDK's law).
+    for (const auto& testCase : {Case{"A043", CoreLossesDcBiasFactorSource::UNIVERSAL_ESTIMATE, 0.670, 2.32, 0.831},
+                                 Case{"PC47", CoreLossesDcBiasFactorSource::MAKER_ESTIMATE, 0.2188, 4.582, 0.1634}}) {
+        // A renamed copy: the WARNING is logged once per material and process.
+        auto material = Core::resolve_material(testCase.name);
+        REQUIRE(!material.get_permeability().get_reversible());
+        REQUIRE(!material.get_permeability().get_incremental());
+        material.set_name(testCase.name + " DC-bias estimate test");
+        double saturationRatio = magneticFluxDensityDcBias / Core::get_magnetic_flux_density_saturation(material, temperature, false);
+
+        Logger::getInstance().disableCollector();
+        Logger::getInstance().enableCollector(LogLevel::WARNING);
+        auto factor = CoreLosses::calculate_dc_bias_factor(material, excitation, temperature);
+        CHECK(dc_bias_warning_collected(material.get_name()));
+        CHECK(factor.source == testCase.source);
+        CHECK(factor.is_estimated());
+        REQUIRE(factor.saturationFluxDensityRatio);
+        CHECK_THAT(factor.saturationFluxDensityRatio.value(), Catch::Matchers::WithinRel(saturationRatio, 1e-12));
+        CHECK_THAT(factor.unboundedValue, Catch::Matchers::WithinRel(dc_bias_law(saturationRatio, testCase.b0, testCase.c, testCase.k), 1e-12));
+        // Once: a second call logs nothing.
+        CoreLosses::calculate_dc_bias_factor(material, excitation, temperature);
+        CHECK(!dc_bias_warning_collected(material.get_name()));
+        Logger::getInstance().disableCollector();
+    }
+}
+
+TEST_CASE("Test_Core_Losses_Dc_Bias_Factor_NiZn_Without_Curve_Is_One", "[physical-model][core-losses][dc-bias]") {
+    settings.reset();
+    clear_databases();
+    auto material = Core::resolve_material("44");
+    REQUIRE(material.get_material_composition() == MaterialComposition::NI_ZN);
+    auto excitation = build_biased_sinusoidal_flux_excitation(100000, 0.05, 0.1);
+    auto factor = CoreLosses::calculate_dc_bias_factor(material, excitation, 25);
+    CHECK(factor.source == CoreLossesDcBiasFactorSource::NOT_COVERED);
+    CHECK(factor.value == 1);
+}
+
+TEST_CASE("Test_Core_Losses_Dc_Bias_Factor_Throws_On_Missing_Data", "[physical-model][core-losses][dc-bias]") {
+    settings.reset();
+    clear_databases();
+    double temperature = 25;
+    auto excitation = build_biased_sinusoidal_flux_excitation(100000, 0.05, 0.1);
+
+    SECTION("A MnZn ferrite without a curve and without saturation data") {
+        auto material = Core::resolve_material("PC47");
+        material.set_saturation({});
+        CHECK_THROWS_AS(CoreLosses::calculate_dc_bias_factor(material, excitation, temperature), MaterialException);
+        // The estimate's own refusal, not a later failure deeper in the saturation lookup.
+        CHECK_THROWS_WITH(CoreLosses::calculate_dc_bias_factor(material, excitation, temperature),
+                          Catch::Matchers::ContainsSubstring("no saturation flux density"));
+    }
+    SECTION("A ferrite without a curve and without materialComposition") {
+        auto material = Core::resolve_material("PC47");
+        material.set_material_composition(std::nullopt);
+        CHECK_THROWS_AS(CoreLosses::calculate_dc_bias_factor(material, excitation, temperature), MaterialException);
+    }
+    SECTION("A DC field strength past the curve's last point, with material data extrapolation off") {
+        settings.set_allow_material_data_extrapolation(false);
+        auto material = Core::resolve_material("77");
+        double frequency = 100000;
+        // 0.49 T (Alf, 2026-11-22, ABT #2470; was 0.4 T): on 77's datasheet loop 0.4 T sits at 71 A/m, 0.49 T at 219 A/m.
+        double magneticFluxDensityDcBias = 0.49;
+        auto points = dc_bias_curve_points(material.get_permeability().get_incremental());
+        REQUIRE(dc_bias_field_strength(material, magneticFluxDensityDcBias, temperature, frequency) > points.back().first);
+        auto biased = build_biased_sinusoidal_flux_excitation(frequency, 0.05, magneticFluxDensityDcBias);
+        CHECK_THROWS_AS(CoreLosses::calculate_dc_bias_factor(material, biased, temperature), MaterialException);
+    }
+    settings.reset();
+}
+
+// Past a curve's last point, with allowMaterialDataExtrapolation on (the default), the last segment continues as a power
+// law, mu = mu_last (H / H_last)^s, s its log-log slope, and the method says it is extrapolated (Alf, 2026-11-22: a real
+// 77 boost inductor, Example_12, sits at 216 A/m on a curve that ends at 180 A/m).
+TEST_CASE("Test_Core_Losses_Dc_Bias_Factor_Extrapolates_Past_The_Curve_When_Allowed", "[physical-model][core-losses][dc-bias]") {
+    settings.reset();
+    clear_databases();
+    REQUIRE(settings.get_allow_material_data_extrapolation());
+    double temperature = 25;
+    double frequency = 100000;
+    // 0.49 T (Alf, 2026-11-22, ABT #2470; was 0.4 T): on 77's datasheet loop 0.4 T sits at 71 A/m, 0.49 T at 219 A/m.
+    double magneticFluxDensityDcBias = 0.49;
+    auto material = Core::resolve_material("77");
+    auto points = dc_bias_curve_points(material.get_permeability().get_incremental());
+    double fieldStrength = dc_bias_field_strength(material, magneticFluxDensityDcBias, temperature, frequency);
+    REQUIRE(fieldStrength > points.back().first);
+    const auto& last = points[points.size() - 1];
+    const auto& previous = points[points.size() - 2];
+    double slope = std::log(last.second / previous.second) / std::log(last.first / previous.first);
+    double expected = points.front().second / (last.second * std::pow(fieldStrength / last.first, slope));
+
+    auto factor = CoreLosses::calculate_dc_bias_factor(material, build_biased_sinusoidal_flux_excitation(frequency, 0.05, magneticFluxDensityDcBias), temperature);
+    CHECK(factor.source == CoreLossesDcBiasFactorSource::INCREMENTAL);
+    CHECK_THAT(factor.unboundedValue, Catch::Matchers::WithinRel(expected, 1e-9));
+    CHECK_THAT(factor.method, Catch::Matchers::ContainsSubstring("EXTRAPOLATED"));
+    settings.reset();
+}
+
 // User report 2026-10-09: PC95 (Roshen-only in MAS), sinusoid, 100 kHz, 25 C lost its
 // hysteresis term below ~73 mT — 0.63 kW/m3 at 61 mT against 32.9 kW/m3 at 76 mT, the low
 // side scaling exactly as B^2 f^2 (eddy only). The analytical minor-loop tip has no positive
@@ -5289,12 +5542,15 @@ TEST_CASE("Flyback DC operating point stays on the material's DC-bias table when
     CHECK(std::isfinite(sweep.get_y_points()[0]));
     CHECK(sweep.get_y_points()[0] > 0);
 
-    // At 200 kHz the same currents have no fixed point: F(mu) jumps from ~50 to the saturated 1 across mu = 26.1
-    // (the table end, 483.4 A/m), and F(1) = 59.9, so mu = 1 is no root either. The solve closes on the step, not
-    // on a root, and the core is saturated: the point is flagged and carries no loss.
+    // At 200 kHz the same currents found no fixed point while the flyback's peak current was turned into flux
+    // through the linear inductance: at mu = 1 that peak was worth almost no flux, F(mu) jumped across the table
+    // end and the point was flagged saturated with L = 0.97 uH. The peak current now sets B through the gap's load
+    // line and the material's curve (ABT #2502): the point has a root, B peak 0.351 T under B_sat 0.562 T and
+    // L = 37.5 uH, so it is unsaturated and carries a loss. The no-root criterion lost this case as its test.
     REQUIRE(sweep.get_saturated_points().value().size() == 2);
-    CHECK(sweep.get_saturated_points().value()[1]);
-    CHECK(std::isnan(sweep.get_y_points()[1]));
+    CHECK_FALSE(sweep.get_saturated_points().value()[1]);
+    CHECK(std::isfinite(sweep.get_y_points()[1]));
+    CHECK(sweep.get_y_points()[1] > 0);
 }
 
 // ABT #1602: the core-loss series resistance builds an equivalent winding N = sqrt(L * R). It used to
